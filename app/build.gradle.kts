@@ -35,6 +35,9 @@ android {
         versionCode = 10
         versionName = "0.8.0"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        // On-device instrumented test suite (app/src/androidTest). Headless (PR1):
+        // engine .so load + parity, native RAW/TIFF/PNG, presets/recipes/masks.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -109,4 +112,17 @@ dependencies {
     // Real org.json on the unit-test classpath (the android.jar stub throws "not
     // mocked"); lets Presets JSON round-trip be tested on the plain JVM.
     testImplementation("org.json:json:20231013")
+
+    // On-device instrumented tests (app/src/androidTest). AndroidJUnitRunner + rules +
+    // ext.junit for @RunWith(AndroidJUnit4); espresso is unused in PR1 (headless) but
+    // harmless. The compose ui-test deps are pinned by the same BOM the app uses so a
+    // later PR2 can add testTag-driven UI tests without touching versions.
+    androidTestImplementation(libs.junit)
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
