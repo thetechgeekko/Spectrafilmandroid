@@ -6,6 +6,13 @@
 > cross-checked against the current app + engine inventory. Every claim about what LR does is
 > cited to a specific RE doc/symbol; every "our gap" was verified against the tree.
 
+> **⚠️ Verification caveat (added 2026-07-03).** The "every 'our gap' was verified against the tree"
+> claim above proved UNRELIABLE. On re-check, item #1's Neutral preset was **already shipped**
+> (`neutral_adobe_like`, commit `7ef915b`) and item #2's histogram panel was **already shipped**
+> (`PreviewHistogramOverlay` + toggle, `Viewer.kt`/`MainActivity.kt`) — yet both were listed as unbuilt
+> "gaps." **Re-verify every item against the current tree before starting it.** A full re-audit of
+> items #3–#20 is recommended before trusting any remaining "Our gap" line.
+
 ## The prime directive (read this first)
 
 **Bit-exact parity with the upstream spektrafilm oracle on the DEFAULT / EXPORT path is non-negotiable.**
@@ -47,8 +54,8 @@ strip `-fno-finite-math-only`).
 
 | # | Title | Value | Effort | Parity class |
 |---|-------|-------|--------|--------------|
-| 1 | "Neutral (Adobe-like)" built-in preset | High | S | default-safe |
-| 2 | Live histogram + shadow/highlight clip indicators | High | S | default-safe |
+| 1 | "Neutral (Adobe-like)" preset — ✅ **shipped** (`7ef915b`) | High | S | default-safe |
+| 2 | Live histogram ✅ **shipped** + clip indicators ✅ **added 2026-07-03** | High | S | default-safe |
 | 3 | Debounce/pause render during slider & crop gestures | High | S | default-safe |
 | 4 | 8-band HSL / Color Mixer (partition-of-unity) | High | M | default-safe |
 | 5 | 3-way Color Grading wheels + Split Toning | High | M | default-safe |
@@ -82,10 +89,14 @@ no bloom. They then wrote a concrete parameter recipe to close it.
 (`RESEARCH_LIGHTROOM_RENDER.md` "Lightroom's default render pipeline" L9-20 + Result table L28-37 +
 "Alignment" levers 1-4 L39-49 + "Recommended product move" L51-53.)
 
-**Our gap.** We ship 28 film/print-pairing presets (`BuiltInPresets.kt`, `PRESETS.md`) but no
-Lightroom-style neutral starting point. The DCP camera profile CANNOT go into the default filming stage
-(it would break `simulate_e2e`/`filming`), but every lever the RE author cites already exists as a
-`SpektraParams` field.
+**Our gap — ✅ ALREADY SHIPPED (this claim was stale).** A `neutral_adobe_like` preset ("Neutral —
+Clean Baseline", group "Neutral") already ships in `assets/spektra/presets.json`, added in commit
+`7ef915b` alongside `RESEARCH_LIGHTROOM_RENDER.md` and kept through the 28-look rebuild (`f59792f`). It
+wires −0.2 EV + glare-off (matching the recipe) but turns `dirCouplers`/`halation` fully OFF (the recipe
+said *reduce*, not kill) and omits the optional mild contrast curve. The DCP camera profile still CANNOT
+go into the default filming stage (it would break `simulate_e2e`/`filming`). **Do not rebuild.** Optional
+refinement toward the exact measured recipe (reduce-not-kill couplers/halation, add a mild contrast
+curve) needs a device render loop to tune against `raw_test.bin` — the item's own "validate visually" step.
 
 **Parity class + gate.** default-safe (Tier 0/4). Pure parameter bundle in Kotlin — zero `cpp`, the film
 default stays the app identity. No golden impact by construction.
@@ -111,9 +122,14 @@ luminance histograms with SDR/HDR flags and shadow/highlight clip warnings for t
 (`icb-by-feature.md` ## Render_Preview L750; `icb-signatures.txt` L134. Also `cr_stage_ColorHistograms`
 in `cr-symbols-curated.txt`.)
 
-**Our gap.** A histogram is already computed and drawn *behind the tone-curve editor* (`ToneCurve.kt`,
-`Viewer.kt` reference it), but there is no standalone always-on histogram panel and no clip-warning
-overlay. This is the cheapest UX win in the set — the reduction primitive already exists.
+**Our gap — ✅ MOSTLY SHIPPED (this claim was stale).** The standalone always-on histogram panel
+already ships: `PreviewHistogramOverlay` (a Lightroom-style translucent top-edge overlay in `Viewer.kt`)
+plus `HistogramCard`, driven by a `showHistogram` toggle wired in `MainActivity.kt`. Only the
+**shadow/highlight clip indicators** were genuinely missing — **added 2026-07-03**: `computeHistogram`
+now tracks the sampled count, and `drawHistogram` paints Lightroom-style corner triangles (top-left =
+shadow, top-right = highlight) tinted to whichever channels rail (`clippedChannels` + `HistogramClipTest`
+guard the pure decision). **Still open:** the *tappable* on-image clip "blinkies" overlay (tap the corner
+to highlight blown/crushed pixels on the preview) — a larger, separate follow-on.
 
 **Parity class + gate.** default-safe (Tier 0). Read-only reduction over the final output `ByteBuffer`;
 zero effect on exported pixels.
