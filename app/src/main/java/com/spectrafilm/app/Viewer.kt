@@ -55,6 +55,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.clipRect
@@ -576,13 +577,18 @@ fun PreviewHistogramOverlay(bitmap: Bitmap, modifier: Modifier = Modifier) {
     }
 }
 
-/** Per-channel 256-bin counts plus the per-channel maximum used for scaling. */
+/**
+ * Per-channel 256-bin counts plus the per-channel maximum used for scaling and the number of
+ * pixels [sampled] (the denominator for clip fractions — bins r/g/b[0] and [255] are the
+ * shadow/highlight clip counts).
+ */
 class Histogram(
     val r: IntArray,
     val g: IntArray,
     val b: IntArray,
     val luma: IntArray,
     val peak: Int,
+    val sampled: Int,
 )
 
 /** Sample the bitmap (stride-decimated for speed) into 256-bin RGB + luma histograms. */
@@ -595,6 +601,7 @@ fun computeHistogram(bmp: Bitmap): Histogram {
     val targetSamples = 200_000L
     val stride = max(1, (total / targetSamples).toInt())
     val px = IntArray(w)
+    var sampled = 0
     var sy = 0
     while (sy < h) {
         bmp.getPixels(px, 0, w, 0, sy, w, 1)
@@ -607,6 +614,7 @@ fun computeHistogram(bmp: Bitmap): Histogram {
             r[rr]++; g[gg]++; b[bb]++
             val y = ((rr * 54 + gg * 183 + bb * 19) shr 8).coerceIn(0, 255)
             l[y]++
+            sampled++
             sx += stride
         }
         sy += stride
@@ -615,7 +623,7 @@ fun computeHistogram(bmp: Bitmap): Histogram {
     for (i in 0 until 256) {
         peak = max(peak, max(max(r[i], g[i]), max(b[i], l[i])))
     }
-    return Histogram(r, g, b, l, peak)
+    return Histogram(r, g, b, l, peak, sampled)
 }
 
 private fun DrawScope.drawHistogram(hist: Histogram) {
@@ -638,6 +646,51 @@ private fun DrawScope.drawHistogram(hist: Histogram) {
     drawChannel(hist.r, Color(0x88FF4040))
     drawChannel(hist.g, Color(0x8840FF40))
     drawChannel(hist.b, Color(0x884070FF))
+
+    // Shadow (top-left) / highlight (top-right) clip indicators: a corner triangle lit in the
+    // color of whichever channels rail — all three -> white — the standard Lightroom cue.
+    drawClipCorner(atLeft = true, clippedChannels(hist.r[0], hist.g[0], hist.b[0], hist.sampled, CLIP_THRESHOLD))
+    drawClipCorner(atLeft = false, clippedChannels(hist.r[255], hist.g[255], hist.b[255], hist.sampled, CLIP_THRESHOLD))
+}
+
+/** Fraction of sampled pixels at a channel's rail above which its clip indicator lights. */
+private const val CLIP_THRESHOLD = 0.001f
+
+/**
+ * Which of the three channels clip — more than [threshold]·[sampled] pixels railed — returned
+ * as (r, g, b) booleans, or null when none clip. Pure (no Compose/Android types) so it is unit
+ * tested directly; the caller maps the triple to an indicator color.
+ */
+fun clippedChannels(
+    rCount: Int,
+    gCount: Int,
+    bCount: Int,
+    sampled: Int,
+    threshold: Float,
+): Triple<Boolean, Boolean, Boolean>? {
+    if (sampled <= 0) return null
+    val t = threshold * sampled
+    val rc = rCount > t
+    val gc = gCount > t
+    val bc = bCount > t
+    return if (rc || gc || bc) Triple(rc, gc, bc) else null
+}
+
+/** Draw a small clip-warning triangle in a top corner, tinted to the [clipped] channels. */
+private fun DrawScope.drawClipCorner(atLeft: Boolean, clipped: Triple<Boolean, Boolean, Boolean>?) {
+    if (clipped == null) return
+    val (rc, gc, bc) = clipped
+    val color = Color(if (rc) 1f else 0f, if (gc) 1f else 0f, if (bc) 1f else 0f, 1f)
+    val leg = size.height * 0.24f
+    val path = Path().apply {
+        if (atLeft) {
+            moveTo(0f, 0f); lineTo(leg, 0f); lineTo(0f, leg)
+        } else {
+            moveTo(size.width, 0f); lineTo(size.width - leg, 0f); lineTo(size.width, leg)
+        }
+        close()
+    }
+    drawPath(path, color)
 }
 
 /**
