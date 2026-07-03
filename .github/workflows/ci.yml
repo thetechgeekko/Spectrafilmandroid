@@ -258,6 +258,13 @@ jobs:
           # the output must be byte-identical at 1 vs 8 workers (scan, print, and the
           # grain+halation branch). Guards the bit-exact parity gate under threading.
           build_run test_parallel "$ASSET" tests/scan_portra_input_rgb.f64
+          # Grain thread-count invariance at the unit level: both grain paths now run
+          # their independent (channel x sublayer) RNG streams concurrently
+          # (kernels/parallel.h parallel_tasks), each into a private plane, accumulated
+          # serially in canonical order -> byte-identical for any worker count. This
+          # ALSO gates the non-sublayer path (apply_grain_to_density), which the
+          # default-params test_parallel above never reaches (grain.sublayers_active).
+          build_run test_grain_parallel
           # Optional tone curve on the final display RGB: the default (inactive) and an
           # identity active curve must reproduce the scan_portra golden bit-for-bit
           # (new look control must not perturb existing goldens); a real S-curve must

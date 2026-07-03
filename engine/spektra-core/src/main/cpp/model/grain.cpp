@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "kernels/gaussian.h"
+#include "kernels/parallel.h"
 #include "kernels/stats.h"
 
 namespace spk {
@@ -113,23 +114,33 @@ void apply_grain_to_density(const float* density_cmy, int npix, int width,
     // Accumulator per channel-interleaved pixel (the Python code does
     // density_cmy += density_min before sampling, then out -= density_min after).
     std::vector<double> acc(static_cast<size_t>(npix) * 3, 0.0);
-    std::vector<float> shifted(static_cast<size_t>(npix));   // one channel plane
-    std::vector<float> layer_out(static_cast<size_t>(npix));
 
-    for (int c = 0; c < 3; ++c) {
+    // The 3×n_sub (channel × sublayer) calls are INDEPENDENT seeded RNG streams,
+    // so run them concurrently — each into its own private output plane
+    // (index k = c*n_sub + sl). The RNG walk WITHIN a call stays serial. We then
+    // accumulate serially in canonical (c, sl) order, so the float add-order — and
+    // the output — is byte-identical to the serial loop for any thread count. See
+    // apply_grain_to_density_layers below / kernels/parallel.h for the contract.
+    const int ntasks = 3 * n_sub;
+    std::vector<float> planes(static_cast<size_t>(npix) * ntasks);
+    parallel_tasks(ntasks, [&](int k) {
+        const int c = k / n_sub, sl = k % n_sub;
+        std::vector<float> shifted(static_cast<size_t>(npix));  // task-private
         // density_cmy[:,c] + density_min[c]
         for (int i = 0; i < npix; ++i)
             shifted[i] = static_cast<float>(
                 static_cast<double>(density_cmy[i * 3 + c]) + grain.density_min[c]);
-
+        uint64_t seed = static_cast<uint64_t>(grain.seed_base[c] + sl * 10 +
+                                              grain.seed_offset);
+        layer_particle_model(shifted.data(), npix, width, height,
+                             density_max[c], n_ppp[c], grain.uniformity[c],
+                             seed, &planes[static_cast<size_t>(k) * npix]);
+    });
+    for (int c = 0; c < 3; ++c) {
         for (int sl = 0; sl < n_sub; ++sl) {
-            uint64_t seed = static_cast<uint64_t>(grain.seed_base[c] + sl * 10 +
-                                                  grain.seed_offset);
-            layer_particle_model(shifted.data(), npix, width, height,
-                                 density_max[c], n_ppp[c], grain.uniformity[c],
-                                 seed, layer_out.data());
+            const float* lo = &planes[static_cast<size_t>(c * n_sub + sl) * npix];
             for (int i = 0; i < npix; ++i)
-                acc[static_cast<size_t>(i) * 3 + c] += layer_out[i];
+                acc[static_cast<size_t>(i) * 3 + c] += lo[i];
         }
         // /= n_sub_layers, then -= density_min[c]
         for (int i = 0; i < npix; ++i) {
@@ -175,24 +186,39 @@ void apply_grain_to_density_layers(const float* density_cmy_layers, int npix,
 
     // Accumulator per channel-interleaved pixel.
     std::vector<double> acc(static_cast<size_t>(npix) * 3, 0.0);
-    std::vector<float> shifted(static_cast<size_t>(npix));   // one sublayer plane
-    std::vector<float> layer_out(static_cast<size_t>(npix));
 
+    // Each (channel, sublayer) is an INDEPENDENT seeded RNG stream, so the 9
+    // layer_particle_model calls run concurrently — each into its own private
+    // output plane (index k = c*3 + sl). The RNG walk WITHIN a call stays serial
+    // (mt19937 consumed in raster order with data-dependent draw counts, so it
+    // cannot be split across pixels bit-exactly). We then accumulate serially in
+    // canonical (c, sl) order, so the float add-order — and therefore the output —
+    // is byte-identical to the serial loop for any thread count. Grain is only
+    // statistically matched to the oracle and excluded from the byte-exact
+    // goldens; its parity gate is thread-invariance, which this preserves (see
+    // kernels/parallel.h and tests/test_parallel.cpp).
+    std::vector<float> planes(static_cast<size_t>(npix) * 9);
+    parallel_tasks(9, [&](int k) {
+        const int c = k / 3, sl = k % 3;
+        std::vector<float> shifted(static_cast<size_t>(npix));  // task-private
+        // density_cmy_layers[:,sl,c] += density_min_layers[sl,c]
+        for (int i = 0; i < npix; ++i) {
+            float v = density_cmy_layers[static_cast<size_t>(i) * 9 + sl * 3 + c];
+            shifted[i] = static_cast<float>(static_cast<double>(v) +
+                                            dmin_layers[sl][c]);
+        }
+        uint64_t seed = static_cast<uint64_t>(grain.seed_base[c] + sl * 10 +
+                                              grain.seed_offset);
+        layer_particle_model(shifted.data(), npix, width, height,
+                             dmax_lay[sl][c], n_ppp[sl][c], grain.uniformity[c],
+                             seed, grain.blur_dye_clouds_um,
+                             &planes[static_cast<size_t>(k) * npix]);
+    });
     for (int c = 0; c < 3; ++c) {
         for (int sl = 0; sl < 3; ++sl) {
-            // density_cmy_layers[:,sl,c] += density_min_layers[sl,c]
-            for (int i = 0; i < npix; ++i) {
-                float v = density_cmy_layers[static_cast<size_t>(i) * 9 + sl * 3 + c];
-                shifted[i] = static_cast<float>(static_cast<double>(v) +
-                                                dmin_layers[sl][c]);
-            }
-            uint64_t seed = static_cast<uint64_t>(grain.seed_base[c] + sl * 10 +
-                                                  grain.seed_offset);
-            layer_particle_model(shifted.data(), npix, width, height,
-                                 dmax_lay[sl][c], n_ppp[sl][c], grain.uniformity[c],
-                                 seed, grain.blur_dye_clouds_um, layer_out.data());
+            const float* lo = &planes[static_cast<size_t>(c * 3 + sl) * npix];
             for (int i = 0; i < npix; ++i)
-                acc[static_cast<size_t>(i) * 3 + c] += layer_out[i];
+                acc[static_cast<size_t>(i) * 3 + c] += lo[i];
         }
     }
 

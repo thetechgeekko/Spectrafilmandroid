@@ -24,6 +24,7 @@
 #define SPK_KERNELS_PARALLEL_H
 
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -106,6 +107,39 @@ void parallel_for(int begin, int end, const Body& body) {
     body(begin, std::min(begin + chunk, end));
     for (auto& w : workers) w.join();
 #endif  // SPK_USE_TBB
+}
+
+// Run body(i) for each i in [0, ntasks) across up to parallel_num_threads()
+// threads, pulling task indices off a shared atomic counter (dynamic load
+// balancing — the extra task when ntasks doesn't divide the worker count lands
+// on whichever thread frees up first). Unlike parallel_for there is NO min-chunk
+// gate: this is for a SMALL number of COARSE, heavyweight tasks (e.g. the grain
+// RNG streams), where per-thread spawn cost is negligible.
+//
+// DETERMINISM CONTRACT: task-to-thread assignment must not affect the result, so
+// the caller MUST have each task write only DISJOINT outputs; any cross-task
+// reduction is the caller's job to do serially AFTER this returns. Given that,
+// the output is byte-identical for any thread count — the thread-invariance the
+// parity gate requires. body MUST be free of cross-task shared mutable state.
+template <typename Body>
+void parallel_tasks(int ntasks, const Body& body) {
+    if (ntasks <= 0) return;
+    int nthreads = std::min(parallel_num_threads(), ntasks);
+    if (nthreads <= 1) {
+        for (int i = 0; i < ntasks; ++i) body(i);
+        return;
+    }
+    std::atomic<int> next{0};
+    auto worker = [&]() {
+        int i;
+        while ((i = next.fetch_add(1, std::memory_order_relaxed)) < ntasks)
+            body(i);
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(nthreads - 1));
+    for (int t = 1; t < nthreads; ++t) workers.emplace_back(worker);
+    worker();  // the calling thread participates
+    for (auto& w : workers) w.join();
 }
 
 }  // namespace spk
