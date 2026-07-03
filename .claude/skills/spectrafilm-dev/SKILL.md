@@ -189,6 +189,30 @@ ANDROID_SDK_ROOT=/opt/android-sdk JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
 
 ---
 
+## On-device export benchmark (measured; the export path ≠ the parity gate)
+
+The parity gate above proves *correctness*; `engine/spektra-core/src/main/cpp/tests/bench_export.cpp`
+measures *export speed* on a real arm64 device (local tool, not CI). Build it with the NDK
+`aarch64-linux-android24-clang++` over the same engine source glob + the two writer TUs, with
+`-lz -landroid` (`-landroid` is REQUIRED — `__ANDROID__` pulls in the AAssetManager path); push the
+binary + the `assets/spektra` tree to `/data/local/tmp` and run under `adb shell` (full recipe in the
+file header). **On Windows, drive `adb` from PowerShell, not git-bash** — git-bash mangles
+`/data/local/tmp` into `C:/Program Files/Git/data/...`. For the app build use Android Studio's jbr as
+`JAVA_HOME` (a too-new PATH `java`, e.g. JDK 26, breaks Gradle 8.14). PowerShell `>` corrupts binary
+redirects (UTF-16) — capture `adb exec-out screencap` etc. from git-bash or via `adb pull`.
+
+**Measured 2026-07-02 (SM-S948W, 12 MP):** a full export ≈ **74.5 s, of which grain is ~67 s (90 %)**
+— NOT the spectral integrals. Grain parallelizes **byte-identically** (9 independent channel×sublayer
+RNG streams saturate 8 cores; *within* a call the `mt19937` stream must stay serial per
+`parallel.h:20-21`). The serial separable blurs (`kernels/gaussian.cpp`, `model/diffusion.cpp` have no
+`parallel_for`), the double 140 MB result memcpy, and the PNG16 zlib deflate are the other bit-exact
+levers → ~6× export. Ranked plan + root causes: `docs/EXPORT_PERF_2026-07-02.md`. Grain's determinism
+constraint is *thread-invariance*, not oracle-byte-equality (grain is only statistically matched to
+the oracle + excluded from the byte-exact goldens), so parallelizing the 9 calls is byte-identical to
+today's output.
+
+---
+
 ## Reference files
 
 - `references/parity-and-build.md` — toolchain pins, full CI gate list, host-parity compile

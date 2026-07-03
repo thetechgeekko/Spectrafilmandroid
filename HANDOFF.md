@@ -29,8 +29,37 @@
 - **This branch now carries the unmerged oklrab commits (slice 2) on top of `origin/main` + the
   `1174fd8` docs commit.** Open a NEW draft PR for them; the remote branch auto-deletes on merge and
   recreates with a plain push. Never stack new work on already-merged history.
+- **Export-speed: grain parallelized + MEASURED (2026-07-02, on-device SM-S948W).** A 12 MP export was
+  **74.5 s, of which grain was ~67 s (90 %)**. Grain's 9 (ch×sublayer) RNG streams now run on a new
+  `parallel_tasks` helper (`kernels/parallel.h`), each into a private plane, accumulated serially in
+  canonical order — **byte-identical** to serial for any worker count (proven: `test_grain_parallel`
+  1-vs-8 both paths, `test_parallel` grain+halation scan+print 1-vs-8, and a new-vs-old serial `cmp`
+  = 0). **Measured: grain 67 s → 32.8 s (~2.0×), export 74.5 s → 40.0 s (~1.86×).** This is the
+  `ceil(9/8)` **2-wave** ceiling — the earlier "~8.5 s / ~6×" projection was optimistic (9 unequal
+  streams on 8 heterogeneous, thermally-limited cores). Items 2–5 (blurs/PNG/copy, ~7 s) still open.
+  Full breakdown + the >2× counter-RNG lever in **`docs/EXPORT_PERF_2026-07-02.md`**; repeatable
+  on-device bench at **`engine/spektra-core/src/main/cpp/tests/bench_export.cpp`** (recipe in header).
+  See the "Export speed" section below.
 
-## Next — P2 #6 slice 3: `jzazbz` (then slice 4 `cam16ucs`)
+## Next session (user directive 2026-07-02) — Lightroom-parity feature backlog
+
+**Read `docs/NEXT_SESSION_LIGHTROOM.md` first.** 20 ranked improvements RE'd from the Lightroom docs
+(`docs/RESEARCH_LIGHTROOM_*` + `docs/lightroom-re/*`), cross-checked against our tree, each parity-
+classified (default-safe / opt-in / preview-only / parity-risk) with a cited LR source, our verified
+gap, the exact gate, and a concrete first step (target file/function). Ranked by value ÷ effort.
+Top of the list (all **default-safe** = `:app`/seam only, engine goldens untouched):
+1. **"Neutral (Adobe-like)" preset** (S) — closes the measured LR-neutral render gap with existing params.
+2. **Live histogram + clip indicators** (S) — promote the tone-curve histogram to a standalone panel.
+3. **Debounce render during slider/crop gestures** (S) — one settle-render on release.
+4. **8-band HSL / Color Mixer** (M) — post-engine, raised-cosine band weights (anti-banding), identity at 0.
+5. **3-way Color Grading wheels + Split Toning** (M) — shares the HSL band kernel.
+Then vignette, Whites/Blacks+parametric curves, Auto-Tone, embedded-JPEG first-paint, spectral-prefix
+cache, Clarity/Texture, Dehaze, … down to XL/parity-risk (guided-filter Highlights/Shadows, tiled
+export). Discipline: `default-safe` → work in `:app` or the pre/post-engine seam, never touch `cpp`;
+`opt-in` → author a NEW oracle golden + `SPK_NUM_THREADS` 1≡8 assertion in the SAME session (like the
+`gamut_out_*` gates); never merge an ungated engine change.
+
+## Also queued — P2 #6 slice 3: `jzazbz` (then slice 4 `cam16ucs`)
 
 Slice 2 `oklrab` is DONE (see the state block above). Clone the same pattern; the templates are now
 `tools/parity/gen_gamut_oklrab_golden.py`, `model/gamut_compression.{h,cpp}` (oklch + oklrab
@@ -53,6 +82,30 @@ the `"jzazbz"` branch of `_get_output_c_max_table` in `utils/gamut_compression.p
 Per increment: default path byte-identical, opt-in/default-OFF, feature-on within tol
 (`max_abs ≤ 1e-4`, `rms ≤ 1e-5`), `SPK_NUM_THREADS` 1≡8, NDK r27 3-ABI build, commit+push on green.
 **Ship ONE algo per PR** — subagents died on token limits when given more, so keep each unit small.
+
+## Export speed (bit-exact) — grain DONE 2026-07-02; items 2–5 open
+
+Full detail: `docs/EXPORT_PERF_2026-07-02.md`. Bench: `tests/bench_export.cpp`. Order (all keep the
+CI parity gate green + `SPK_NUM_THREADS` 1≡8):
+1. **Grain — ✅ DONE (67 s → 32.8 s, ~2.0×, byte-identical).** The 9 `layer_particle_model` calls in
+   `apply_grain_to_density_layers` + `apply_grain_to_density` now run on `parallel_tasks`
+   (`kernels/parallel.h` — coarse atomic-scheduled task-parallel, no min-chunk gate), each into a
+   private plane, accumulated serially in canonical (c, sl) order. Gated by `test_grain_parallel`
+   (both paths) + `test_parallel`, both 1≡8. **~2× is the `ceil(9/8)` 2-wave ceiling** for the
+   bit-exact approach; >2× needs per-pixel counter-RNG (different realization → stat-golden regen +
+   product call). Export is now **~40 s**; grain (32.8 s) still dominates.
+2. **Halation + DIR blurs (~5 s → ~0.7 s).** `parallel_for` the separable row/col passes in
+   `kernels/gaussian.cpp` + `model/diffusion.cpp` — bit-exact (independent output elements). These
+   ARE byte-exact-gated (`diffusion_e2e`, spatial gates) — verify they stay green.
+3. **Double 140 MB memcpy → single owned buffer** (`spektra.cpp:1493` + `spektra_jni.cpp:641`).
+4. **PNG16 zlib → libdeflate** (MIT, GPLv3-OK) or per-band parallel deflate (2.1 s → ~0.5 s; decoded
+   pixels identical, file bytes differ). PNG-export only; TIFF-uncompressed is already ~free.
+5. **Camera/enlarger diffusion** (8.5 s when ON, default-OFF): `parallel_for` rows+channels now, and
+   restore FFT convolution (`apply_diffusion_filter_um`, `diffusion.cpp:437-450` is O(n·ks²) with an
+   image-scaled radius — an FFT→direct regression vs the oracle). Shared by camera + enlarger.
+
+Grain is only STATISTICALLY oracle-matched (never element-wise), so its determinism constraint is
+thread-invariance, not oracle-byte-equality — the 9-way parallel keeps it byte-identical to today.
 
 ### Also open (unchanged)
 - **Strategy-B rebaseline cluster** (`PRIORITY_ROADMAP` #20-27; incl. CAT02→CAT16 + xy-clip removal)
@@ -213,6 +266,7 @@ Per increment: default path byte-identical, opt-in/default-OFF, feature-on withi
 `CLAUDE.md` build/parity/arch · `docs/AUDIT.md` open items + severity · `CHANGELOG.md` release notes ·
 `docs/PRIORITY_ROADMAP_2026-06-24.md` the #1–#27 priority numbering ·
 `docs/UPSTREAM_SYNC_2026-06-24.md` Strategy-A/B port plan · `docs/IMPROVEMENT_BACKLOG.md` LR-RE'd
-feature list · `docs/PERF_ROADMAP.md` perf plan+policy · `docs/USER_DRIVEN_SOLUTIONS.md` +
+feature list · `docs/PERF_ROADMAP.md` perf plan+policy · `docs/EXPORT_PERF_2026-07-02.md` measured
+on-device export breakdown (grain=90%) + bit-exact speedup plan · `docs/USER_DRIVEN_SOLUTIONS.md` +
 `.claude/skills/spectrafilm-solutions/` the user-need catalog · `docs/RESEARCH_*` / `docs/lightroom-re/`
 RE studies · `docs/PRESETS.md` / `docs/FILM_STOCKS.md` content · `docs/maps/` source-project maps.

@@ -31,6 +31,37 @@ gate).
 At ~0.8 MP/s on 4 cores, a 12 MP proxy ≈ 15 s on CPU — orders of magnitude off Lightroom's
 GPU pipeline. CPU micro-opt alone won't close that; the gap is **architectural (GPU)**.
 
+## Measured (on-device arm64, the EXPORT path — 2026-07-02, SM-S948W, 8 cores)
+
+This satisfies the "profile on a real arm64 device" caveat below. **Full detail:
+`docs/EXPORT_PERF_2026-07-02.md`. Bench: `engine/spektra-core/src/main/cpp/tests/bench_export.cpp`.**
+
+A **12 MP full-res export = ~74.5 s**, and — contrary to the host-x86 framing above — the spectral
+integrals are **not** the export bottleneck: **grain is ~67 s (90 %)**; everything else (spectral +
+blurs + scan) is ~7.4 s and the PNG16 zlib write ~2.1 s (TIFF-uncompressed ~free). Crucially the big
+lever here is **CPU-parallelizable AND bit-exact**, unlike the interactive-proxy levers (#1–#3 below):
+
+- **Grain 67 s → 32.8 s (~2.0×), byte-identical — ✅ DONE (measured).** The default (sublayer) path
+  runs **9 independent (channel×sublayer) `layer_particle_model` calls**, each with its own seed;
+  they now run on `parallel_tasks` (`kernels/parallel.h`, coarse atomic-scheduled — `parallel_for`
+  would run 9 coarse items serially past its min-chunk gate), each into a private plane, accumulated
+  serially in canonical order. *Within* a call the `mt19937` stream stays serial. Grain is only
+  statistically oracle-matched + excluded from the byte-exact goldens, so this is byte-identical to
+  the serial output for any worker count (gated by `test_grain_parallel` + `test_parallel`, 1≡8).
+  **Reality check:** 9 unequal streams on 8 heterogeneous, thermally-limited cores is a `ceil(9/8)`
+  **2-wave** job → ~2×, not the ~8× the "saturate 8 cores" wording implied. >2× bit-exactly needs
+  per-pixel counter-RNG (different grain realization → stat-golden regen + a product call).
+- **Halation + DIR separable blurs ~5 s → ~0.7 s**, byte-identical (parallelize rows/cols; currently
+  `kernels/gaussian.cpp`/`model/diffusion.cpp` have no `parallel_for`).
+- **PNG16 zlib 2.1 s → ~0.5 s** via **libdeflate** (MIT) / parallel bands — decoded pixels identical.
+- **Camera/enlarger diffusion** is a pathological O(n·ks²) non-separable direct convolution with an
+  image-scaled radius (default-OFF; an FFT→direct regression vs the oracle) — restore FFT + parallel.
+
+Net (grain done, rest projected): default-preset export **74.5 s → 40.0 s now (grain), → ~34 s with
+items 2+5, all bit-exact.** A genuine CPU win with NO GPU/fp16/LUT precision trade-off — just
+un-parallelized serial work. Grain (32.8 s) still dominates the residual; its 2-wave ceiling, not the
+~7 s serial tail, is the floor for the bit-exact approach.
+
 ## Already done (the bit-exact wins)
 - **Deterministic fork-join threading** (`kernels/parallel`) — fills oneTBB's role here and is
   *byte-identical across thread counts* (a property raw TBB wouldn't give for free). 3× on 4 cores.

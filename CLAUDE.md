@@ -94,7 +94,7 @@ g++ -std=c++17 -O2 -pthread -I. -I../../../../../tools/parity \
 # then run with the args the CI `engine-parity` job uses (see .github/workflows/ci.yml)
 ```
 
-A test passes when its output contains no `FAIL` line. CI `engine-parity` gates (35 tests):
+A test passes when its output contains no `FAIL` line. CI `engine-parity` gates (36 tests):
 `simulate_e2e` (goldens + BOTH film-density memos + the print-density memo + per-param key
 completeness), `filming`, `spatial`, `crop_resize`, `downscale` (minification AA prefilter),
 `autoexposure`, `small_preview_aa` (AE metering downscale AA), `diffusion` (+`_e2e`),
@@ -109,7 +109,11 @@ compression), the spektral-param wiring gates
 `highlight_boost_e2e` (the pre-clip highlight-boost in filming.expose),
 `spatial_decouple_e2e` (per-effect spatial gating: lens blur ON / halation OFF),
 `print_spatial_e2e` (print-route filming spatial branch),
-and **`test_parallel`** (thread-invariance, fresh engine per thread count). The param-wiring
+**`test_parallel`** (thread-invariance, fresh engine per thread count), and
+**`test_grain_parallel`** (unit-level grain thread-invariance for BOTH grain paths — the
+non-sublayer `apply_grain_to_density` path is otherwise ungated, since default params take the
+sublayer path; grain's 9 (channel×sublayer) RNG streams now run on `parallel_tasks`, byte-identical
+to serial for any worker count). The param-wiring
 goldens are pinned to oracle SHA `c1d0e44` (see `tools/parity/setup_env.sh`). The exact
 per-test argv is in `.github/workflows/ci.yml` — copy from there rather than guessing.
 
