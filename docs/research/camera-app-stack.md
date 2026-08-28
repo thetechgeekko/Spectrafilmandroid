@@ -6,8 +6,10 @@ bokeh + film simulation — to be researched and kept on file. Nothing here is c
 scheduled, or started. Every claim below was checked against a primary source on
 2026-08-28; the ones that still need a device are marked.
 
-Companion to `docs/PERF_ROADMAP.md` (what shipped), `docs/research/perf-lab.md` (what was
-measured and rejected), and `docs/MOBILE_STRATEGY.md`.
+Companion to `docs/PERF_ROADMAP.md` (what shipped) and `docs/MOBILE_STRATEGY.md`.
+**Note:** `docs/research/perf-lab.md` is cited throughout for measured numbers, but it
+lives on branch `claude/perf-lab` (PR #156) and is not on `main` yet — read it with
+`git show claude/perf-lab:docs/research/perf-lab.md` until that merges.
 
 ---
 
@@ -220,7 +222,115 @@ the default path.
 - [ ] Whether `spk_bake_cube_lut`'s 33³ grid is fine enough for the look, or whether video
       needs 65³.
 
-## 10. Honest scope note
+## 10. Verification round 2 — a second candidate architecture, checked
+
+A second document was put forward proposing a **multi-DSL native engine** (Halide for
+CPU image pipelines, Slang for Vulkan kernels, ISPC for irregular CPU SIMD, MNN for
+neural work, Faust/KFR for audio, OpenCV G-API for orchestration, FFmpeg for media).
+Nineteen recommendations across it were each checked against primary sources and then
+adversarially challenged against this repo's actual constraints.
+
+**Result: two survived** — Vulkan compute + SPIR-V (which we already run) and LiteRT,
+and the latter only in the confined mask shape the tree already stakes out.
+
+The document deserves credit the previous list did not: **every project in it is real,
+alive, and GPLv3-inbound-compatible.** No fabrications, nothing dead. Verified
+last-commit dates clustered on 2026-08-19 … 2026-08-28. The rejections are therefore
+about *fit*, not about health or licence — a much better class of disagreement.
+
+### What the checks found that the document did not say
+
+| Technology | Finding |
+|---|---|
+| **Tiramisu** | Emits **no ARM code at all**. `gen_halide_obj()` hardcodes `{AVX, SSE41, LargeBuffers}` at two source sites; zero `neon`/`aarch64`/`android` matches in `src/` or `include/`. It is also a *Halide front end*, so adopting it means Halide **plus** a polyhedral layer. Its 2026 revival is specifically on the **autoscheduler** — the component least compatible with a byte-identity gate. |
+| **HIPAcc** | x86-only: the sole CPU backend is literally `lib/Backend/CPU_x86.cpp`; word-boundary NEON count across `lib/` and `include/` is **zero**. Default branch last moved **2021-03-20**. Its one Android story was RenderScript, which its own maintainers moved off the default branch *and* Google deprecated. |
+| **ArrayFire** | The document says "not my recommendation for the main Android runtime", which implies it is an option one could choose. **There is no Android build** — no Android strings in the tree, not listed as a supported platform. The correct statement is "cannot be built for Android". |
+| **KFR** | A licence trap the document navigated and a file-only audit would fail. Root `LICENSE.txt` is the bare **GPL Version 2, June 1991** text — read literally, GPL-2.0-**only**, which is *incompatible* with GPLv3. The README says GPLv2**+**. The `+` is the whole ballgame, and the document flagged it correctly. |
+| **ISPC** | Android/NEON support is **real**, not doc-only — genuine `fmla`/`fmul` on `vNN.4s` for all three of our ABIs. Rejecting it on portability would have been wrong; the sound reason is that SPMD vectorisation reassociates reductions, which our gate forbids, and Highway already occupies the slot *with* order-preserving lanes. |
+
+### Where this document is right and §8 above was wrong
+
+One correction to our own record, and it matters.
+
+§8 dismissed the EDSL category on the strength of the 1.04–1.07× tiling measurement.
+That is a fair rebuttal of the **scheduling** pitch and a **non-sequitur against the
+portability pitch** — and the two got conflated. `docs/research/simd-halide-experiment.md`
+makes the portability argument explicitly ("write filming/printing/scan *once* and get
+CPU + GPU, instead of hand-writing GLSL plus maintaining a parallel CPU
+implementation") and calls Halide-Vulkan "a **maintainability** argument first, a speed
+one only if measured to be". This document picked that up; §8 did not.
+
+It bites on the one large unbuilt thing we have: **#148's filming shader** (spectral
+upsampling → camera raw → density curves → DIR couplers). Written by hand that is two
+implementations of the same physics, kept inside 1e-4 of each other forever. Written
+once in Halide it is one. That is the strongest argument for Halide in this project and
+neither of our documents was making it.
+
+Two caveats stand: Halide-Vulkan would be **f32-only** on this fleet
+(`gpu-device-probe.md` Tier 0: `shaderFloat64 = false` on the Adreno 840), and Halide's
+own docs file Vulkan performance tuning under Known TODO.
+
+### Where the document's architecture is wrong
+
+Its split is "Halide for full-resolution capture, Slang/Vulkan for real-time preview".
+That contains a hidden premise — that the *same* pipeline runs in both places and only
+resolution and schedule differ. §3 above says that premise is false by two to three
+orders of magnitude, so the split is not a choice between two options; it is two
+implementations of something that cannot run either way.
+
+The architecture has **no third box** for *precompute the look, so the per-frame cost
+becomes a texture fetch independent of how expensive the look was to derive*. That is a
+structural omission, not a disagreement about numbers, and `spk_bake_cube_lut` +
+`test_bake_lut` already fill it.
+
+Worse for the Slang half specifically: the preview kernel it would target **has already
+been offloaded and it did not help** — GPU M1 produced no measurable preview speedup
+because grain and halation dominate. `gpu-device-probe.md` Tier 2 shows why small frames
+cannot benefit: 0.3 MP warm-call median 48.3 ms vs 158.3 ms at 12 MP, almost entirely
+fixed overhead.
+
+### The smallest subset worth keeping
+
+1. **Halide, aimed at Vulkan codegen rather than CPU tiling** — and only once #148 is
+   actually sized. The value is one source for CPU + GPU, not speed.
+2. **A GPU effects layer for the LUT residual** — grain, halation and glare composited
+   over a baked cube, which is the honest answer to §3's pointwise limitation. It needs
+   no new language: two more `.comp` files through the existing `vulkan_compute.cpp`.
+
+Everything else is dropped, and each for a specific reason rather than a general
+suspicion: ISPC (Highway holds the slot with the property ISPC gives up), Slang (two
+shaders totalling ~70 lines do not justify a compiler dependency — revisit past roughly
+ten), MNN (the LiteRT seam is built and has a 0 MB fallback), Faust/KFR (no audio in the
+product), G-API (the third refusal of the same shape as oneTBB and the MediaPipe
+calculator graph — `kernels/parallel`'s thread-count invariance is a gate), FFmpeg
+(MediaCodec is platform and free, and three purpose-built writers already ship).
+
+### The cost nobody costed
+
+The `engine-parity` job calls `build_run` **38 times**, and each call recompiles the
+whole engine with a single `g++` over a glob — 78 source files, 16,908 lines, 38 times
+per run, no shared object cache. **Any file a new toolchain adds is paid for 38 times.**
+A *codegen* toolchain is worse than linear: its generator must run before that `g++`
+line, which today has no build system at all. Adding one AOT layer means converting the
+parity job from "g++ a glob" into a real build graph — and that job is this project's
+prime directive made executable.
+
+Today a contributor needs three pinned SDK components and a host `g++` to run the gate.
+Under the proposed architecture they would also need Halide, ISPC and a Slang compiler.
+Raising the cost of running the gate raises the odds of an ungated engine change, which
+is this project's specific failure mode.
+
+### One open question this raised
+
+Our two SIMD/codegen efforts both landed on *regular, dense, order-fixed* work — Highway
+on the f32 FIR and f64 IIR, Halide on the ks×ks PSF convolution. The genuinely
+**irregular** kernels (the Poisson-binomial samplers in `kernels/stats.cpp`, the
+DIR-coupler develop loop) got neither; they received plain `parallel_for` in S4/S7. The
+answer is still not ISPC — grain's fixed-block seeding is exactly what makes 12 MP
+1-vs-8-worker outputs `memcmp`-identical. But *have we ever profiled the irregular
+kernels as a class?* is asked nowhere in our documentation, and it should be.
+
+## 11. Honest scope note
 
 The current app is a stills RAW editor whose value is bit-exact parity with an oracle. A
 camera app with video, audio, depth, matting and real-time simulation is a different
