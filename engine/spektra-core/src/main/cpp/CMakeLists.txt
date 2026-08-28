@@ -156,6 +156,39 @@ endif()
 # same fixed chunk boundaries -> still bit-identical across thread counts). Default
 # builds keep the dependency-free fork-join and are unchanged. Provide oneTBB via the
 # toolchain/find_package or a pinned FetchContent (mirroring lib:libraw) when enabling.
+# ---------------------------------------------------------------------------
+# OPT-IN per-ABI microarchitecture tuning (perf-lab).
+#
+# The shipped flags target the ABI baseline: arm64-v8a means ARMv8.0, so the
+# compiler may not use anything a 2018 phone lacked, even on a 2026 flagship.
+# -mcpu lets it schedule for the real part and use the later ISA revisions
+# (dotprod, fp16 arithmetic, LSE atomics) it already knows about.
+#
+# WHY THIS IS OFF BY DEFAULT AND SHOULD STAY THAT WAY UNTIL MEASURED: raising
+# the baseline produces an APK that SIGILLs on any device older than the chosen
+# core. It also changes instruction selection, so it can move the last bits of a
+# float result and must be re-gated against the parity suite before it ships.
+# The safe shipping form of this idea is -mtune (schedule for a core, keep the
+# baseline ISA), which is what SPK_TUNE_ONLY selects.
+option(SPK_TUNE_ARM64 "arm64: tune codegen for a specific core (perf lab)" OFF)
+set(SPK_TUNE_ARM64_CPU "cortex-a76" CACHE STRING
+    "Core to pass to -mcpu/-mtune when SPK_TUNE_ARM64 is on")
+option(SPK_TUNE_ONLY "Use -mtune (schedule only, baseline ISA kept) rather than -mcpu" ON)
+
+if(SPK_TUNE_ARM64 AND ANDROID_ABI STREQUAL "arm64-v8a")
+    if(SPK_TUNE_ONLY)
+        target_compile_options(spektra PRIVATE -mtune=${SPK_TUNE_ARM64_CPU})
+        message(STATUS "spektra: -mtune=${SPK_TUNE_ARM64_CPU} (baseline ISA kept)")
+    else()
+        target_compile_options(spektra PRIVATE -mcpu=${SPK_TUNE_ARM64_CPU})
+        message(WARNING
+            "spektra: -mcpu=${SPK_TUNE_ARM64_CPU} RAISES THE ISA BASELINE. The "
+            "resulting library will crash with SIGILL on older arm64 devices, and "
+            "instruction selection changes must be re-gated against the parity "
+            "suite before shipping.")
+    endif()
+endif()
+
 option(SPK_USE_TBB "Use Intel oneTBB as the parallel-for backend" OFF)
 if(SPK_USE_TBB)
     find_package(TBB REQUIRED)

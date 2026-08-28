@@ -17,6 +17,7 @@
 #include <cmath>
 #include <vector>
 
+#include "kernels/gaussian_hwy.h"
 #include "kernels/parallel.h"
 
 namespace spk {
@@ -76,7 +77,11 @@ void gaussian_fir_plane(double* img, int w, int h, double sigma, double truncate
                 double kw = kernel[k + radius];
                 int ii = reflect(i + k, n);
                 const double* irow = &img[static_cast<size_t>(ii) * m];
-                for (int j = 0; j < m; ++j) trow[j] += irow[j] * kw;
+                if (hwy_fir::available()) {
+                    hwy_f64::vertical_accum(trow, irow, m, kw);
+                } else {
+                    for (int j = 0; j < m; ++j) trow[j] += irow[j] * kw;
+                }
             }
         }
     });
@@ -100,11 +105,16 @@ void gaussian_fir_plane(double* img, int w, int h, double sigma, double truncate
                         sval += trow[reflect(j + k, m)] * kernel[k + radius];
                     orow[j] = sval;
                 }
-                for (int j = radius; j < m - radius; ++j) {
-                    double sval = 0.0;
-                    for (int k = -radius; k <= radius; ++k)
-                        sval += trow[j + k] * kernel[k + radius];
-                    orow[j] = sval;
+                if (hwy_fir::available()) {
+                    hwy_f64::horizontal_interior(trow, kernel.data(), radius,
+                                                 radius, m - radius, orow);
+                } else {
+                    for (int j = radius; j < m - radius; ++j) {
+                        double sval = 0.0;
+                        for (int k = -radius; k <= radius; ++k)
+                            sval += trow[j + k] * kernel[k + radius];
+                        orow[j] = sval;
+                    }
                 }
                 for (int j = m - radius; j < m; ++j) {
                     double sval = 0.0;
@@ -176,8 +186,14 @@ void iir_vertical(double* img, int w, int h, const YvvCoeffs& c) {
             double x0 = img[j];
             s1[j - jb] = s2[j - jb] = s3[j - jb] = x0;
         }
+        const bool simd = hwy_fir::available();
         for (int i = 0; i < n; ++i) {
             double* row = &img[static_cast<size_t>(i) * m];
+            if (simd) {
+                hwy_f64::iir_step(row + jb, s1.data(), s2.data(), s3.data(), mc,
+                                  c.B, c.B1, c.B2, c.B3);
+                continue;
+            }
             for (int j = jb; j < je; ++j) {
                 double x = row[j];
                 double val = c.B * x + c.B1 * s1[j - jb] + c.B2 * s2[j - jb] +
@@ -192,6 +208,11 @@ void iir_vertical(double* img, int w, int h, const YvvCoeffs& c) {
         }
         for (int i = n - 1; i >= 0; --i) {
             double* row = &img[static_cast<size_t>(i) * m];
+            if (simd) {
+                hwy_f64::iir_step(row + jb, s1.data(), s2.data(), s3.data(), mc,
+                                  c.B, c.B1, c.B2, c.B3);
+                continue;
+            }
             for (int j = jb; j < je; ++j) {
                 double x = row[j];
                 double y = c.B * x + c.B1 * s1[j - jb] + c.B2 * s2[j - jb] +
@@ -274,6 +295,10 @@ void exponential_filter_per_channel_d(const double* img, int w, int h, int chann
                                     truncate);
         double a = kExpAmplitude[k];
         parallel_for(0, total, [&](int lo, int hi) {
+            if (hwy_fir::available()) {
+                hwy_f64::axpy(out + lo, comp.data() + lo, hi - lo, a);
+                return;
+            }
             for (int i = lo; i < hi; ++i) out[i] += a * comp[i];
         });
     }

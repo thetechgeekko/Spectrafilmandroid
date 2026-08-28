@@ -53,6 +53,30 @@ namespace spk {
 // can vary it via setenv to assert thread-count invariance.
 int parallel_num_threads();
 
+// OPT-IN big.LITTLE affinity (perf-lab). Android schedulers are free to park the
+// render pool on efficiency cores, and a fork-join is only as fast as its slowest
+// chunk: one worker on a 2.0 GHz little core stalls the join for everyone, so the
+// whole map runs at little-core speed no matter how many big cores are idle. This
+// pins the calling thread to the cores whose cpuinfo_max_freq is at least
+// SPK_BIG_CORE_RATIO (default 0.80) of the fastest core's. Spawned workers INHERIT
+// the mask on Linux, so one syscall per thread covers the pool.
+//
+// OFF unless SPK_BIG_CORES is 1/on/true — an untouched build is bit-for-bit and
+// scheduler-for-scheduler what it was.
+//
+// OUTPUT IS UNAFFECTED BY CONSTRUCTION: affinity moves *where* a chunk runs, never
+// what it computes. Chunk boundaries stay a pure function of (count, nthreads), and
+// when the mask changes the worker count the thread-invariance contract already
+// covers it — that is exactly what test_parallel asserts.
+//
+// Idempotent per thread (a thread_local latch), so calling it on every parallel_for
+// costs one predicted branch after the first.
+void parallel_pin_to_big_cores();
+
+// Number of cores the ratio classifies as "big", or 0 when detection failed or the
+// platform has no affinity API. Diagnostic / worker-count capping.
+int parallel_big_core_count();
+
 // Minimum pixels per worker. Below this the range runs serially to avoid thread
 // spawn overhead dominating (e.g. small preview renders).
 constexpr int kParallelMinChunk = 8192;
@@ -79,6 +103,10 @@ void parallel_dispatch(int begin, int end, int nthreads, const Body& body) {
     const int count = end - begin;
     // Ceil-divide so the chunk boundaries are fixed by (count, nthreads) alone.
     const int chunk = (count + nthreads - 1) / nthreads;
+
+    // OPT-IN (SPK_BIG_CORES): keep the pool off the efficiency cluster. No-op
+    // unless enabled, and never affects chunk boundaries or arithmetic.
+    parallel_pin_to_big_cores();
 
 #ifdef SPK_USE_TBB
     // oneTBB backend: schedule the SAME fixed chunks via tbb::parallel_for with a

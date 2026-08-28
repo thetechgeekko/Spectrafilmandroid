@@ -79,6 +79,23 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         get() = prefs.getBoolean(KEY_GPU_EXPORT, false)
         set(v) { prefs.edit().putBoolean(KEY_GPU_EXPORT, v).apply() }
 
+    /**
+     * PROGRESSIVE LADDER rung (perf lab). Longest edge of the live DRAFT render that
+     * runs while a slider is being dragged, before the crisp settle pass lands.
+     *
+     * Was the fixed constant [DRAFT_RENDER_MAX_PX]; made a setting so the coarse/fine
+     * trade can be swept on a real device instead of guessed. Lower tracks the finger
+     * more closely; higher makes the live frame a better preview of the settle result.
+     * Clamped to a band where the step-down is still meaningful — below 128 the frame
+     * is too coarse to judge a colour edit by, and above 512 the draft costs enough
+     * that it stops being a draft.
+     *
+     * Defaults to [DRAFT_RENDER_MAX_PX], so an untouched install renders as before.
+     */
+    var draftRenderMaxPx: Int
+        get() = prefs.getInt(KEY_DRAFT_MAX_PX, DRAFT_RENDER_MAX_PX).coerceIn(128, 512)
+        set(v) { prefs.edit().putInt(KEY_DRAFT_MAX_PX, v.coerceIn(128, 512)).apply() }
+
     var theme: ThemeMode
         get() = runCatching { ThemeMode.valueOf(prefs.getString(KEY_THEME, ThemeMode.SYSTEM.name)!!) }
             .getOrDefault(ThemeMode.SYSTEM)
@@ -145,6 +162,7 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         private const val KEY_GPU_PREVIEW = "gpu_preview"
         private const val KEY_GPU_ENGINE = "gpu_engine_preview"
         private const val KEY_GPU_EXPORT = "gpu_engine_export"
+        private const val KEY_DRAFT_MAX_PX = "draft_render_max_px"
         private const val KEY_THEME = "theme"
         private const val KEY_OUTPUT_CS = "output_color_space"
         private const val KEY_PREVIEW_MAX = "preview_max_size"

@@ -995,6 +995,16 @@ class MainActivity : ComponentActivity() {
             snapshotFlow { previewTick }.collect {
                 val e = engine ?: return@collect
                 if (cropOverlayOpen || maskOverlayOpen || sampleOverlayOpen || compareMode) return@collect
+                // Lightroom's ICBSliderTrackingBegin/End gate. `interacting` has been
+                // written by SliderInteraction since the widget shipped but was never
+                // read, so the draft pass fired on EVERY edit — including discrete ones
+                // (a switch, a dropdown, applying a preset), where it buys nothing: the
+                // crisp settle pass is already only 500 ms away, so the draft just burns
+                // a render and flashes a soft frame before the sharp one lands.
+                //
+                // Reading it here is what the widget's own doc comment always described:
+                // draft while a slider is actually moving, straight to crisp otherwise.
+                if (!interacting.value) return@collect
                 val fullEdge = state.previewMaxSize.coerceAtLeast(256)
                 // Grade-only edit? Re-grade the retained full-quality settle result in
                 // pure Kotlin — zero native work, and it beats a low-res draft on quality.
@@ -1010,7 +1020,12 @@ class MainActivity : ComponentActivity() {
                         .onFailure { Diag.w("render mode=draft failed: ${it.message}") }
                     return@collect
                 }
-                val draftEdge = minOf(DRAFT_RENDER_MAX_PX, fullEdge)
+                // Progressive ladder rung. The edge is a setting rather than a constant
+                // so the coarse/fine trade can be swept on a real device: lower = the
+                // image tracks the finger more closely, higher = the live frame is closer
+                // to what the settle pass will show. Defaults to DRAFT_RENDER_MAX_PX, so
+                // an untouched install renders exactly as before.
+                val draftEdge = minOf(settings.draftRenderMaxPx, fullEdge)
                 if (draftEdge >= fullEdge) return@collect       // no meaningful step-down to draft
                 val proxy = sourceCache.get(
                     uri = sourceUri?.toString(), kind = sourceKind.name,

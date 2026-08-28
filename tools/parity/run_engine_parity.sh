@@ -24,6 +24,19 @@ cd "$CPP"
 SRC=(spektra.cpp gpu/*.cpp kernels/*.cpp io/*.cpp model/*.cpp profiles/*.cpp runtime/*.cpp runtime/stages/*.cpp)
 DEF=(-DSPK_TEST_DIR="\"$CPP/tests\"")
 
+# Optional extra compile flags + sources, so an OPT-IN build variant can be gated
+# against the SAME table CI runs rather than a hand-picked subset. The default is
+# empty, so a plain invocation is byte-for-byte the CI build.
+#
+#   SPK_PARITY_EXTRA_FLAGS="-DSPK_ENABLE_HIGHWAY -I/path/to/highway ..." \
+#   SPK_PARITY_EXTRA_SRC="/path/to/highway/hwy/*.cc" \
+#     bash tools/parity/run_engine_parity.sh
+#
+# This does not touch the (test, argv) table, so the CI drift check above still
+# compares like for like.
+read -r -a EXTRA_FLAGS <<< "${SPK_PARITY_EXTRA_FLAGS:-}"
+read -r -a EXTRA_SRC <<< "${SPK_PARITY_EXTRA_SRC:-}"
+
 # The (test, argv) table, mirroring the workflow's build_run calls in order.
 TESTS=(
   "test_simulate_e2e|$ASSET|$G/scan_portra|tests/scan_portra_input_rgb.f64|$G"
@@ -86,7 +99,9 @@ pids=()
 for entry in "${TESTS[@]}"; do
   name="${entry%%|*}"
   ( g++ -std=c++17 -O2 -pthread -I. -I"$ROOT/tools/parity" "${DEF[@]}" \
-      "tests/$name.cpp" "${SRC[@]}" -o "$OUT/$name" 2> "$OUT/$name.build" ) &
+      ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+      "tests/$name.cpp" "${SRC[@]}" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} \
+      -o "$OUT/$name" 2> "$OUT/$name.build" ) &
   pids+=($!)
   # Throttle without `wait -n` (absent from the bash 3.2 shipped on macOS).
   while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done

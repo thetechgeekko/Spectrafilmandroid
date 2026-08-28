@@ -66,6 +66,7 @@ fun SettingsScreen(
     var theme by remember { mutableStateOf(settings.theme) }
     var outputCs by remember { mutableStateOf(settings.defaultOutputColorSpace) }
     var previewSize by remember { mutableIntStateOf(settings.previewMaxSize) }
+    var draftSize by remember { mutableIntStateOf(settings.draftRenderMaxPx) }
     var film by remember { mutableStateOf(settings.defaultFilmProfile) }
     var print by remember { mutableStateOf(settings.defaultPrintProfile) }
     var format by remember { mutableStateOf(settings.exportFormat) }
@@ -115,6 +116,15 @@ fun SettingsScreen(
                 range = 128..1024,
                 onValueChange = { previewSize = it; settings.previewMaxSize = it },
                 tooltip = "Long edge of the interactive preview, in pixels.",
+            )
+            IntSlider(
+                label = "Draft render size",
+                value = draftSize,
+                range = 128..512,
+                onValueChange = { draftSize = it; settings.draftRenderMaxPx = it },
+                tooltip = "Long edge of the fast frame drawn while a slider is being " +
+                    "dragged, before the crisp render lands. Lower tracks your finger " +
+                    "more closely; higher previews the final result more faithfully.",
             )
             if (filmGroups.isNotEmpty()) {
                 GroupedDropdown(
