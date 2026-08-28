@@ -28,6 +28,7 @@ add_library(spektra SHARED
         # Kernels:
         kernels/interp.cpp
         kernels/gaussian.cpp
+        kernels/gaussian_hwy.cpp            # Highway SIMD FIR (compiles to nothing unless SPK_ENABLE_HIGHWAY)
         kernels/exponential_filter.cpp      # float64 Gaussian + exponential mixture (spatial)
         kernels/spectral_upsampling.cpp     # Hanatos2025 RGB->spectrum (M3)
         kernels/stats.cpp                   # Poisson + Binomial samplers (grain, M6)
@@ -93,6 +94,61 @@ if(SPK_ENABLE_VULKAN)
     find_library(vulkan-lib vulkan)
     target_compile_definitions(spektra PRIVATE SPK_ENABLE_VULKAN=1)
     target_link_libraries(spektra ${vulkan-lib})
+endif()
+
+# OPT-IN Highway SIMD kernels (#124; plan in docs/research/highway-vendoring.md).
+# OFF by default: without it kernels/gaussian_hwy.cpp compiles to nothing and the
+# library is byte-identical to today. When ON, google/highway 1.4.0 is fetched at
+# configure time (release asset + SHA256, the lib:libraw FetchContent pattern) and
+# the f32 separable-FIR Gaussian gains explicit SIMD lanes.
+#
+# DETERMINISM: the ported passes vectorise ACROSS OUTPUT PIXELS only — each output's
+# accumulation order over the kernel taps is unchanged — so the SIMD path is
+# bit-identical to the scalar one, not an approximation. HWY_COMPILE_ONLY_STATIC
+# pins ONE target per ABI (no runtime dispatch), making instruction selection an
+# asserted contract rather than a compiler-lowering accident; see the static_assert
+# in kernels/gaussian_hwy.cpp.
+option(SPK_ENABLE_HIGHWAY "Build the Highway SIMD kernels (opt-in, bit-identical)" OFF)
+set(SPK_HIGHWAY_VERSION "1.4.0" CACHE STRING "Vendored google/highway release tag")
+set(SPK_HIGHWAY_URL
+    "https://github.com/google/highway/releases/download/${SPK_HIGHWAY_VERSION}/highway-${SPK_HIGHWAY_VERSION}.tar.gz"
+    CACHE STRING "Highway release-asset tarball URL")
+# Release asset (immutable), verified two ways in docs/research/highway-vendoring.md.
+set(SPK_HIGHWAY_SHA256 "36f672ab48ddb3c8555e9e89e16fe400cd7d16c6eb455a1a3d0c146a63ababdc"
+    CACHE STRING "SHA256 of the Highway release asset")
+# Escape hatch for offline/air-gapped builds: point at an extracted checkout.
+set(SPK_HIGHWAY_SOURCE_DIR "" CACHE PATH
+    "Pre-vendored highway source dir (contains hwy/highway.h); skips FetchContent")
+if(SPK_ENABLE_HIGHWAY)
+    # HWY_ENABLE_TESTS=OFF is MANDATORY: ON downloads googletest at *configure* time.
+    set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(HWY_FORCE_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    if(SPK_HIGHWAY_SOURCE_DIR AND EXISTS "${SPK_HIGHWAY_SOURCE_DIR}/hwy/highway.h")
+        message(STATUS "spektra: using pre-vendored Highway at ${SPK_HIGHWAY_SOURCE_DIR}")
+        add_subdirectory("${SPK_HIGHWAY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/hwy-build" EXCLUDE_FROM_ALL)
+    else()
+        include(FetchContent)
+        FetchContent_Declare(
+            highway_upstream
+            URL "${SPK_HIGHWAY_URL}"
+            URL_HASH SHA256=${SPK_HIGHWAY_SHA256}
+        )
+        FetchContent_GetProperties(highway_upstream)
+        if(NOT highway_upstream_POPULATED)
+            FetchContent_Populate(highway_upstream)
+        endif()
+        add_subdirectory("${highway_upstream_SOURCE_DIR}" "${highway_upstream_BINARY_DIR}"
+                         EXCLUDE_FROM_ALL)
+    endif()
+    target_compile_definitions(spektra PRIVATE
+        SPK_ENABLE_HIGHWAY=1
+        HWY_COMPILE_ONLY_STATIC=1   # one target per ABI, no runtime dispatch
+        HWY_DISABLE_PCLMUL_AES=1)   # x86_64: keep the baseline at SSE4 w/o PCLMUL/AES
+    target_link_libraries(spektra hwy)
 endif()
 
 # OPT-IN Intel oneTBB parallel backend (default OFF). When ON, kernels/parallel.h
