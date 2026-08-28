@@ -36,6 +36,24 @@
  *     approximation for halation and pays O(ks^2) for the same shape here. Lever B
  *     measures what the mixture costs in accuracy and saves in time.
  *
+ *  D. THE IRREGULAR KERNELS, PROFILED AS A CLASS -- the gap a review of this branch
+ *     surfaced. Both of our SIMD/codegen efforts landed on REGULAR work: Highway on
+ *     the f32 FIR and f64 IIR, Halide on the ks x ks PSF convolution. The genuinely
+ *     irregular kernels -- the Poisson/Binomial particle samplers in kernels/stats.cpp
+ *     that grain is built on -- got neither, and were never profiled as a class. That
+ *     matters because the device round found grain + halation holding the preview
+ *     time: halation is now covered (lever 1 in the branch), grain is not.
+ *
+ *     What makes them irregular is not incidental. fast_poisson_one branches on
+ *     lam >= 30 and fast_binomial_one on n < 25 and then on n*p*(1-p) > 10, so the
+ *     work per sample depends on the DATA, and each branch consumes a different
+ *     number of draws from a serial std::mt19937. Lanes cannot run in lockstep on a
+ *     shared RNG stream when each lane wants a different count -- which is why the
+ *     usual SIMD answer does not apply here, and why the fixed-block seeding contract
+ *     (what makes 12 MP 1-vs-8-worker output memcmp-identical) exists in the first
+ *     place. This lever measures the cost per regime, and the penalty when the regime
+ *     varies per sample the way it does in a real render.
+ *
  *  C. fp16 STORAGE FOR THE SPATIAL PLANES. PERF_ROADMAP item 3, written down and
  *     never attempted, though kernels/half.h has shipped exact IEEE-754 conversions
  *     the whole time. The blur planes are float64: 8 bytes per sample through a
@@ -59,6 +77,7 @@
 #include "kernels/exponential_filter.h"
 #include "kernels/gaussian.h"
 #include "kernels/half.h"
+#include "kernels/stats.h"
 
 namespace {
 
@@ -462,6 +481,138 @@ void run(int w, int h, double sigma) {
 
 }  // namespace lever_c
 
+// ===========================================================================
+// Lever D -- the irregular kernels (grain's Poisson/Binomial samplers)
+// ===========================================================================
+namespace lever_d {
+
+// Each case names the branch it lands in, so the output reads as a regime map
+// rather than a wall of numbers.
+struct Regime {
+    const char* name;
+    double lam;      // Poisson rate, or -1 for a binomial case
+    long long n;     // Binomial n
+    double p;        // Binomial p
+};
+
+const Regime kPoisson[] = {
+    {"lam=2      (small, inversion)", 2.0, 0, 0.0},
+    {"lam=15     (mid, inversion)", 15.0, 0, 0.0},
+    {"lam=29     (just under lam>=30)", 29.0, 0, 0.0},
+    {"lam=31     (just over  lam>=30)", 31.0, 0, 0.0},
+    {"lam=500    (normal approx)", 500.0, 0, 0.0},
+};
+
+const Regime kBinomial[] = {
+    {"n=8   p=0.5  (n<25 Bernoulli)", -1.0, 8, 0.5},
+    {"n=24  p=0.5  (just under n<25)", -1.0, 24, 0.5},
+    {"n=26  p=0.5  (npq=6.5, inversion)", -1.0, 26, 0.5},
+    {"n=200 p=0.5  (npq=50, normal)", -1.0, 200, 0.5},
+    {"n=200 p=0.01 (npq=1.98, inversion)", -1.0, 200, 0.01},
+};
+
+double bench_poisson(double lam, int n_samples) {
+    spk::StatsRng rng(20260828u);
+    volatile int64_t sink = 0;
+    const double t0 = now_ms();
+    for (int i = 0; i < n_samples; ++i) sink += spk::fast_poisson_one(lam, rng);
+    const double t1 = now_ms();
+    (void)sink;
+    return (t1 - t0) * 1e6 / n_samples;  // ns per sample
+}
+
+double bench_binomial(long long n, double p, int n_samples) {
+    spk::StatsRng rng(20260828u);
+    volatile int64_t sink = 0;
+    const double t0 = now_ms();
+    for (int i = 0; i < n_samples; ++i) sink += spk::fast_binomial_one(n, p, rng);
+    const double t1 = now_ms();
+    (void)sink;
+    return (t1 - t0) * 1e6 / n_samples;
+}
+
+// The realistic case: a real render hands these a DIFFERENT parameter per pixel,
+// so the branch predictor cannot settle and every sample may take a different
+// path. The gap between this and the best fixed regime is the cost of
+// irregularity itself, which is the number this lever exists to produce.
+double bench_poisson_mixed(int n_samples) {
+    spk::StatsRng rng(20260828u);
+    volatile int64_t sink = 0;
+    // Sweep lam across both sides of the lam>=30 threshold, deterministically.
+    const double t0 = now_ms();
+    for (int i = 0; i < n_samples; ++i) {
+        const double lam = 1.0 + static_cast<double>((i * 37) % 600);
+        sink += spk::fast_poisson_one(lam, rng);
+    }
+    const double t1 = now_ms();
+    (void)sink;
+    return (t1 - t0) * 1e6 / n_samples;
+}
+
+double bench_binomial_mixed(int n_samples) {
+    spk::StatsRng rng(20260828u);
+    volatile int64_t sink = 0;
+    const double t0 = now_ms();
+    for (int i = 0; i < n_samples; ++i) {
+        const long long n = 1 + (i * 17) % 400;       // straddles n<25 and npq>10
+        const double p = 0.02 + 0.96 * ((i * 29) % 50) / 50.0;
+        sink += spk::fast_binomial_one(n, p, rng);
+    }
+    const double t1 = now_ms();
+    (void)sink;
+    return (t1 - t0) * 1e6 / n_samples;
+}
+
+void run(int n_samples) {
+    std::printf("\n[D] irregular kernels -- grain's samplers (kernels/stats.cpp), "
+                "%d samples each, 1 thread\n", n_samples);
+
+    std::printf("    fast_poisson_one:\n");
+    double best_p = 1e18, worst_p = 0.0;
+    for (const Regime& r : kPoisson) {
+        const double ns = bench_poisson(r.lam, n_samples);
+        if (ns < best_p) best_p = ns;
+        if (ns > worst_p) worst_p = ns;
+        std::printf("      %-34s %8.1f ns/sample\n", r.name, ns);
+    }
+    const double mixed_p = bench_poisson_mixed(n_samples);
+    std::printf("      %-34s %8.1f ns/sample   <-- realistic\n",
+                "lam varies per sample", mixed_p);
+    std::printf("      regime spread %.1fx (best %.1f, worst %.1f); "
+                "mixed vs best %.2fx\n",
+                worst_p / best_p, best_p, worst_p, mixed_p / best_p);
+
+    std::printf("    fast_binomial_one:\n");
+    double best_b = 1e18, worst_b = 0.0;
+    for (const Regime& r : kBinomial) {
+        const double ns = bench_binomial(r.n, r.p, n_samples);
+        if (ns < best_b) best_b = ns;
+        if (ns > worst_b) worst_b = ns;
+        std::printf("      %-34s %8.1f ns/sample\n", r.name, ns);
+    }
+    const double mixed_b = bench_binomial_mixed(n_samples);
+    std::printf("      %-34s %8.1f ns/sample   <-- realistic\n",
+                "n,p vary per sample", mixed_b);
+    std::printf("      regime spread %.1fx (best %.1f, worst %.1f); "
+                "mixed vs best %.2fx\n",
+                worst_b / best_b, best_b, worst_b, mixed_b / best_b);
+
+    // Scale the per-sample cost to a real render so the number means something.
+    // apply_grain_to_density draws per pixel per channel.
+    const double mp12 = 12.0e6 * 3.0;
+    std::printf("    at 12 MP x 3 channels, one draw each: poisson %.2f s, "
+                "binomial %.2f s (1 thread)\n",
+                mixed_p * mp12 * 1e-9, mixed_b * mp12 * 1e-9);
+    std::printf("    READ IT THIS WAY: a large regime spread or a large mixed-vs-best\n"
+                "      ratio means the cost is DATA-dependent, which is exactly what\n"
+                "      lane-parallel SIMD cannot absorb -- each lane would want a\n"
+                "      different number of draws from one serial RNG stream. A small\n"
+                "      spread would mean the branches are cheap and the real cost is\n"
+                "      elsewhere (the RNG itself), which WOULD be attackable.\n");
+}
+
+}  // namespace lever_d
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -473,6 +624,7 @@ int main(int argc, char** argv) {
     lever_b::run(quick ? 256 : 512, quick ? 256 : 512, 4.0);
     if (!quick) lever_b::run(512, 512, 12.0);
     lever_c::run(quick ? 512 : 1024, quick ? 512 : 1024, 8.0);
+    lever_d::run(quick ? 200000 : 1000000);
 
     std::printf("\n=== end perf lab ===\n");
     return 0;

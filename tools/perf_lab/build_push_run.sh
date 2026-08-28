@@ -100,12 +100,13 @@ done
 
 # ===========================================================================
 echo
-echo "=== 3/3  parity-affecting levers (GEMM / separable PSF / fp16) ============"
+echo "=== 3/3  parity-affecting levers + the irregular-kernel profile =========="
 # ===========================================================================
 "$CXX" $CFLAGS \
   "$ROOT/tools/perf_lab/perf_lab.cpp" \
   "$CPP/kernels/exponential_filter.cpp" "$CPP/kernels/gaussian.cpp" \
   "$CPP/kernels/gaussian_hwy.cpp" "$CPP/kernels/parallel.cpp" "$CPP/kernels/half.cpp" \
+  "$CPP/kernels/stats.cpp" \
   -o "$WORK/perf_lab"
 adb push -q "$WORK/perf_lab" "$DEV/" >/dev/null
 adb shell "chmod 755 $DEV/perf_lab"

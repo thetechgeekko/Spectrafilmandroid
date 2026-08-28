@@ -32,6 +32,7 @@ renderer.
 | 7 | **GPU print-expose** offload (#148 first rung) | yes, existing GPU toggles | **3.1e-06 vs CPU, engages** |
 | 8 | **Draft-render gate** on slider interaction | yes, always on | dead state now read |
 | 9 | Draft rung as a **setting** | yes, Settings slider | sweepable on device |
+| 10 | **Irregular kernels profiled as a class** | bench only | **8.3× regime spread** |
 
 Host numbers below are x86 `-O2` on a shared container and are **indicative only** —
 `docs/PERF_ROADMAP.md` records that this host has already mispredicted on-device
@@ -276,6 +277,61 @@ The draft rung is `AppSettings.draftRenderMaxPx` (Settings → "Draft render siz
 coarse/fine trade can be swept on a device instead of guessed — lower tracks the
 finger more closely, higher makes the live frame a better preview of the settle
 result.
+
+## 10. The irregular kernels, profiled as a class — the gap a review found
+
+Both of our SIMD/codegen efforts landed on **regular, dense, order-fixed** work: Highway
+on the f32 FIR and the f64 IIR, Halide on the ks×ks PSF convolution. The genuinely
+irregular kernels — the Poisson/Binomial particle samplers in `kernels/stats.cpp` that
+grain is built from — got neither, and had **never been profiled as a class**. That gap
+matters: the device round found grain *and* halation holding the preview time. Halation
+is covered by §1 above. Grain was not covered by anything.
+
+What makes them irregular is structural, not incidental. `fast_poisson_one` branches on
+`lam >= 30`; `fast_binomial_one` branches on `n < 25` and then on `n·p·(1−p) > 10`. So
+the work per sample depends on the **data**, and each branch consumes a different number
+of draws from a serial `std::mt19937`.
+
+**Host result (x86, 1 thread, 200k samples per regime):**
+
+```
+fast_poisson_one:
+  lam=2      (small, inversion)          61.2 ns/sample
+  lam=15     (mid, inversion)           179.6 ns/sample
+  lam=29     (just under lam>=30)       300.4 ns/sample
+  lam=31     (just over  lam>=30)        36.7 ns/sample
+  lam=500    (normal approx)             36.0 ns/sample
+  lam varies per sample                  77.7 ns/sample   <-- realistic
+  regime spread 8.3x;  mixed vs best 2.16x
+
+fast_binomial_one:
+  n=24  p=0.5  (just under n<25)        218.3 ns/sample
+  n=200 p=0.5  (npq=50, normal)          37.9 ns/sample
+  n,p vary per sample                    61.5 ns/sample   <-- realistic
+  regime spread 5.8x;  mixed vs best 1.62x
+```
+
+**There is a cliff at the threshold, and it points the wrong way.** λ=29 costs
+**300.4 ns** and λ=31 costs **36.7 ns** — an 8× step *down* as λ grows, because the
+inversion branch accumulates the CDF term by term (work grows with λ) while the normal
+approximation above the threshold is O(1). The expensive branch is the **low-λ** one,
+and low λ is the ordinary grain regime.
+
+**What this rules out, and what it opens.** The 8.3× spread is the answer to "why not
+SIMD this too": lane-parallel execution cannot absorb data-dependent cost when each lane
+would want a different number of draws from one serial RNG stream — which is also why
+the fixed-block seeding contract exists (it is what makes 12 MP 1-vs-8-worker outputs
+`memcmp`-identical). So Highway is not the tool here, and neither is ISPC.
+
+What it does open is a different question the bench makes askable: the cliff is in *our
+own inversion loop*, not in the RNG, and it is a pure restatement of the same CDF. That
+is an algorithmic target rather than a vectorisation one — and it sits on the stage the
+device says is hot.
+
+**Two honest caveats.** Host x86, so treat the ratios rather than the digits. And the
+"varies per sample" case sweeps a synthetic λ range (1…600); the real per-pixel λ
+distribution from `apply_grain_to_density` is what the device run should be read
+against, which is why the tool prints both.
 
 ## Running it
 
