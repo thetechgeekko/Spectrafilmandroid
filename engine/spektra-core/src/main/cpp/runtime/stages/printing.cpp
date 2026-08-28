@@ -12,11 +12,14 @@
  */
 #include "runtime/stages/printing.h"
 
+#include <atomic>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
+#include "gpu/vulkan_compute.h"
 #include "kernels/exp10.h"
 #include "kernels/lut3d.h"
 #include "kernels/lut3d_cache.h"
@@ -75,6 +78,159 @@ void cmy_to_print_log_raw_fn(const double in[3], double out[3], void* vctx) {
     out[0] = std::log10(std::fmax(raw0, 0.0) + 1e-10);
     out[1] = std::log10(std::fmax(raw1, 0.0) + 1e-10);
     out[2] = std::log10(std::fmax(raw2, 0.0) + 1e-10);
+}
+
+// =========================================================================
+// GPU print-expose offload (perf lab, first rung of #148's full-chain GPU).
+//
+// The print integral turns out to be the SAME SHAPE as the scan integral the
+// LINEAR kernel (gpu/scan_spectral_lin.comp) already runs:
+//
+//   scan  : out[k] = sum_b 10^-(c . dye[b])            * icmf[b][k]
+//   print : raw[k] = sum_b 10^-(c . cd[b] + base[b])   * fi[b] * sens[b][k]
+//
+// so no new shader is needed — only a different fold of the per-band constants,
+// plus an IDENTITY matrix in the kernel's XYZ->RGB slot (the print integral's
+// output is already the value we want, not a colour-space conversion of it):
+//
+//   dye[b][k]  = film.channel_density[b][k]                    (identical to scan)
+//   icmf[b][k] = 10^-base_density[b] * filtered_illuminant[b] * sens[b][k]
+//
+// Reusing the validated kernel is the whole point: the arithmetic the PR #145
+// device probe measured inside the oracle bar is the arithmetic that runs here.
+//
+// PREVIEW/EXPERIMENTAL, exactly like the scan offload: gated by
+// params.allow_gpu (fed from spk_params' allow_gpu_scan latch), re-gated per
+// frame, validated once on device, and any failure at any point falls straight
+// back to the exact CPU integral for that frame.
+// =========================================================================
+constexpr int kGpuNB = 81;  // the shader's fixed band count
+
+std::atomic<int> g_gpu_print_state{0};      // 0 unchecked, 1 passed, 2 failed
+std::atomic<long long> g_gpu_print_frames{0};
+
+// NaN contract, mirroring build_gpu_scan_tables: a band whose base or channel
+// density (or filtered illuminant) is NaN makes `light` NaN, which the CPU
+// engine zeroes for EVERY pixel, so BOTH table rows are zeroed here. With dye
+// zeroed the shader computes D = 0 and 10^0 * 0 == 0 — reproducing the CPU's
+// nan_to_num exactly rather than propagating a NaN the shader has no guard for.
+// `sens` cannot carry NaN: it is nan_to_num'd where it is built.
+bool build_gpu_print_tables(const Profile& film, const PrintingParams& params,
+                            const std::vector<double>& sens,
+                            std::vector<float>* dye, std::vector<float>* icmf) {
+    if (film.n_samples != kGpuNB) return false;
+    dye->assign(kGpuNB * 3, 0.0f);
+    icmf->assign(kGpuNB * 3, 0.0f);
+    for (int l = 0; l < kGpuNB; ++l) {
+        const float* cd = film.channel_density.data() + static_cast<size_t>(l) * 3;
+        const float base = film.base_density[static_cast<size_t>(l)];
+        const double fi = params.filtered_illuminant[l];
+        if (std::isnan(base) || std::isnan(cd[0]) || std::isnan(cd[1]) ||
+            std::isnan(cd[2]) || std::isnan(fi))
+            continue;  // both rows stay 0
+        (*dye)[l * 3 + 0] = cd[0];
+        (*dye)[l * 3 + 1] = cd[1];
+        (*dye)[l * 3 + 2] = cd[2];
+        const double w = std::pow(10.0, -static_cast<double>(base)) * fi;
+        for (int k = 0; k < 3; ++k)
+            (*icmf)[l * 3 + k] =
+                static_cast<float>(w * sens[static_cast<size_t>(l) * 3 + k]);
+    }
+    return true;
+}
+
+// The CPU integral, evaluated for the self-check grid with plain libm math.
+// Deliberately a separate transcription rather than a call into the per-pixel
+// loop: the check must compare the GPU against what the ENGINE computes, and
+// inlining it here keeps the two visibly side by side.
+void print_raw_cpu_reference(const Profile& film, const PrintingParams& params,
+                             const std::vector<double>& sens, const float* cmy,
+                             int n, double* raw_out) {
+    for (int p = 0; p < n; ++p) {
+        const double c0 = static_cast<double>(cmy[p * 3 + 0]);
+        const double c1 = static_cast<double>(cmy[p * 3 + 1]);
+        const double c2 = static_cast<double>(cmy[p * 3 + 2]);
+        double r[3] = {0.0, 0.0, 0.0};
+        for (int l = 0; l < kGpuNB; ++l) {
+            const float* cd = film.channel_density.data() + static_cast<size_t>(l) * 3;
+            const double spectral = c0 * static_cast<double>(cd[0]) +
+                                    c1 * static_cast<double>(cd[1]) +
+                                    c2 * static_cast<double>(cd[2]) +
+                                    static_cast<double>(film.base_density[l]);
+            double light = std::pow(10.0, -spectral) * params.filtered_illuminant[l];
+            if (std::isnan(light)) light = 0.0;
+            for (int k = 0; k < 3; ++k)
+                r[k] += light * sens[static_cast<size_t>(l) * 3 + k];
+        }
+        for (int k = 0; k < 3; ++k) raw_out[static_cast<size_t>(p) * 3 + k] = r[k];
+    }
+}
+
+// One-time on-device validation, same contract as gpu_scan_self_check: sweep the
+// density domain the print route actually sees (plus one NaN pixel, so the
+// upload guard is exercised), run both paths, and only trust the GPU if it
+// agrees within the oracle band. The verdict is cached process-wide — it
+// validates the DEVICE's arithmetic and the fold's shape, not one frame's
+// numbers, so a later frame with different enlarger filters reuses it.
+//
+// Compared in LOG-RAW space, not raw: log_raw is what flows on to the paper
+// curves, and raw itself spans orders of magnitude, where an absolute
+// tolerance would mean nothing.
+bool gpu_print_self_check(const Profile& film, const PrintingParams& params,
+                          const std::vector<double>& sens,
+                          const std::vector<float>& dye,
+                          const std::vector<float>& icmf) {
+    int st = g_gpu_print_state.load(std::memory_order_acquire);
+    if (st != 0) return st == 1;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);
+    st = g_gpu_print_state.load(std::memory_order_acquire);
+    if (st != 0) return st == 1;
+
+    double cmax[3] = {0.0, 0.0, 0.0};
+    for (int nrow = 0; nrow < film.n_density_pts; ++nrow) {
+        const float* dc = film.density_curves.data() + static_cast<size_t>(nrow) * 3;
+        for (int c = 0; c < 3; ++c) {
+            const double v = static_cast<double>(dc[c]);
+            if (!std::isnan(v) && v > cmax[c]) cmax[c] = v;
+        }
+    }
+    const int G = 8;
+    const double kLo = -0.1;
+    const int n = G * G * G + 1;
+    std::vector<float> in(static_cast<size_t>(n) * 3);
+    size_t i = 0;
+    for (int a = 0; a < G; ++a)
+        for (int b = 0; b < G; ++b)
+            for (int c = 0; c < G; ++c) {
+                in[i * 3 + 0] = static_cast<float>(kLo + (cmax[0] - kLo) * a / (G - 1));
+                in[i * 3 + 1] = static_cast<float>(kLo + (cmax[1] - kLo) * b / (G - 1));
+                in[i * 3 + 2] = static_cast<float>(kLo + (cmax[2] - kLo) * c / (G - 1));
+                ++i;
+            }
+    in[i * 3 + 0] = in[i * 3 + 1] = in[i * 3 + 2] = std::nanf("");
+
+    std::vector<double> cpu(static_cast<size_t>(n) * 3);
+    print_raw_cpu_reference(film, params, sens, in.data(), n, cpu.data());
+
+    static const float kIdentity[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+                                       0.0f, 0.0f, 0.0f, 1.0f};
+    std::vector<float> gpu(static_cast<size_t>(n) * 3, -1.0f);
+    bool ok = spk::gpu::scan_spectral_linear(in.data(), gpu.data(),
+                                             static_cast<uint32_t>(n), dye.data(),
+                                             icmf.data(), kIdentity);
+    if (ok) {
+        double worst = 0.0;
+        for (size_t k = 0; k < gpu.size(); ++k) {
+            const double a = std::log10(std::fmax(static_cast<double>(gpu[k]), 0.0) + 1e-10);
+            const double b = std::log10(std::fmax(cpu[k], 0.0) + 1e-10);
+            const double d = std::fabs(a - b);
+            if (d > worst) worst = d;
+        }
+        ok = worst <= 1e-4;
+    }
+    g_gpu_print_state.store(ok ? 1 : 2, std::memory_order_release);
+    return ok;
 }
 
 }  // namespace
@@ -147,7 +303,58 @@ void print_expose(const Profile& film, const Profile& print_profile,
     // default path (use_enlarger_lut == false) never even constructs the LUT,
     // staying byte-identical to the per-pixel exp10_vec integral.
     std::vector<double> lut_lr;  // (npix*3) when use_enlarger_lut, else empty
-    if (params.use_enlarger_lut) {
+    // EXPERIMENTAL GPU offload of the spectral integral (perf lab, first rung of
+    // #148). Fills the SAME lut_lr plane the opt-in enlarger LUT would, so the
+    // whole tail below — midgray factor, preflash, the 10^/log10 round trip, the
+    // optional diffusion filter — runs unchanged on the CPU. Any failure at any
+    // step leaves lut_lr empty, so the route falls back to the enlarger LUT if
+    // the user opted into it, and otherwise to the exact per-pixel integral.
+    //
+    // ORDER MATTERS, and it is the scan offload's precedent: on success this
+    // SKIPS the enlarger LUT build entirely, rather than deferring to it. The
+    // direct fp32 integral (~3e-6 vs the f64 chain, measured by
+    // tests/test_gpu_host.cpp) is TIGHTER than the LUT's own ~5e-5
+    // interpolation error, so preferring the LUT would trade accuracy away for
+    // nothing. It also matters practically: spk_simulate_preview force-enables
+    // both spectral LUTs, so gating this behind !use_enlarger_lut would mean the
+    // offload never engaged on the interactive path at all — which is the one
+    // that needs it.
+    bool gpu_lr_done = false;
+    if (params.allow_gpu && S == kGpuNB && spk::gpu::available()) {
+        std::vector<float> dye, icmf;
+        if (build_gpu_print_tables(film, params, sens, &dye, &icmf) &&
+            gpu_print_self_check(film, params, sens, dye, icmf)) {
+            static const float kIdentity[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+                                               0.0f, 0.0f, 0.0f, 1.0f};
+            std::vector<float> gpu_raw(static_cast<size_t>(npix) * 3);
+            if (spk::gpu::scan_spectral_linear(density_cmy, gpu_raw.data(),
+                                               static_cast<uint32_t>(npix),
+                                               dye.data(), icmf.data(),
+                                               kIdentity)) {
+                // The kernel stops at `raw`; the constant tail (midgray factor,
+                // preflash 3-vector, log10 floor) is pointwise and stays on the
+                // CPU, exactly as the direct path computes it.
+                lut_lr.resize(static_cast<size_t>(npix) * 3);
+                double* const lr = lut_lr.data();
+                const double efm = params.exposure_factor_midgray;
+                parallel_for(0, npix, [&](int lo, int hi) {
+                    for (int p = lo; p < hi; ++p)
+                        for (int k = 0; k < 3; ++k) {
+                            const double raw =
+                                static_cast<double>(
+                                    gpu_raw[static_cast<size_t>(p) * 3 + k]) *
+                                    efm +
+                                preflash_raw[k];
+                            lr[static_cast<size_t>(p) * 3 + k] =
+                                std::log10(std::fmax(raw, 0.0) + 1e-10);
+                        }
+                });
+                gpu_lr_done = true;
+                g_gpu_print_frames.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (params.use_enlarger_lut && !gpu_lr_done) {
         // Per-channel domain bounds (printing.py::expose):
         //   data_min = -film_render.grain.density_min
         //   data_max =  np.nanmax(film.data.density_curves, axis=0)
@@ -231,6 +438,10 @@ void print_expose(const Profile& film, const Profile& print_profile,
                                     lut_lr.data());
     }
 
+    // True when lut_lr carries a precomputed log_raw plane, from EITHER the
+    // opt-in enlarger LUT or the GPU offload above.
+    const bool lr_precomputed = params.use_enlarger_lut || gpu_lr_done;
+
     // The Python reference runs the whole spectral chain in float64 and stores
     // float32 only at the final write. Mirror that exactly.
     parallel_for(0, npix, [&](int lo, int hi) {
@@ -239,7 +450,7 @@ void print_expose(const Profile& film, const Profile& print_profile,
         // from the opt-in enlarger LUT or evaluated directly (the default,
         // byte-exact path — its exp10_vec SIMD is left untouched).
         double lr0, lr1, lr2;
-        if (params.use_enlarger_lut) {
+        if (lr_precomputed) {
             const double* lr = lut_lr.data() + static_cast<size_t>(p) * 3;
             lr0 = lr[0];
             lr1 = lr[1];
@@ -425,6 +636,15 @@ void print_develop(const Profile& print_profile, const PrintingParams& params,
                                     print_profile.log_exposure.data(),
                                     print_profile.n_density_pts,
                                     params.density_curve_gamma, density_cmy_out);
+}
+
+int gpu_print_expose_state() {
+    return g_gpu_print_state.load(std::memory_order_acquire);
+}
+
+unsigned long long gpu_print_frames_rendered() {
+    return static_cast<unsigned long long>(
+        g_gpu_print_frames.load(std::memory_order_relaxed));
 }
 
 }  // namespace spk

@@ -198,10 +198,24 @@ int main(int argc, char** argv) {
         check(st == 1, "self-check passed (state == 1)");
         check(spk_gpu_scan_frames() > 0,
               "frames counter engaged (spk_gpu_scan_frames > 0)");
+        // PRINT-EXPOSE offload (perf lab): the print route above ran with
+        // allow_gpu on, so its integral must have engaged too. Without these the
+        // print numbers printed above would still pass on a silent CPU fallback,
+        // which is exactly the failure mode worth catching — the offload is only
+        // interesting if it is actually running.
+        std::printf("info: gpu print state=%d frames=%llu\n", spk_gpu_print_state(),
+                    static_cast<unsigned long long>(spk_gpu_print_frames()));
+        check(spk_gpu_print_state() == 1,
+              "print-expose self-check passed (spk_gpu_print_state == 1)");
+        check(spk_gpu_print_frames() > 0,
+              "print-expose offload engaged (spk_gpu_print_frames > 0)");
     }
-    if (st == 0)
+    if (st == 0) {
         check(spk_gpu_scan_frames() == 0,
               "frames counter stays 0 without a GPU");
+        check(spk_gpu_print_frames() == 0,
+              "print-expose offload never engaged without a GPU");
+    }
 
     std::printf(g_fail ? "test_gpu_host: FAIL\n" : "test_gpu_host: ALL OK\n");
     return g_fail;

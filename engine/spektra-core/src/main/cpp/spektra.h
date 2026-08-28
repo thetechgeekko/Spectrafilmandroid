@@ -393,6 +393,21 @@ int spk_gpu_scan_state(void);
  * eligible frame yet; state 0 = never attempted. */
 uint64_t spk_gpu_scan_frames(void);
 
+/* EXPERIMENTAL GPU PRINT-EXPOSE offload (perf lab, first rung of full-chain
+ * GPU): the print route's 81-band spectral integral runs on the GPU, reusing
+ * the same validated linear kernel as the scan offload with a different fold of
+ * the per-band constants. Governed by the SAME allow_gpu_scan latch, so the
+ * existing preview/export toggles cover it with no new switch.
+ *
+ * State: 0 = the one-time on-device self-check has not run, 1 = passed, 2 =
+ * failed (CPU integral permanent for this process). */
+int spk_gpu_print_state(void);
+
+/* Frames whose print-expose integral actually ran on the GPU. 0 with state == 1
+ * means eligible but never engaged. Together with spk_gpu_print_state this makes
+ * the print offload externally observable, exactly like the scan one. */
+uint64_t spk_gpu_print_frames(void);
+
 /* Per-stage/per-filter wall-clock breakdown of the LAST render, formatted as
  * "stage=ms other=ms ..." (non-zero stages only) into `buf` (capacity `cap`);
  * returns bytes written. DIAGNOSTIC — reading the clock never changes output.

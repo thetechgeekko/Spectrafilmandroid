@@ -29,6 +29,9 @@ renderer.
 | 4 | Diffusion PSF via **Gaussian mixture** instead of direct O(ks²) | bench only | **109× but far outside the band** |
 | 5 | **fp16 / f32** storage for the spatial planes | bench only | **no win; fp16 is slower** |
 | 6 | Per-ABI **`-mcpu`/`-mtune`** tuning | yes, `SPK_TUNE_ARM64` | needs a device |
+| 7 | **GPU print-expose** offload (#148 first rung) | yes, existing GPU toggles | **3.1e-06 vs CPU, engages** |
+| 8 | **Draft-render gate** on slider interaction | yes, always on | dead state now read |
+| 9 | Draft rung as a **setting** | yes, Settings slider | sweepable on device |
 
 Host numbers below are x86 `-O2` on a shared container and are **indicative only** —
 `docs/PERF_ROADMAP.md` records that this host has already mispredicted on-device
@@ -195,6 +198,85 @@ the baseline ISA: safe to ship, still needs a parity re-gate. `-mcpu` additional
 selection — measurable here, not shippable without a device-tier policy. The CMake
 block warns loudly on that path.
 
+## 7. GPU print-expose offload — the first real rung of #148
+
+**The gap this closes.** GPU M1 put the *scan* integral on the GPU. The on-device
+round then reported no measurable preview win, because the print and filming
+stages still ran every band on the CPU. Full-chain GPU (#148) is XL work; this is
+the slice of it that needed no new shader at all.
+
+**Why no new shader.** The two integrals are the same shape:
+
+```
+scan  : out[k] = Σ_b 10^-(c · dye[b])          · icmf[b][k]
+print : raw[k] = Σ_b 10^-(c · cd[b] + base[b]) · fi[b] · sens[b][k]
+```
+
+so the existing, device-validated `scan_spectral_lin.comp` runs the print route
+unchanged once the per-band constants are folded differently:
+
+```
+dye[b][k]  = film.channel_density[b][k]                        (identical to scan)
+icmf[b][k] = 10^-base_density[b] · filtered_illuminant[b] · sens[b][k]
+```
+
+with an identity matrix in the kernel's XYZ→RGB slot, since the print integral's
+output is already the value wanted. The arithmetic the PR #145 device probe
+measured inside the oracle bar is therefore the arithmetic that runs here.
+
+**NaN contract**, mirroring `build_gpu_scan_tables`: a band whose base or channel
+density (or filtered illuminant) is NaN makes `light` NaN, which the CPU zeroes
+for every pixel, so **both** table rows are zeroed — with `dye` zeroed the shader
+computes `D = 0` and `10^0 · 0 == 0`, reproducing `nan_to_num` exactly instead of
+propagating a NaN the shader has no guard for. `sens` cannot carry NaN; it is
+`nan_to_num`'d where it is built.
+
+**It precedes the enlarger LUT rather than deferring to it**, which is the scan
+offload's own precedent and matters twice over. The direct fp32 integral is
+**~3e-6** against the f64 chain, tighter than the LUT's ~5e-5 interpolation
+error, so preferring the LUT would trade accuracy away for nothing. And
+`spk_simulate_preview` force-enables both spectral LUTs, so gating behind
+`!use_enlarger_lut` would have meant the offload never engaged on the
+interactive path — the one that needs it. That was measured, not assumed: the
+first wiring did exactly that, and the frame counter read 2 (exports only).
+
+**Verified** under SwiftShader by `tests/test_gpu_host.cpp`, which now asserts
+the offload actually engaged rather than silently falling back:
+
+```
+info print/linear: GPU-export-vs-CPU-export max_abs=3.149e-06
+info print/fused : GPU-export-vs-CPU-export max_abs=2.434e-06
+info: gpu print state=1 frames=2
+ok: print-expose self-check passed (spk_gpu_print_state == 1)
+ok: print-expose offload engaged (spk_gpu_print_frames > 0)
+```
+
+and by a preview-path probe (three renders with a print-affecting param varied so
+the density memo cannot serve them): frames 1 → 2 → 3, state 1.
+
+**Governed by the existing toggles.** `PrintingParams::allow_gpu` is fed from the
+same `allow_gpu_scan` latch scanning uses, so the Settings GPU preview / GPU
+export switches cover it with no new switch. `spk_gpu_print_state()` /
+`spk_gpu_print_frames()` and a matching pair of one-time logcat lines make it
+externally observable — "gpu scan path ACTIVE" says nothing about the print
+kernel, and unobservable silence is the failure mode #146 already caught once.
+
+## 8–9. Draft-render gate and the draft rung
+
+`SliderInteraction` has written `interacting` since the widget shipped, and its
+own doc comment describes reading it — "render a fast live DRAFT only while a
+slider is actively dragged, then the crisp full pass on release — so a discrete
+edit (switch/dropdown) skips the draft". **Nothing ever read it.** The draft pass
+fired on every edit, including discrete ones, where it buys nothing: the crisp
+settle pass is only 500 ms behind, so the draft just burns a render and flashes a
+soft frame before the sharp one lands. Now read.
+
+The draft rung is `AppSettings.draftRenderMaxPx` (Settings → "Draft render size",
+128…512, default `DRAFT_RENDER_MAX_PX` = 384) rather than a constant, so the
+coarse/fine trade can be swept on a device instead of guessed — lower tracks the
+finger more closely, higher makes the live frame a better preview of the settle
+result.
+
 ## Running it
 
 ```bash
@@ -207,9 +289,19 @@ Host-side, the same binaries build with the compile lines in each file's header.
 
 ## What this branch deliberately does NOT contain
 
-Cold start (#152), the export foreground service (#153), full-chain GPU preview
-(#148), pause-render-on-gesture and the progressive pyramid (`PERF_ROADMAP` items 5
-and 6). Those are app-architecture and UI work, not kernel levers — a bench cannot
-answer them, and folding them in here would make one branch impossible to judge.
+Cold start (#152) and the export foreground service (#153) — app-architecture
+work a bench cannot answer.
+
+**The REST of #148.** The print integral is one of three; `filming` (spectral
+upsampling → camera raw → density curves → DIR couplers) is a genuinely new
+shader with a much larger surface, and the remaining CPU↔GPU round-trips between
+stages are the other half of the milestone. What landed here is the slice that
+reused a validated kernel; the rest is still XL and still wants the on-device
+stage timings before anyone sizes it.
+
+**The deep progressive pyramid** (`PERF_ROADMAP` item 6). The app-level ladder is
+now gated and tunable (§8–9), but the native model — the engine itself producing
+a coarse result and refining it, reusing work across levels — needs the memo
+structure reworked and is not a bench question either.
 
 *Film modeling powered by spektrafilm (GPLv3).*

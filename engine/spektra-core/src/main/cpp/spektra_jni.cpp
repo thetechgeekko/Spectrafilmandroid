@@ -701,6 +701,30 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
             __android_log_print(ANDROID_LOG_INFO, "Spektra",
                                 "gpu scan path ACTIVE (eligible preview frames render on the GPU)");
         }
+        // Same pair for the PRINT-EXPOSE offload (perf lab). It is a separate
+        // kernel dispatch with its own self-check, and it only runs on the print
+        // route, so "scan ACTIVE" says nothing about it — without these two the
+        // print offload would be exactly the ambiguous silence #146 called out.
+        static bool gpu_print_state_logged = false;
+        const int gpu_print = spk_gpu_print_state();
+        if (!gpu_print_state_logged && gpu_print != 0) {
+            gpu_print_state_logged = true;
+            if (gpu_print == 1) {
+                __android_log_print(ANDROID_LOG_INFO, "Spektra",
+                                    "gpu print-expose self-check PASSED on this device/driver");
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, "Spektra",
+                                    "gpu print-expose self-check FAILED on this device/driver; "
+                                    "the print integral stays on the CPU path this session");
+            }
+        }
+        static bool gpu_print_engaged_logged = false;
+        if (!gpu_print_engaged_logged && spk_gpu_print_frames() > 0) {
+            gpu_print_engaged_logged = true;
+            __android_log_print(ANDROID_LOG_INFO, "Spektra",
+                                "gpu print-expose path ACTIVE (print-route frames render "
+                                "their spectral integral on the GPU)");
+        }
     }
     // Per-stage/per-filter timing of this render (#146/#152): one line so the
     // owner can see where the latency goes (grain/halation/filming vs scan, and

@@ -63,6 +63,16 @@ void print_reference_log_raw(const Profile& film, const Profile& print_profile,
                              const PrintingParams& params, const double cmy_film[3],
                              double log_raw_out[3]);
 
+// EXPERIMENTAL GPU print-expose offload, observability only (perf lab / #148).
+// State: 0 = the one-time on-device self-check has not run, 1 = it passed and
+// the offload may engage, 2 = it failed and the CPU integral is permanent for
+// this process. print_expose consults it internally.
+int gpu_print_expose_state();
+
+// Frames whose print-expose integral actually ran on the GPU. 0 with state == 1
+// means the path was eligible but never taken (no frame reached it).
+unsigned long long gpu_print_frames_rendered();
+
 }  // namespace spk
 
 #endif  // SPK_RUNTIME_STAGES_PRINTING_H

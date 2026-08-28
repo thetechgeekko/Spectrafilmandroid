@@ -1303,6 +1303,10 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
           p->normalize_print_exposure != 0, p->print_exposure_compensation != 0); }
     // enlarger.print_exposure (default 1.0) multiplies the print exposure.
     pparams.print_exposure = p->print_exposure;
+    // Same GPU latch scanning uses (INTERNAL — never the raw user flag), so one
+    // toggle governs both offloads. print_expose re-gates per frame and falls
+    // back to the exact CPU integral on any failure.
+    pparams.allow_gpu = (p->allow_gpu_scan != 0);
 
     // OPT-IN s023 print density-curve morph (print_render.density_curves_morph).
     // Default-off -> print_develop uses the stored density_curves table (the
@@ -1709,6 +1713,10 @@ extern "C" {
 int spk_gpu_scan_state(void) { return spk::gpu_scan_preview_state(); }
 
 uint64_t spk_gpu_scan_frames(void) { return spk::gpu_scan_frames_rendered(); }
+
+int spk_gpu_print_state(void) { return spk::gpu_print_expose_state(); }
+
+uint64_t spk_gpu_print_frames(void) { return spk::gpu_print_frames_rendered(); }
 
 int spk_stage_timings(char* buf, int cap) {
     return spk::stage_timings_format(buf, cap);
