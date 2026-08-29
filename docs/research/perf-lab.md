@@ -1308,10 +1308,33 @@ dimensions divide by no worker count.
 from the variant ladder rather than guessed, but that is a prediction until a run says
 otherwise.
 
-The `grade` half is deliberately a separate change: `ColorGrade` and `MaskCompositor`
-are buffer-only and unit-testable the same way, but `simResultToBitmap` writes through
-`Bitmap.setPixels`, which a JVM test cannot gate — so it needs a different safety story
-and should not ride along on this one.
+### What was built for the grade half
+
+The safety problem was that `simResultToBitmap` — the one pass with **no** early-out, so
+the whole 678 ms baseline at default sliders — writes through `Bitmap.setPixels`, which a
+JVM test cannot gate.
+
+The answer was to split it: the per-pixel hot loop is now a pure
+`packToArgb(FloatArray, IntArray, count)`, which a JVM test *can* gate, leaving only the
+`setPixels` call in the Android-touching part. The strip is then **bulk-read** in one
+`FloatBuffer.get(array)` instead of three bounds-checked `get(i)` per pixel — §16.9 put
+per-element buffer ops at ~51% of an equivalent loop's cost, and this loop has no scatter
+at all, so that is the whole of the win available.
+
+The arithmetic is character-for-character what the inlined loop did, so output is
+unchanged. `PackToArgbTest` asserts the contract rather than restating the formula:
+clamping in both directions, round-half-up, channel order, opaque alpha, that a short
+final band writes no further than its own pixel count, and that **NaN clamps to 0** —
+which matters because the engine's NaN semantics are load-bearing elsewhere.
+
+One memory note: the scratch is now a float strip *plus* the int strip, so the band is
+sized by the float budget (~4 MB = 1M floats) rather than the int one. Total managed
+scratch stays in the same class as the single 4 MB `IntArray` it replaced, and stays
+independent of image megapixels — the OOM that motivated striping is not reintroduced.
+
+`ColorGrade` and `MaskCompositor` are untouched: both early-out at default settings, so
+neither is in the measured 678 ms. They are the same shape and can follow if a
+measurement ever puts them on the path.
 
 ### 16.7 The real shape of the non-engine time
 

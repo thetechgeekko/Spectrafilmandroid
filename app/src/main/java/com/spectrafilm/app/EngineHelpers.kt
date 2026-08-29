@@ -456,25 +456,51 @@ fun simResultToBitmap(
     // Tag the bitmap with the engine output space so the system color-manages it to the panel
     // (and embeds the right ICC on Bitmap.compress export) instead of assuming sRGB. native; no IntArray.
     val bmp = createTaggedBitmap(w, h, colorSpace)
-    // ~4 MB scratch per strip (1M ints), at least one row, at most the whole image.
-    val bandRows = (1024 * 1024 / w).coerceIn(1, h)
+    // Scratch is now a FLOAT strip plus the int strip, so the band is sized by the float
+    // budget (~4 MB = 1M floats) rather than the int one. Total managed scratch stays in the
+    // same class as the single 4 MB IntArray this replaced, and stays independent of image
+    // megapixels — the OOM note above still holds.
+    val bandRows = (1024 * 1024 / (w * 3)).coerceIn(1, h)
+    val src = FloatArray(w * bandRows * 3)
     val strip = IntArray(w * bandRows)
     var y = 0
     while (y < h) {
         val rows = minOf(bandRows, h - y)
-        var k = 0
-        var i = y * w * 3
-        repeat(w * rows) {
-            val r = (min(1f, maxOf(0f, f.get(i))) * 255f + 0.5f).toInt()
-            val g = (min(1f, maxOf(0f, f.get(i + 1))) * 255f + 0.5f).toInt()
-            val b = (min(1f, maxOf(0f, f.get(i + 2))) * 255f + 0.5f).toInt()
-            strip[k++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            i += 3
-        }
+        val n = w * rows
+        // Bulk-read the strip instead of three bounds-checked FloatBuffer.get() per pixel.
+        // A device variant ladder put per-element buffer ops at ~51% of an equivalent
+        // per-pixel loop's cost, with sequential reads costing nothing once bulk
+        // (docs/research/perf-lab.md §16.9). This loop has no scatter, so that is the
+        // whole of the win here.
+        f.position(y * w * 3)
+        f.get(src, 0, n * 3)
+        packToArgb(src, strip, n)
         bmp.setPixels(strip, 0, w, 0, y, w, rows)
         y += rows
     }
     return bmp
+}
+
+/**
+ * Clamp, scale, round and pack [count] interleaved RGB float32 pixels from [src] into
+ * opaque ARGB_8888 ints in [dst].
+ *
+ * Split out as a pure function on purpose: it is the per-pixel hot loop of
+ * [simResultToBitmap], and a JVM unit test can gate it while the `Bitmap.setPixels` beside
+ * it cannot (`Bitmap` is an android.jar stub that throws off-device). The arithmetic is
+ * character-for-character what the inlined loop did, so output is unchanged — NaN included,
+ * which clamps to 0 exactly as before.
+ */
+internal fun packToArgb(src: FloatArray, dst: IntArray, count: Int) {
+    var i = 0
+    var k = 0
+    while (k < count) {
+        val r = (min(1f, maxOf(0f, src[i])) * 255f + 0.5f).toInt()
+        val g = (min(1f, maxOf(0f, src[i + 1])) * 255f + 0.5f).toInt()
+        val b = (min(1f, maxOf(0f, src[i + 2])) * 255f + 0.5f).toInt()
+        dst[k++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        i += 3
+    }
 }
 
 /**
