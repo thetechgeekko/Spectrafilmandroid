@@ -53,9 +53,11 @@ object EngineHolder {
         // gates this on an env var, which a running JVM cannot set for itself, so it
         // has to be pushed in from here. Cheap and side-effect-free when off.
         runCatching {
-            val on = AppSettings.from(app).bigCores
+            val settings = AppSettings.from(app)
+            settings.clearLegacyBigCores()
+            val on = settings.bigCores
             SpektraEngine.setBigCores(if (on) 1 else 0)
-            if (on) Diag.i("big cores on detected=${SpektraEngine.bigCoreCount()}")
+            if (on) Diag.i("big cores on (experiment) detected=${SpektraEngine.bigCoreCount()}")
         }.onFailure { Diag.w("big cores apply failed: ${it.message}") }
         return runCatching { SpektraEngine.fromAssets(app.assets) }
             .onSuccess { Diag.i("engine create ok via=fromAssets") }

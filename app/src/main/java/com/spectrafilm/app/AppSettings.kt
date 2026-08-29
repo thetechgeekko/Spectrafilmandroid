@@ -89,6 +89,22 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         set(v) { prefs.edit().putBoolean(KEY_BIG_CORES, v).apply() }
 
     /**
+     * One-time cleanup of the ORIGINAL `big_cores` key.
+     *
+     * When the Settings row was removed, nothing wrote that key any more but
+     * EngineHolder still read and honoured it — so anyone who had ever flipped the
+     * switch was left permanently 1.41x slow, with no UI to discover it and no way
+     * to turn it off. The key above is deliberately a NEW name, so a stale value can
+     * never be honoured again; this drops the old one so it does not linger.
+     */
+    fun clearLegacyBigCores() {
+        if (prefs.contains(LEGACY_KEY_BIG_CORES)) {
+            prefs.edit().remove(LEGACY_KEY_BIG_CORES).apply()
+            Diag.i("cleared legacy big_cores pref (feature was measured 1.41x slower)")
+        }
+    }
+
+    /**
      * GPU ENGINE preview (Vulkan, GPU M1 #146) — distinct from [gpuPreview] (the
      * GLES LUT loupe overlay above): the film simulation itself runs its scan
      * stage on the GPU for interactive previews (~2e-6 from the CPU chain,
@@ -197,7 +213,11 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         private const val KEY_GPU_ENGINE = "gpu_engine_preview"
         private const val KEY_GPU_EXPORT = "gpu_engine_export"
         private const val KEY_DRAFT_MAX_PX = "draft_render_max_px"
-        private const val KEY_BIG_CORES = "big_cores"
+        // Renamed from "big_cores". The old key must never be read again — see
+        // clearLegacyBigCores(). This one exists only so an A/B can still be driven
+        // from a shell without a UI; it is not a product setting.
+        private const val KEY_BIG_CORES = "big_cores_experiment"
+        private const val LEGACY_KEY_BIG_CORES = "big_cores"
         private const val KEY_THEME = "theme"
         private const val KEY_OUTPUT_CS = "output_color_space"
         private const val KEY_PREVIEW_MAX = "preview_max_size"

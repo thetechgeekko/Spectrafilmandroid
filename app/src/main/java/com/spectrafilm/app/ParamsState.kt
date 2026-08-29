@@ -240,12 +240,21 @@ class ParamsState {
      * AppSettings.previewMaxSize (NOT preset/recipe state — loadFrom leaves it
      * alone, exactly like [gpuEngine] and [gpuExport] below).
      *
-     * loadFrom USED to restore this from the incoming params. Because recipes are
-     * keyed by source uri, opening a RAW replayed its saved recipe and put this
-     * straight back to whatever was stored — so Settings' "Preview max size" moved
-     * the demo image and was silently inert for every real photo, which in turn
-     * blocked the 1-2 MP preview sweep (#146). It is still WRITTEN by toParams, as
-     * gpuPreview/gpuExport also are; it is simply no longer read back.
+     * There were FOUR paths that replayed a stored value over the user's setting, and
+     * removing only the obvious one did not fix it. Recipes are keyed by source uri
+     * and auto-applied on open, so a real photo always got its stale value back while
+     * the demo image (which has no recipe) honoured the setting — which is why the bug
+     * presented as "inert for RAW only". The live path was NOT this class:
+     *
+     *   Recipes.load -> Presets.decode -> the "display" block in Presets   (the read
+     *                                                                       that bit)
+     *   Presets.encode "display"                                           (the write)
+     *   BuiltInPresets                                                     (a 3rd copy)
+     *   ParamsState.loadFrom                                               (this one)
+     *
+     * All four are gone. Dropping the READ is what disarms the recipes already on
+     * disk, which keep carrying the field. It is still WRITTEN into the engine params
+     * by toParams, exactly as gpuPreview/gpuExport are.
      */
     var previewMaxSize by mutableIntStateOf(640)
 

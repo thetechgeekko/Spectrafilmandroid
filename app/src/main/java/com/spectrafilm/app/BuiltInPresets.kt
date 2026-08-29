@@ -104,7 +104,6 @@ object BuiltInPresets {
             if (st.has("applyHanatos2025AdaptationWindow")) s.adaptationWindow = st.optBoolean("applyHanatos2025AdaptationWindow", s.adaptationWindow)
             if (st.has("applyHanatos2025AdaptationSurface")) s.adaptationSurface = st.optBoolean("applyHanatos2025AdaptationSurface", s.adaptationSurface)
             if (st.has("spectralGaussianBlur")) s.spectralGaussianBlur = st.f("spectralGaussianBlur", s.spectralGaussianBlur)
-            if (st.has("previewMaxSize")) s.previewMaxSize = st.optInt("previewMaxSize", s.previewMaxSize)
         }
 
         p.optJSONObject("camera")?.let { c ->

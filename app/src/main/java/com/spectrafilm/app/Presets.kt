@@ -320,9 +320,8 @@ object Presets {
             put("blue", pointsToJson(s.toneCurveBlue))
         })
 
-        put("display", JSONObject().apply {
-            put("previewMaxSize", s.previewMaxSize)
-        })
+        // NO "display" block. previewMaxSize is an app-level device setting owned by
+        // AppSettings, not a property of a look — see ParamsState.previewMaxSize.
     }
 
     /**
@@ -502,9 +501,12 @@ object Presets {
             s.toneCurveBlue = jsonToPoints(t.optJSONArray("blue"))
         }
 
-        o.optJSONObject("display")?.let { d ->
-            s.previewMaxSize = d.optInt("previewMaxSize", s.previewMaxSize)
-        }
+        // "display".previewMaxSize is deliberately NOT read back. Recipes are keyed by
+        // source uri and auto-applied on open, so this line silently replayed a stale
+        // preview size over the user's Settings value on every real photo — the demo
+        // image (which has no recipe) honoured the setting, which is exactly why the
+        // bug looked like "inert for RAW only". Every already-saved recipe still
+        // carries the old field; dropping the READ is what disarms them.
     }
 
     private fun <E : Enum<E>> enumOf(name: String, values: List<E>, def: E): E =

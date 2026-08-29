@@ -981,6 +981,14 @@ still what you think it is — here, grepping `decode kind=RAW 383x510` on every
 
 ### 15.6 A prediction about `grade`, written before the measurement arrives
 
+> **OUTCOME (§16): survived its falsifier, but it was not the big fish.** `grade`
+> measured **707 ms** — above the "a few tens of ms" that would have falsified it, so
+> the three single-threaded JVM passes are real and cost real time. But it is 4.9% of
+> an export against decode's 35.3%. Calling it "the cheapest remaining win on the
+> export path" was wrong: it is cheap, it is a win, and it is seventh of the size of
+> the actual problem. The prediction was right about the mechanism and wrong about
+> the stakes.
+
 Recorded now, while the device is unreachable, so the pending run tests it rather
 than confirms it after the fact — the discipline §11 adopted after the f64 tier was
 removed for benchmarking before proving.
@@ -1012,6 +1020,136 @@ lives in decode or encode instead — in which case this section is wrong and th
 answer is elsewhere.
 
 Either way the next run decides it, which is the point of writing it down first.
+
+## 16. The phase split — the answer is DECODE, by a factor of 23
+
+The device came back and the run completed. Same RAW, 3060x4080, Ultra HDR / Q100 /
+full resolution / sRGB, foreground throughout, `decode kind=RAW 3060x4080` confirmed
+on every run per §15.5. Run 1 carried the permission prompt and is excluded from the
+medians; runs 2-5 are clean.
+
+| run | decode | simulate | grade | encode | ok in | sum | total−sum |
+|---|---|---|---|---|---|---|---|
+| 1* | 5191 | 9436 | 663 | 217 | 15532 | 15507 | 25 |
+| 2 | 5005 | 8342 | 715 | 220 | 14298 | 14282 | 16 |
+| 3 | 5122 | 8511 | 706 | 217 | 14572 | 14556 | 16 |
+| 4 | 5064 | 8250 | 708 | 215 | 14250 | 14237 | 13 |
+| 5 | 5505 | 8271 | 706 | 217 | 14711 | 14699 | 12 |
+
+**Medians of runs 2-5:**
+
+```
+  decode     5093 ms   35.3%
+  simulate   8306 ms   57.5%
+  grade       707 ms    4.9%
+  encode      217 ms    1.5%
+  residual     15 ms    0.1%
+```
+
+### 16.1 What this settles
+
+**Decode is the answer, and encode is a rounding error.** 5093 ms against 217 ms —
+a factor of 23. Decode alone is larger than any single engine stage: 1.5× the whole
+grain stage, 2.5× halation.
+
+Against the 1-2 s target, if a GPU pipeline made **every engine stage free**:
+
+```
+  decode 5093 + grade 707 + encode 217 + residual 15  =  ~6032 ms
+```
+
+So GPU-on-the-engine cannot reach the target on its own — §15.4 said that as
+arithmetic, and this is the measurement. What changes is *where* the remaining work
+is: **what LibRaw is doing for 5.09 s on a 25 MB file** is now the highest-value
+unexamined question in the project. Threading, half-size paths, demosaic choice —
+none of it has ever been profiled. It also sharpens the vkdt question rather than
+settling it: vkdt-style pipelines put demosaic on the GPU, so decode is precisely the
+part that would move if we went external.
+
+### 16.2 Both reconciliations closed, and two pre-flight warnings were wrong
+
+The instrumentation fixes in `876bed3` worked. **Reconciliation 1 closes to 12-25 ms
+(0.1%)** — the head/mid/tail gaps were real but together worth ~15 ms, not the
+visible hole predicted.
+
+**Reconciliation 2 also closes, and the prediction that it would NOT was wrong.** The
+warning was that `simulate` must exceed the stage sum because `spektra_jni.cpp`
+mallocs ~140 MB and wraps it *after* printing the timings. Measured, the engine
+boundary is exactly where we thought:
+
+| run | stage sum | simulate | delta |
+|---|---|---|---|
+| 1 | 9437.4 | 9436 | −1.4 |
+| 2 | 8391.5 | 8342 | −49.5 |
+| 3 | 8552.6 | 8511 | −41.6 |
+| 4 | 8295.2 | 8250 | −45.2 |
+| 5 | 8345.3 | 8271 | −74.3 |
+
+**A small real finding hides in the sign.** The delta is consistently *negative*: the
+per-stage timers sum to 40-75 ms MORE than the wall clock of the entire native call,
+which cannot literally be true. Some stage timers overlap or double-count by
+**0.5-0.9%**. Not a boundary problem, but the `stage timings` line is very slightly
+optimistic and should not be treated as exact.
+
+**And a retraction of ours.** §15's fix moved the `POST_NOTIFICATIONS` request off the
+export path on the theory that a permission dialog would demote the process out of
+`/top-app` and cost 3.90×. Measured, it does not:
+
+```
+  cpuset WHILE PERMISSION DIALOG UP: /top-app  adj=0
+  mCurrentFocus=...GrantPermissionsActivity
+```
+
+`GrantPermissionsActivity` overlays the task without moving the process. Run 1's
+~7% overshoot is taps and dialog, not a cpuset move. The change is kept — asking
+while the user is still choosing options is better anyway — but **its stated
+justification was falsified**, and that is worth more than the change.
+
+### 16.3 Two bugs of our own, one of them a stranding trap
+
+**The `big_cores` migration trap.** Removing the Settings row left nothing writing the
+pref while `EngineHolder` still read and honoured it. Any user who had ever flipped
+that switch was left permanently **1.41× slow**, with no UI to discover it and no way
+to turn it off. Found because the device itself arrived in that state. Fixed: the key
+is renamed so a stale value can never be honoured again, and the old one is dropped on
+first run.
+
+**"Preview max size" was not fixed by the first attempt — the wrong function was
+patched.** The diagnosis was right (a per-uri recipe replays a stale value) but
+`ParamsState.loadFrom` is not the live path. There were **four**:
+
+```
+  Recipes.load -> Presets.decode -> the "display" block   <- the read that actually bit
+  Presets.encode "display"                                <- the write
+  BuiltInPresets                                          <- a third copy
+  ParamsState.loadFrom                                    <- the only one first removed
+```
+
+All four are gone now. Dropping the **read** is what disarms the recipes already on
+disk — all 33 on the device still carry `previewMaxSize: 640`. The decisive control
+was a source with no saved recipe: `decode kind=PHOTO 383x510 maxEdge=1019`, honoured.
+
+### 16.4 #146's preview offload is a null result, across a 16× range
+
+Six renders per config, fresh process and recipe-free source each time, GPU
+self-check PASSED and both GPU paths ACTIVE in every ON config. Note the decode is
+**power-of-2 quantized** by both LibRaw and the platform decoder, so preview size is
+not continuous — reachable points are 0.195, 0.78, 3.12 and 12.5 MP. 1-2 MP was
+bracketed, not hit.
+
+| preview | GPU OFF median | GPU ON median | ratio |
+|---|---|---|---|
+| 0.78 MP | 691.5 ms | 658.0 ms | 0.95× (4.8% faster) |
+| 3.12 MP | 2438.5 ms | 2456.5 ms | 1.007× (0.7% slower) |
+
+Scaling the preview up does **not** reveal a GPU win. At 0.78 MP the 4.8% sits inside
+the OFF set's own spread (629-714); at 3.12 MP it is gone. With the 195k px result
+from the #146 validation (562 vs 562 ms) that is three sizes across a 16× range with
+no usable speedup at any of them.
+
+The GPU scan path is genuinely active and genuinely correct. It is simply too small a
+fraction of a frame to matter — grain and halation are filming-stage, on the CPU, and
+dominate. **#146's preview-offload question is closed on this device.**
 
 ## Running it
 
