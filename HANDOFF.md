@@ -1,5 +1,94 @@
 # Spektrafilm Android — Session Handoff
 
+---
+
+## ORDER FOR THE DEVICE/LAPTOP SESSION (2026-08-29, head `cec55d4`)
+
+*Written here because a cloud session cannot message another session directly — the
+credential is accepted for its own work but not for delivery. This file is the channel.
+Pull to `cec55d4` first.*
+
+### Why task 1 is first
+
+On release the engine is **5504 of 6251 ms — 88% of an export**. Deleting decode, grade
+and encode *entirely* still leaves 5.5 s against a 1–2 s target. The CPU side is finished
+as a lever, and the route is decided: **our own 81-band GLSL shaders, vkdt as the
+architecture guide** (`docs/research/vkdt-decision.md` §11). But **nobody has ever
+measured GPU against CPU on a big engine stage at export resolution on this hardware.**
+Every GPU argument in that document rests on a number that does not exist yet.
+
+### 1. GPU vs CPU, scan route, full resolution — the decisive one
+
+No new code needed: the experimental GPU export toggle and the persistent Vulkan host
+already ship.
+
+- **RELEASE build.** Not debug — see the warning below.
+- Full-res export, scan route, GPU export toggle **OFF**, then **ON**. Three reps each.
+- Send the whole `stage timings` line for both, not just the total. The `scan=` slot is
+  the one that matters.
+- **Report the ratio even if it is bad.** A 1.2× is as decisive as a 10× — it collapses
+  the rewrite case, and that is worth knowing before anyone writes a shader.
+
+### 2. Confirm #160 on device
+
+Black Pro-Mist was O(n²) and 98.2% of a render: **30.7 s for one 640px preview** at the
+app's own defaults, extrapolating to ~10.9 hours at 12 MP. Now FFT + real-to-complex on
+the CPU (17663 → 195 ms on host, 90.7×). Flip Pro-Mist on, one preview render, one full
+export, report `camera_diffusion=`. `SPK_DIFFUSION_FFT=0` forces the old direct path for
+an on-device A/B; `SPK_DIFFUSION_FFT_MAX` tunes the transform cap.
+
+### 3. The all-effects ladder, on release
+
+Print route, full res, one export each: baseline / + Pro-Mist / + lens blur / + glare /
++ highlight boost / ALL ON. `stage timings` line for each. **Two traps that have both
+bitten already:** zero slots are SKIPPED (a missing slot means off, not free), and
+`scan_spatial` and `glare_field` are SUB-MEASURES nested inside `scan` — do not add the
+printed slots up.
+
+### 4. #119 wizard
+
+Unblocked. The stale "Scan film" instruction is fixed — the control is **"Slide mode
+(skip print)"** under Simulation → Scanner.
+
+### STAY ON RELEASE, and this is not a formality
+
+Three of the four native modules compiled at **`-O0`** in debug until `19cb57e` — no
+`CMAKE_CXX_FLAGS_DEBUG` guard, so CMake's default `-g` applied. That is why decode moved
+6.68× between builds while the engine moved 1.48×. **Every number taken before that fix
+was a debug number.** Do not flip to debug for `run-as`; prefs inspection is not worth
+turning every measurement back into a debug measurement.
+
+### What landed today, so you are not re-deriving it
+
+- **`4da9b19`** — diffusion FFT + r2c. `kernels/fft.{h,cpp}` (`FftPlan` + `RfftPlan`),
+  `kernels/fft_convolve.{h,cpp}`. Parity suite is **39 tests** now, green on both legs.
+- **`cec55d4`** — CI runs our GLSL under **lavapipe** (`mesa-vulkan-drivers` +
+  `libvulkan-dev`). `test_gpu_host` validates at 2.4–3.6e-06 against the CPU reference,
+  in 5 s, with no GPU. It gates the shader's **math and determinism** — **not**
+  performance, and **not** arm64 transcendental precision. Which is exactly why task 1
+  still needs your device.
+- **`2b5ac31`** — 44 bands vs our 81: the scan route survives 10 nm, the print route does
+  not (15–17 codes). That is why we keep 81.
+- **`e99bbea`** — Halide fusion is **0.78–1.51×** on our real shape (stencils kill it),
+  not the 18–36× a stencil-free spike reports. Not adopted. NumHalide also not adopted —
+  but note the determinism objection against it was **wrong and is retracted**; it is
+  byte-identical across Halide thread counts.
+- **A hard rule for the shader work** (`perf-lab.md` §21.3): **interpolate every LUT,
+  never round an index.** A 1-ULP index difference flips `cast<int>` to the next table
+  entry — a 60,000× output amplification. Our CPU LUTs interpolate, so we are immune; a
+  GPU port differs by ~1 ULP *everywhere* by construction (fp32 vs f64), so a
+  nearest-index fetch in a shader would scatter single-step errors across the frame.
+
+### One caution about today's work
+
+CI broke twice, both times because the change was verified in an environment
+**better-equipped than CI**: the host parity build globs sources where the Android
+CMakeLists enumerates them, and this container already had `libvulkan-dev`. Guards were
+added for both, but the root cause — local green does not imply CI green — is unfixed.
+If something here does not build on your side, suspect that first.
+
+---
+
 ## Current state (2026-08-28, the GPU line opens: #127 resolved, M1 preview offload)
 
 - **Owner priority: GPU first** (supersedes the baseline-first ordering; #119 stays
