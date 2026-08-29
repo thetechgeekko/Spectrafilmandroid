@@ -97,13 +97,15 @@ g++ -std=c++17 -O2 -pthread -I. -I../../../../../tools/parity \
 A test passes when its output contains no `FAIL` line. `tools/parity/run_engine_parity.sh`
 builds and runs the whole suite locally with the same argv as CI (it fails loudly if its table
 drifts from the workflow's `build_run` count). `engine-parity` is a **two-leg matrix** — the same
-38 tests at `-O2` and at the shipping `-O3 -ffast-math -fno-finite-math-only`, because the release
+39 tests at `-O2` and at the shipping `-O3 -ffast-math -fno-finite-math-only`, because the release
 APK's numerics were otherwise never gated. A plain local run reproduces the `-O2` leg only; for the
 other, prefix `SPK_PARITY_EXTRA_FLAGS="-O3 -ffast-math -fno-finite-math-only"`. CI `engine-parity`
-gates (38 tests):
+gates (39 tests):
 `simulate_e2e` (goldens + BOTH film-density memos + the print-density memo + per-param key
 completeness), `filming`, `spatial`, `crop_resize`, `downscale` (minification AA prefilter),
 `autoexposure`, `small_preview_aa` (AE metering downscale AA), `diffusion` (+`_e2e`),
+`fft_convolve` (the FFT diffusion path against a verbatim transcription of the direct
+loop, incl. a kernel wider than the image, + 1-vs-8-worker byte-identity),
 `lut_accel`, `lut_cache_e2e` (spectral 3D-LUT memo: warm engine byte-identical to a fresh one,
 every key-folded param perturbed one at a time, 1-vs-8 workers through a warm cache),
 `scanner_lut_e2e`, `enlarger_lut_e2e`, `output_spaces`, `lensblur`, `tonecurve`,
@@ -129,7 +131,7 @@ per-test argv is in `.github/workflows/ci.yml` — copy from there rather than g
 - Engine `CMAKE_CXX_FLAGS_RELEASE` is `-O3 -ffast-math -fno-finite-math-only`.
   **`-fno-finite-math-only` is required** — the scanning stage relies on NaN propagation through
   `density_to_light` to match spektrafilm's profile null handling. Do not strip it.
-  All 38 gates pass at these flags as well as at `-O2`; note this holds for the **band**, not for
+  All 39 gates pass at these flags as well as at `-O2`; note this holds for the **band**, not for
   byte-equality between the two builds — `-ffast-math` reassociates, which is exactly what
   invalidated a Highway f64 byte-identity claim proven only at `-O2` (`docs/research/perf-lab.md` §14).
 - `tools/parity/` is the standalone `.spkvec` golden-vector comparator (CMake + ctest self-test,
@@ -148,7 +150,16 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
 
 - Current version: `versionCode 11` / `versionName 0.9.0`, `minSdk 24`, `targetSdk`/`compileSdk 34`.
   ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`.
-- Commit with `-c commit.gpgsign=false` (the signing server rejects signing here).
+- **Commit signing is environment-dependent — test it, don't assume.** This line used to
+  read "commit with `-c commit.gpgsign=false` (the signing server rejects signing here)"
+  unconditionally. In a **Claude Code cloud container that already has signing configured**
+  (`gpg.format ssh`, `gpg.ssh.program /tmp/code-sign`, `commit.gpgsign true`) that is
+  **false**: a probe commit signed fine and carried a real SSH signature, and passing the
+  flag is what produced two Unverified commits the stop hook then flagged. So: try a signed
+  commit first; only fall back to `-c commit.gpgsign=false` where signing actually fails
+  (which is where the original note came from — keep it for that case). Note
+  `git commit --amend` / `git rebase --exec` may need explicit permission, so it is much
+  cheaper to sign on the first commit than to fix it afterwards. (2026-08-29.)
 - **A new engine `.cpp` must be added to `engine/.../cpp/CMakeLists.txt` by hand, and the
   parity suite will NOT catch it if you forget.** The host parity build compiles with a
   glob (`kernels/*.cpp model/*.cpp ...`, see the build line above); the Android build

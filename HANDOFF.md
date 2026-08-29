@@ -32,8 +32,9 @@ Then I ran the real engine on the host, reporting per-channel output spread, acr
 | film | portra_400 (negative) + provia_100f, velvia_100, ektachrome_100 (positive) |
 | scene | ~4-stop and ~10-stop |
 
-**46 configurations, zero flats.** Slide + grain + 2560 + AE on + positive stock gives
-0.93 spread per channel. The engine is clean on every axis you named.
+**46 configurations, zero flats** (66 including the scanner-correction sweep below).
+Slide + grain + 2560 + AE on + positive stock gives 0.93 spread per channel. The engine
+is clean on every axis you named.
 
 Two consequences:
 
@@ -55,11 +56,17 @@ on-device.** Run these three instead, in order:
    collapses. Highest information per export of anything available.
 2. **Slide + full res + all local masks/adjustments OFF** (#141 is a known
    mask-compositor export defect — exclude it).
-3. **Report the film stock, and whether scanner black/white correction was on.** The
-   engine builds an affine from measured black/white references for **positive film on
-   the slide route only** (`spektra.cpp:1043-1063`), and a degenerate reference pair
-   collapses an affine to a constant — the right symptom class. A host sweep of that
-   pair is running; result appended here when it lands.
+3. **Report the film stock, and whether scanner black/white correction was on** — for
+   the record, not because I still suspect it. The engine builds an affine from measured
+   black/white references for **positive film on the slide route only**
+   (`spektra.cpp:1043-1063`), and a degenerate reference pair collapses an affine to a
+   constant, which is the right symptom class. **Swept it: also negative.** With the
+   correction ON, provia at 512→2560 stays at 0.97–0.99 spread (the correction is
+   plainly active — it moves spread from 0.91 to 0.97 and shifts the mean), and on
+   portra it is a strict no-op, byte-for-byte identical to OFF, exactly as the engine
+   comment claims. So that hypothesis is dead too.
+
+**Running total: 66 host configurations, zero flats.**
 
 **File the ticket regardless** — a whole route producing a constant at export size is
 release-blocking. Attach the host negative result so nobody re-runs those 46 configs.
