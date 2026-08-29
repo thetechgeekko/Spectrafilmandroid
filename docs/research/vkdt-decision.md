@@ -460,17 +460,43 @@ What we cannot keep is byte-equality *with the CPU path*. The GPU contract has t
 "within parity tolerance of the CPU reference", with byte-equality retained only
 GPU-to-GPU on the same device.
 
-**3. CI cannot run it.** All 38 gates compile with host g++; GitHub runners have no GPU.
-A software Vulkan implementation (Mesa **lavapipe**, or SwiftShader) would give a
-deterministic, GPU-free CI leg that actually executes the SPIR-V — the shaders are already
-compiled to `.spv` and embedded as `_spv.inc`, so the pieces exist. **Untested — nobody has
-tried this here**, and it needs a spike before anyone counts on it.
+**3. CI cannot run it — RESOLVED, it can.** The concern was that all the gates compile with
+host g++ and GitHub runners have no GPU, so a wrong shader would surface only as a wrong
+picture on a device. Mesa **lavapipe** was the candidate and was recorded as untested.
+
+**Tried, and it works.** `mesa-vulkan-drivers` is a stock Ubuntu package the runner installs
+in seconds; it provides a software Vulkan 1.4 device (`llvmpipe`,
+`PHYSICAL_DEVICE_TYPE_CPU`). Our existing `tests/test_gpu_host.cpp` — previously marked
+LOCAL-ONLY for exactly this reason — runs the real Vulkan branch under it and passes:
+
+| | GPU export vs CPU export |
+|---|---|
+| `scan/linear`, `scan/fused` | within 1e-4 |
+| `print/linear` | `max_abs` **3.580e-06** |
+| `print/fused` | `max_abs` **2.434e-06** |
+
+plus warm-host determinism (three GPU previews byte-identical) and the #149 law that
+`gpu_preview` cannot reach an export. The GPU preview is also *closer* to the export than
+the CPU LUT preview is (print/linear 1.332e-04 vs 4.921e-04).
+
+Wired into the `engine-native` job. **One trap, and the gate is built around it:**
+`test_gpu_host` reports `ALL OK` in *both* cases — with a GPU it validates the shader, and
+without one it validates only the fallback law. Those are not the same gate, so the CI step
+additionally requires `self-check passed (state == 1)`; a broken or missing ICD therefore
+fails loudly instead of silently downgrading to a no-op that stays green. Verified in both
+directions before landing.
+
+**What this gates and what it does not.** It gates the shader's **math** and its
+**determinism**. It says nothing about **performance** — lavapipe is a CPU rasterizer — and
+nothing about an **arm64 GPU's transcendental precision**, since GLSL leaves `pow`/`exp2` to
+a vendor-defined ULP bound. Point 1 above still has to be measured on a device.
 
 ### 11.5 The order this implies
 
-1. **Validate `scan_spectral.comp` numerically on real hardware.** It exists, it is 81-band,
-   and its accuracy against the CPU reference has never been measured on an arm64 GPU. That
-   is the cheapest possible first GPU result and it de-risks every later shader.
+1. ~~**Validate `scan_spectral.comp` numerically on real hardware.**~~ **Partly done, in
+   software.** Under lavapipe it validates at 2.4–3.6e-06 against the CPU reference, and
+   that is now a CI gate (§11.4). What remains is the *arm64* half: vendor `pow`/`exp2`
+   precision on a real Adreno, which software Vulkan cannot stand in for.
 2. **Measure GPU vs CPU on `scan` at export resolution** (§5) — still the unknown that
    sizes everything.
 3. **Fix `camera_diffusion`'s algorithm** (#160) — on the CPU first, where the parity suite

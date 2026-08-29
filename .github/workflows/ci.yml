@@ -65,6 +65,48 @@ jobs:
           nm -D libspektra.so | grep -E "spk_simulate|spk_engine_create" || \
             (echo "missing expected engine symbols" && exit 1)
 
+      # -----------------------------------------------------------------------
+      # GPU shader gate. gpu/scan_spectral.comp is an 81-band GLSL compute kernel
+      # and it is the seed of the "own shaders, vkdt as architecture guide" route
+      # (docs/research/vkdt-decision.md 11). Until now nothing executed it in CI,
+      # because the runners have no GPU -- so a wrong shader would have surfaced
+      # only as a wrong picture on a device.
+      #
+      # It does not need a GPU. mesa-vulkan-drivers ships LAVAPIPE, a software
+      # Vulkan implementation, and the runner installs it in seconds. That runs
+      # the real SPIR-V through the real Vulkan branch.
+      #
+      # WHAT THIS GATES AND WHAT IT DOES NOT. It gates the shader's MATH (against
+      # the CPU reference, ~3e-06 in practice) and its run-to-run determinism. It
+      # says NOTHING about performance (lavapipe is a CPU rasterizer) and NOTHING
+      # about an arm64 GPU's transcendental precision -- GLSL leaves pow/exp2 to a
+      # vendor-defined ULP bound, so that still has to be measured on a device.
+      # -----------------------------------------------------------------------
+      - name: Install software Vulkan (lavapipe)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mesa-vulkan-drivers
+
+      - name: GPU shader validation under lavapipe
+        working-directory: engine/spektra-core/src/main/cpp
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          g++ -std=c++17 -O2 -pthread -I. -I"$GITHUB_WORKSPACE/tools/parity" \
+            -DSPK_ENABLE_VULKAN=1 \
+            tests/test_gpu_host.cpp spektra.cpp gpu/*.cpp kernels/*.cpp io/*.cpp \
+            model/*.cpp profiles/*.cpp runtime/*.cpp runtime/stages/*.cpp \
+            -lvulkan -o /tmp/test_gpu_host
+          /tmp/test_gpu_host "$GITHUB_WORKSPACE/engine/spektra-core/src/main/assets/spektra" \
+            2>&1 | tee /tmp/gpu_host.out
+          # test_gpu_host reports ALL OK in BOTH cases: with a GPU it checks the
+          # shader, and without one it checks only the fallback law. Those are not
+          # the same gate, so require that a GPU was actually found -- otherwise a
+          # broken ICD would silently downgrade this to a no-op and stay green.
+          grep -q "self-check passed (state == 1)" /tmp/gpu_host.out || \
+            (echo "no GPU engaged — this gate validated nothing" && exit 1)
+          grep -q "test_gpu_host: ALL OK" /tmp/gpu_host.out || exit 1
+
   # ---------------------------------------------------------------------------
   # Engine parity: compile the deterministic stage tests and run them against the
   # BUNDLED assets (profiles + spectral LUT) and the committed goldens. This is a
