@@ -13,9 +13,14 @@
  */
 #include "model/diffusion.h"
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>   // debug.spektra.fftmax / .fft (tuning_knob)
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <vector>
 
@@ -372,18 +377,52 @@ std::atomic<unsigned long long> g_fft_fallbacks{0};
 // dramatically SLOWER, silently. spk::diffusion_fft_fallbacks() counts those
 // events so the failure is at least observable; check it after any change here.
 // An r2c f32 transform would buy N=4096's block size at roughly N=2048's memory.
+// Read a tuning knob that must be settable on a SHIPPING build.
+//
+// std::getenv alone is not enough on Android: an app process inherits no shell
+// environment, and `wrap.<pkg>` (the usual way in) requires a debuggable app, so
+// on a release APK -- the only build whose numbers are worth measuring -- these
+// knobs were simply unreachable. The device session hit exactly that: the
+// SPK_DIFFUSION_FFT_MAX experiment could not be run without a rebuild per value,
+// and a rebuild drops the loaded image, so the experiment cost a human every
+// time.
+//
+// So: env var first (host tests, benches, CI), then an Android system property,
+// which `adb shell setprop` can set on a release build with no rebuild:
+//
+//     adb shell setprop debug.spektra.fftmax 4096
+//     adb shell setprop debug.spektra.fft 0        # force the direct loop
+//
+// Same mechanism as debug.spektra.dumpparams, which is already proven to work on
+// this project's release builds.
+const char* tuning_knob(const char* env_name, const char* prop_name, char* buf,
+                        size_t cap) {
+    if (const char* env = std::getenv(env_name)) return env;
+#if defined(__ANDROID__)
+    if (cap >= PROP_VALUE_MAX && __system_property_get(prop_name, buf) > 0 && buf[0])
+        return buf;
+#else
+    (void)prop_name; (void)buf; (void)cap;
+#endif
+    return nullptr;
+}
+
 int fft_max_transform() {
-    if (const char* env = std::getenv("SPK_DIFFUSION_FFT_MAX")) {
-        const int v = std::atoi(env);
+    char buf[92] = {0};
+    if (const char* v0 = tuning_knob("SPK_DIFFUSION_FFT_MAX", "debug.spektra.fftmax",
+                                     buf, sizeof(buf))) {
+        const int v = std::atoi(v0);
         if (v >= 16) return v;
     }
     return kFftConvMaxTransform;
 }
 
 bool use_fft(int w, int h, int ks) {
-    if (const char* env = std::getenv("SPK_DIFFUSION_FFT")) {
-        if (env[0] == '0') return false;
-        if (env[0] == '1') return true;
+    char buf[92] = {0};
+    if (const char* v0 = tuning_knob("SPK_DIFFUSION_FFT", "debug.spektra.fft",
+                                     buf, sizeof(buf))) {
+        if (v0[0] == '0') return false;
+        if (v0[0] == '1') return true;
     }
     const int n = fft_convolve_transform_size(w, h, ks, fft_max_transform());
     if (n < ks + 1) return false;                 // no valid block -> direct
