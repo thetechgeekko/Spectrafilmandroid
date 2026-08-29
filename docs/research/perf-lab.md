@@ -2000,6 +2000,80 @@ for our chain is between 0.78× and 1.51×, not the 18–36× a naive spike repo
 determinism objection is retired. The spike's real yield is §21.3, which is a constraint on
 how the shaders get written.
 
+## 22. The effects ladder, measured on device (2026-08-29)
+
+Six full-resolution exports, 4080x3060 = 12.48 MP, print route, JPEG q100, GPU export on,
+on the fixed post-R8 release build. Each middle row is baseline **plus one** effect; the
+last is all four together. Param state held constant across every row and pinned as the
+run's header: the shipped built-in preset **"Portra 160 - Soft Light Portrait"**, not
+`PARAM_DEFAULTS` — a named built-in is as reproducible as the defaults, which was the
+actual requirement.
+
+| row | total ms | delta vs base | the stage itself |
+|---|---:|---:|---|
+| L1 baseline | 10013 | - | - |
+| L2 + Pro-Mist | 19673 | **+9660** | `camera_diffusion` 9877.3 |
+| L3 + lens blur | 9774 | -239 | `lens_blur` 177.3 (4.60 um) |
+| L4 + glare | 9929 | -84 | `glare_field` 190.9 (0.03%) |
+| L5 + highlight boost | 9932 | -81 | `highlight_boost` 37.3 (2.0 EV) |
+| L6 ALL ON | 20109 | +10096 | all four |
+
+Every row was range-checked (no `min == max` in any arm) — the discipline that caught the
+degenerate-frame GPU measurement in §2. `fft_fallbacks=0` on both diffusion rows, so those
+`camera_diffusion` numbers are genuine N=2048 transforms and not a silent direct-loop
+fallback. That was the counter's first real use; note it has only ever printed 0, so it is
+confirmed **wired**, not yet confirmed **sensitive**.
+
+### 22.1 The totals are noise-bound; read the stage timings instead
+
+Sum of the four total-deltas is 9256 against an ALL-ON delta of 10096 — a gap of +840 that
+looks like superadditivity. **It is not.** Rows L3, L4 and L5 each did strictly MORE work
+than baseline and every one came in BELOW it (-239, -84, -81). That is physically
+impossible, so the floor is measurement noise, and the inflated sample is the baseline:
+L1 was the first export of the session and ran cold, while every later comparable row
+landed in 9774-9932. **Noise floor is roughly +/-250 ms on a 10 s export, about 2.5%.**
+
+So any effect under about half a second cannot be read from the total at all. At stage
+level the four are additive to **1.3%**:
+
+    isolated:  9877.3 + 177.3 + 190.9 + 37.3 = 10282.8
+    in ALL ON: 9719.5 + 190.5 + 197.8 + 41.1 = 10148.9
+
+Glare is the one effect whose own slot understates it: `glare_field` is nested inside
+`scan`, and `scan` moved 428.7 (baseline) -> 648.3 (+glare) -> 676.6 (all on). Glare
+really costs about 220 ms, of which the field build is 191.
+
+### 22.2 There are exactly two effects worth optimising
+
+Pro-Mist is 9877 of the 10283 ms of total ladder-effect cost — **96%**. The other three
+together are 405 ms, which is inside twice the noise floor.
+
+But the 10 s baseline is not free, and none of it is a ladder effect: grain 4340-4540,
+halation 1915-2124, dir_couplers 1243-1305, so about **7.9 s of the 10 s baseline** is
+those three. The honest summary of an all-effects export is roughly **half Pro-Mist and
+half grain+halation+couplers**, with the three small effects as rounding error.
+
+If effect cost is the target there are two candidates, `camera_diffusion` and `grain`, and
+nothing else on this list is worth engineering time.
+
+### 22.3 CORRECTION: the 39 s Pro-Mist figure was a SETTING, not a resolution property
+
+Section 20 and PR #156 quoted `camera_diffusion` at **39127 ms**, and derived from it that
+Pro-Mist was **85% of a 12 MP export**. This ladder measures the same filter, on the same
+image, at the same 12.48 MP, at **9877 ms** and **48%**.
+
+The difference is the Pro-Mist strength in this preset versus whatever was set on the day
+of the #160 run. So:
+
+- **39127 ms was never a property of 12 MP.** It was a property of one filter setting.
+- The "85% of the export" framing belongs to that setting, not to Black Pro-Mist generally.
+- The **90.7x FFT speedup is unaffected** — that was a before/after on one fixed
+  configuration, which is exactly the comparison a speedup claim needs.
+
+Recorded rather than quietly restated, because it is the fourth time on this branch that a
+number turned out to describe a condition nobody had written down: a debug build (S19), a
+degenerate frame (S2), a file size (S1), and now a slider position.
+
 ## Running it
 
 ```bash
