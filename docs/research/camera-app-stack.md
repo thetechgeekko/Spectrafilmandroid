@@ -211,8 +211,14 @@ the default path.
 
 ## 9. What to verify before any of this becomes a plan
 
-- [ ] The perf-lab device numbers (`tools/perf_lab/build_push_run.sh`, PR #156) — they set
-      what the CPU path is actually worth.
+- [x] The perf-lab device numbers — **done**, see `docs/research/perf-lab.md` §11.
+      Headline: core affinity is worth 1.58× bit-identically; every SIMD/codegen lever
+      measured neutral or negative on arm64; a 12.5 MP export that used to be SIGKILLed
+      at 4m46s completed in 13.85 s (cause not yet isolated).
+- [ ] **Re-measure #152's cold-start claim at a comparable resolution.** The ~8.8 s
+      figure came from a much larger image than the 510×383 later measured at 699 ms
+      cold / 595 ms warm, so the two are not the same measurement. What the newer run
+      does show is that `tc_lut_build` is a one-off at app start, not per-source setup.
 - [ ] A camera→Vulkan AHardwareBuffer import round-trip on the S26 Ultra: does the driver
       accept our formats without a blit?
 - [ ] A baked-LUT video loop at 1080p30 and 4K30 — measured, not extrapolated from §3.

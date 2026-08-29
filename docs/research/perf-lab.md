@@ -19,86 +19,113 @@ the already-adopted "proxy approximate, export exact" policy. A lever that is fa
 and outside the band on the export path is not a speedup; it is a different
 renderer.
 
-## Status of each lever
+## Status of each lever — DEVICE-DECIDED
 
-| # | Lever | Wired in? | Host verdict |
-|---|-------|-----------|--------------|
-| 1 | Highway **f64** lanes on the halation tier | yes, `SPK_ENABLE_HIGHWAY` + `SPK_SIMD` | bit-identical; speed inconclusive on host |
-| 2 | **big.LITTLE affinity** for the fork-join pool | yes, `SPK_BIG_CORES` | no-op on host (no cpufreq data) |
-| 3 | Spectral integral as **batched/GEMM-shaped** matrix ops | bench only | **~1.05× — not worth it** |
-| 4 | Diffusion PSF via **Gaussian mixture** instead of direct O(ks²) | bench only | **109× but far outside the band** |
-| 5 | **fp16 / f32** storage for the spatial planes | bench only | **no win; fp16 is slower** |
-| 6 | Per-ABI **`-mcpu`/`-mtune`** tuning | yes, `SPK_TUNE_ARM64` | needs a device |
-| 7 | **GPU print-expose** offload (#148 first rung) | yes, existing GPU toggles | **3.1e-06 vs CPU, engages** |
-| 8 | **Draft-render gate** on slider interaction | yes, always on | dead state now read |
-| 9 | Draft rung as a **setting** | yes, Settings slider | sweepable on device |
-| 10 | **Irregular kernels profiled as a class** | bench only | **8.3× regime spread** |
+Measured on an SM-S948W (Galaxy S26 Ultra), Adreno 840, on `claude/perf-lab @ 5de7a8b`.
+Host numbers are kept below for contrast; **the arm64 column is what decides**.
 
-Host numbers below are x86 `-O2` on a shared container and are **indicative only** —
-`docs/PERF_ROADMAP.md` records that this host has already mispredicted on-device
-behaviour twice (the scanner LUT, and the scan-vs-print ordering). Run
-`tools/perf_lab/build_push_run.sh` for the numbers that decide anything.
+| # | Lever | Host said | Device said | Verdict |
+|---|-------|-----------|-------------|---------|
+| 1 | Highway **f64** on halation | inconclusive | **~2% SLOWER**, and failed its own byte test | **REMOVED** |
+| 2 | **big.LITTLE affinity** | no-op (no cpufreq) | **1.58×, checksum unchanged** | **SHIP IT** |
+| 3 | GEMM-shaped spectral integral | 1.05× | **0.96–0.97×** | dead, twice over |
+| 4 | Gaussian-mixture diffusion PSF | 109×, 9.2e-02 off | **85× … 692×**, 6.5e-02 off | preview-only |
+| 5 | fp16 / f32 plane storage | no win | **0.97× / 0.94×** | dead |
+| 6 | Per-ABI `-mtune`/`-mcpu` | untested | untested | still open |
+| 7 | **GPU print-expose** offload | 3.1e-06 vs CPU | **engaged, all four log lines fired** | works |
+| 8–9 | Draft gate + tunable rung | — | shipped | — |
+| 10 | Irregular-kernel profile | 8.3× spread | **11.8× / 8.1× spread** | cliff confirmed |
 
----
+**One lever survives as a clear win, and it is the one nobody expected.** Affinity —
+pure scheduling, zero arithmetic change, bit-identical output — beat every SIMD and
+codegen idea on this branch combined.
 
-## 1. Highway f64 lanes on the halation tier
+## 1. Highway f64 lanes on the halation tier — BUILT, MEASURED, REMOVED
 
-**The gap this closes.** The earlier Highway round (#155) covered only the f32 FIR,
-which is the *grain and glare* blur. Halation runs through
-`kernels/exponential_filter.cpp` — a separate float64 tier — and `halation_active`
-defaults to 1, so that tier executes on essentially every render. The original
-header argued the f64 side was not worth porting because arm64 gives it only two
-lanes. That reasoning weighed lane count and ignored which stage the device said was
-hot: the #146 validation round found the filming stage (grain **plus halation**)
-holding the preview time the GPU scan offload could not touch. Two lanes over a
-stage that runs beats eight over one that does not.
+The reasoning was sound and the result was not. The earlier round covered only the
+f32 FIR; halation runs through a separate float64 tier and `halation_active`
+defaults to 1, so the default-ON spatial cost had never been touched. Four routines
+went in — `vertical_accum`, `horizontal_interior`, `iir_step`, `axpy`.
 
-**What was ported.** Four routines in `spk::hwy_f64` (`kernels/gaussian_hwy.{h,cpp}`):
-`vertical_accum`, `horizontal_interior`, `iir_step`, `axpy`. The IIR step is the one
-that matters — the Young & van Vliet recurrence runs *down* rows, so columns are
-independent and lane-parallel, and it is 4 multiplies + 3 adds per element, i.e.
-arithmetic-bound rather than load-bound.
+**The device killed it on both axes at once.**
 
-**Bit-identity.** Every routine keeps the scalar accumulation order and uses separate
-`Mul`/`Add` — never a fused multiply-add, which would round once where the scalar
-rounds twice. The four-term IIR sum reproduces C++'s left-to-right association
-exactly. `tests/test_exp_filter_hwy.cpp` asserts byte-equality against transcribed
-scalar references over lengths 1…4099 (straddling every lane boundary Highway can
-pick) and, for the IIR, over four chained steps so a divergent lane would compound
-rather than cancel.
+*Speed*, S26 Ultra, SIMD ON vs OFF:
 
-**Host result.** All four routines byte-identical. End-to-end
-`exponential_filter_per_channel_d` checksums identical with SIMD on and off. Timing
-at 1024×768, four paired runs: SIMD 46.5 / 51.6 / 57.8 / 60.9 ms, scalar 52.0 / 52.7
-/ 57.7 / 60.6 ms — **overlapping ranges, no verdict**. The host target is SSE2 (2
-f64 lanes, the same width arm64 NEON gives), so the device is not expected to be
-dramatically different in *ratio*, but it is far less noisy and it is the machine
-that matters.
+```
+640x480    34.19 ms  vs  33.43 ms      (SIMD 2% SLOWER)
+1024x768   73.50 ms  vs  71.96 ms      (SIMD 2% SLOWER)
+```
 
-## 2. big.LITTLE affinity
+arm64 NEON gives f64 only **two lanes**, and the IIR is latency-bound on a serial
+three-tap recurrence rather than throughput-bound — so there was nothing for two
+lanes to recover, and the load/store overhead showed up as a small loss.
 
-**The gap this closes.** `kernels/parallel.cpp` had no affinity code at all. A
-fork-join is only as fast as its slowest chunk: one worker scheduled onto a 2.0 GHz
-efficiency core stalls the join for every other worker, so the whole map completes at
-little-core speed no matter how many big cores sat idle. On a 3-cluster ARM part
-that is a plausible ~2× left on the floor, and it had never been checked.
+*Correctness*, and this is the more important half: `test_exp_filter_hwy` **failed**
+on device with `f64 horizontal_interior byte-identical to scalar` — 36 mismatches.
+The host had passed. Reproduced immediately once the host was rebuilt with the
+**flags the engine actually ships with**:
 
-**Implementation.** `parallel_pin_to_big_cores()` reads each core's
-`cpufreq/cpuinfo_max_freq` and pins to those at or above `SPK_BIG_CORE_RATIO`
-(default 0.80) of the fastest. Spawned workers inherit the mask on Linux, so one
-`sched_setaffinity` per thread covers the pool; a `thread_local` latch makes repeat
-calls a predicted branch. When pinning is on, `parallel_num_threads()` caps the pool
-to the big-core count — oversubscribing a restricted mask just queues chunks behind
-each other, which is the problem, not the fix.
+```
+-O2                                 : ALL OK          <- what was tested
+-O3 -ffast-math -fno-finite-math-only : FAILS          <- what ships
+```
 
-**Output is unaffected by construction.** Affinity changes *where* a chunk runs,
-never what it computes; chunk boundaries remain a pure function of
-`(count, nthreads)`, and the thread-count invariance contract already covers the
-worker-count cap — that is exactly what `test_parallel` asserts.
+**Root cause, and the lesson.** `-ffast-math` licenses the compiler to reassociate
+and contract the **scalar reference** as freely as it likes. The hand-written lanes
+have a fixed order. Both are "correct"; they simply land in different places. The
+byte-identity claim was never wrong about the lanes — it was **only ever validated
+at `-O2`**, and the engine ships at `-O3 -ffast-math`.
 
-**Gated OFF** (`SPK_BIG_CORES`), and it self-disables when the mask would cover every
-core or when no cpufreq data exists (x86 hosts, most emulators), so an untouched
-build is scheduler-for-scheduler what it was.
+A follow-up probe put the actual divergence at **max_abs 1.1e-16, max_rel 2.1e-16,
+on one element per row** — about twelve orders of magnitude inside the 1e-4 band,
+and independent of thread count, so the thread-invariance gate was never at risk.
+So this was a **claim** failure, not a numerical one.
+
+**Removed anyway**, because slower plus unprovable is not a trade worth keeping. The
+routines, the wiring and the test are gone; `exponential_filter.cpp` is scalar again.
+
+**What did NOT get removed, and why:** the f32 tier stays. It sits on the grain path
+the device says is hot, and it showed 2.1–2.7× on host. Its test now reports
+`max_abs` on every comparison and gates on **absolute** distance (the oracle band is
+absolute; a relative measure explodes wherever a normalised tap sum passes near
+zero). Under the shipping flags it measures **max_abs 2.38e-07** — 420× inside the
+band — and it passes at both `-O2` and `-O3 -ffast-math`.
+
+**A warning worth keeping.** The end-to-end checksums matched across `SPK_SIMD` on/off
+even while the unit test failed, and the script's VERDICT line said "IDENTICAL". The
+device session flagged the contradiction rather than reporting the green line, and
+was right to: agreement was achieved by **not reaching the failing path** at those
+sizes. An end-to-end checksum is not a substitute for a unit claim.
+
+## 2. big.LITTLE affinity — the win, and it was not the expected one
+
+`kernels/parallel.cpp` had no affinity code at all. Measured on the S26 Ultra
+(6× 3.63 GHz + 2× 4.74 GHz), on the halation path:
+
+```
+cpuinfo_max_freq: 3628800 x6, 4742400 x2
+
+baseline (no pinning)        73.50 ms   checksum=d44700b538679a17
+SPK_BIG_CORES=1 ratio=1.00   46.41 ms   checksum=d44700b538679a17   1.58x
+SPK_BIG_CORES=1 ratio=0.80   46.34 ms   checksum=d44700b538679a17   1.59x
+SPK_BIG_CORES=1 ratio=0.50   69.85 ms   checksum=d44700b538679a17   1.05x
+```
+
+**1.58×, and the checksum is byte-identical in every row.** Of everything on this
+branch this is the only lever that is *both* faster *and* exact.
+
+The shape of the result is the interesting part: ratios 1.00 and 0.80 select the
+**same two prime cores** (0.80 × 4742400 = 3793920, above the 3628800 the other six
+run at), and ratio 0.50 admits all eight, landing back at baseline. So the measured
+finding is precise: **two 4.74 GHz cores beat all eight.** A fork-join completes when
+its slowest chunk does, and with equal-sized chunks the six slower cores set the pace
+for everyone while adding memory contention and join overhead.
+
+That also **explains a separate bug**. #153 records a 12.5 MP export SIGKILLed by
+Samsung device-health after 4m46s while backgrounded — and Android moves backgrounded
+work onto the efficiency cores. The same export on this branch, in the foreground,
+finished in **13.85 s**. Affinity and the foreground service in #153 are two views of
+one problem: *this engine is extremely sensitive to which cores it lands on.*
 
 ## 3. Spectral integral as batched matrix ops — **negative result**
 
@@ -332,6 +359,115 @@ device says is hot.
 "varies per sample" case sweeps a synthetic λ range (1…600); the real per-pixel λ
 distribution from `apply_grain_to_density` is what the device run should be read
 against, which is why the tool prints both.
+
+## 11. What the device run added that no host bench could
+
+### The export finding — possibly the biggest user-visible win so far
+
+On `main @ e7cd9d0` a 12.5 MP export ran **4m46s and was SIGKILLed** by
+`com.sec.android.sdhms` before finishing (#153). On this branch, the same-size
+export **completed in 13.85 s**.
+
+**The cause is not isolated**, and it should not be claimed as this branch's doing
+until it is. The likeliest explanation is not a code change at all: the killed run
+was **backgrounded**, and Android parks backgrounded work on efficiency cores — which
+§2 just measured as worth 1.58× on its own, before thermal throttling over four
+minutes compounds it. Isolating this deliberately (foreground vs background, branch
+vs main) is worth more than any remaining micro-optimisation on this branch.
+
+### Where export time actually goes — 3060×4080, 13.85 s total
+
+```
+grain          3043.8 ms
+halation       2139.5 ms
+dir_couplers   1321.6 ms
+scan            700.1 ms
+scan_spatial    335.7 ms
+print_expose    319.2 ms
+filming_expose  171.4 ms
+preprocess      134.3 ms
+develop          30.8 ms
+```
+
+**grain + halation + couplers ≈ 6.5 s of the ~8.2 s in stages.** The GPU work so far
+targets `scan` + `print_expose` ≈ 1.0 s. That is the honest map of the remaining
+headroom, and it matches the preview finding from the earlier device round.
+
+### All four GPU log lines fired
+
+```
+gpu preview self-check PASSED on this device/driver
+gpu scan path ACTIVE (eligible preview frames render on the GPU)
+gpu print-expose self-check PASSED on this device/driver
+gpu print-expose path ACTIVE (print-route frames render their spectral integral on the GPU)
+```
+
+The print-expose offload — the tractable slice of #148 — **engages on real hardware**,
+not just under SwiftShader.
+
+### Cold vs warm is NOT ~15×, and the dossier said it was
+
+Measured on this branch:
+
+| Case | Cold | Warm | Ratio |
+|---|---|---|---|
+| demo 256×256 | 283 ms | 78 ms | **3.6×** |
+| RAW 510×383 | 699 ms | 595 ms | **1.18×** |
+
+The mechanism: `tc_lut_build` (26.1 ms) is paid **once, on the demo render at app
+start**, so by the time a RAW is imported it already logs `tc_lut_build=0.0`. The
+demo's 3.6× comes from the memos skipping filming/develop/couplers/print entirely,
+not from a LUT rebuild.
+
+**Caveat against over-correcting.** The earlier ~8.8 s cold figure behind #152 was a
+much larger image than the 510×383 used here, so these are not the same measurement
+and the new numbers do not simply refute the old one. What they *do* establish is
+that the mechanism attributed to per-source setup is largely a **one-off at app
+start**. #152 needs re-measuring at a comparable resolution before its framing is
+trusted.
+
+### Levers 3–5 and 10, arm64 numbers
+
+```
+[A] spectral integral, 1e6 px, 1 thread
+    per-pixel loop (today)          438.69 ms
+    tiled P=32/128/512      452.03 / 452.45 / 453.96 ms   0.97x   EXACT
+    tiled+planar (GEMM-like) 455.08 / 457.30 / 459.15 ms  0.96x   1.4e-14
+    -> host said 1.05x. arm64 says 0.96x. A dud AND slightly negative. Dead.
+
+[B] radial-exponential PSF, 512x512
+    lambda=4.0  ks=65    direct  395.92 ms -> mixture 4.63 ms   85.5x   7.4e-02 off
+    lambda=12.0 ks=193   direct 3410.65 ms -> mixture 4.93 ms  692.2x   6.5e-02 off
+    -> the win GROWS with kernel size (the mixture is O(1) in ks). 692x is enormous
+       and the deviation is ~650x outside the band. Preview-only, never export.
+
+[C] spatial-plane precision, 1024x1024, sigma=8.0 (half_simd=yes on arm64)
+    f64 plane + f64 filter   5.53 ms   reference
+    f32 plane + f32 filter   5.68 ms   0.97x   max_abs 6.3e-08
+    fp16 storage + f32       5.91 ms   0.94x   max_abs 3.8e-05
+    -> host predicted no win and fp16 worst. Confirmed exactly, even with native
+       fp16 conversion available. PERF_ROADMAP item 3 is retired on real hardware.
+
+[D] grain samplers, 1e6 samples, 1 thread
+    poisson  lam=2 24.6 | lam=15 75.9 | lam=29 129.5 | lam=31 11.0 | lam=500 11.0
+             varying 14.6 ns    spread 11.8x   mixed/best 1.33x
+    binomial n=8 31.0 | n=24 91.7 | n=26 72.9 | n=200 11.3 | n=200 p=.01 29.9
+             varying 35.7 ns    spread 8.1x    mixed/best 3.17x
+    at 12 MP x 3ch, one draw each: poisson 0.52 s, binomial 1.28 s (1 thread)
+    -> the cliff REPRODUCES and is sharper than host: 129.5 ns at lam=29 vs
+       11.0 ns at lam=31. Still the wrong way round, still our own inversion loop.
+```
+
+### Five script bugs the device run found, all fixed
+
+The runner had never been executed anywhere but this container, and it showed:
+`uname` on Git Bash yields `mingw64_nt-…` where the NDK wants `windows-x86_64`;
+no `-static-libstdc++`, so the pushed binary died on a missing `libc++_shared.so`;
+`-I$CPP` unquoted, which word-splits on a checkout path containing spaces; SDK
+auto-detect assuming the Linux layout; and `set -e`, which aborted the whole run on
+the first failing test — **losing the affinity sweep and every lever to one non-zero
+exit.** That last one is the worst of the five: a correctness failure is exactly when
+the rest of the data matters most.
 
 ## Running it
 

@@ -613,9 +613,60 @@ void run(int n_samples) {
 
 }  // namespace lever_d
 
+// ===========================================================================
+// Lever E -- the halation path itself, and the core-affinity sweep target
+// ===========================================================================
+namespace lever_e {
+
+// FNV-1a over the raw bytes: a stable fingerprint so a run under one affinity
+// policy can be proved identical to a run under another. Affinity must never
+// change output, and printing the checksum is how that is checked rather than
+// assumed.
+uint64_t checksum(const std::vector<double>& v) {
+    uint64_t h = 1469598103934665603ull;
+    const auto* p = reinterpret_cast<const unsigned char*>(v.data());
+    for (size_t i = 0; i < v.size() * sizeof(double); ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+void run(int w, int h) {
+    const int channels = 3;
+    std::mt19937 rng(20260828u);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    std::vector<double> img(static_cast<size_t>(w) * h * channels);
+    for (auto& v : img) v = u(rng);
+    std::vector<double> out(img.size(), 0.0);
+    // Halation decay in pixels, per channel -- red scatters furthest, which is
+    // what makes the red halo. Large enough that the IIR branch is the one taken.
+    const double decay[3] = {14.0, 9.0, 6.0};
+
+    spk::exponential_filter_per_channel_d(img.data(), w, h, channels, decay,
+                                          out.data());  // warm
+    const double t0 = now_ms();
+    const int reps = 3;
+    for (int r = 0; r < reps; ++r)
+        spk::exponential_filter_per_channel_d(img.data(), w, h, channels, decay,
+                                              out.data());
+    const double t1 = now_ms();
+    std::printf("exponential_filter %dx%d x%d: %.2f ms/call  checksum=%016llx\n", w, h,
+                channels, (t1 - t0) / reps,
+                static_cast<unsigned long long>(checksum(out)));
+}
+
+}  // namespace lever_e
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    // The affinity sweep re-runs just the halation bench under different
+    // SPK_BIG_CORE_RATIO values, so it needs a mode that prints one line.
+    if (argc > 1 && std::strcmp(argv[1], "--halation-only") == 0) {
+        lever_e::run(1024, 768);
+        return 0;
+    }
     const bool quick = (argc > 1 && std::strcmp(argv[1], "--quick") == 0);
     std::printf("=== spektrafilm perf lab — untried levers, measured ===\n");
     std::printf("oracle band: max_abs <= 1e-4 AND rms <= 1e-5\n");
@@ -625,6 +676,10 @@ int main(int argc, char** argv) {
     if (!quick) lever_b::run(512, 512, 12.0);
     lever_c::run(quick ? 512 : 1024, quick ? 512 : 1024, 8.0);
     lever_d::run(quick ? 200000 : 1000000);
+
+    std::printf("\n[E] halation path (exponential_filter, the default-ON spatial tier)\n");
+    std::printf("    ");
+    lever_e::run(quick ? 640 : 1024, quick ? 480 : 768);
 
     std::printf("\n=== end perf lab ===\n");
     return 0;
