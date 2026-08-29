@@ -209,12 +209,25 @@ fun ZoomableImage(
         }
     }
 
-    // Clamp the pan so the (scaled) content stays within the view bounds.
-    fun clampOffset(raw: Offset, s: Float): Offset {
-        val maxX = max(0f, (viewSize.width * (s - 1f)) / 2f)
-        val maxY = max(0f, (viewSize.height * (s - 1f)) / 2f)
-        return Offset(raw.x.coerceIn(-maxX, maxX), raw.y.coerceIn(-maxY, maxY))
-    }
+    // Clamp the pan so the (scaled) CONTENT stays within the view bounds.
+    //
+    // The bound must come from the fitted CONTENT rect, not the viewport. The
+    // bitmap is drawn ContentScale.Fit and is therefore LETTERBOXED: at fit it
+    // fills one axis and leaves bars on the other. Using the viewport extent on
+    // the letterboxed axis over-permits the pan by exactly the letterbox ratio,
+    // and the image can be dragged clean out of view — a black viewport with the
+    // zoom pill still reading 410%.
+    //
+    // Measured on device (998x1802 viewport, 4:3 landscape content, s=4.1):
+    // content fits to 998x749, so the true bound is (749*4.1 - 1802)/2 = 634,
+    // while the viewport formula gave (1802*(4.1-1))/2 = 2793 — 4.4x too far.
+    //
+    // The horizontal axis was correct only BY ACCIDENT: this content fills the
+    // width at fit, so fitW == viewSize.width and the two formulas coincide.
+    // That is why panning left/right behaved and up/down went black; a PORTRAIT
+    // photo on this same screen would have broken the other way round.
+    fun clampOffset(raw: Offset, s: Float): Offset =
+        clampPanOffset(raw, viewSize, s, aspect)
 
     Box(
         modifier = modifier
@@ -376,6 +389,21 @@ private fun fitRect(view: IntSize, aspect: Float): FloatArray {
     val left = view.width / 2f - fitW / 2f
     val top = view.height / 2f - fitH / 2f
     return floatArrayOf(left, top, fitW, fitH)
+}
+
+/**
+ * Clamp a pan offset so the SCALED CONTENT cannot be dragged outside the viewport.
+ *
+ * Top-level and `internal` so the math is unit-testable — the defect below shipped
+ * because the only clamp coverage used a square image in a square view, i.e. the
+ * one geometry where the bug is invisible.
+ */
+internal fun clampPanOffset(raw: Offset, view: IntSize, scale: Float, aspect: Float): Offset {
+    if (view.width <= 0 || view.height <= 0 || !(aspect > 0f)) return Offset.Zero
+    val (_, _, fitW, fitH) = fitRect(view, aspect)
+    val maxX = max(0f, (fitW * scale - view.width) / 2f)
+    val maxY = max(0f, (fitH * scale - view.height) / 2f)
+    return Offset(raw.x.coerceIn(-maxX, maxX), raw.y.coerceIn(-maxY, maxY))
 }
 
 /** Inverse of the viewport transform: a view-space point → normalized image coords (UNclamped). */
