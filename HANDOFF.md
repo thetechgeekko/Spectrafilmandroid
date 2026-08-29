@@ -2,6 +2,53 @@
 
 ---
 
+## ROOT CAUSE FOUND, AND THE PRINT ROUTE WAS NEVER FINE (2026-08-29, `7387879`)
+
+**R8 removed `kotlin.Triple.getFirst/getSecond/getThird` and the `kotlin.Pair` pair from
+the release dex, so 19 engine params marshalled as 0.0 in every release APK this project
+has ever shipped.** Found by the device session with the `debug.spektra.dumpparams` dump,
+on the first render. Fixed in `7387879`.
+
+`proguard-rules.pro` keeps `com.spectrafilm.engine.**`, so the engine's own getters
+survived and returned real `Triple`s — but no *bytecode* calls `Triple.getFirst`. Its only
+caller is `spektra_jni.cpp`, by literal string, which R8 cannot see, so it shrank them as
+unreachable. **`-dontobfuscate` prevents renaming, not removal.** A second, independent
+defect made it silent: `unbox_float(nullptr)` returns `0.0f`, and `read_triple_f` wrote
+that into the output *unconditionally*, destroying the defaults rather than leaving them.
+
+### The correction that matters: the print route was ALSO broken
+
+The device read "print is fine" from file size — 5.6 MB versus 76 KB. Reproducing the
+exact zeros on the host says otherwise (`tools/r8_check/r8_zeros_repro.cpp`, 512×512,
+portra_400):
+
+| case | spread R/G/B | mean R/G/B |
+|---|---|---|
+| slide, correct params | 0.470 / 0.385 / 0.383 | 0.520 / 0.300 / 0.220 |
+| **slide, R8 zeros** | **0.000 / 0.000 / 0.000** | 0.863 / 0.525 / 0.416 — **flat** |
+| print, correct params | 0.830 / 0.830 / 0.811 | 0.477 / 0.361 / 0.345 |
+| **print, R8 zeros** | **0.036 / 0.035 / 0.031** | **0.054 / 0.057 / 0.069** |
+
+The slide constant lands at 8-bit **[220 134 106]**; the device reported **[220 135 106]**
+from a different scene through a different JPEG path. One code apart in green — the
+mechanism, confirmed numerically rather than by inference.
+
+Print did not survive: spread collapses **23×**, mean drops to near-black. It is not
+*constant*, so it still compresses to megabytes and passes a file-size glance — which is
+the only reason it read as healthy. **Both routes were broken in every release build; one
+was merely broken visibly.** Any "print is the trustworthy leg" reasoning — including
+using it as the clean baseline for a GPU re-measurement — is invalid.
+
+### What this invalidates
+
+Every on-device number taken before `7387879`, not only the slide-route ones: the 25.2×
+GPU scan ratio (a degenerate frame *and* 19 wrong params), the effects ladder (halation and
+coupler vectors zeroed), and #119's baseline doc. `docs/AUDIT.md` §D also needs revisiting
+— the 2026-06-04 on-device validation of a minified build passed while this was live,
+because it confirmed the app *ran*, not that its numbers were right.
+
+---
+
 ## REPLY 2 — THE ENGINE IS EXONERATED ON THE SHIPPING TOOLCHAIN (2026-08-29)
 
 *CORRECTION (appended after this section was written): direct delivery to another
