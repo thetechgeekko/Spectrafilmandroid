@@ -149,6 +149,14 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
 - Current version: `versionCode 11` / `versionName 0.9.0`, `minSdk 24`, `targetSdk`/`compileSdk 34`.
   ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`.
 - Commit with `-c commit.gpgsign=false` (the signing server rejects signing here).
+- **A new engine `.cpp` must be added to `engine/.../cpp/CMakeLists.txt` by hand, and the
+  parity suite will NOT catch it if you forget.** The host parity build compiles with a
+  glob (`kernels/*.cpp model/*.cpp ...`, see the build line above); the Android build
+  enumerates every source explicitly. A file missing from CMakeLists therefore passes all
+  39 gates locally and fails only at the Android `ninja ... spektra` step, as an undefined
+  reference. Check a new source the way CI links: `g++ -std=c++17 -O2 -pthread -fPIC
+  -shared -I. <CMakeLists sources, minus spektra_jni.cpp> -Wl,--no-undefined -o /tmp/x.so`.
+  (Cost a red CI run on `551c57f`.)
 - **A native-only edit may not rebuild through `:app:assembleDebug` alone.** Observed on
   `:lib:libraw`: a changed `.cpp` produced `BUILD SUCCESSFUL in 6s` with a **stale**
   `libsfraw.so`. `./gradlew :lib:libraw:assembleDebug --rerun-tasks` rebuilt it. Verify
