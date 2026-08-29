@@ -1242,6 +1242,44 @@ Every branch is the same shape, which is exactly why 180° costs what 90° costs
 measurement predicted the code, and the code confirms it. CW180 in particular is a
 pure reversal that never needed a scatter at all.
 
+### 16.9 #159 step 1, measured: it is BOTH, in almost equal parts
+
+The rotation cost was instrumented directly rather than inferred — `rotate ms=1126
+angle=180 3060x4080` — which independently confirms the 1155 ms surcharge and the code
+reading. Then four variants of the same rotation:
+
+| | reads | writes | time |
+|---|---|---|---|
+| **A** shipping | per-element | per-element, scattered | 1126 ms |
+| **D** | **bulk** | per-element, scattered | 1119, 1172 ms |
+| **C** | bulk | per-element, **cache-local** | 597, 625 ms |
+| **B** | bulk | **bulk sequential** | **39, 43 ms** |
+
+```
+  A -> D   reads made bulk, writes unchanged     no change   => READS COST NOTHING
+  A -> C   writes made cache-local               -515 ms     => memory scatter,  46%
+  C -> B   writes made bulk                      -570 ms     => per-element op,  51%
+```
+
+**The step-1 hypothesis was a false binary.** It asked "traversal or scatter", expecting
+one. It is both, in almost equal halves, and it is neither of them on the read side.
+A/C/B are all the same angle, so the 515 ms is a clean within-angle comparison; D is a
+different angle, but it sits on A's number despite bulk reads, so the "reads are free"
+leg does not carry the conclusion alone.
+
+**This retired half of what had just been built.** The first cut of this fix bulk-read
+source rows for every angle and kept a per-element scattered write for 90/270 — which
+is *exactly variant D*, worth nothing. Only the CW180 path (variant B) was right.
+
+So 90/270 now work a **64×64 tile** at a time. Within a tile each source column's slice
+lands on a **contiguous** destination column run, so it bulk-writes; the transpose
+itself happens in plain `FloatArray`s, so the inner loop has no bounds-checked buffer
+ops at all. That attacks both halves rather than the 46% tiling alone would reach —
+the measurement's own conclusion was that tiling by itself lands near 600 ms, not 40.
+
+Measured side effect of the CW180 path: decode fell to 3803/3921 ms against 4737
+rotated and 3616 unrotated, i.e. the surcharge is essentially gone on that angle.
+
 ### 16.8 What was built for the rotation half
 
 `LinearImage.rotated()` no longer does the obvious per-pixel loop.
@@ -1251,9 +1289,12 @@ pure reversal that never needed a scatter at all.
 - **180° writes its destination row in bulk too**, with no scatter at all. It is a pure
   reversal and never needed one. Only 90°/270° still scatter, because their destination
   is a column.
-- **Work is split by source row across up to 8 workers.** For every rotation a source
-  row maps to a distinct destination row (180°) or column (90°/270°), so no two workers
-  ever write the same output element.
+- **90°/270° work a 64×64 tile at a time** (see §16.9 for why row-at-a-time could only
+  ever scatter), transposing in plain `FloatArray`s and bulk-writing each contiguous
+  destination run.
+- **Work is split by source row for 180° and by source column for 90°/270°.** In both
+  cases the destination *row* is then a function of the split variable alone, so every
+  worker owns whole destination rows — no shared element and no false sharing.
 - Below 64 000 px it stays single-threaded, so a preview render pays no spawn cost.
 
 Gated by `RotationTest` on the JVM, in CI: the existing exact pixel-mapping tests still
@@ -1262,9 +1303,10 @@ holds natively, asserted the same way the parity suite asserts `SPK_NUM_THREADS`
 and equality against a naive reference at 1/3/8/64 workers on a 61×43 image whose
 dimensions divide by no worker count.
 
-**Not yet measured on device** — the numbers above are the problem, not the fix. #159
-step 1 is also the diagnostic: if 180° gets fast and 90° stays slow after this, the
-scattered destination writes are the remaining cost and it wants tiling.
+**The 180° path is measured** (§16.9: 1126 → ~41 ms, and decode drops to ~3.8 s against
+4737 rotated). **The tiled 90°/270° path is not yet measured on device** — it is built
+from the variant ladder rather than guessed, but that is a prediction until a run says
+otherwise.
 
 The `grade` half is deliberately a separate change: `ColorGrade` and `MaskCompositor`
 are buffer-only and unit-testable the same way, but `simResultToBitmap` writes through

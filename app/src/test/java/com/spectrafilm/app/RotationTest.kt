@@ -224,6 +224,26 @@ class RotationTest {
     }
 
     @Test
+    fun rotation_matchesReferenceAcrossTheTileBoundary() {
+        // 90/270 now work a 64x64 tile at a time, so the interesting sizes are the ones
+        // that straddle that edge: a partial tile in either axis, and exactly one tile.
+        for (w in intArrayOf(63, 64, 65, 127, 129)) {
+            for (h in intArrayOf(63, 64, 65)) {
+                val src = floatsOf(noiseImage(w, h))
+                for (r in quarterTurns) {
+                    for (workers in intArrayOf(1, 5)) {
+                        val got = floatsOf(noiseImage(w, h).rotatedWithWorkers(r, workers))
+                        assertArrayEquals(
+                            "$r ${w}x$h with $workers workers",
+                            naiveRotate(src, w, h, r), got, 0f,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     fun defaultWorkers_isOneForPreviewScaleImages() {
         // A preview render must not pay thread-spawn cost; a full-res export should.
         assertEquals(1, defaultRotWorkers(6L))

@@ -13,6 +13,7 @@ import com.spectrafilm.engine.LinearImage
 import com.spectrafilm.engine.SimResult
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
 
 // Allocate the backing buffer for a rotated/flipped LinearImage of [floats] float32 elements.
 // Above ~64 MB the buffer is allocated OFF the managed heap (native malloc) so a full-res
@@ -140,6 +141,11 @@ fun LinearImage.flippedHorizontal(): LinearImage {
 // images stay single-threaded.
 private const val ROT_PARALLEL_MIN_PIXELS = 64_000L
 
+// Transpose tile edge, in pixels. 64x64x3 float32 is ~49 KB, so a tile plus its
+// destination run stays inside L2 while the runs are long enough (192 floats) for the
+// bulk write to pay for itself.
+private const val ROT_TILE = 64
+
 internal fun defaultRotWorkers(pixels: Long): Int =
     if (pixels < ROT_PARALLEL_MIN_PIXELS) 1
     else Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
@@ -187,66 +193,101 @@ internal fun LinearImage.rotatedWithWorkers(
     val (outBuf, onClose) = allocRotBuf(nw * nh * ch)
     val rowFloats = w * ch
 
-    // Each worker takes its OWN buffer duplicates: a FloatBuffer's position is per-view,
-    // so sharing one across threads would corrupt the bulk transfers below.
-    fun runRows(y0: Int, y1: Int) {
-        val src = data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
-        val dst = outBuf.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+    // 180: a source row becomes a destination row, reversed. Bulk in, reverse in a plain
+    // array, bulk out — no scatter anywhere.
+    fun reverseRows(src: FloatBuffer, dst: FloatBuffer, y0: Int, y1: Int) {
         val row = FloatArray(rowFloats)
         val out = FloatArray(rowFloats)
         for (y in y0 until y1) {
             src.position(y * rowFloats)
             src.get(row, 0, rowFloats)
-            when (rotation) {
-                SourceRotation.CW180 -> {
-                    var x = 0
-                    while (x < w) {
-                        val s = x * ch
-                        val d = (w - 1 - x) * ch
-                        out[d] = row[s]; out[d + 1] = row[s + 1]; out[d + 2] = row[s + 2]
-                        x++
-                    }
-                    dst.position((h - 1 - y) * rowFloats)
-                    dst.put(out, 0, rowFloats)
-                }
-                SourceRotation.CW90 -> {
-                    val nx = h - 1 - y
-                    var x = 0
-                    while (x < w) {
-                        val s = x * ch
-                        val d = (x * nw + nx) * ch
-                        dst.put(d, row[s]); dst.put(d + 1, row[s + 1]); dst.put(d + 2, row[s + 2])
-                        x++
-                    }
-                }
-                SourceRotation.CW270 -> {
-                    var x = 0
-                    while (x < w) {
-                        val s = x * ch
-                        val d = ((w - 1 - x) * nw + y) * ch
-                        dst.put(d, row[s]); dst.put(d + 1, row[s + 1]); dst.put(d + 2, row[s + 2])
-                        x++
-                    }
-                }
-                SourceRotation.NONE -> {}  // unreachable: NONE returned at the top
+            var x = 0
+            while (x < w) {
+                val s = x * ch
+                val d = (w - 1 - x) * ch
+                out[d] = row[s]; out[d + 1] = row[s + 1]; out[d + 2] = row[s + 2]
+                x++
             }
+            dst.position((h - 1 - y) * rowFloats)
+            dst.put(out, 0, rowFloats)
         }
     }
 
-    val n = workers.coerceIn(1, h)
+    // 90/270: the destination is a COLUMN, so a row-at-a-time pass can only scatter. Work
+    // a tile at a time instead — then within a tile each source column's slice lands on a
+    // CONTIGUOUS destination column run, which bulk-writes. The transpose itself happens
+    // in plain FloatArrays, so the inner loop has no bounds-checked buffer ops at all.
+    fun transposeCols(src: FloatBuffer, dst: FloatBuffer, xStart: Int, xEnd: Int) {
+        val tile = FloatArray(ROT_TILE * ROT_TILE * ch)
+        val run = FloatArray(ROT_TILE * ch)
+        var xb = xStart
+        while (xb < xEnd) {
+            val xw = minOf(ROT_TILE, xEnd - xb)
+            var yb = 0
+            while (yb < h) {
+                val yh = minOf(ROT_TILE, h - yb)
+                for (j in 0 until yh) {
+                    src.position(((yb + j) * w + xb) * ch)
+                    src.get(tile, j * xw * ch, xw * ch)
+                }
+                for (i in 0 until xw) {
+                    val x = xb + i
+                    val drow: Int
+                    val dcol0: Int
+                    if (rotation == SourceRotation.CW90) {
+                        // (x,y) -> (h-1-y, x): destination row x, columns descending in y.
+                        drow = x
+                        dcol0 = h - (yb + yh)
+                        for (j in 0 until yh) {
+                            val k = (yh - 1 - j) * ch
+                            val s = (j * xw + i) * ch
+                            run[k] = tile[s]; run[k + 1] = tile[s + 1]; run[k + 2] = tile[s + 2]
+                        }
+                    } else {
+                        // (x,y) -> (y, w-1-x): destination row w-1-x, columns ascending in y.
+                        drow = w - 1 - x
+                        dcol0 = yb
+                        for (j in 0 until yh) {
+                            val k = j * ch
+                            val s = (j * xw + i) * ch
+                            run[k] = tile[s]; run[k + 1] = tile[s + 1]; run[k + 2] = tile[s + 2]
+                        }
+                    }
+                    dst.position((drow * nw + dcol0) * ch)
+                    dst.put(run, 0, yh * ch)
+                }
+                yb += yh
+            }
+            xb += xw
+        }
+    }
+
+    // Each worker takes its OWN buffer duplicates: a FloatBuffer's position is per-view,
+    // so sharing one across threads would corrupt the bulk transfers above.
+    fun work(a: Int, b: Int) {
+        val src = data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val dst = outBuf.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        if (transposed) transposeCols(src, dst, a, b) else reverseRows(src, dst, a, b)
+    }
+
+    // Split 180 by source ROW and 90/270 by source COLUMN. In both cases the destination
+    // ROW is then a function of the split variable alone, so every worker owns whole
+    // destination rows — no shared element, and no false sharing either.
+    val axis = if (transposed) w else h
+    val n = workers.coerceIn(1, axis)
     if (n == 1) {
-        runRows(0, h)
+        work(0, axis)
     } else {
-        val rowsPer = (h + n - 1) / n
+        val per = (axis + n - 1) / n
         val threads = ArrayList<Thread>(n - 1)
-        var start = rowsPer
-        while (start < h) {
+        var start = per
+        while (start < axis) {
             val a = start
-            val b = minOf(start + rowsPer, h)
-            threads += Thread { runRows(a, b) }.also { it.start() }
+            val b = minOf(start + per, axis)
+            threads += Thread { work(a, b) }.also { it.start() }
             start = b
         }
-        runRows(0, minOf(rowsPer, h))       // the caller takes the first chunk
+        work(0, minOf(per, axis))            // the caller takes the first chunk
         threads.forEach { it.join() }
     }
 
