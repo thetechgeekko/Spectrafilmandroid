@@ -1222,16 +1222,40 @@ class MainActivity : ComponentActivity() {
         // (it is a data class), so a relaunch fires for every field that can alter the render —
         // identical trigger behaviour to the old per-frame snapshot, with no per-frame alloc.
         val snapshot by remember { derivedStateOf { state.toParams() } }
+        // NOTE the three grade fields at the end. They are POST-ENGINE (not part of
+        // `snapshot`, i.e. state.toParams()), and they were absent from every effect
+        // key in this file — so moving Saturation, Vibrance or Gamut compression
+        // changed the slider and nothing else: previewTick never bumped, the draft
+        // collector below never emitted, and the image sat unchanged until some
+        // unrelated engine parameter was touched. Three shipped controls that looked
+        // dead.
+        //
+        // Adding them here does NOT cost a native render. gradeCacheKey() is built
+        // from the ENGINE params + decode key + edge, so a grade-only edit hits the
+        // retained pristine result and both the draft and settle paths take their
+        // zero-native-work re-grade branch. That machinery was already correct; it
+        // was simply never reached.
+        //
+        // This is the drift the audit's immutable EditorRenderRequest (PERF-01) is
+        // meant to make impossible: three hand-maintained key lists that must agree
+        // with each other and with toParams(), and did not. Until that lands, if you
+        // add a post-engine control you must add it to ALL THREE effects below.
         LaunchedEffect(snapshot, sourceUri, sourceKind, rotation,
             state.rawWhiteBalance, state.rawTemperature, state.rawTint,
             state.creativeWbTemp, state.creativeWbTint, state.balanceToFilmStock,
-            state.localAdjustments) { previewTick++ }
+            state.localAdjustments,
+            state.saturation, state.vibrance, state.gamutCompress) { previewTick++ }
 
         // --- Non-destructive recipe: debounced auto-save ---
+        // Grade fields included for the same reason as the render trigger above:
+        // Presets.toJsonString already SERIALIZES them, so the recipe content was
+        // right — but a grade-only edit never fired this effect, so it was not
+        // persisted until some other change happened to save it along the way.
         LaunchedEffect(snapshot, recipeKey, recipeReady, defaultsJson, rotation,
             state.rawWhiteBalance, state.rawTemperature, state.rawTint,
             state.creativeWbTemp, state.creativeWbTint, state.balanceToFilmStock,
-            state.localAdjustments) {
+            state.localAdjustments,
+            state.saturation, state.vibrance, state.gamutCompress) {
             if (!recipeReady || recipeKey == null) return@LaunchedEffect
             delay(700)
             val current = runCatching { Presets.toJsonString(state) }.getOrNull()
@@ -1272,8 +1296,14 @@ class MainActivity : ComponentActivity() {
         // Uses a slightly shorter delay than auto-save so a quick undo right after an edit
         // still finds the entry recorded; both are debounced independently and key on the
         // same inputs, so this adds no extra previewTick churn or re-decodes.
+        // Grade fields added here too. snapshotNow() already captures them (it goes
+        // through Presets.toJsonString), so the CONTENT was complete and only the
+        // TRIGGER was missing — which meant a grade-only edit pushed no undo step,
+        // and a later unrelated edit then collapsed both into a single step that
+        // undid more than the user did.
         LaunchedEffect(snapshot, recipeKey, recipeReady, rotation,
-            state.rawWhiteBalance, state.rawTemperature, state.rawTint) {
+            state.rawWhiteBalance, state.rawTemperature, state.rawTint,
+            state.saturation, state.vibrance, state.gamutCompress) {
             if (!recipeReady) return@LaunchedEffect
             delay(500)
             // settleDecision (unit-tested in EditHistoryTest) handles the subtle case where a
