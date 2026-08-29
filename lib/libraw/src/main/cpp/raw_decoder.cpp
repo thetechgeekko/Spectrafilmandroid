@@ -21,6 +21,7 @@
 #include "raw_decoder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -479,7 +480,24 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
                           const uint8_t* srcData, size_t srcLen) {
     DecodeResult result;
 
+    // Intra-decode phase timers (#158). `phaseMs()` returns the delta since the last
+    // call and re-stamps, so the phases are contiguous by construction and cannot
+    // double-count. Cost is a handful of steady_clock reads against a ~3.5 s decode.
+    // maybe_unused because the line they feed is Android-only and this file also
+    // compiles for the host test.
+    using phase_clk = std::chrono::steady_clock;
+    auto phaseAt = phase_clk::now();
+    auto phaseMs = [&phaseAt]() {
+        auto now = phase_clk::now();
+        double d = std::chrono::duration<double, std::milli>(now - phaseAt).count();
+        phaseAt = now;
+        return d;
+    };
+    [[maybe_unused]] double mUnpack = 0, mProcess = 0, mMemImg = 0,
+                            mCopy = 0, mAdapt = 0, mColour = 0;
+
     int rc = raw.unpack();
+    mUnpack = phaseMs();
     if (rc != LIBRAW_SUCCESS) {
         result.librawCode = rc;
         result.status = dngsniff::classifyUnpackFailure(srcData, srcLen);
@@ -503,7 +521,9 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
         return result;
     }
     applyParityParams(raw, options);
+    phaseMs();  // param setup is not decode work — keep it out of `process`
     rc = raw.dcraw_process();
+    mProcess = phaseMs();
     if (rc != LIBRAW_SUCCESS) {
         result.librawCode = rc;
         result.status = SFRAW_ERR_PROCESS;
@@ -514,6 +534,7 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
 
     int status = LIBRAW_SUCCESS;
     libraw_processed_image_t* img = raw.dcraw_make_mem_image(&status);
+    mMemImg = phaseMs();
     if (img == nullptr || status != LIBRAW_SUCCESS) {
         if (img) LibRaw::dcraw_clear_mem(img);
         result.librawCode = status;
@@ -563,9 +584,11 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
             result.rgb[di + 2] = static_cast<float>(src[si + 2]) * kInv16;
         }
     }
+    mCopy = phaseMs();
     LibRaw::dcraw_clear_mem(img);
 
     applyAcesAdaptation(result.rgb.data(), static_cast<size_t>(ow) * oh, options);
+    mAdapt = phaseMs();
 
     // Final colourspace conversion: linear ACES2065-1 -> linear ProPhoto RGB, the
     // engine's input space (raw_file_processor.py's output_colorspace step). Done
@@ -574,11 +597,16 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     // (spektra_jni hardcodes the engine input to ProPhoto), so every native RAW
     // decode ran through the wrong primaries.
     aces2065ToProPhotoRGB(result.rgb.data(), static_cast<size_t>(ow) * oh);
+    mColour = phaseMs();
 
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "sfraw",
         "decoded %dx%d (halfSize=%d) -> %dx%d (maxLongEdge=%d, step=%d)",
         fullW, fullH, options.halfSize ? 1 : 0, ow, oh, options.maxLongEdge, step);
+    __android_log_print(ANDROID_LOG_INFO, "sfraw",
+        "decode phases ms: unpack=%.0f process=%.0f memimg=%.0f copy=%.0f "
+        "adapt=%.0f colour=%.0f",
+        mUnpack, mProcess, mMemImg, mCopy, mAdapt, mColour);
 #endif
 
     result.colorSpace = "ProPhoto RGB";
@@ -636,6 +664,7 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) {
     // TODO(libraw): for very large RAWs, switch to a LibRaw_abstract_datastream
     // backed by the fd to avoid the full read into RAM.
     std::vector<uint8_t> bytes;
+    [[maybe_unused]] auto ioAt = std::chrono::steady_clock::now();
     {
         std::fseek(fp, 0, SEEK_END);
         long size = std::ftell(fp);
@@ -647,6 +676,15 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) {
         }
     }
     std::fclose(fp);  // closes dup_fd
+#ifdef __ANDROID__
+    // Separated from the phases above because it happens before LibRaw sees anything.
+    // Only the fd path is timed: decodeFromBuffer has no file read, and exports take
+    // this one.
+    __android_log_print(ANDROID_LOG_INFO, "sfraw", "decode io ms: fileread=%.0f bytes=%zu",
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ioAt).count(),
+        bytes.size());
+#endif
     if (bytes.empty()) {
         result.status = SFRAW_ERR_INPUT;
         result.error = "failed to read RAW from fd";

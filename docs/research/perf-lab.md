@@ -1365,6 +1365,92 @@ negative. Nothing near the ~140 MB allocation scale, so the boundary is where we
 it is — but a few stage timers overlap or double-count by ~0.3-0.9%, and the
 `stage timings` line should not be quoted as exact.
 
+## 17. Both answers: the transpose holds, and decode is 77% demosaic
+
+### 17.1 #159 — the tiled transpose works, and the surcharge is gone
+
+| angle | `rotate ms` | vs the original 1126 ms |
+|---|---|---|
+| 180 | **25** | 45× |
+| 270 | **37** | 30× |
+| 90 | **44** | 26× |
+
+90/270 sit next to 180. **They did not stall near 600**, so there is no residual
+per-element half hiding in the transpose — tiling *plus* plain-`FloatArray` inner loops
+took both halves, which is what §16.9's decomposition said was needed. The "tiling alone
+lands near 600" caveat was correct about tiling alone and simply does not apply.
+
+180 came in at **25 ms, below the hand-rolled 41 ms variant B** — the 8-worker split is
+worth roughly another 1.6× on top of the bulk-op win.
+
+**The surcharge is closed.** Decode is now flat across every rotation:
+
+```
+  NONE 3565      180 3580      270 3589      90 3665      (ms)
+```
+
+against 4737 rotated / 3616 unrotated before. A rotated export now costs within ~100 ms
+of an unrotated one. Correctness was spot-checked on device as well as in CI: the 90°
+case rendered full-screen with no tile seams and no artefacts at the 64-px boundaries.
+
+### 17.2 #158 — it is NOT I/O. `dcraw_process` is 77% of decode.
+
+Four full-resolution exports, 25 MB DNG (24 999 540 bytes):
+
+| phase | ms | share |
+|---|---|---|
+| `fileread` | ~120 | 3.4% |
+| `unpack` | ~43 | 1.2% |
+| **`process`** (`dcraw_process`) | **~2750** | **77.0%** |
+| `memimg` | ~96 | 2.7% |
+| `copy` (uint16→float subsample) | ~218 | 6.1% |
+| `adapt` | ~5 | 0.1% |
+| `colour` | ~61 | 1.7% |
+| unaccounted | ~287 | 8.0% |
+
+**The caveat resolved in the favourable direction.** §16.5 said that if the time were in
+I/O, neither LibRaw knob would touch it. Reading the whole 25 MB file costs **120 ms**,
+and the DNG's own decompression (`unpack`) is **43 ms** — both nearly free.
+
+77% is `dcraw_process`, which is **exactly where the pragmas are**: `ahd_demosaic.cpp`
+and `postprocessing_aux.cpp` both live inside it, and with `user_qual` unset AHD is what
+runs. Both levers in #158 point at the same 2750 ms.
+
+Neither is consequence-free, and the difference matters:
+
+- **OpenMP** does not change a pixel, but adds a runtime dependency and needs a
+  thread-count policy that does not fight the engine's own fork-join.
+- **`user_qual`** changes the decoded image, so it is a quality decision, not a perf one.
+
+Two smaller items the split surfaced, both the same non-parity-gated class as rotation
+and grade: `copy` at 218 ms is a single-threaded scalar uint16→float loop over 12.5 M
+pixels, and **287 ms (8%) is unaccounted inside decode** — `open_buffer`, the
+`result.rgb` allocation and the JNI marshalling. Flagged rather than assumed inert;
+decode is not 100% understood yet.
+
+The instrumentation that produced this is now landed rather than a local patch, so the
+split can be re-measured at any time.
+
+### 17.3 Where the export stands, and what is NOT yet measured
+
+12405 ms unrotated:
+
+| | ms | share | |
+|---|---|---|---|
+| `simulate` | ~8000 | 65% | parity-gated — the engine |
+| `decode` | ~3565 | 29% | of which 77% is `dcraw_process` |
+| `grade` | ~655 | 5% | single-threaded JVM, not parity-gated |
+| `encode` | ~205 | 2% | settled, not worth touching |
+| rotation | **~0** | — | was 1155 — **closed** |
+
+**The 655 ms grade figure is from the OLD code.** That run was on `0ee3319`, which
+predates the bulk-read and `packToArgb` split (`506991b` / `69e816b`). The grade half of
+#159 is built and CI-gated but **has not been measured on device**, and nothing here
+should be read as evidence that it worked.
+
+So the live targets are `dcraw_process` at 2750 ms and `grade` at ≤655 ms. Neither needs
+a GPU and neither touches a golden.
+
 ## Running it
 
 ```bash
