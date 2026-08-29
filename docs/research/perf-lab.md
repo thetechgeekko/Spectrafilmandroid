@@ -1141,6 +1141,15 @@ lever of the two: LibRaw's OpenMP paths are per-pixel deterministic, so it shoul
 output-identical, which makes it a pure win if it works. It costs linking libomp on
 the NDK.
 
+Stated precisely, because a first pass at this got it half wrong: LibRaw is **not
+vendored in-tree**. It arrives at configure time via `FetchContent`, pinned to the
+0.21.4 release tarball plus a SHA256, so grepping `lib/libraw/` says nothing about
+what pragmas the upstream sources carry. What IS verified is the enablement side —
+no `find_package(OpenMP)`, no `-fopenmp`, no OpenMP define anywhere in the build.
+**Whatever OpenMP support LibRaw 0.21.4 has, this build does not turn it on.**
+Confirming the pragmas exist in the fetched tree is step zero for anyone picking
+this up.
+
 **`user_qual` is never set**, so LibRaw's default interpolation applies — AHD, one of
 the slower ones. Unlike threading this is **not free**: changing the demosaic changes
 the decoded image, therefore the engine's input, therefore the output. It is a
