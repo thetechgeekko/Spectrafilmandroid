@@ -469,6 +469,96 @@ the first failing test — **losing the affinity sweep and every lever to one no
 exit.** That last one is the worst of the five: a correctness failure is exactly when
 the rest of the data matters most.
 
+## 12. "Don't accept defeat" — where the next win actually is
+
+The owner's direction after the device run was that a flat result is not a stopping
+point, and specifically asked whether OpenCV (including OpenCV on GPU) is the route.
+Taking that seriously means pointing it at the stage the device says is hot, not the
+stage that is convenient.
+
+### OpenCV on halation — the arithmetic says no, and it is not close
+
+Halation's 2139 ms looks like a textbook case for a tuned CV library. It is not, for
+a structural reason:
+
+- `gaussian_iir_plane` uses the **Young & van Vliet 3rd-order IIR** — 3 taps forward
+  and 3 back, **O(1) per pixel regardless of sigma**.
+- `cv::GaussianBlur` is a **separable FIR** — O(ks) per pixel, ks ≈ 6σ+1.
+
+Halation runs decay 14 px through the 3-Gaussian mixture, so its widest component is
+σ ≈ 38.8, i.e. **ks ≈ 233**. Swapping our 6 taps for OpenCV's ~233 is roughly **39×
+more arithmetic per pixel**, and no amount of SIMD in OpenCV's kernel recovers a 39×
+algorithmic gap. OpenCV would very likely be *slower* here, not faster.
+
+Two measurements from this branch already point the same way and were taken on the
+exact code in question: Highway f64 lanes on this path came out **2% slower** (§1),
+and an f32 plane through an f32 filter came out **0.97×** (§5, lever C). The filter is
+**latency-bound on a serial recurrence**, not throughput-bound — which is precisely
+the regime where a faster library kernel buys nothing.
+
+### OpenCV on GPU — a second GPU stack for a problem we already solved
+
+OpenCL is not in the Android NDK and is vendor-optional; Qualcomm ships a driver but
+apps reach it by `dlopen`, which is not a supported contract. We already have a
+working, device-validated Vulkan compute host with a self-check and automatic CPU
+fallback. Adding OpenCL means a second GPU stack with the same non-bit-reproducible
+float behaviour, for stages we can already dispatch through the host we have.
+
+Plus size: core+imgproc across three ABIs is comparable to or larger than the entire
+current 15.9 MB APK.
+
+**None of that is "OpenCV is bad."** It is a fine library, Apache-2.0, and its
+`imgproc` grab-bag is genuinely useful if masking ever needs broad CV ops. It is the
+wrong tool for *this* bottleneck.
+
+### The lever that IS there — and it is bit-exact
+
+Grain is **3043 ms**, the largest stage in the export. Lever D found the cliff; a
+follow-up probe found where the time inside it actually goes:
+
+```
+fast_poisson_one(lam=29)       160.92 ns/sample
+  draws consumed per sample     30.00        (Knuth: expected lam+1)
+  30 draws x 4.11 ns         =  123.3 ns     -> 77% of the sample
+StatsRng::uniform()              4.11 ns/draw
+raw mt19937 word                 1.69 ns/word
+StatsRng::normal()              13.11 ns/draw
+```
+
+**77% of the Poisson sampler is the random number generator**, not the sampler logic.
+Knuth's method multiplies uniforms until the product falls below `exp(-λ)`, so it
+consumes λ+1 draws — 30 of them at λ=29, and low λ is the ordinary grain regime.
+
+That reframes the problem completely:
+
+- **Changing the sampler** (rejection methods, a lower normal-approximation threshold)
+  would cut the draw count, but changes which numbers come out. That is a visible
+  change to the grain a user sees, and it is not bit-exact.
+- **Changing how MT19937 produces its words is free.** The Mersenne Twister's output
+  is defined by a fixed linear recurrence over a 624-word state. *How* those words are
+  computed is an implementation detail — a block-at-a-time SIMD twist and tempering
+  emits the **identical sequence**. Same draws, same samples, same grain, same bits.
+
+So the one route that attacks 77% of the largest stage **without touching a single
+output bit** is a vectorised MT19937 block generator. `uniform()` at 4.11 ns against a
+1.69 ns raw word says the distribution wrapper is already thin; the win would come
+from the generation itself.
+
+**Unmeasured, and stated as a hypothesis, not a result.** It needs the same treatment
+everything else here got: a standalone probe that proves byte-identical output against
+`std::mt19937` first, then a number. That probe is the next thing worth building, and
+it is a much better use of effort than a library swap the arithmetic already rules out.
+
+### What to do now, in order
+
+1. **Ship the affinity win.** 1.58×, bit-identical, measured. It is sitting in this
+   branch behind `SPK_BIG_CORES` and wants a decision about defaulting it on.
+2. **Isolate the export finding** (§11): 4m46s + SIGKILL on main vs 13.85 s here. If
+   it is foreground-vs-background, #153's foreground service is worth more than any
+   kernel work on this list.
+3. **Probe the vectorised MT19937** — byte-identity first, speed second.
+4. Leave OpenCV out of the render path.
+
 ## Running it
 
 ```bash
