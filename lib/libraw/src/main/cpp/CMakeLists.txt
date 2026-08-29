@@ -195,6 +195,53 @@ else ()
 endif ()
 
 # --------------------------------------------------------------------------
+# OpenMP (#158).
+# --------------------------------------------------------------------------
+# LibRaw guards 43 `#pragma omp` sites behind LIBRAW_USE_OPENMP, and
+# libraw_types.h only defines that `#if defined(_OPENMP)`. Without -fopenmp every
+# one of them is inert — which is how `dcraw_process` came to be 2760 ms, 77% of a
+# 3.6 s full-resolution decode, running single-threaded on an 8-core phone
+# (docs/research/perf-lab.md §17.2). The pragmas sit in exactly the files that
+# matter: ahd_demosaic.cpp (the default, since raw_decoder.cpp never sets
+# user_qual) and postprocessing_aux.cpp — both inside dcraw_process.
+#
+# This changes no pixel. That is precisely why it is preferred over lowering
+# user_qual, which would alter the decoded image and so be a quality decision
+# rather than a performance one. Verify byte-identical decode output before and
+# after rather than assuming it.
+#
+# -static-openmp links libomp INTO the .so instead of shipping a separate
+# libomp.so; it is an NDK driver flag, so it is only added for Android. Detection
+# is a real compile+link probe with the same flags, so a toolchain without OpenMP
+# degrades to the previous single-threaded build with a warning instead of
+# failing the build.
+option(SFRAW_ENABLE_OPENMP "Compile LibRaw with OpenMP (unlocks its demosaic pragmas)" ON)
+set(SFRAW_OPENMP_FLAGS -fopenmp)
+if (ANDROID)
+    list(APPEND SFRAW_OPENMP_FLAGS -static-openmp)
+endif ()
+set(SFRAW_OPENMP_ACTIVE OFF)
+if (SFRAW_ENABLE_OPENMP)
+    include(CheckCXXSourceCompiles)
+    string(REPLACE ";" " " SFRAW_OPENMP_FLAGS_STR "${SFRAW_OPENMP_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${SFRAW_OPENMP_FLAGS_STR}")
+    check_cxx_source_compiles(
+            "#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }"
+            SFRAW_HAVE_OPENMP)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if (SFRAW_HAVE_OPENMP)
+        set(SFRAW_OPENMP_ACTIVE ON)
+        message(STATUS "sfraw: LibRaw OpenMP ENABLED (${SFRAW_OPENMP_FLAGS_STR}) — #158")
+    else ()
+        message(WARNING "sfraw: -fopenmp unavailable; LibRaw demosaic stays "
+                "single-threaded and the #158 lever is NOT pulled")
+    endif ()
+endif ()
+if (SFRAW_OPENMP_ACTIVE AND TARGET raw)
+    target_compile_options(raw PRIVATE ${SFRAW_OPENMP_FLAGS})
+endif ()
+
+# --------------------------------------------------------------------------
 # Our decoder + JNI bridge.
 # --------------------------------------------------------------------------
 add_library(sfraw SHARED
@@ -203,6 +250,12 @@ add_library(sfraw SHARED
 )
 
 target_include_directories(sfraw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# The OpenMP runtime has to reach the final .so, not just the static archive.
+if (SFRAW_OPENMP_ACTIVE)
+    target_compile_options(sfraw PRIVATE ${SFRAW_OPENMP_FLAGS})
+    target_link_options(sfraw PRIVATE ${SFRAW_OPENMP_FLAGS})
+endif ()
 
 if (SFRAW_HAVE_LIBRAW)
     target_link_libraries(sfraw raw)

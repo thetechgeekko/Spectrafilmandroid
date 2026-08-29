@@ -1478,6 +1478,37 @@ they turn out to have been ~490 ms of the ~650. Same physics, opposite visibilit
 That is why the fix here was read-side only and needed no threading: there was nothing
 else in the way.
 
+### 17.6 #158, first lever: OpenMP enabled
+
+Owner's call was OpenMP first, and it is the right order — it is the one of the two
+that **changes no pixel**, so it can be verified rather than judged.
+
+`lib/libraw/src/main/cpp/CMakeLists.txt` now compiles LibRaw with `-fopenmp`
+(`-static-openmp` on Android, so libomp is linked into the `.so` rather than shipped
+beside it), which defines `_OPENMP`, which is what `libraw_types.h` gates
+`LIBRAW_USE_OPENMP` on — and that is what all 43 pragmas are behind. They sit in
+exactly the files that matter: `ahd_demosaic.cpp` (the default, since `raw_decoder.cpp`
+never sets `user_qual`) and `postprocessing_aux.cpp`, both inside `dcraw_process`.
+
+Detection is a real compile-and-link probe with the same flags, so a toolchain without
+OpenMP degrades to the previous single-threaded build with a warning rather than failing
+the build. `SFRAW_ENABLE_OPENMP=OFF` turns it off.
+
+**Not measured, and the verification is specific.** Two things have to be true, and
+neither is assumed:
+
+1. `process` drops from ~2760 ms. If it does not, `_OPENMP` did not reach the LibRaw
+   translation units and the pragmas are still inert — check the configure log for
+   `sfraw: LibRaw OpenMP ENABLED`.
+2. **The decoded output is byte-identical.** LibRaw's OpenMP loops are per-pixel and
+   per-row independent, so it should be — but "should be" is what the parity gate exists
+   to distrust, and the decoder sits *outside* that gate. Export the same RAW before and
+   after and compare the files byte-for-byte.
+
+No thread cap was set. Capping without measuring is exactly what made the "Use
+performance cores" setting a 1.41× regression (§16.3), and decode does not overlap the
+engine's own pool in time, so there is nothing to contend with.
+
 ### 17.5 #159 closed — the tally, and what is left
 
 | | before | after |
