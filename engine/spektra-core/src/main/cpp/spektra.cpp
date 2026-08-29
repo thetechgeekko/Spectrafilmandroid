@@ -51,6 +51,7 @@
 
 #include "io/npy_lut.h"
 #include "kernels/lut3d_cache.h"  // spk_engine holds the spectral 3D-LUT memo by value
+#include "kernels/parallel.h"     // spk_set_big_cores -> parallel_set_big_cores
 #include "model/color_filters.h"
 #include "profiles/profile.h"
 #include "runtime/color_reference.h"
@@ -1717,6 +1718,10 @@ uint64_t spk_gpu_scan_frames(void) { return spk::gpu_scan_frames_rendered(); }
 int spk_gpu_print_state(void) { return spk::gpu_print_expose_state(); }
 
 uint64_t spk_gpu_print_frames(void) { return spk::gpu_print_frames_rendered(); }
+
+void spk_set_big_cores(int mode) { spk::parallel_set_big_cores(mode); }
+
+int spk_big_core_count(void) { return spk::parallel_big_core_count(); }
 
 int spk_stage_timings(char* buf, int cap) {
     return spk::stage_timings_format(buf, cap);

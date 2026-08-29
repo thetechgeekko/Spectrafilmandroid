@@ -7,6 +7,17 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- A backgrounded export is moved to the little-cluster cpuset and runs ~4x
+         slower (measured 13894 ms -> 55631 ms on a 12.5 MP export), and becomes a
+         kill candidate for Samsung's device-health manager. ExportForegroundService
+         holds the process in the foreground scheduling group while it renders. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- API 33+: without this the ongoing-export notification is not shown. The
+         service still gets foreground priority either way, so no runtime prompt is
+         raised for it — the speed-up does not depend on the user granting this. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- Legacy gallery export (API <= 28) writes to public Pictures storage.
          On API 29+ scoped storage is used via MediaStore and needs no permission. -->
     <uses-permission
@@ -37,5 +48,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Runs no work of its own: it exists only to keep the process in the
+             foreground scheduling group for the duration of an export. -->
+        <service
+            android:name=".ExportForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

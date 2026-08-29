@@ -241,6 +241,33 @@ class SpektraEngine private constructor(
         const val SHAPER_NONE = 0
         const val SHAPER_SRGB = 1
 
+        /**
+         * Pin the render pool to the device's performance cores.
+         *
+         * A fork-join is only as fast as its slowest chunk, so one worker parked on an
+         * efficiency core sets the pace for the whole map however many big cores sit
+         * idle. Measured 1.51x on the default-ON spatial path (SM-S948W, two 4.74 GHz
+         * prime cores beating all eight) with the output checksum unchanged.
+         *
+         * Output is unaffected by construction: this changes only WHERE a chunk runs
+         * and how many workers split it, and every worker count is byte-identical —
+         * the thread-invariance the parity gate already asserts.
+         *
+         * @param mode 1 = on, 0 = off, -1 = defer to the `SPK_BIG_CORES` env var.
+         * Safe to call between renders, including mid-session.
+         */
+        @JvmStatic fun setBigCores(mode: Int) = nativeSetBigCores(mode)
+
+        /**
+         * Cores currently classified as "big", or 0 when pinning is off, detection
+         * failed, or the mask would cover every core (pinning to all cores is not
+         * pinning). Use it to report whether the setting did anything on this device.
+         */
+        @JvmStatic fun bigCoreCount(): Int = nativeBigCoreCount()
+
+        @JvmStatic private external fun nativeSetBigCores(mode: Int)
+        @JvmStatic private external fun nativeBigCoreCount(): Int
+
         @JvmStatic private external fun nativeCreate(assetDir: String?): Long
         @JvmStatic private external fun nativeCreateFromAssets(assetManager: AssetManager): Long
 

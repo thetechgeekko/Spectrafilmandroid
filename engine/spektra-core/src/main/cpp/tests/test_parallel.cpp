@@ -75,7 +75,8 @@ bool simulate_with_threads(const std::string& asset_dir, const spk_image* in,
 
 // Assert two run outputs are bitwise identical; print + return PASS/FAIL.
 bool check_identical(const char* label, const std::vector<float>& a,
-                     const std::vector<float>& b) {
+                     const std::vector<float>& b,
+                     const char* what = "1-thread vs 8-thread") {
     if (a.size() != b.size()) {
         std::printf("[%s] size mismatch %zu vs %zu -> FAIL\n", label, a.size(),
                     b.size());
@@ -90,8 +91,8 @@ bool check_identical(const char* label, const std::vector<float>& a,
         if (d < 0) d = -d;
         if (d > max_abs) { max_abs = d; argmax = i; }
     }
-    std::printf("[%s] 1-thread vs 8-thread: max_abs=%.3e (worst idx=%zu) -> %s\n",
-                label, max_abs, argmax, same ? "PASS" : "FAIL");
+    std::printf("[%s] %s: max_abs=%.3e (worst idx=%zu) -> %s\n",
+                label, what, max_abs, argmax, same ? "PASS" : "FAIL");
     return same;
 }
 
@@ -261,6 +262,53 @@ int main(int argc, char** argv) {
         ok &= simulate_with_threads(asset_dir, &in_img, &p, 1, &r1);
         ok &= simulate_with_threads(asset_dir, &in_img, &p, 8, &r8);
         ok &= check_identical("scan_film+diffusion_filter", r1, r8);
+    }
+
+    // 8) BIG-CORE PINNING toggled around renders (spk_set_big_cores).
+    //
+    //    Scope, stated honestly: on a homogeneous host every core reports the same
+    //    cpuinfo_max_freq (or none at all), so detect_big_cores returns 0 and the
+    //    pin itself is a NO-OP here. This scenario therefore gates the PLUMBING,
+    //    not the pinning: that flipping the mode bumps the generation counter, that
+    //    a worker whose thread-local latch predates the bump re-evaluates instead
+    //    of going stale, that the OFF path's restore branch does not corrupt a
+    //    thread's mask, and that none of it perturbs a single output byte. The
+    //    pinning's effect on placement can only be observed on a big.LITTLE device,
+    //    which is what the on-device sweep in docs/research/perf-lab.md covers.
+    //
+    //    Output invariance is the real contract: affinity may change how many
+    //    workers split the range, and every worker count must be byte-identical.
+    {
+        spk_params p = base;
+        p.scan_film = 1;
+        p.grain_active = 1;
+        p.halation_active = 1;
+
+        std::vector<float> off_before, on, off_after;
+        spk_set_big_cores(0);
+        ok &= simulate_with_threads(asset_dir, &in_img, &p, 8, &off_before);
+
+        spk_set_big_cores(1);
+        ok &= simulate_with_threads(asset_dir, &in_img, &p, 8, &on);
+        ok &= check_identical("big_cores off->on", off_before, on,
+                              "8-thread, pinning off vs on");
+
+        // Back off again: the restore branch runs on every worker that had pinned.
+        spk_set_big_cores(0);
+        ok &= simulate_with_threads(asset_dir, &in_img, &p, 8, &off_after);
+        ok &= check_identical("big_cores on->off", off_before, off_after,
+                              "8-thread, pinning off vs restored");
+
+        // With pinning off the reported count must be 0 whatever the topology, so
+        // parallel_num_threads() cannot be capped by a stale detection result.
+        const int n_off = spk_big_core_count();
+        const bool count_ok = (n_off == 0);
+        std::printf("[big_cores count when off] %d -> %s\n", n_off,
+                    count_ok ? "PASS" : "FAIL");
+        ok &= count_ok;
+
+        // Restore the default so later work in this process is unaffected.
+        spk_set_big_cores(-1);
     }
 
     std::printf("%s\n", ok ? "ALL PASS" : "FAIL");

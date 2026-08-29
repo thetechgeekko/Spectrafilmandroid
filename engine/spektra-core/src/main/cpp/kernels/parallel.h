@@ -73,9 +73,27 @@ int parallel_num_threads();
 // costs one predicted branch after the first.
 void parallel_pin_to_big_cores();
 
-// Number of cores the ratio classifies as "big", or 0 when detection failed or the
-// platform has no affinity API. Diagnostic / worker-count capping.
+// Number of cores the ratio classifies as "big", or 0 when detection failed, the
+// platform has no affinity API, or pinning is currently off. Diagnostic /
+// worker-count capping.
 int parallel_big_core_count();
+
+// Programmatic override of the SPK_BIG_CORES env gate, so the app can offer this
+// as a setting: the engine is loaded into a running process that cannot setenv
+// its own pre-main environment. mode is 1 (on), 0 (off), or -1 (defer to the env
+// var, the default).
+//
+// Safe to call between renders, including mid-session:
+//   * the sysfs topology probe is cached, so a toggle costs no I/O;
+//   * each toggle bumps a generation counter, and a thread whose latch predates
+//     the current generation re-applies the mask on its next parallel_for, so
+//     turning the setting OFF really unpins (the mask captured before the first
+//     pin is restored) rather than leaving the pool stuck on the big cluster.
+//
+// OUTPUT IS UNAFFECTED: this changes only which cores run a chunk and how many
+// workers split it, and every worker count is byte-identical by the chunking
+// contract above — which is what test_parallel asserts.
+void parallel_set_big_cores(int mode);
 
 // Minimum pixels per worker. Below this the range runs serially to avoid thread
 // spawn overhead dominating (e.g. small preview renders).

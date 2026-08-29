@@ -55,6 +55,31 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         set(v) { prefs.edit().putBoolean(KEY_GPU_PREVIEW, v).apply() }
 
     /**
+     * Pin the render pool to the device's performance cores.
+     *
+     * A fork-join is only as fast as its slowest chunk, so one worker parked on an
+     * efficiency core paces the whole map however many big cores sit idle. Measured
+     * on an SM-S948W, halation path, 1024x768:
+     *
+     * ```
+     *   no pinning        71.86 ms      1.00x
+     *   pinned (2 prime)  47.58 ms      1.51x
+     * ```
+     *
+     * Capping the pool WITHOUT pinning does not do it (SPK_NUM_THREADS=2 measured
+     * 68.70 ms, essentially baseline), so this is about which cores run the work,
+     * not how many workers there are.
+     *
+     * Output is unaffected by construction — affinity moves only WHERE a chunk runs,
+     * and every worker count is byte-identical under the parity gate's thread-
+     * invariance contract. Default OFF pending an A/B over a whole render: the 1.51x
+     * is one spatial filter on one device, not the end-to-end pipeline.
+     */
+    var bigCores: Boolean
+        get() = prefs.getBoolean(KEY_BIG_CORES, false)
+        set(v) { prefs.edit().putBoolean(KEY_BIG_CORES, v).apply() }
+
+    /**
      * GPU ENGINE preview (Vulkan, GPU M1 #146) — distinct from [gpuPreview] (the
      * GLES LUT loupe overlay above): the film simulation itself runs its scan
      * stage on the GPU for interactive previews (~2e-6 from the CPU chain,
@@ -163,6 +188,7 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         private const val KEY_GPU_ENGINE = "gpu_engine_preview"
         private const val KEY_GPU_EXPORT = "gpu_engine_export"
         private const val KEY_DRAFT_MAX_PX = "draft_render_max_px"
+        private const val KEY_BIG_CORES = "big_cores"
         private const val KEY_THEME = "theme"
         private const val KEY_OUTPUT_CS = "output_color_space"
         private const val KEY_PREVIEW_MAX = "preview_max_size"

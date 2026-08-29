@@ -980,3 +980,20 @@ JNI(jstring, nativeBakeCubeLut)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     throw_cpp_exception(env, e);
     return nullptr;
 }
+
+/*
+ * Big-core pinning (perf-lab, issue #117). The engine gates this on the
+ * SPK_BIG_CORES env var, which an Android app cannot set for its own process —
+ * the JVM is already up by the time any Kotlin runs. These two forward the
+ * setting so the win is reachable from the shipping build.
+ *
+ * Instance-less (@JvmStatic in the companion): pinning is a process-wide policy
+ * for the render pool, not per-engine state.
+ */
+JNI(void, nativeSetBigCores)(JNIEnv* /*env*/, jclass /*clazz*/, jint mode) {
+    spk_set_big_cores(static_cast<int>(mode));
+}
+
+JNI(jint, nativeBigCoreCount)(JNIEnv* /*env*/, jclass /*clazz*/) {
+    return static_cast<jint>(spk_big_core_count());
+}

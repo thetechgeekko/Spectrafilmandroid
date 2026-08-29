@@ -40,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.spectrafilm.engine.ColorSpace
+import com.spectrafilm.engine.SpektraEngine
 
 /**
  * The Settings UI. [settings] is the live store; [onThemeChanged] lets the host re-apply
@@ -74,6 +75,7 @@ fun SettingsScreen(
     var keepGps by remember { mutableStateOf(settings.exportKeepGps) }
     var gpuPreview by remember { mutableStateOf(settings.gpuPreview) }
     var gpuEngine by remember { mutableStateOf(settings.gpuEngine) }
+    var bigCores by remember { mutableStateOf(settings.bigCores) }
     var gpuExport by remember { mutableStateOf(settings.gpuExportEngine) }
 
     Column(
@@ -222,6 +224,33 @@ fun SettingsScreen(
                 Switch(
                     checked = gpuEngine,
                     onCheckedChange = { gpuEngine = it; settings.gpuEngine = it },
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Use performance cores", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Keep the render off this phone's efficiency cores. A render is only " +
+                            "as fast as its slowest worker, so one chunk on a slow core paces " +
+                            "the whole frame — measured 1.5x faster on the test device. The " +
+                            "result is bit-for-bit identical either way; only where the work " +
+                            "runs changes. Applies immediately.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = bigCores,
+                    onCheckedChange = {
+                        bigCores = it
+                        settings.bigCores = it
+                        // Takes effect on the next render — no restart, so the A/B is one tap.
+                        SpektraEngine.setBigCores(if (it) 1 else 0)
+                        Diag.i("big cores set=$it detected=${SpektraEngine.bigCoreCount()}")
+                    },
                 )
             }
             Row(

@@ -408,6 +408,30 @@ int spk_gpu_print_state(void);
  * the print offload externally observable, exactly like the scan one. */
 uint64_t spk_gpu_print_frames(void);
 
+/* Pin the render pool to the device's big cores (perf-lab, issue #117).
+ *
+ * A fork-join is only as fast as its slowest chunk, so one worker parked on an
+ * efficiency core sets the pace for the whole map no matter how many big cores
+ * sit idle. Pinning the pool to the cores whose cpuinfo_max_freq is within
+ * SPK_BIG_CORE_RATIO (default 0.80) of the fastest measured 1.51x on the
+ * default-ON spatial path on an SM-S948W, with the output checksum unchanged.
+ *
+ * This exists because the gate was an env var and an Android app cannot set its
+ * own pre-main environment, so the win was unreachable from the shipping build.
+ *
+ * mode: 1 = on, 0 = off, -1 = defer to SPK_BIG_CORES (the default; every
+ * existing host and CI invocation behaves exactly as before).
+ *
+ * Safe between renders, including mid-session — see kernels/parallel.h. Output
+ * is unaffected by construction: affinity changes only WHERE a chunk runs and
+ * how many workers split it, and every worker count is byte-identical. */
+void spk_set_big_cores(int mode);
+
+/* Cores currently classified as big, or 0 when pinning is off, detection failed,
+ * or the mask would cover every core (pinning to all cores is not pinning). Lets
+ * the caller report whether the setting actually did anything on this device. */
+int spk_big_core_count(void);
+
 /* Per-stage/per-filter wall-clock breakdown of the LAST render, formatted as
  * "stage=ms other=ms ..." (non-zero stages only) into `buf` (capacity `cap`);
  * returns bytes written. DIAGNOSTIC — reading the clock never changes output.

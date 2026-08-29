@@ -4,6 +4,7 @@
  */
 #include "kernels/parallel.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,24 @@ bool env_enabled(const char* name) {
     if (!v || !*v) return false;
     return std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0 ||
            std::strcmp(v, "true") == 0 || std::strcmp(v, "yes") == 0;
+}
+
+// Programmatic big-core override (parallel_set_big_cores). -1 defers to the env
+// var, which is the default and keeps every existing host/CI invocation exactly
+// as it was. Relaxed ordering is enough: a stale read costs at most one render
+// on the previous policy, and the policy never affects the arithmetic.
+std::atomic<int> g_big_cores_mode{-1};
+
+// Bumped on every policy change. A thread whose pin latch predates the current
+// value re-applies the mask, which is what makes turning the setting OFF at
+// runtime actually unpin an already-pinned worker.
+std::atomic<unsigned> g_big_cores_generation{0};
+
+// Current policy: the programmatic override when set, else the env var.
+bool big_cores_enabled() {
+    const int mode = g_big_cores_mode.load(std::memory_order_relaxed);
+    if (mode >= 0) return mode != 0;
+    return env_enabled("SPK_BIG_CORES");
 }
 
 #if defined(__linux__)
@@ -95,24 +114,57 @@ int detect_big_cores(
 }  // namespace
 
 int parallel_big_core_count() {
-    static const int n = env_enabled("SPK_BIG_CORES") ? detect_big_cores(nullptr) : 0;
+    // The sysfs probe is cached because the topology cannot change under us; the
+    // POLICY is read live so a runtime toggle takes effect without a restart.
+    // (Previously the probe was folded into the policy in one `static const`,
+    // which pinned the answer to whatever the env said on the very first call.)
+    if (!big_cores_enabled()) return 0;
+    static const int n = detect_big_cores(nullptr);
     return n;
+}
+
+void parallel_set_big_cores(int mode) {
+    const int m = mode < 0 ? -1 : (mode != 0 ? 1 : 0);
+    const int prev = g_big_cores_mode.exchange(m, std::memory_order_relaxed);
+    // Only a real change costs a re-pin; a settings screen that rewrites the same
+    // value on every recomposition must not force a syscall per render.
+    if (prev != m) g_big_cores_generation.fetch_add(1u, std::memory_order_relaxed);
 }
 
 void parallel_pin_to_big_cores() {
 #if defined(__linux__)
-    // One latch per thread: workers spawned after this inherit the mask, so the
-    // pool is covered by the orchestrator's single call, and a thread that somehow
-    // starts its own parallel_for pays one syscall and no more.
-    static thread_local bool done = false;
-    if (done) return;
-    done = true;
-    if (!env_enabled("SPK_BIG_CORES")) return;
+    // One latch per thread, versioned by the policy generation: workers spawned
+    // after this inherit the mask, so the pool is covered by the orchestrator's
+    // single call, and a thread that somehow starts its own parallel_for pays one
+    // syscall and no more. Storing the generation (rather than a bare bool) is
+    // what lets a mid-session toggle re-apply: a thread pinned under generation N
+    // re-evaluates once the counter moves to N+1.
+    static thread_local unsigned applied = 0u;  // 0 = never applied
+    const unsigned gen = g_big_cores_generation.load(std::memory_order_relaxed) + 1u;
+    if (applied == gen) return;
+    applied = gen;
+
+    // The mask this thread had before we first touched it, so that turning the
+    // setting OFF restores the scheduler's own placement instead of leaving the
+    // pool stuck on the big cluster. Captured lazily: workers are spawned fresh
+    // per fork-join, so probing affinity on threads we are never going to pin
+    // would put two syscalls on the DEFAULT (feature-off) path of every render.
+    static thread_local cpu_set_t original;
+    static thread_local bool restorable = false;  // captured AND since pinned
+
+    if (!big_cores_enabled()) {
+        if (restorable) {
+            (void)sched_setaffinity(0, sizeof(original), &original);
+            restorable = false;
+        }
+        return;
+    }
     cpu_set_t mask;
     if (detect_big_cores(&mask) <= 0) return;
+    const bool captured = sched_getaffinity(0, sizeof(original), &original) == 0;
     // A failure here is not an error worth propagating: the render is still
     // correct on whatever cores the scheduler picks, just possibly slower.
-    (void)sched_setaffinity(0, sizeof(mask), &mask);
+    if (sched_setaffinity(0, sizeof(mask), &mask) == 0 && captured) restorable = true;
 #endif
 }
 

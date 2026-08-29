@@ -49,6 +49,14 @@ object EngineHolder {
      */
     private fun create(ctx: Context): SpektraEngine {
         val app = ctx.applicationContext
+        // Apply the stored core-affinity choice before the first render. The engine
+        // gates this on an env var, which a running JVM cannot set for itself, so it
+        // has to be pushed in from here. Cheap and side-effect-free when off.
+        runCatching {
+            val on = AppSettings.from(app).bigCores
+            SpektraEngine.setBigCores(if (on) 1 else 0)
+            if (on) Diag.i("big cores on detected=${SpektraEngine.bigCoreCount()}")
+        }.onFailure { Diag.w("big cores apply failed: ${it.message}") }
         return runCatching { SpektraEngine.fromAssets(app.assets) }
             .onSuccess { Diag.i("engine create ok via=fromAssets") }
             .getOrElse { fromAssetsErr ->

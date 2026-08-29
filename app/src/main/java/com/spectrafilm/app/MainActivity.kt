@@ -1777,6 +1777,10 @@ class MainActivity : ComponentActivity() {
                             val exportStartMs = System.currentTimeMillis()
                             Diag.i("export start format=${exportFmt.name}")
                             exporting = true; exportDone = false; status = "rendering full resolution…"
+                            // Hold the process in the foreground scheduling group for the whole
+                            // render. Leaving the app mid-export otherwise drops it to the little
+                            // cluster and costs ~4x (13894 ms -> 55631 ms on a 12.5 MP export).
+                            ExportForegroundService.start(ctx)
                             scope.launch {
                                 val result = runCatching {
                                     withContext(Dispatchers.Default) {
@@ -1832,6 +1836,10 @@ class MainActivity : ComponentActivity() {
                                     status = "export failed: ${it.message}"
                                     Toast.makeText(ctx, "Export failed: ${it.message}", Toast.LENGTH_LONG).show()
                                 }
+                            }.invokeOnCompletion {
+                                // Covers success, failure AND cancellation: if the activity goes
+                                // away mid-export the ongoing notification must go with it.
+                                ExportForegroundService.stop(ctx)
                             }
                         }
                     },

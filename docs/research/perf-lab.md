@@ -27,7 +27,7 @@ Host numbers are kept below for contrast; **the arm64 column is what decides**.
 | # | Lever | Host said | Device said | Verdict |
 |---|-------|-----------|-------------|---------|
 | 1 | Highway **f64** on halation | inconclusive | **~2% SLOWER**, and failed its own byte test | **REMOVED** |
-| 2 | **big.LITTLE affinity** | no-op (no cpufreq) | **1.58×, checksum unchanged** | **SHIP IT** |
+| 2 | **big.LITTLE affinity** | no-op (no cpufreq) | **1.51×, checksum unchanged** | **SHIPPED (§13.4)** |
 | 3 | GEMM-shaped spectral integral | 1.05× | **0.96–0.97×** | dead, twice over |
 | 4 | Gaussian-mixture diffusion PSF | 109×, 9.2e-02 off | **85× … 692×**, 6.5e-02 off | preview-only |
 | 5 | fp16 / f32 plane storage | no win | **0.97× / 0.94×** | dead |
@@ -111,7 +111,9 @@ SPK_BIG_CORES=1 ratio=0.80   46.34 ms   checksum=d44700b538679a17   1.59x
 SPK_BIG_CORES=1 ratio=0.50   69.85 ms   checksum=d44700b538679a17   1.05x
 ```
 
-**1.58×, and the checksum is byte-identical in every row.** Of everything on this
+**1.51×, and the checksum is byte-identical in every row.** (The 1.58× below is
+the first single pass; §13.2 re-measured it as a median of four and separated the
+pinning from the worker-count cap — pinning is what wins.) Of everything on this
 branch this is the only lever that is *both* faster *and* exact.
 
 The shape of the result is the interesting part: ratios 1.00 and 0.80 select the
@@ -362,7 +364,12 @@ against, which is why the tool prints both.
 
 ## 11. What the device run added that no host bench could
 
-### The export finding — possibly the biggest user-visible win so far
+### The export finding — ISOLATED IN §13, AND IT WAS NOT THE BRANCH
+
+> **Superseded. Read §13 before quoting anything below.** The 2×2 isolation run
+> settled it: backgrounding costs **4.0×**, this branch is worth **1.12×**, and the
+> ~20× headline this section was built on does not survive. The paragraph is kept
+> as written because the doubt it recorded turned out to be the correct read.
 
 On `main @ e7cd9d0` a 12.5 MP export ran **4m46s and was SIGKILLed** by
 `com.sec.android.sdhms` before finishing (#153). On this branch, the same-size
@@ -595,19 +602,137 @@ one than the engine words ever were. It is also stdlib-implementation-shaped, wh
 makes it a different kind of risk; it is not attempted here.
 
 **The ordered recommendation below is unchanged by this result** — affinity is still
-the measured 1.58×, and the export finding is still worth more than any of it.
+the measured 1.51×, and the export finding is still worth more than any of it.
 
 ### What to do now, in order
 
-1. **Ship the affinity win.** 1.58×, bit-identical, measured. It is sitting in this
-   branch behind `SPK_BIG_CORES` and wants a decision about defaulting it on.
-2. **Isolate the export finding** (§11): 4m46s + SIGKILL on main vs 13.85 s here. If
-   it is foreground-vs-background, #153's foreground service is worth more than any
-   kernel work on this list.
+1. ~~Ship the affinity win~~ — **done (§13)**: reachable from the app as a setting
+   (`spk_set_big_cores`), because the env-var gate was unreachable from a running
+   JVM. Default OFF pending a whole-render A/B.
+2. ~~Isolate the export finding~~ — **done (§13), and the answer was
+   foreground-vs-background**. #153's foreground service landed here as a result;
+   it is worth ~4×, more than every kernel lever on this branch combined.
 3. ~~Probe the vectorised MT19937~~ — **done, and it is a no**: bit-identical
    (0 diffs over 10 M words and 200 k samples) but 1.05× on `uniform()` and noise on
    the sampler, because the distribution wrapper is 40% of a draw.
 4. Leave OpenCV out of the render path.
+5. **Open**: why the fork-join is non-monotonic in thread count (§13), and what the
+   remaining unexplained ~4.3× in the original SIGKILLed run actually was.
+
+## 13. Second device run — the two things only a phone could answer
+
+Device: SM-S948W. Both questions were designed so the answer would change what we
+build next, and both did.
+
+### 13.1 Export isolation — the 20× was not the branch
+
+Four runs, same image, same settings, screen held on:
+
+| # | branch | app state | result | export time |
+|---|---|---|---|---|
+| 1 | `claude/perf-lab` | foreground | completed | **13 894 ms** |
+| 2 | `claude/perf-lab` | HOME immediately | completed | **55 631 ms** |
+| 3 | `main` | foreground | completed | **15 574 ms** |
+| 4 | `main` | HOME immediately | completed | **66 278 ms** |
+
+- **Backgrounding: 4.00× (branch), 4.26× (main).**
+- **This branch: 1.12× foreground, 1.19× background.**
+
+So the ~20× headline of §11 decomposes into a 4× scheduling effect and a 1.12×
+code effect. Every kernel lever on this branch put together is worth less than
+one-third of what leaving the app costs. That is the finding.
+
+The slowdown is broad, not one stage — which is what a cpuset move looks like and
+what a single slow kernel does not (run 1 → run 2):
+
+```
+preprocess     134.9 ->   737.5   5.5x        print_expose   324.7 ->  1232.0   3.8x
+grain         3086.7 -> 15811.6   5.1x        scan           742.9 ->  2381.8   3.2x
+filming_expose 173.6 ->   872.5   5.0x        scan_spatial   380.4 ->  1149.9   3.0x
+develop         30.4 ->   121.4   4.0x        halation      2125.2 ->  4454.6   2.1x
+                                              dir_couplers  1296.7 ->  2710.8   2.1x
+```
+
+**What is still NOT explained.** The run did not reproduce the kill: run 4 is
+exactly the configuration that died at 4m46s last time and it finished in 66 s.
+Backgrounding accounts for 4× of the original ~20×; the remaining ~4.3× is
+unaccounted for. The differences from the original are real — the screen was held
+on and the app only backgrounded (not screen-off, not minutes of dwell), and the
+format was ULTRA_HDR rather than JPEG. **The direction is settled; the magnitude
+is not.** Reproducing the kill needs screen-off and several minutes of dwell,
+which is a different experiment.
+
+Minor, recorded rather than smoothed: branch runs wrote 10 348 734 bytes, `main`
+runs 10 348 689 — 45 bytes apart on identical inputs, unverified, probably
+metadata. `main` emits no `stage timings` line (that logging is new here), so runs
+3–4 have totals only.
+
+### 13.2 Affinity — faster cores, not fewer threads
+
+`SPK_BIG_CORES` does two things at once (pins to the prime cores **and** caps the
+pool to their count), so the win could have been either. Separating them, medians
+of four passes at 1024×768 (the first pass came out non-monotonic, so single
+passes were not trusted):
+
+| config | median ms | vs baseline |
+|---|---|---|
+| baseline (no env) | 71.86 | 1.00× |
+| `SPK_NUM_THREADS=1` | 59.61 | 1.21× |
+| `SPK_NUM_THREADS=2` | 68.70 | 1.05× |
+| `SPK_NUM_THREADS=4` | 54.67 | 1.31× |
+| `SPK_NUM_THREADS=6` | 70.39 | 1.02× |
+| `SPK_NUM_THREADS=8` | 68.21 | 1.05× |
+| `SPK_BIG_CORES=1` ratio 1.00 | **47.58** | **1.51×** |
+
+Checksums identical in every run (`ec74c9dfb7bc2f31` at 640×480,
+`d44700b538679a17` at 1024×768). Nothing diverged.
+
+**Capping the pool is not what wins.** `SPK_NUM_THREADS=2` — the same worker count
+pinning ends up with — lands at baseline. Pinning is doing the work, so core
+placement is the mechanism and thread-count tuning is not a substitute.
+
+This also revises §2's 1.58× down to **1.51×**: that figure was a single pass, this
+is a median of four.
+
+**Open question — thread count is not monotonic.** T=4 (54.67) beats T=1, T=2, T=6
+and T=8, and T=2 is worse than T=1. A plausible mechanism: the join waits on the
+slowest chunk, so the result depends on where each chunk lands, and at small worker
+counts a single chunk on an efficiency core paces everything — at T=4 the chunks
+are small enough that even a slow one finishes quickly. That is a hypothesis, not a
+measurement. Practical consequence: **T=4 alone recovers ~60% of the pinning win
+with no affinity code**, which is a cheap fallback where pinning is unavailable.
+
+### 13.3 A provenance correction
+
+The run reported that `perf_lab --halation-only` does not exist and that the
+73.50/46.41 figures came from `test_exp_filter_hwy`. Checked against the branch:
+
+- `--halation-only` **does** exist (`perf_lab.cpp:666`) — added in `87c60af`,
+  three commits after the `5de7a8b` the device session had checked out.
+- The four runner-portability bugs **were** fixed, also in `87c60af`. At `5de7a8b`
+  the script genuinely has `set -euo pipefail` and none of the rest.
+- `test_exp_filter_hwy.cpp` was **deleted** in `87c60af` together with the f64
+  Highway tier it tested (`grep -c hwy exponential_filter.cpp` = 0).
+
+So §13.2 was measured with a **stale binary benchmarking a removed feature**. The
+relative conclusion survives — every config ran that same binary, and both benches
+drive the same `exponential_filter_per_channel_d` through the same fork-join — but
+the absolute milliseconds do not describe shipping code, and the provenance as
+reported was wrong. A stale checkout is the cause of all three discrepancies.
+
+### 13.4 What was built in response
+
+| Finding | Change |
+|---|---|
+| Backgrounding costs 4× | `ExportForegroundService` — holds the process in the foreground scheduling group for the duration of an export (#153). Runs no work of its own, so it touches nothing on the render path. |
+| Pinning is worth 1.51×, and the env gate is unreachable from a running JVM | `spk_set_big_cores()` / `spk_big_core_count()` + a **Use performance cores** setting. Applies mid-session: the policy is generation-counted so an already-pinned worker re-evaluates, and turning it off restores the mask captured before the first pin. |
+| Both need a whole-render A/B | Setting defaults **OFF**. 1.51× is one spatial filter on one device. |
+
+Gate: all 38 parity tests green, including a new `test_parallel` scenario 8 that
+toggles pinning off→on→off around renders and asserts byte-identical output plus a
+correct `spk_big_core_count()` when off. Stated honestly, that scenario gates the
+**plumbing**, not the pinning — on a homogeneous host `detect_big_cores` returns 0
+and the pin is a no-op, so placement can only be observed on a big.LITTLE device.
 
 ## Running it
 
@@ -615,14 +740,17 @@ the measured 1.58×, and the export finding is still worth more than any of it.
 bash tools/perf_lab/build_push_run.sh   # laptop + attached device
 ```
 
-Three sections: the f64 Highway A/B (with a cross-process checksum equality check),
+Three sections: the f32 Highway A/B (with a cross-process checksum equality check;
+the f64 tier this once ran was removed in `87c60af` — see §1),
 an affinity sweep over `SPK_BIG_CORE_RATIO`, and the three parity-affecting levers.
 Host-side, the same binaries build with the compile lines in each file's header.
 
 ## What this branch deliberately does NOT contain
 
-Cold start (#152) and the export foreground service (#153) — app-architecture
-work a bench cannot answer.
+Cold start (#152) — app-architecture work a bench cannot answer.
+
+(The export foreground service, **#153**, was on this list until the isolation run
+in §13 measured it at ~4×. It is now implemented here: `ExportForegroundService`.)
 
 **The REST of #148.** The print integral is one of three; `filming` (spectral
 upsampling → camera raw → density curves → DIR couplers) is a genuinely new
