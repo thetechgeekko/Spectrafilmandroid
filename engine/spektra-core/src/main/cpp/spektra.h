@@ -439,6 +439,21 @@ int spk_big_core_count(void);
  * goes (#146/#152). */
 int spk_stage_timings(char* buf, int cap);
 
+/* DIAGNOSTIC. Number of times this render's diffusion stage chose the FFT path
+ * and fft_convolve_same REFUSED it (an allocation failure at the chosen
+ * transform size, in practice), so the direct O(w*h*ks^2) loop ran instead.
+ *
+ * That fallback is correct but can be ~100x slower and is otherwise INVISIBLE:
+ * no error, no log, just a slow render. Any measurement of the diffusion stage
+ * -- above all one that raises SPK_DIFFUSION_FFT_MAX -- must read this, because
+ * "the bigger transform did not help" and "the bigger transform never ran"
+ * produce identical timings.
+ *
+ * Process-global and monotonic; spk_diffusion_reset_fft_fallbacks() zeroes it,
+ * so a caller can scope the count to one render. */
+uint64_t spk_diffusion_fft_fallbacks(void);
+void spk_diffusion_reset_fft_fallbacks(void);
+
 void spk_image_free(spk_image*);
 
 /* Debug taps (mirror DebugParams) for the golden-vector parity harness: dump an

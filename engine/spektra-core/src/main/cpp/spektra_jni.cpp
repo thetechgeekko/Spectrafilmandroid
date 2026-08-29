@@ -862,10 +862,30 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     {
         char tbuf[512];
         if (spk_stage_timings(tbuf, sizeof(tbuf)) > 0) {
+            // The diffusion FFT fallback count rides on THIS line rather than a
+            // line of its own, and is printed even when it is 0.
+            //
+            // Both of those are deliberate. It qualifies camera_diffusion's
+            // number, so it belongs beside it — a separate line can be missed,
+            // or read against the wrong render. And a count that only appeared
+            // when nonzero would recreate the trap stage_timer.h already
+            // documents: zero slots are SKIPPED, so absence is not evidence.
+            // Here absence means "diffusion did not run"; "fft_fallbacks=0"
+            // means "it ran and took the transform". Those must not look alike,
+            // because a nonzero count invalidates the timing on the same line.
+            const bool diffusion_ran = std::strstr(tbuf, "camera_diffusion") != nullptr;
+            char fbuf[48] = {0};
+            if (diffusion_ran) {
+                std::snprintf(fbuf, sizeof(fbuf), " fft_fallbacks=%llu",
+                              static_cast<unsigned long long>(
+                                  spk_diffusion_fft_fallbacks()));
+            }
             __android_log_print(ANDROID_LOG_INFO, "Spektra",
-                                "stage timings ms [%s]: %s",
-                                preview ? "preview" : "export", tbuf);
+                                "stage timings ms [%s]: %s%s",
+                                preview ? "preview" : "export", tbuf, fbuf);
         }
+        // Scope the next render's count to that render, like the stage timers.
+        spk_diffusion_reset_fft_fallbacks();
     }
 #endif
     if (st != SPK_OK) { throw_status(env, st); return nullptr; }
