@@ -82,8 +82,22 @@ jobs:
       # about an arm64 GPU's transcendental precision -- GLSL leaves pow/exp2 to a
       # vendor-defined ULP bound, so that still has to be measured on a device.
       # -----------------------------------------------------------------------
-      - name: Install software Vulkan (lavapipe)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mesa-vulkan-drivers
+      # TWO packages, and they are not interchangeable: mesa-vulkan-drivers ships
+      # the lavapipe ICD (the runtime driver) while libvulkan-dev ships
+      # vulkan/vulkan.h AND the libvulkan.so link target. Installing only the
+      # first compiles nothing -- it fails at `#include <vulkan/vulkan.h>`, which
+      # is exactly how this step first went red.
+      - name: Install software Vulkan (lavapipe + headers)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan-dev
+          # Fail here, with a readable message, rather than inside g++ if a future
+          # packaging change moves either piece.
+          test -f /usr/include/vulkan/vulkan.h \
+            || (echo "libvulkan-dev did not provide vulkan/vulkan.h" && exit 1)
+          test -f /usr/share/vulkan/icd.d/lvp_icd.json \
+            || (echo "mesa-vulkan-drivers did not provide the lavapipe ICD" && exit 1)
 
       - name: GPU shader validation under lavapipe
         working-directory: engine/spektra-core/src/main/cpp
