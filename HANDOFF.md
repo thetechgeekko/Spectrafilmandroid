@@ -51,6 +51,13 @@ case three ways. All at `-O3 -ffast-math -fno-finite-math-only`, slide route, gr
 The third row is the compiler, architecture and flags the APK actually ships. **Identical
 to six decimals across all three, and none is flat.** T=1 vs T=8 also identical.
 
+The table above shows one case; the **full 12-case sweep** (5 scenes x T=1/T=8, plus the
+print-route and grain-off controls) then finished on aarch64 and **every line matches the
+x86_64 run to all six reported decimals** — including the print control at
+0.986413/0.988814/0.979199 and grain-off at 0.924929/0.577006/0.461372. Stated precisely:
+that is agreement of the reported statistic, NOT byte-equality of the images, which
+CLAUDE.md correctly says does not hold across architectures.
+
 So: the engine sources, built as we ship them, do not produce this bug. It is not arm64
 codegen, not `-ffast-math`, not thread count, not hostile input values, and not any of the
 66 configurations from the earlier sweep. Combined with your grain-toggle result, what is
