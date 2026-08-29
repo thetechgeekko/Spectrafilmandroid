@@ -979,6 +979,40 @@ attempts "succeeded" in 2.2 s and looked like a spectacular win.
 state between A and B needs a positive confirmation in the log that the subject is
 still what you think it is — here, grepping `decode kind=RAW 383x510` on every run.
 
+### 15.6 A prediction about `grade`, written before the measurement arrives
+
+Recorded now, while the device is unreachable, so the pending run tests it rather
+than confirms it after the fact — the discipline §11 adopted after the f64 tier was
+removed for benchmarking before proving.
+
+`simResultToBitmapGraded` -> `gradeBufferToBitmap` is three passes over the
+full-resolution buffer, and **all three are single-threaded JVM per-pixel loops** —
+while the entire native engine beside them is multi-threaded:
+
+| pass | early-out |
+|---|---|
+| `ColorGrade.applyInPlace` — `OutputCctf.decode` x3, optional gamut compression, Oklab chroma | yes, if saturation/vibrance/gamut are all inactive |
+| `MaskCompositor.applyInPlace` — **one full pass per active local adjustment** | yes, if no adjustment has an op and >1e-4 coverage |
+| `simResultToBitmap` — clamp, round, pack to ARGB8888, `setPixels` per strip | **NO. It always runs.** |
+
+**The prediction.** `grade` will be materially non-zero even with every slider at its
+default, because that last pass is an unconditional ~12.5 M-iteration JVM loop doing
+three `FloatBuffer.get()` calls, a clamp, a round and a pack per pixel. With chroma
+or gamut active it is two such passes; with N local adjustments, 2+N.
+
+**Why this matters more than its size.** None of it is parity-gated. It is entirely
+post-engine — the project's own playbook tier — so parallelising it across the same
+fork-join the engine already uses, or moving it native, touches no golden and risks
+no band. If the prediction holds, it is the cheapest remaining win on the export path
+and it needs no GPU at all.
+
+**What would falsify it:** `grade` coming back at a few tens of ms. That would mean
+the JIT is handling these loops far better than the shape suggests, and the 5656 ms
+lives in decode or encode instead — in which case this section is wrong and the
+answer is elsewhere.
+
+Either way the next run decides it, which is the point of writing it down first.
+
 ## Running it
 
 ```bash
