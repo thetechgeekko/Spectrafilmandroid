@@ -150,3 +150,77 @@ If that number is good, this document becomes the plan. If it is bad, it saves m
 Either way it should be taken before the commitment, not after — which is the same
 discipline that retired the Highway f64 tier, the "Use performance cores" setting, and
 the first cut of the 90/270 transpose.
+
+## 8. Reading the actual source: vkdt already implements spektrafilm — on a different grid
+
+Checked against a clone of `hanatos/vkdt` at `b95b3a0`, not from recollection.
+
+**`src/pipe/modules/filmsim/readme.md`, first line:** *"this is an implementation of
+Andrea Volpato's spektrafilm."* Same upstream our engine is a port of. The module has
+our whole pipeline as Vulkan compute shaders — `expose.comp`, `develop.comp`,
+`scatter.comp`, `halin/halout.comp`, `dirlut.comp` (DIR couplers), `negprint.comp`,
+`print.glsl`, `scan.glsl` — and its parameter list maps almost one-to-one onto ours,
+down to `preflash`, `cp amt`, `lang r/g/b`, `cp rad`, `hal bnc`, `hal dec`, `scat amt`,
+`g fast`, `g slow`, `exhaust`, `hl boost`. Those are the same features our
+`preflash_e2e`, `provia_couplers_e2e` and `highlight_boost_e2e` gates cover.
+
+The whole module is **1979 lines**, because most of the math is precomputed into
+`filmsim.lut` by `mklut-profiles.py` — which runs against spektrafilm's own
+`profile/*.json`.
+
+**Licence is fine.** vkdt's code is 2-clause BSD (13 files carry GPL, none in filmsim),
+which is compatible with our GPLv3. The filmsim *profiles* are CC BY-SA 4.0 by Andrea
+Volpato — the same data-licensing situation we are already in.
+
+### But it is not our model, and the readme understates by how much
+
+`filmsim.glsl` declares its wavelength grid outright:
+
+```
+  lambda_arr[11] = 380, 390, 400 ... 800, 810      // 44 bands @ 10 nm
+```
+
+Ours, from `model/spectral.h`: *"Mirrors spektrafilm/config.py exactly:
+SpectralShape(380, 780, 5), i.e. 380..780 nm @ 5 nm -> 81 samples. This governs every
+spectral..."*
+
+**vkdt runs the spectral integrals at half our resolution** — 44 bands at 10 nm against
+81 at 5 nm — and over a different range. That is a different quadrature in *every*
+spectral step: camera-raw formation, dye density to transmittance, enlarger exposure,
+scan to XYZ. It will not sit inside `max_abs ≤ 1e-4`; it is not a precision question but
+a different discretisation.
+
+The readme discloses "some changes for efficiency (for instance the grain model was
+swapped out)". The 5 nm → 10 nm halving is a larger change than the grain swap and is
+not named there. Not a criticism of vkdt — it is a real-time editor and the trade is
+obviously right for it — but it is decisive for us.
+
+Two smaller structural differences, recorded for completeness:
+
+- **Base-2 density math.** vkdt uses `exp2(-ds)`; our engine has a dedicated
+  `kernels/exp10.h` because spektrafilm's densities are base-10. Convertible in
+  principle, a different numerical path in practice.
+- **Subgroup reductions.** `filmsim.glsl` reduces with `subgroupAdd`. Summation order
+  depends on `gl_SubgroupSize`, which differs between GPU vendors — so results would
+  vary by *device*, not just from the CPU. Our contract currently requires invariance
+  across thread counts; this would add a device axis we have never had to defend.
+
+### What this changes about the decision
+
+It removes the vaguest version of the question and replaces it with a sharp one.
+
+**"Adopt vkdt's filmsim" now means "ship a 44-band model instead of an 81-band one."**
+That is a *product* decision about output, not an engineering one about speed, and it is
+the owner's to make — the same class as `user_qual` in #158, and much bigger.
+
+The third route is now the well-founded one rather than the speculative one:
+
+> **Write our own 81-band GPU shaders, using vkdt's module as the architecture guide.**
+
+vkdt has already proven the pipeline maps onto Vulkan compute, shown how to lay out the
+LUT, and shown which stages decompose into which kernels — at 1979 readable lines under
+a compatible licence. That is an enormous head start on design while leaving our grid,
+our grain model, and our parity gate intact.
+
+What it does not tell us is still §5's question: what GPU actually buys on our biggest
+stage. Nothing here substitutes for measuring that.
