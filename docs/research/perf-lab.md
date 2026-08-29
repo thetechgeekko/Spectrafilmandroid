@@ -1758,6 +1758,130 @@ Both prior contaminations in this dossier (the rotated source in §16, the debug
 here) were unrecorded *variables*, not wrong *measurements*. The instrument was fine
 both times.
 
+
+## 20. The blind spot, measured: Black Pro-Mist is O(n²) and unusable
+
+§18 said every optional effect was unmeasured and called it the most consequential gap in
+the dossier. The owner's instinct — *"jitni bhi effects hai hamne check nahi kie aur vo hi
+sabse khatarnak hai"* — was right, and one of them is far worse than anything else here.
+
+`tools/stage_split/` renders a synthetic scene at full resolution and prints
+`spk_stage_timings` per case, including the optional effects that no export profile has
+ever covered (`stage_timings_format` skips zero slots, so a gated-off filter is invisible
+rather than shown as `0.0`). Host, 4-core Xeon @2.8 GHz, `-O2`, 4 workers — the absolute
+milliseconds do not transfer to the phone, the **shape** does.
+
+### 20.1 The ladder, print route, 768x768, tame scene
+
+| case | wall ms | what changed |
+|---|---|---|
+| baseline (grain + halation on) | 1129 | |
+| + glare | 995 | `glare_field=30` (nested in `scan`) |
+| + lens blur | 1147 | `lens_blur=15` |
+| + highlight boost | — | `highlight_boost=2.8` |
+| **+ Black Pro-Mist** | **65265** | **`camera_diffusion=64118`** |
+
+Three of the four unmeasured effects are trivial. The fourth is **98.2% of the render**.
+
+### 20.2 It is quadratic in pixel count, and the law is clean
+
+| side | pixels | `camera_diffusion` ms | ratio |
+|---|---|---|---|
+| 192 | 0.037 MP | 253 | |
+| 384 | 0.147 MP | 4108 | **16.2x** for 4x pixels |
+| 640 | 0.41 MP | 30653 | |
+| 768 | 0.59 MP | 66376 | **16.2x** for 4x pixels |
+
+Sixteen-fold for four-fold pixels, twice, is n². The mechanism is in the source, not
+inferred: `apply_diffusion_filter_um` (`model/diffusion.cpp:333`) sets
+
+```
+radius = ceil(max(8 * bloom_max_lambda_px, 5)),  bloom_max_lambda_px ∝ 1 / pixel_size_um
+```
+
+so the kernel radius grows with image width (physically correct — the PSF is a fixed size
+*on the film*), builds a full 2D `ks x ks` PSF with `ks = 2*radius+1`, and then, in its own
+words, "convolve each channel **directly** in double precision". Cost is
+`n_pixels x ks² x 3`, and `ks ∝ √n`. That is n², exactly as measured.
+
+The radius cap (`min(radius, min(h,w)/2 - 1)`) does not rescue it: the cap is `∝ width` and
+the radius is `∝ width`, so whichever is smaller stays smaller at every resolution — the
+cap either always binds or never does, and it cannot change the exponent.
+
+### 20.3 What this means for the product, which is the point
+
+**These are the app's own defaults.** `DiffusionState` (`ParamsState.kt:609`) ships
+`family = "black_pro_mist"`, `strength = 0.5f`, `spatialScale = 1f`, every size `1f` —
+exactly the configuration benchmarked. A user flipping the toggle gets this.
+
+- **30.7 s for ONE 640x640 preview render** — and 640 is `preview_max_size`'s default. The
+  interactive slider path, not an export. Even if the phone is 5x this host, that is a
+  6 s hang per preview.
+- **A 12 MP export extrapolates to ~7.6 hours** on this host (n² from 768: 20.35² = 414x).
+  Divide by any plausible device factor and it is still hours. This is an extrapolation,
+  flagged as one — but the law held across a 16x pixel range with 4% error, and §20.2
+  shows the cap cannot bend it.
+
+**Nobody has ever run this.** Every profile in §16-§19 was taken at defaults, and
+`camera_diffusion` defaults off, and zero slots are skipped — so the stage has been
+invisible in every measurement this project has taken.
+
+### 20.4 It is a faithful port, which makes it a parity decision
+
+`model/diffusion.cpp`'s header says it mirrors `spektrafilm/model/diffusion.py`'s
+`apply_diffusion_filter_um` and its PSF helpers. So the cost is almost certainly inherited
+from the oracle's algorithm rather than introduced here. *(Stated from our own source
+comments — the oracle is not checked out in this container, so this specific claim is
+unverified against upstream.)*
+
+That matters because it makes the fix a **parity** question, not a bug fix. `diffusion`
+and `diffusion_e2e` are two of the 38 gates. Any of the obvious repairs changes pixels:
+
+- **FFT convolution** — mathematically the same operator, O(n log n), but not bit-exact.
+- **A sum of separable/IIR exponential filters** — the PSF is a weighted sum of
+  `exp(-r/λ)/(2πλ²)` terms, and `kernels/exponential_filter.h` (which already makes
+  halation O(n) per pass, independent of sigma) is the machinery for it. Radially
+  symmetric `exp(-r/λ)` is not separable, so this is an approximation.
+- **Cap the radius in absolute pixels** — cheapest, changes the look at high resolution,
+  and breaks the "fixed physical size on film" property that makes the effect correct.
+
+All three are the owner's call, not an engineering one — the same class as the 44-band
+question in `vkdt-decision.md` §9.
+
+### 20.5 Two things this corrects about our own GPU reasoning
+
+1. **"grain is 42% of the engine" is scene-specific, not a constant.** The same bench on a
+   wide-range scene (8 stops, `lum=8.0` speculars) versus a tame one (2 stops, no
+   speculars), same resolution:
+
+   | scene | grain @384 | grain @768 | scales with pixels? |
+   |---|---|---|---|
+   | wide | 8053 ms | 9253 ms | **no** — 1.15x for 4x pixels |
+   | tame | 82 ms | 282 ms | yes — 3.4x |
+
+   ~100x spread at fixed resolution. The mechanism is documented at `grain.cpp:82`:
+   `fast_binomial_one` "falls into an O(n) CDF-inversion walk where density approaches its
+   maximum, so a bright sky can cost hundreds of times more per pixel than a shadow" — the
+   dynamic block scheduling exists precisely to balance it. What was never quantified is
+   the magnitude, and it is enormous. **Export time is not bounded by resolution**; a
+   high-contrast frame can cost orders of magnitude more than a flat one.
+
+2. **That weakens the GPU-grain case in `vkdt-decision.md` §5.** Massively divergent
+   per-lane work is the worst shape for a GPU: every lane in a subgroup waits for the
+   slowest. The §5 experiment is still the right one to run, but "grain is the biggest
+   stage so move it first" was reasoning from a share that turns out to be a property of
+   one photograph.
+
+### 20.6 The method note
+
+This bench was nearly reported wrong. The first run used the wide scene and said "grain is
+91% of the engine" — a number that would have gone straight into a decision doc and
+redirected the GPU work. It was caught by a scaling check that took two minutes: **4x the
+pixels gave 1.15x the time**, which no per-pixel stage can do. The rule this adds:
+
+> Before believing any stage share, check that the stage scales with the thing you think
+> drives it. A stage that does not scale with pixel count is not measuring what you think.
+
 ## Running it
 
 ```bash
