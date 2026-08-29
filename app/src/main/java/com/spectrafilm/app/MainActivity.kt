@@ -1769,6 +1769,23 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            // Ask for POST_NOTIFICATIONS when the export SHEET opens — NOT when the
+            // export starts. A system permission dialog takes focus, and on the
+            // measured device losing /top-app costs 3.90x (§15.1): asking at the
+            // moment the render begins would contaminate the very first export with
+            // the exact effect a whole session was spent characterising. Here the
+            // dialog resolves while the user is still choosing options and nothing
+            // is rendering, and it is still in context — they are about to export.
+            LaunchedEffect(showExportSheet) {
+                if (showExportSheet &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED
+                ) {
+                    runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
+                }
+            }
+
             // --- Lightroom-style export options sheet ---
             if (showExportSheet) {
                 ExportSheet(
@@ -1810,13 +1827,19 @@ class MainActivity : ComponentActivity() {
                             // from 700 to 50. It does NOT recover the ~4x background
                             // slowdown — no service-tier cpuset on the measured device
                             // contains the prime cores. See ExportForegroundService.
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.POST_NOTIFICATIONS)
-                                != PackageManager.PERMISSION_GRANTED
-                            ) {
-                                runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
-                            }
                             ExportForegroundService.start(ctx)
+                            // Phase accumulators live out here so the reconciliation can be
+                            // printed next to `ok in`, using the SAME total. Everything from
+                            // exportStartMs to the final log is in exactly one bucket, and the
+                            // leftover is printed as `residual` rather than left for a reader
+                            // to compute — the earlier version closed its last phase before
+                            // res.close() and the coroutine unwind, so it undershot by design.
+                            var phSetup = 0L
+                            var phDecode = 0L
+                            var phExif = 0L
+                            var phSim = 0L
+                            var phGrade = 0L
+                            var phEnc = 0L
                             scope.launch {
                                 val result = runCatching {
                                     withContext(Dispatchers.Default) {
@@ -1827,9 +1850,12 @@ class MainActivity : ComponentActivity() {
                                         // full-res bitmap grade and the encode — none of which any
                                         // measurement has ever separated, which makes it impossible
                                         // to say what a GPU pipeline could and could not reach.
+                                        // setup = the permission check, the startForegroundService
+                                        // IPC round trip and the coroutine dispatch hops.
                                         val tDecode0 = System.currentTimeMillis()
+                                        phSetup = tDecode0 - exportStartMs
                                         val image = loadSource(EXPORT_MAX_EDGE_PX)
-                                        val tDecodeMs = System.currentTimeMillis() - tDecode0
+                                        phDecode = System.currentTimeMillis() - tDecode0
                                         if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
                                             // Export the decoded scene-linear INPUT (before the film
                                             // engine) as a 32-bit float TIFF; the engine is skipped.
@@ -1839,21 +1865,28 @@ class MainActivity : ComponentActivity() {
                                             } finally {
                                                 image.close()
                                             }
-                                            Diag.i(
-                                                "export phases ms: decode=$tDecodeMs simulate=0 grade=0 " +
-                                                    "encode=${System.currentTimeMillis() - tEnc0}"
-                                            )
+                                            phEnc = System.currentTimeMillis() - tEnc0
                                             null  // no rendered bitmap to preview
                                         } else {
                                             // Copy source EXIF; GPS only when opted in.
+                                            // A full EXIF read of a ~25 MB RAW plus two thread-pool
+                                            // hops — its own phase, not silently between two others.
+                                            val tExif0 = System.currentTimeMillis()
                                             val srcExif = withContext(Dispatchers.IO) { readSourceExif(ctx, sourceUri, keepGps = keepGps) }
+                                            phExif = System.currentTimeMillis() - tExif0
+                                            // `simulate` is the engine PLUS its JNI marshalling: the
+                                            // input close below, and the ~140 MB result malloc +
+                                            // NewDirectByteBuffer that spektra_jni.cpp performs AFTER
+                                            // it prints `stage timings`. So this always exceeds the
+                                            // sum of that line, and a gap of a few hundred ms is the
+                                            // expected null result, not a boundary problem.
                                             val tSim0 = System.currentTimeMillis()
                                             val res = try {
                                                 e.simulate(image, state.toParams())
                                             } finally {
                                                 image.close()
                                             }
-                                            val tSimMs = System.currentTimeMillis() - tSim0
+                                            phSim = System.currentTimeMillis() - tSim0
                                             try {
                                                 val tGrade0 = System.currentTimeMillis()
                                                 val bmp0 = simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
@@ -1862,7 +1895,7 @@ class MainActivity : ComponentActivity() {
                                                 val bmp = longEdge?.let { edge ->
                                                     scaleBitmapToLongEdge(bmp0, edge).also { if (it !== bmp0) bmp0.recycle() }
                                                 } ?: bmp0
-                                                val tGradeMs = System.currentTimeMillis() - tGrade0
+                                                phGrade = System.currentTimeMillis() - tGrade0
                                                 val tEnc0 = System.currentTimeMillis()
                                                 withContext(Dispatchers.IO) {
                                                     when (exportFmt) {
@@ -1872,10 +1905,7 @@ class MainActivity : ComponentActivity() {
                                                         else -> saveToGallery(ctx, bmp, exportFmt, exportOptions.jpegQuality, srcExif, displayName = baseName)
                                                     }
                                                 }
-                                                Diag.i(
-                                                    "export phases ms: decode=$tDecodeMs simulate=$tSimMs " +
-                                                        "grade=$tGradeMs encode=${System.currentTimeMillis() - tEnc0}"
-                                                )
+                                                phEnc = System.currentTimeMillis() - tEnc0
                                                 bmp
                                             } finally {
                                                 res.close()
@@ -1885,7 +1915,14 @@ class MainActivity : ComponentActivity() {
                                 }
                                 result.onSuccess { bmp ->
                                     bmp?.let { preview = it }
-                                    Diag.i("export format=${exportFmt.name} ok in ${System.currentTimeMillis() - exportStartMs}ms")
+                                    val totalMs = System.currentTimeMillis() - exportStartMs
+                                    val accounted = phSetup + phDecode + phExif + phSim + phGrade + phEnc
+                                    Diag.i(
+                                        "export phases ms: setup=$phSetup decode=$phDecode exif=$phExif " +
+                                            "simulate=$phSim grade=$phGrade encode=$phEnc " +
+                                            "residual=${totalMs - accounted} total=$totalMs"
+                                    )
+                                    Diag.i("export format=${exportFmt.name} ok in ${totalMs}ms")
                                     exportDone = true
                                     status = "saved to Pictures/Spektrafilm"
                                 }.onFailure {
