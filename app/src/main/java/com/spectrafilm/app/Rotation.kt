@@ -136,77 +136,121 @@ fun LinearImage.flippedHorizontal(): LinearImage {
     return flippedResult
 }
 
+// Below this many pixels a rotation is not worth spawning threads for; preview-scale
+// images stay single-threaded.
+private const val ROT_PARALLEL_MIN_PIXELS = 64_000L
+
+internal fun defaultRotWorkers(pixels: Long): Int =
+    if (pixels < ROT_PARALLEL_MIN_PIXELS) 1
+    else Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+
 /**
  * Return a new [LinearImage] rotated clockwise by [rotation]. [NONE] returns the input
  * unchanged (no copy). 90/270 swap width and height. Operates on the float view of the
  * native ByteBuffer.
+ *
+ * ## Why this is not the obvious per-pixel loop
+ *
+ * It used to be, and it cost **1155 ms** of a 12.5 MP export — a flat surcharge on ANY
+ * non-zero rotation. The device measurement that found it noted that 180 degrees costs
+ * exactly what 90 does even though 180 transposes nothing, which said the cost was the
+ * loop SHAPE rather than the geometry: every branch did three `FloatBuffer.get()` and
+ * three scattered indexed `put()` per pixel, single-threaded — ~75 M bounds-checked
+ * buffer operations at 12.5 MP. See `docs/research/perf-lab.md` §16.6.
+ *
+ * So source rows are read in BULK into a plain FloatArray (sequential, unchecked), and
+ * 180 — a pure reversal — writes its destination row in bulk too, with no scatter at
+ * all. Only 90/270 still scatter, because their destination is a column.
+ *
+ * ## Worker-count invariance
+ *
+ * Work is split by SOURCE row. For every rotation a source row maps to a distinct
+ * destination row (180) or column (90/270), so no two workers ever write the same output
+ * element and the result is byte-identical for any worker count — the same contract
+ * `kernels/parallel` holds natively. `RotationTest` asserts it 1-vs-8, exactly as the
+ * engine parity suite does with `SPK_NUM_THREADS`.
  */
-fun LinearImage.rotated(rotation: SourceRotation): LinearImage {
+fun LinearImage.rotated(rotation: SourceRotation): LinearImage =
+    rotatedWithWorkers(rotation, defaultRotWorkers(width.toLong() * height))
+
+internal fun LinearImage.rotatedWithWorkers(
+    rotation: SourceRotation,
+    workers: Int,
+): LinearImage {
     if (rotation == SourceRotation.NONE) return this
     val ch = 3
     val w = width
     val h = height
-    val src = data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+    val transposed = rotation == SourceRotation.CW90 || rotation == SourceRotation.CW270
+    val nw = if (transposed) h else w
+    val nh = if (transposed) w else h
+    val (outBuf, onClose) = allocRotBuf(nw * nh * ch)
+    val rowFloats = w * ch
 
-    fun newBuf(n: Int): Pair<ByteBuffer, ((ByteBuffer) -> Unit)?> = allocRotBuf(n)
-
-    // Each non-NONE branch allocates a fresh managed buffer; free the input afterwards so
-    // an off-heap full-res export source is reclaimed (no-op for managed inputs).
-    val rotated = when (rotation) {
-        SourceRotation.CW90 -> {
-            val nw = h
-            val nh = w
-            val (outBuf, onClose) = newBuf(nw * nh * ch)
-            val dst = outBuf.asFloatBuffer()
-            for (y in 0 until h) {
-                for (x in 0 until w) {
+    // Each worker takes its OWN buffer duplicates: a FloatBuffer's position is per-view,
+    // so sharing one across threads would corrupt the bulk transfers below.
+    fun runRows(y0: Int, y1: Int) {
+        val src = data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val dst = outBuf.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val row = FloatArray(rowFloats)
+        val out = FloatArray(rowFloats)
+        for (y in y0 until y1) {
+            src.position(y * rowFloats)
+            src.get(row, 0, rowFloats)
+            when (rotation) {
+                SourceRotation.CW180 -> {
+                    var x = 0
+                    while (x < w) {
+                        val s = x * ch
+                        val d = (w - 1 - x) * ch
+                        out[d] = row[s]; out[d + 1] = row[s + 1]; out[d + 2] = row[s + 2]
+                        x++
+                    }
+                    dst.position((h - 1 - y) * rowFloats)
+                    dst.put(out, 0, rowFloats)
+                }
+                SourceRotation.CW90 -> {
                     val nx = h - 1 - y
-                    val ny = x
-                    val s = (y * w + x) * ch
-                    val d = (ny * nw + nx) * ch
-                    dst.put(d, src.get(s))
-                    dst.put(d + 1, src.get(s + 1))
-                    dst.put(d + 2, src.get(s + 2))
+                    var x = 0
+                    while (x < w) {
+                        val s = x * ch
+                        val d = (x * nw + nx) * ch
+                        dst.put(d, row[s]); dst.put(d + 1, row[s + 1]); dst.put(d + 2, row[s + 2])
+                        x++
+                    }
                 }
-            }
-            LinearImage(outBuf, nw, nh, colorSpace, onClose = onClose)
-        }
-        SourceRotation.CW180 -> {
-            val (outBuf, onClose) = newBuf(w * h * ch)
-            val dst = outBuf.asFloatBuffer()
-            for (y in 0 until h) {
-                for (x in 0 until w) {
-                    val nx = w - 1 - x
-                    val ny = h - 1 - y
-                    val s = (y * w + x) * ch
-                    val d = (ny * w + nx) * ch
-                    dst.put(d, src.get(s))
-                    dst.put(d + 1, src.get(s + 1))
-                    dst.put(d + 2, src.get(s + 2))
+                SourceRotation.CW270 -> {
+                    var x = 0
+                    while (x < w) {
+                        val s = x * ch
+                        val d = ((w - 1 - x) * nw + y) * ch
+                        dst.put(d, row[s]); dst.put(d + 1, row[s + 1]); dst.put(d + 2, row[s + 2])
+                        x++
+                    }
                 }
+                SourceRotation.NONE -> {}  // unreachable: NONE returned at the top
             }
-            LinearImage(outBuf, w, h, colorSpace, onClose = onClose)
         }
-        SourceRotation.CW270 -> {
-            val nw = h
-            val nh = w
-            val (outBuf, onClose) = newBuf(nw * nh * ch)
-            val dst = outBuf.asFloatBuffer()
-            for (y in 0 until h) {
-                for (x in 0 until w) {
-                    val nx = y
-                    val ny = w - 1 - x
-                    val s = (y * w + x) * ch
-                    val d = (ny * nw + nx) * ch
-                    dst.put(d, src.get(s))
-                    dst.put(d + 1, src.get(s + 1))
-                    dst.put(d + 2, src.get(s + 2))
-                }
-            }
-            LinearImage(outBuf, nw, nh, colorSpace, onClose = onClose)
-        }
-        SourceRotation.NONE -> this  // unreachable: NONE returned at the top
     }
+
+    val n = workers.coerceIn(1, h)
+    if (n == 1) {
+        runRows(0, h)
+    } else {
+        val rowsPer = (h + n - 1) / n
+        val threads = ArrayList<Thread>(n - 1)
+        var start = rowsPer
+        while (start < h) {
+            val a = start
+            val b = minOf(start + rowsPer, h)
+            threads += Thread { runRows(a, b) }.also { it.start() }
+            start = b
+        }
+        runRows(0, minOf(rowsPer, h))       // the caller takes the first chunk
+        threads.forEach { it.join() }
+    }
+
+    val rotated = LinearImage(outBuf, nw, nh, colorSpace, onClose = onClose)
     close()
     return rotated
 }

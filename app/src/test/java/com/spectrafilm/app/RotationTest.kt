@@ -13,6 +13,7 @@ package com.spectrafilm.app
 import com.spectrafilm.engine.LinearImage
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Test
@@ -148,5 +149,86 @@ class RotationTest {
         assertEquals(SourceRotation.CW90, SourceRotation.fromDegrees(450))
         assertEquals(SourceRotation.CW270, SourceRotation.fromDegrees(-90))
         assertEquals(SourceRotation.CW270, SourceRotation.fromDegrees(-450))
+    }
+
+    // --- parallel rotation (perf-lab §16.6): the fast path must not move a byte ---
+
+    /** Deterministic pseudo-random image, so a mis-split row is not masked by flat data. */
+    private fun noiseImage(w: Int, h: Int): LinearImage {
+        val b = ByteBuffer.allocateDirect(w * h * 3 * 4).order(ByteOrder.nativeOrder())
+        val f = b.asFloatBuffer()
+        var s = 12345
+        for (i in 0 until w * h * 3) {
+            s = s * 1103515245 + 12345
+            f.put(i, ((s ushr 8) and 0xFFFF) / 65535f)
+        }
+        return LinearImage(b, w, h)
+    }
+
+    private fun floatsOf(img: LinearImage): FloatArray {
+        val f = img.data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val a = FloatArray(img.width * img.height * 3)
+        f.position(0)
+        f.get(a)
+        return a
+    }
+
+    /** The obvious per-pixel mapping this file used to do inline — the reference. */
+    private fun naiveRotate(src: FloatArray, w: Int, h: Int, r: SourceRotation): FloatArray {
+        val transposed = r == SourceRotation.CW90 || r == SourceRotation.CW270
+        val nw = if (transposed) h else w
+        val out = FloatArray(w * h * 3)
+        for (y in 0 until h) for (x in 0 until w) {
+            val nx: Int
+            val ny: Int
+            when (r) {
+                SourceRotation.CW90 -> { nx = h - 1 - y; ny = x }
+                SourceRotation.CW180 -> { nx = w - 1 - x; ny = h - 1 - y }
+                SourceRotation.CW270 -> { nx = y; ny = w - 1 - x }
+                SourceRotation.NONE -> { nx = x; ny = y }
+            }
+            val s = (y * w + x) * 3
+            val d = (ny * nw + nx) * 3
+            out[d] = src[s]; out[d + 1] = src[s + 1]; out[d + 2] = src[s + 2]
+        }
+        return out
+    }
+
+    private val quarterTurns =
+        listOf(SourceRotation.CW90, SourceRotation.CW180, SourceRotation.CW270)
+
+    @Test
+    fun rotation_isWorkerCountInvariant() {
+        // 300x250 = 75 000 px, above ROT_PARALLEL_MIN_PIXELS, so the default path is
+        // parallel too. Height 250 is not divisible by 8, which is where a row-split
+        // off-by-one would show.
+        for (r in quarterTurns) {
+            val one = floatsOf(noiseImage(300, 250).rotatedWithWorkers(r, 1))
+            val many = floatsOf(noiseImage(300, 250).rotatedWithWorkers(r, 8))
+            assertArrayEquals("$r: 1 worker vs 8 must be byte-identical", one, many, 0f)
+        }
+    }
+
+    @Test
+    fun rotation_matchesNaiveReference() {
+        // Deliberately non-square with prime-ish dimensions divisible by no worker count.
+        val w = 61
+        val h = 43
+        val src = floatsOf(noiseImage(w, h))
+        for (r in quarterTurns) {
+            for (workers in intArrayOf(1, 3, 8, 64)) {
+                val got = floatsOf(noiseImage(w, h).rotatedWithWorkers(r, workers))
+                assertArrayEquals("$r with $workers workers", naiveRotate(src, w, h, r), got, 0f)
+            }
+        }
+    }
+
+    @Test
+    fun defaultWorkers_isOneForPreviewScaleImages() {
+        // A preview render must not pay thread-spawn cost; a full-res export should.
+        assertEquals(1, defaultRotWorkers(6L))
+        assertEquals(1, defaultRotWorkers(63_999L))
+        val cpus = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+        assertEquals(cpus, defaultRotWorkers(12_500_000L))
     }
 }
