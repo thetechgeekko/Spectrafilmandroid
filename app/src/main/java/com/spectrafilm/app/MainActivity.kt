@@ -767,7 +767,23 @@ class MainActivity : ComponentActivity() {
             }
             // EXIF baseline (when applicable) first, then the user's manual rotate steps.
             val based = if (applyExifBaseline) img.applyExif(exif) else img
-            based.rotated(rotation).also {
+            // Rotation is a measured cost (perf-lab §16.6/§16.9), so it gets a permanent
+            // breadcrumb rather than a local patch every time someone re-measures it.
+            // Logged HERE and not inside rotated(): Diag wraps android.util.Log, which
+            // throws in a plain JVM unit test, and RotationTest exercises rotated()
+            // directly. Dimensions are read before the call because rotated() closes its
+            // input.
+            val rotW = based.width
+            val rotH = based.height
+            val rotT0 = if (rotation == SourceRotation.NONE) 0L else System.currentTimeMillis()
+            val rotatedImg = based.rotated(rotation)
+            if (rotation != SourceRotation.NONE) {
+                Diag.i(
+                    "rotate ms=${System.currentTimeMillis() - rotT0} angle=${rotation.degrees} " +
+                        "${rotW}x$rotH workers=${defaultRotWorkers(rotW.toLong() * rotH)}"
+                )
+            }
+            rotatedImg.also {
                 // Creative white balance: bake a pre-engine Bradford CAT into the linear input here
                 // (parity-free — engine/spektra-core is untouched). No-op when neutral; it's part of
                 // the decode-cache key so a change re-decodes, like raw temp/tint.

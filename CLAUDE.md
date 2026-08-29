@@ -149,6 +149,14 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
 - Current version: `versionCode 11` / `versionName 0.9.0`, `minSdk 24`, `targetSdk`/`compileSdk 34`.
   ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`.
 - Commit with `-c commit.gpgsign=false` (the signing server rejects signing here).
+- **A native-only edit may not rebuild through `:app:assembleDebug` alone.** Observed on
+  `:lib:libraw`: a changed `.cpp` produced `BUILD SUCCESSFUL in 6s` with a **stale**
+  `libsfraw.so`. `./gradlew :lib:libraw:assembleDebug --rerun-tasks` rebuilt it. Verify
+  the object actually changed before trusting an on-device measurement of it.
+- **Do not use `strings` to check a literal made it into a `.so`.** On the Windows /
+  Git-Bash toolchain it returns nothing for these libraries and so reports 0 matches for
+  strings that ARE present — it did this for the long-standing `decoded %dx%d` literal,
+  which is what exposed the tool rather than the build. Use `grep -ac '<literal>' lib.so`.
 - Release signing: drop `keystore.properties` (`storeFile`/`storePassword`/`keyAlias`/`keyPassword`)
   in the repo root; absent it, release falls back to debug signing.
 - Release `isMinifyEnabled = true` (R8 shrink via `proguard-rules.pro`: `-dontobfuscate` + JNI/enum
