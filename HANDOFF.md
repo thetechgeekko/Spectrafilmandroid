@@ -2,11 +2,11 @@
 
 ---
 
-## ORDER FOR THE DEVICE/LAPTOP SESSION (2026-08-29, head `cec55d4`)
+## ORDER FOR THE DEVICE/LAPTOP SESSION (2026-08-29, head `6dd2126`)
 
 *Written here because a cloud session cannot message another session directly — the
 credential is accepted for its own work but not for delivery. This file is the channel.
-Pull to `cec55d4` first.*
+Pull to `6dd2126` first — that commit is the one carrying this order.*
 
 ### Why task 1 is first
 
