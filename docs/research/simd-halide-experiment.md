@@ -73,6 +73,32 @@ symmetric but **not separable**, so a separable rewrite would change the rendere
 the schedule. Halide's win is therefore pure scheduling (vectorise x, parallel rows, tap loops
 as the serial inner dimensions).
 
+> **CORRECTION (2026-08-29). That paragraph is wrong, and the bench below ran in the wrong
+> regime.** Two errors, found when `tools/stage_split/` finally measured the *feature* rather
+> than a synthetic kernel (`perf-lab.md` §20):
+>
+> 1. **A shortcut does exist: FFT convolution.** "Not separable" rules out a separable
+>    rewrite, not every rewrite. FFT computes the *identical* operator (up to float rounding,
+>    ~1e-15 relative in f64 — eleven orders inside the 1e-4 bar) in O(n log n) instead of
+>    O(n·ks²), with **no change to the rendered look**. The claim above generalised from
+>    separability to all algorithms, and that step does not hold.
+> 2. **The benched kernels are 134x–163,456x smaller than the real ones.** This bench used
+>    `ks = 9, 17, 33`. Black Pro-Mist's actual kernel radius is
+>    `ceil(8 × bloom_max_lambda_um × scale / pixel_size_um)`, and `bloom_max_lambda_um` is
+>    `380 × 2.5 = 950` — so **`ks = 273` at the 640 px default preview and `ks = 1725` at a
+>    12 MP export**. Per channel that is 3.05e10 and 3.72e13 MACs against 2.27e8 for the
+>    largest case below.
+>
+> The direct-vs-FFT crossover is at **`ks ≈ 14–15`** at both resolutions. The cases below
+> straddle it; the shipping feature runs 20x–120x past it. So the 2–3x measured here is real
+> and correctly measured, but it is a scheduling win on a kernel size the feature never uses,
+> and it was then used to predict "Halide is worth wiring at ~2–3x if camera diffusion is big".
+> Camera diffusion turned out to be 98.2% of a render — and 2–3x on 30.7 s of preview is still
+> 10–15 s. **Fix the algorithm first (#160); schedule the result afterwards.**
+>
+> The ranking, all three layers measured on the same kernel: Halide scheduling **~2–3x**,
+> a GLSL compute port **~180x**, FFT **~12,600x**. See `vkdt-decision.md` §11.3.
+
 Host numbers, and this is where the framing matters:
 
 | case | scalar (`-march=native`, serial) | Halide serial | speedup | max_abs |
@@ -140,7 +166,9 @@ Read the result against the per-stage timings that now land in logcat (#146/#152
 
 - If **grain** is the big number on device → Highway is the lever, and it is *already*
   bit-identical, so it can land on the default path with the 38-gate suite as the only gate.
-- If **camera diffusion** is enabled and big → Halide is worth wiring, opt-in, at ~2–3×.
+- If **camera diffusion** is enabled and big → ~~Halide is worth wiring, opt-in, at ~2–3×.~~
+  **Superseded.** It is big — 98.2% of a render — but the correction above shows 2–3x is
+  nowhere near enough, and the kernel is 134x larger than anything benched here. #160 first.
 - If **halation** is the big number → **neither of these touches it.** Halation runs the *f64*
   exponential/Gaussian mixture (`kernels/exponential_filter.cpp`), where Highway gives two f64
   lanes on arm64 — exactly what `kernels/exp10.h` already delivers — and which this experiment
