@@ -73,6 +73,48 @@ private:
     std::vector<double> tw_;      // interleaved cos/-sin twiddles, n_/2 entries
 };
 
+// Real-input transform of length n (n a power of two, n >= 2), built on an
+// FftPlan of length n/2.
+//
+// A real sequence has a Hermitian spectrum, so only n/2 + 1 bins are independent
+// and the other half is redundant. Exploiting that halves BOTH the spectrum
+// storage and the transform work, which is the whole point: fft_convolve's
+// scratch is the binding constraint on how large a transform it can afford, and
+// a larger transform is what makes a big kernel cheap (see its overlap-save
+// notes).
+//
+// Method: pack the even and odd samples as the real and imaginary parts of a
+// half-length complex sequence, transform that, then untangle the two
+// interleaved spectra. Costs one complex FFT of length n/2 plus an O(n) fixup
+// instead of a complex FFT of length n.
+//
+// Deterministic on the same terms as FftPlan: fixed order, precomputed twiddles,
+// no reduction. forward() and inverse() are exact inverses up to rounding, with
+// inverse() NOT scaled -- apply inverse_scale() once, as with FftPlan.
+class RfftPlan {
+public:
+    RfftPlan() = default;
+    explicit RfftPlan(int n);
+
+    int size() const { return n_; }
+    // Number of complex bins produced: n/2 + 1.
+    int bins() const { return n_ / 2 + 1; }
+
+    // real[n_] -> spectrum[2 * bins()] interleaved re/im. Buffers must not alias.
+    void forward(const double* real_in, double* spectrum_out) const;
+    // spectrum[2 * bins()] -> real[n_]. Unscaled; multiply by inverse_scale().
+    // The input spectrum is READ-ONLY (an internal scratch copy is made), so a
+    // caller may reuse a shared kernel spectrum across many inverse transforms.
+    void inverse(const double* spectrum_in, double* real_out) const;
+
+    double inverse_scale() const { return half_.size() > 0 ? 1.0 / n_ : 1.0; }
+
+private:
+    int n_ = 0;
+    FftPlan half_;              // length n_/2
+    std::vector<double> tw_;    // exp(-2*pi*i*k/n_) for k in [0, n_/2], interleaved
+};
+
 // Smallest power of two >= v (v >= 1).
 int fft_next_pow2(int v);
 

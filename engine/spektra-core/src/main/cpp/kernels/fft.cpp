@@ -97,4 +97,115 @@ void FftPlan::run(double* data, bool inverse) const {
 void FftPlan::forward(double* data) const { run(data, /*inverse=*/false); }
 void FftPlan::inverse(double* data) const { run(data, /*inverse=*/true); }
 
+
+// ---------------------------------------------------------------------------
+// RfftPlan — real-input transform via a half-length complex one.
+//
+// THE DERIVATION, because the fixup is where this goes wrong silently.
+//
+// Let M = n/2 and z[k] = x[2k] + i*x[2k+1] for k in [0, M). One complex FFT of
+// length M gives Z = FFT_M(z), which holds the two interleaved spectra mixed
+// together. Writing E for the DFT of the even samples and O for the odd:
+//
+//     A = Z[k mod M],  B = conj(Z[(M-k) mod M])
+//     E[k] = (A + B) / 2
+//     O[k] = (A - B) / (2i)            == (A - B) * (-i/2)
+//     X[k] = E[k] + exp(-2*pi*i*k/n) * O[k],   k in [0, M]
+//
+// Checks that catch a sign slip immediately: at k = 0 the twiddle is 1 and
+// X[0] = Re(Z[0]) + Im(Z[0]) = sum(even) + sum(odd) = sum(x); at k = M the
+// twiddle is -1 and X[M] = sum(even) - sum(odd), the Nyquist bin. Both are real,
+// as they must be.
+//
+// The inverse runs it backwards. Using X[M-k]'s conjugate and the identity
+// conj(W_{M-k}) = -W_k:
+//
+//     conj(X[M-k]) = E[k] - W_k * O[k]
+//  => E[k] = (X[k] + conj(X[M-k])) / 2
+//     O[k] = conj(W_k) * (X[k] - conj(X[M-k])) / 2
+//     Z[k] = E[k] + i * O[k]
+//
+// then z = IFFT_M(Z) and x[2k] = Re(z[k]), x[2k+1] = Im(z[k]).
+// ---------------------------------------------------------------------------
+
+RfftPlan::RfftPlan(int n) : n_(n) {
+    if (n_ < 2) { n_ = 2; }
+    const int m = n_ / 2;
+    half_ = FftPlan(m);
+    tw_.resize(static_cast<size_t>(m + 1) * 2);
+    for (int k = 0; k <= m; ++k) {
+        const double a = -2.0 * M_PI * static_cast<double>(k) / static_cast<double>(n_);
+        tw_[static_cast<size_t>(k) * 2 + 0] = std::cos(a);
+        tw_[static_cast<size_t>(k) * 2 + 1] = std::sin(a);
+    }
+}
+
+void RfftPlan::forward(const double* real_in, double* spectrum_out) const {
+    const int m = n_ / 2;
+    // z[k] = x[2k] + i*x[2k+1], transformed in place in the caller's output
+    // buffer's first 2*m doubles (it has 2*(m+1), so there is room).
+    std::vector<double> z(static_cast<size_t>(m) * 2);
+    for (int k = 0; k < m; ++k) {
+        z[static_cast<size_t>(k) * 2 + 0] = real_in[2 * k];
+        z[static_cast<size_t>(k) * 2 + 1] = real_in[2 * k + 1];
+    }
+    half_.forward(z.data());
+
+    for (int k = 0; k <= m; ++k) {
+        const int ka = k % m;
+        const int kb = (m - k) % m;
+        const double ar = z[static_cast<size_t>(ka) * 2 + 0];
+        const double ai = z[static_cast<size_t>(ka) * 2 + 1];
+        const double br =  z[static_cast<size_t>(kb) * 2 + 0];
+        const double bi = -z[static_cast<size_t>(kb) * 2 + 1];   // conj
+
+        const double er = 0.5 * (ar + br);
+        const double ei = 0.5 * (ai + bi);
+        // (A - B) * (-i/2)
+        const double dr = ar - br, di = ai - bi;
+        const double orr =  0.5 * di;
+        const double oi = -0.5 * dr;
+
+        const double wr = tw_[static_cast<size_t>(k) * 2 + 0];
+        const double wi = tw_[static_cast<size_t>(k) * 2 + 1];
+
+        spectrum_out[static_cast<size_t>(k) * 2 + 0] = er + (wr * orr - wi * oi);
+        spectrum_out[static_cast<size_t>(k) * 2 + 1] = ei + (wr * oi + wi * orr);
+    }
+}
+
+void RfftPlan::inverse(const double* spectrum_in, double* real_out) const {
+    const int m = n_ / 2;
+    std::vector<double> z(static_cast<size_t>(m) * 2);
+    for (int k = 0; k < m; ++k) {
+        const double xr = spectrum_in[static_cast<size_t>(k) * 2 + 0];
+        const double xi = spectrum_in[static_cast<size_t>(k) * 2 + 1];
+        const double yr =  spectrum_in[static_cast<size_t>(m - k) * 2 + 0];
+        const double yi = -spectrum_in[static_cast<size_t>(m - k) * 2 + 1];  // conj
+
+        const double er = 0.5 * (xr + yr);
+        const double ei = 0.5 * (xi + yi);
+        const double dr = 0.5 * (xr - yr);
+        const double di = 0.5 * (xi - yi);
+
+        // O[k] = conj(W_k) * (X[k] - conj(X[M-k]))/2
+        const double wr =  tw_[static_cast<size_t>(k) * 2 + 0];
+        const double wi = -tw_[static_cast<size_t>(k) * 2 + 1];   // conj(W_k)
+        const double orr = wr * dr - wi * di;
+        const double oi = wr * di + wi * dr;
+
+        // Z[k] = E[k] + i*O[k]
+        z[static_cast<size_t>(k) * 2 + 0] = er - oi;
+        z[static_cast<size_t>(k) * 2 + 1] = ei + orr;
+    }
+    half_.inverse(z.data());
+    // half_.inverse is unscaled; the caller applies inverse_scale() == 1/n_, and
+    // the half-length transform needs 1/m == 2/n_. Fold the factor-of-2
+    // difference in here so the caller's single 1/n_ is correct.
+    for (int k = 0; k < m; ++k) {
+        real_out[2 * k]     = 2.0 * z[static_cast<size_t>(k) * 2 + 0];
+        real_out[2 * k + 1] = 2.0 * z[static_cast<size_t>(k) * 2 + 1];
+    }
+}
+
 }  // namespace spk

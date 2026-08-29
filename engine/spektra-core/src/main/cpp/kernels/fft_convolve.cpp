@@ -32,12 +32,19 @@
  * therefore take one transform and no tiling at all.
  *
  * ---------------------------------------------------------------------------
- * WHY NOT REAL-TO-COMPLEX. A r2c transform would halve both memory and time, and
- * this is the obvious next optimisation. It is deliberately not done here: the
- * first landing is a correctness-and-determinism exercise held to a tolerance
- * against the direct loop, and a c2c transform keeps the index algebra above
- * plainly readable. The same applies to packing two of the three channels into
- * one complex transform.
+ * REAL-TO-COMPLEX. Both the image tile and the kernel are real, so their spectra
+ * are Hermitian and only n/2 + 1 of the n columns are independent. Storing and
+ * transforming just those halves BOTH the scratch and the work versus a complex
+ * transform. That matters more than a plain 2x: scratch is what caps the
+ * transform size, and transform size is what makes a large kernel cheap. At
+ * n = 2048 the two spectra cost ~67 MB instead of ~134 MB.
+ *
+ * The row pass is kernels/fft.h's RfftPlan (real n -> n/2+1 complex bins, one
+ * half-length complex FFT plus an O(n) fixup); the column pass is an ordinary
+ * complex FFT of length n over each of the n/2 + 1 kept columns.
+ *
+ * Still on the table: packing two of the three channels into one complex
+ * transform, which would take three channel-passes down to two.
  */
 #include "kernels/fft_convolve.h"
 
@@ -52,35 +59,49 @@
 namespace spk {
 namespace {
 
-// 2D in-place transform of an N x N interleaved-complex plane: all rows, then all
-// columns. Each row/column transform is independent and touches only its own
-// line, so the parallel split cannot change any result -- the determinism
-// contract survives for any worker count.
-void fft2(double* buf, int n, const FftPlan& plan, bool inverse) {
-    parallel_for(0, n, [&](int lo, int hi) {
-        for (int y = lo; y < hi; ++y) {
-            double* row = buf + static_cast<size_t>(y) * n * 2;
-            if (inverse) plan.inverse(row); else plan.forward(row);
-        }
-    });
-    // Columns: gather into a contiguous scratch line, transform, scatter back.
-    // The gather/scatter is what makes the column pass cache-tolerable; a
-    // transform striding by n*2 doubles directly is dramatically slower.
-    parallel_for(0, n, [&](int lo, int hi) {
+// Column pass over the kept n/2+1 columns of an r2c spectrum. Each column is an
+// independent complex transform of length n, gathered into a contiguous scratch
+// line and scattered back -- striding the transform through the spectrum directly
+// is dramatically slower. Independent per column, so the parallel split cannot
+// change any result and the determinism contract survives for any worker count.
+void columns(double* spec, int n, int bins, const FftPlan& plan, bool inverse) {
+    parallel_for(0, bins, [&](int lo, int hi) {
         std::vector<double> col(static_cast<size_t>(n) * 2);
-        for (int x = lo; x < hi; ++x) {
-            for (int y = 0; y < n; ++y) {
-                const size_t s = (static_cast<size_t>(y) * n + x) * 2;
-                col[static_cast<size_t>(y) * 2 + 0] = buf[s + 0];
-                col[static_cast<size_t>(y) * 2 + 1] = buf[s + 1];
+        for (int c = lo; c < hi; ++c) {
+            for (int r = 0; r < n; ++r) {
+                const size_t s = (static_cast<size_t>(r) * bins + c) * 2;
+                col[static_cast<size_t>(r) * 2 + 0] = spec[s + 0];
+                col[static_cast<size_t>(r) * 2 + 1] = spec[s + 1];
             }
             if (inverse) plan.inverse(col.data()); else plan.forward(col.data());
-            for (int y = 0; y < n; ++y) {
-                const size_t s = (static_cast<size_t>(y) * n + x) * 2;
-                buf[s + 0] = col[static_cast<size_t>(y) * 2 + 0];
-                buf[s + 1] = col[static_cast<size_t>(y) * 2 + 1];
+            for (int r = 0; r < n; ++r) {
+                const size_t s = (static_cast<size_t>(r) * bins + c) * 2;
+                spec[s + 0] = col[static_cast<size_t>(r) * 2 + 0];
+                spec[s + 1] = col[static_cast<size_t>(r) * 2 + 1];
             }
         }
+    });
+}
+
+// Real n x n plane -> r2c spectrum (n rows x bins complex).
+void forward2(const double* plane, double* spec, int n, int bins,
+              const RfftPlan& rp, const FftPlan& cp) {
+    parallel_for(0, n, [&](int lo, int hi) {
+        for (int r = lo; r < hi; ++r)
+            rp.forward(plane + static_cast<size_t>(r) * n,
+                       spec + static_cast<size_t>(r) * bins * 2);
+    });
+    columns(spec, n, bins, cp, /*inverse=*/false);
+}
+
+// r2c spectrum -> real n x n plane. Unscaled; the caller applies 1/(n*n).
+void inverse2(double* spec, double* plane, int n, int bins,
+              const RfftPlan& rp, const FftPlan& cp) {
+    columns(spec, n, bins, cp, /*inverse=*/true);
+    parallel_for(0, n, [&](int lo, int hi) {
+        for (int r = lo; r < hi; ++r)
+            rp.inverse(spec + static_cast<size_t>(r) * bins * 2,
+                       plane + static_cast<size_t>(r) * n);
     });
 }
 
@@ -114,52 +135,58 @@ bool fft_convolve_same(const double* padded, int pw, int ph,
     const int n = fft_convolve_transform_size(w, h, ks, max_transform);
     if (n < ks + 1) return false;
     const int block = n - ks + 1;                        // exact outputs per tile
-    const size_t plane = static_cast<size_t>(n) * n * 2;
+    const int bins  = n / 2 + 1;                         // kept Hermitian columns
+    const size_t spec_sz  = static_cast<size_t>(n) * bins * 2;
+    const size_t plane_sz = static_cast<size_t>(n) * n;
 
-    std::vector<double> kbuf, tbuf;
+    std::vector<double> kspec, tspec, plane;
     try {
-        kbuf.assign(plane, 0.0);
-        tbuf.assign(plane, 0.0);
+        kspec.assign(spec_sz, 0.0);
+        tspec.assign(spec_sz, 0.0);
+        plane.assign(plane_sz, 0.0);
     } catch (const std::bad_alloc&) {
         return false;                                    // caller falls back
     }
 
-    const FftPlan plan(n);
+    const RfftPlan rp(n);
+    const FftPlan  cp(n);
 
     // Kernel spectrum: kern at the ORIGIN (see the derivation above), zero elsewhere.
     for (int i = 0; i < ks; ++i)
         for (int j = 0; j < ks; ++j)
-            kbuf[(static_cast<size_t>(i) * n + j) * 2] =
+            plane[static_cast<size_t>(i) * n + j] =
                 kern[static_cast<size_t>(i) * ks + j];
-    fft2(kbuf.data(), n, plan, /*inverse=*/false);
+    forward2(plane.data(), kspec.data(), n, bins, rp, cp);
 
-    const double scale = plan.inverse_scale() * plan.inverse_scale();  // 1/(n*n)
+    // Two unscaled inverse transforms are applied per tile (columns, then rows),
+    // each wanting 1/n.
+    const double scale = 1.0 / (static_cast<double>(n) * static_cast<double>(n));
 
     for (int y0 = 0; y0 < h; y0 += block) {
         for (int x0 = 0; x0 < w; x0 += block) {
             // Load the n x n input window at (y0, x0). Rows/cols past the padded
             // plane are zero; they only ever feed outputs beyond (h, w), which are
             // discarded below.
-            std::fill(tbuf.begin(), tbuf.end(), 0.0);
+            std::fill(plane.begin(), plane.end(), 0.0);
             const int rows = std::min(n, ph - y0);
             const int cols = std::min(n, pw - x0);
             parallel_for(0, rows, [&](int lo, int hi) {
                 for (int i = lo; i < hi; ++i) {
                     const double* src =
                         padded + static_cast<size_t>(y0 + i) * pw + x0;
-                    double* dst = tbuf.data() + static_cast<size_t>(i) * n * 2;
-                    for (int j = 0; j < cols; ++j) dst[j * 2] = src[j];
+                    double* dst = plane.data() + static_cast<size_t>(i) * n;
+                    for (int j = 0; j < cols; ++j) dst[j] = src[j];
                 }
             });
 
-            fft2(tbuf.data(), n, plan, /*inverse=*/false);
+            forward2(plane.data(), tspec.data(), n, bins, rp, cp);
 
             // Pointwise complex multiply by the kernel spectrum.
             parallel_for(0, n, [&](int lo, int hi) {
                 for (int i = lo; i < hi; ++i) {
-                    double* t = tbuf.data() + static_cast<size_t>(i) * n * 2;
-                    const double* k = kbuf.data() + static_cast<size_t>(i) * n * 2;
-                    for (int j = 0; j < n; ++j) {
+                    double* t = tspec.data() + static_cast<size_t>(i) * bins * 2;
+                    const double* k = kspec.data() + static_cast<size_t>(i) * bins * 2;
+                    for (int j = 0; j < bins; ++j) {
                         const double ar = t[j * 2], ai = t[j * 2 + 1];
                         const double br = k[j * 2], bi = k[j * 2 + 1];
                         t[j * 2]     = ar * br - ai * bi;
@@ -168,21 +195,19 @@ bool fft_convolve_same(const double* padded, int pw, int ph,
                 }
             });
 
-            fft2(tbuf.data(), n, plan, /*inverse=*/true);
+            inverse2(tspec.data(), plane.data(), n, bins, rp, cp);
 
             // Exact outputs live at [ks-1 + i][ks-1 + j] for i,j in [0, block).
             const int ny = std::min(block, h - y0);
             const int nx = std::min(block, w - x0);
             parallel_for(0, ny, [&](int lo, int hi) {
                 for (int i = lo; i < hi; ++i) {
-                    const double* src =
-                        tbuf.data() +
-                        (static_cast<size_t>(ks - 1 + i) * n + (ks - 1)) * 2;
+                    const double* src = plane.data() +
+                        static_cast<size_t>(ks - 1 + i) * n + (ks - 1);
                     double* dst = out + (static_cast<size_t>(y0 + i) * w + x0) *
                                             out_stride + out_offset;
                     for (int j = 0; j < nx; ++j)
-                        dst[static_cast<size_t>(j) * out_stride] =
-                            src[static_cast<size_t>(j) * 2] * scale;
+                        dst[static_cast<size_t>(j) * out_stride] = src[j] * scale;
                 }
             });
         }

@@ -1826,6 +1826,52 @@ exactly the configuration benchmarked. A user flipping the toggle gets this.
 `camera_diffusion` defaults off, and zero slots are skipped — so the stage has been
 invisible in every measurement this project has taken.
 
+### 20.3b FIXED: FFT convolution, then a real-to-complex transform
+
+The repair landed in two steps, both computing the **same sum** as the direct loop rather
+than approximating it (`551c57f`, then the r2c pass).
+
+**Step 1 — FFT.** `kernels/fft_convolve` replaces the O(w·h·ks²) loop with an
+overlap-save transform. The derivation is in the file header; the part that matters is
+that substituting `p = ks-1-i` turns the flipped-kernel correlation into a linear
+convolution read at offset `ks-1`, which is why the kernel sits at the **origin** of the
+transform and not at its centre — centring would translate the image by `radius` and look
+plausible while being wrong.
+
+**Step 2 — real-to-complex.** Both the tile and the kernel are real, so their spectra are
+Hermitian and only `n/2 + 1` of the `n` columns are independent. Keeping just those halves
+the scratch *and* the work. That matters more than the 2× suggests: scratch is what caps
+the transform size, and transform size is what makes a large kernel cheap.
+
+| side | direct | FFT (c2c) | FFT (r2c) |
+|---|---|---|---|
+| 640 | 30653 | 429 | **175** |
+| 768 | 66376 | 2619 | **828** |
+| 1024 | — | 3005 | **1129** |
+| 1536 | — | 8185 | **4270** |
+
+Best-of-3 on the same run, which is the honest same-methodology comparison (this host is
+shared and single-rep times swing; the *ratio* is stable across both methodologies):
+
+> **640px preview: 17663 ms → 194.7 ms. 90.7×.**
+
+`max_abs` against the direct loop is ~1e-13 on values of order 300 — about 1e-15 relative,
+eleven orders inside the 1e-4 bar — and both paths stay byte-identical across worker
+counts. Gated by `tests/test_fft_convolve.cpp` (single transform, genuine overlap-save
+tiling with partial edge tiles, a kernel wider than the image, 1-vs-8 equality).
+
+**The transform-size cap is measurement-backed, and it survived the r2c change.** Bigger
+is not automatically better: at 1536px, cap 4096 is *slower* than cap 2048 — 16.1 s vs
+7.6 s on c2c, and still 5.8 s vs 2.3 s on r2c — because one 4096 transform costs the same
+flops as four 2048s but four times the memory traffic, and the column pass is
+memory-bound. `SPK_DIFFUSION_FFT=0/1` and `SPK_DIFFUSION_FFT_MAX` expose both knobs for
+on-device A/B.
+
+**What is left.** At 12 MP the kernel is `ks = 1725`, so a 2048 transform yields a usable
+block of only 324 and needs 130 tiles — the export is bounded by tiling efficiency, not by
+the transform. Packing two of the three channels into one complex transform (three channel
+passes → two) is the next cheap win.
+
 ### 20.4 It is a faithful port, which makes it a parity decision
 
 `model/diffusion.cpp`'s header says it mirrors `spektrafilm/model/diffusion.py`'s
