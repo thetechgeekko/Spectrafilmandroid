@@ -1451,6 +1451,70 @@ should be read as evidence that it worked.
 So the live targets are `dcraw_process` at 2750 ms and `grade` at ≤655 ms. Neither needs
 a GPU and neither touches a golden.
 
+### 17.4 The grade half, measured: 650 → 159 ms
+
+Three exports on `e82e10c`:
+
+```
+  grade  BEFORE (0ee3319)   632  643  655  663    median ~650 ms
+  grade  AFTER  (e82e10c)   156  159  164         median  159 ms
+                                                  4.1x, -490 ms
+```
+
+Correctness was checked on device as well as by `PackToArgbTest` — the render was
+visually identical to the pre-fix one, with no channel swap and no banding. A packing
+bug would have been loud.
+
+**And the ladder is refined rather than refuted.** §16.9 concluded "reads cost nothing"
+from A→D. That was over-general, and this run bounds it. The correct statement:
+
+> When the **write** side is pathological, the read side is masked.
+
+In the rotation transpose the per-element scattered writes cost ~1145 ms, so removing
+the reads changed nothing measurable — variant D. In `simResultToBitmap` the writes are
+a sequential `IntArray` fill with **no scatter at all**, so nothing masks the reads, and
+they turn out to have been ~490 ms of the ~650. Same physics, opposite visibility.
+
+That is why the fix here was read-side only and needed no threading: there was nothing
+else in the way.
+
+### 17.5 #159 closed — the tally, and what is left
+
+| | before | after |
+|---|---|---|
+| rotation | 1155 ms | **~40 ms** |
+| grade | 650 ms | **159 ms** |
+
+**~1.6 s off a 12.5 MP export, none of it parity-gated and none of it needing a GPU.**
+End to end the export went from ~14.4 s when this work started to **~12.2 s**.
+
+Where it stands now (medians, rotated 90 so decode carries the ~40 ms):
+
+| | ms | share | |
+|---|---|---|---|
+| `simulate` | 8150 | 66.9% | the engine — parity-gated, the hard one |
+| `decode` | 3647 | 29.9% | of which `process` 2760 = 77% of decode |
+| `encode` | 216 | 1.8% | settled |
+| `grade` | 159 | 1.3% | was 650 |
+| `setup`/`exif`/`residual` | 16 | 0.1% | |
+
+The decode phases held steady across all three runs, confirming `e82e10c` disturbed
+nothing: `fileread` 119/140/137, `unpack` 42/46/46, `process` 2745/2760/2786, `memimg`
+96/94/99, `copy` 223/222/225, `adapt` 4/5/5, `colour` 61/63/63.
+
+**What is left, and it is lopsided:**
+
+- **`simulate` 8150 ms** — the engine. Parity-gated, and the only genuinely hard one.
+- **`process` 2760 ms** — `dcraw_process`. The #158 decision: OpenMP (no pixel changes,
+  but a runtime dependency and a thread-count policy) or `user_qual` (faster, but it
+  moves pixels, so it is a quality call).
+- **`copy` 223 ms** — the last cheap one, and worth naming: it is the *same shape* as
+  the grade loop that just gave 4.1× — a scalar per-pixel pass over 12.5 M pixels with
+  no scatter — except it is already native, so it is not even fighting the JVM. Small,
+  but after grade it should not be assumed optimal.
+- **`unaccounted` 287 ms** inside decode — `open_buffer`, the `result.rgb` allocation
+  and the JNI marshalling.
+
 ## Running it
 
 ```bash
