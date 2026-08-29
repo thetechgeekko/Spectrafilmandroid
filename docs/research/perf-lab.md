@@ -544,10 +544,58 @@ output bit** is a vectorised MT19937 block generator. `uniform()` at 4.11 ns aga
 1.69 ns raw word says the distribution wrapper is already thin; the win would come
 from the generation itself.
 
-**Unmeasured, and stated as a hypothesis, not a result.** It needs the same treatment
-everything else here got: a standalone probe that proves byte-identical output against
-`std::mt19937` first, then a number. That probe is the next thing worth building, and
-it is a much better use of effort than a library swap the arithmetic already rules out.
+### The probe was built. The hypothesis is WRONG — recorded, not buried.
+
+`tools/perf_lab/mt_probe.cpp`. It proves byte-identity first and only then reports a
+number, because the f64 lever on this branch was removed precisely for having done
+that in the other order.
+
+**Both proofs passed.** The scalar transcription matches `std::mt19937` over 10 M
+words with 0 diffs; the SIMD twist matches it over 10 M words with 0 diffs; and
+Poisson samples drawn through the SIMD engine are **identical over 200 000
+mixed-λ draws**. The bit-exactness claim is real: the twist's 227-word dependency
+distance does allow an intra-state vectorisation that changes nothing.
+
+**And it buys nothing where it matters.**
+
+```
+std::mt19937 word            1.76 ns/word
+SIMD twist, scalar temper    1.27 ns/word   1.38x
+SIMD twist + SIMD temper     1.14 ns/word   1.55x   <- the generator IS faster
+
+uniform(), std engine        4.37 ns   = 2.48 engine words + wrapper
+uniform(), SIMD engine       4.17 ns   1.05x        <- and it stops there
+SIMD engine word alone       1.25 ns   -> wrapper costs 1.68 ns/draw
+
+fast_poisson_one(lam=29)  std 145.82 ns  vs  SIMD 157.00 ns   (0.93x)
+```
+
+A 1.55× on raw words became **1.05× on `uniform()`**, and the sampler measured
+between 0.93× and 1.08× across runs — i.e. **noise**. No win.
+
+**Why the model was wrong.** §12 assumed a `uniform()` draw is essentially two engine
+words, so a faster word would carry most of the way. It is not:
+`std::uniform_real_distribution<double>` costs **1.68 ns per draw on top of its two
+words** — roughly **40% of every draw**, and that share does not shrink when the words
+do. Amdahl, applied one layer lower than the analysis had looked.
+
+**One mistake worth naming**, because it nearly produced a wrong answer in the other
+direction: the probe's first shape tempered per word inside `next()`, so the block
+bench read 1.97× while the sampler read **0.81× — slower**. The vectorised temper only
+counts if the sampler actually goes through it. Handing words out of a pre-tempered
+buffer fixed the shape; the honest verdict did not change.
+
+### What this leaves
+
+The residual finding is sharper than the hypothesis it replaced: **the distribution
+wrapper, not the generator, is ~40% of every uniform draw** — about 50 ns of a 146 ns
+Poisson sample at 30 draws. `generate_canonical<double, 53>` has a defined formula, so
+inlining it to produce the identical doubles is a real bit-exact target and a bigger
+one than the engine words ever were. It is also stdlib-implementation-shaped, which
+makes it a different kind of risk; it is not attempted here.
+
+**The ordered recommendation below is unchanged by this result** — affinity is still
+the measured 1.58×, and the export finding is still worth more than any of it.
 
 ### What to do now, in order
 
@@ -556,7 +604,9 @@ it is a much better use of effort than a library swap the arithmetic already rul
 2. **Isolate the export finding** (§11): 4m46s + SIGKILL on main vs 13.85 s here. If
    it is foreground-vs-background, #153's foreground service is worth more than any
    kernel work on this list.
-3. **Probe the vectorised MT19937** — byte-identity first, speed second.
+3. ~~Probe the vectorised MT19937~~ — **done, and it is a no**: bit-identical
+   (0 diffs over 10 M words and 200 k samples) but 1.05× on `uniform()` and noise on
+   the sampler, because the distribution wrapper is 40% of a draw.
 4. Leave OpenCV out of the render path.
 
 ## Running it
