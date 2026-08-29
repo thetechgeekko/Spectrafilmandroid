@@ -122,6 +122,17 @@ struct DiffusionFilterParams {
 // `pixel_size_um` converts the image-plane µm widths to pixels. No-op (image left
 // untouched) when params.active is false, strength<=0, spatial_scale<=0, or the
 // derived p_s<=0 — exactly mirroring spektrafilm.model.diffusion.apply_diffusion_filter_um.
+// Observability for the FFT convolution path (see diffusion.cpp). Counts the
+// renders where the cost model chose the FFT but the transform buffers could not
+// be allocated, so the stage silently ran the direct O(w*h*ks^2) loop instead --
+// correct output, but potentially ~100x slower with nothing in the timing to say
+// so. Read it after any measurement of this stage, and especially after changing
+// SPK_DIFFUSION_FFT_MAX: a nonzero count means the number you just measured is
+// the DIRECT path, not the transform size you thought you were testing.
+// Process-global and monotonic; reset it yourself around a measurement.
+unsigned long long diffusion_fft_fallbacks();
+void diffusion_reset_fft_fallbacks();
+
 void apply_diffusion_filter_um(double* raw, int w, int h,
                                const DiffusionFilterParams& params,
                                double pixel_size_um);

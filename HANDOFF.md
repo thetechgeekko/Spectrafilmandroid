@@ -48,7 +48,13 @@ printed slots up.
 ### 4. #119 wizard
 
 Unblocked. The stale "Scan film" instruction is fixed — the control is **"Slide mode
-(skip print)"** under Simulation → Scanner.
+(skip print)"**, the last row of Simulation → **Output** (below "Saving CCTF encoding",
+`MainActivity.kt:3197`). An earlier revision of this line said Simulation → Scanner,
+which is wrong. Black Pro-Mist is "Camera diffusion filter", last row of the **Film**
+sub-tab.
+
+**Do not run the wizard yet if it would record slide-route rows** — see the flat-render
+bug below.
 
 ### STAY ON RELEASE, and this is not a formality
 

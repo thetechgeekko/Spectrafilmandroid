@@ -37,10 +37,26 @@
 
 namespace spk {
 
-// Default cap on the square transform size. Bounds scratch memory at
-// 2 * N^2 * 16 bytes (two interleaved-complex f64 planes): 134 MB at N = 2048.
-// Raising it makes large-kernel cases markedly faster (fewer, better-filled
+// Default cap on the square transform size. Scratch is two interleaved-complex
+// f64 spectra of N x (N/2+1) plus one N x N real plane:
+//
+//     2 * N*(N/2+1)*2*8  +  N*N*8   bytes
+//
+// = 100.7 MB at N = 2048 and 402.8 MB at N = 4096 (it grows 4x per doubling).
+// An earlier revision of this comment quoted 134 / 537 MB; that was the formula
+// from BEFORE the real-to-complex change, which dropped the spectra from N x N
+// to N x (N/2+1) columns. Measure from the assign() calls in fft_convolve_same,
+// not from this comment.
+//
+// Raising the cap makes large-kernel cases markedly faster (fewer, better-filled
 // tiles) at quadratic memory cost -- see fft_convolve.cpp's overlap-save notes.
+// READ THIS FIRST if you are tempted to raise it: an allocation failure here is
+// NOT an error. fft_convolve_same catches bad_alloc and returns false, and every
+// caller then runs the DIRECT O(w*h*ks^2) loop instead -- which for Black
+// Pro-Mist at 12 MP is the ~10.9-hour path this file exists to remove. So a cap
+// that does not fit the device's free memory does not fail loudly; it silently
+// reverts to the worst case. Raise it only together with a way to observe that
+// fallback (spk::diffusion_fft_fallbacks in model/diffusion.h).
 constexpr int kFftConvMaxTransform = 2048;
 
 // `padded` is the reflect-padded plane, (h + ks - 1) rows by (w + ks - 1) cols
