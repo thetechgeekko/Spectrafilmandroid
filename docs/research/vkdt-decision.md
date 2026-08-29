@@ -353,3 +353,129 @@ debug `-O0` bug (`perf-lab.md` §19). The decoder is no longer where the time is
 PPG or VNG are materially faster. It moves pixels, so it is a quality call and it sits
 outside the parity gate — the same shape of decision as §9, and about a 5% prize. It is
 recorded, not recommended.
+
+## 11. DECIDED: our own 81-band GLSL shaders, vkdt as the architecture guide
+
+Owner's call, 2026-08-29: **route three.** Keep our 81-band / 5 nm grid, keep our grain
+model, keep the parity gate; write our own compute shaders, using vkdt's module graph as
+the design reference rather than adopting its code. §9 supports it — 44 bands costs
+visible print-route accuracy for a speedup that does not apply to the largest stage.
+
+One thing this decision inherits for free: `gpu/scan_spectral.comp` **is already an
+81-band shader** (`#define NB 81`). The route does not start from zero.
+
+### 11.1 What GLSL does to each effect
+
+Answering the owner's question directly — what happens to the effects if we go GLSL.
+
+| stage | shape | GLSL verdict |
+|---|---|---|
+| `scan` spectral integral | per-pixel, 81-band loop, no cross-pixel reads | **already written**, `scan_spectral.comp`. Needs on-device numeric validation, not new code. |
+| `filming_expose` | per-pixel + LUT fetches | same shape as `scan`. Straightforward. |
+| `develop` | per-pixel curve interpolation | trivial — a texture fetch. |
+| `dir_couplers` | per-pixel + a diffusion blur | fine; the blur is the easy part. |
+| `halation` | separable Gaussian + IIR exponential | Gaussian is two passes, textbook. The IIR is a serial recurrence **along** a row, which is bad per-row but there are thousands of rows — parallelise across rows, standard technique. |
+| `lens_blur` | Gaussian | trivial. |
+| `glare_field` | field build, 30 ms today | trivial. |
+| **`grain`** | **per-pixel but wildly divergent** | **the problem child — see 11.2.** |
+| **`camera_diffusion`** | **direct 2D convolution, O(n²)** | **GLSL does not save it — see 11.3.** |
+
+### 11.2 Grain: the divergence problem, and why we happen to be allowed to fix it
+
+§20.5 of `perf-lab.md` measured grain's cost varying ~100x with scene content, because
+`fast_binomial_one` degenerates into an O(n) CDF-inversion walk near maximum density.
+
+On a CPU that is a load-balancing problem, and `grain.cpp` already solves it with dynamic
+block scheduling off an atomic counter. **On a GPU it is much worse**: a subgroup executes
+in lockstep, so if one lane needs ten thousand CDF iterations and the other sixty-three
+need five, all sixty-four pay for the worst. Divergent per-lane work is the single worst
+shape for a compute shader, and grain is the most divergent thing in the engine.
+
+The saving grace is specific to this stage: **grain's parity gate is already statistical.**
+`test_grain` and `test_grain_sublayer` check mean preservation and noise standard deviation
+against committed references — not bytes. So a branch-free reformulation (widen the normal
+approximation's domain, or bound the CDF walk) is checkable by the gate that already
+exists. Grain is the one stage where we have that freedom, and it is exactly the stage
+that needs it.
+
+### 11.3 Black Pro-Mist: the algorithm matters ~70x more than the language
+
+The cost model is derived from the source (`bloom_max_lambda_um = 380 x 2.5 = 950 µm`,
+`radius = ceil(8 x bloom_max_lambda_um x scale / pixel_size_um)`, `ks = 2r+1`, cost =
+`n_pixels x ks² x 3`) and **validated against all four measured points**, which come back
+at a constant 2.85–3.01e9 MAC/s — under 5% spread:
+
+| side | radius | MACs | measured | implied rate |
+|---|---|---|---|---|
+| 192 | 41 | 7.62e8 | 253 ms | 3.01e9 |
+| 384 | 82 | 1.20e10 | 4108 ms | 2.93e9 |
+| 640 | 136 | 9.16e10 | 30653 ms | 2.99e9 |
+| 768 | 163 | 1.89e11 | 66376 ms | 2.85e9 |
+
+At a 12 MP export (3060x4080) the radius is **862** and `ks` is **1725**:
+
+| | 12 MP Pro-Mist |
+|---|---|
+| operations | 1.115e14 MACs |
+| host CPU, measured rate | **10.9 hours** |
+| mobile GPU in GLSL, brute force (~5e11 MAC/s) | **223 seconds** |
+| the same operator via FFT | **~18 ms** |
+
+**GLSL buys ~180x. The algorithm buys ~12,600x.** Porting the direct convolution to a
+compute shader takes an eleven-hour export to a four-minute one, which is still two orders
+of magnitude off a 1–2 s target. Pro-Mist has to be re-derived as an FFT convolution or a
+sum of IIR passes (#160) **whether or not it goes to the GPU**. Doing both makes it free;
+doing only the shader does not make it usable.
+
+This generalises, and it is the main thing to take from the exercise: **GLSL is a constant
+factor. It does not change complexity class.** Every stage above is O(n) or O(n·k) with
+small k, which is why they all port cleanly — and `camera_diffusion` is the one that is
+not, which is why it is the one GLSL cannot rescue.
+
+### 11.4 Three things GLSL costs us, and what to do about each
+
+**1. Precision — fp32, and there is no fp64 to fall back on.** Mobile GPUs either lack the
+`Float64` capability or run it at 1/16–1/32 rate. Our CPU path accumulates the spectral
+integral in `double`, and `scan_spectral.comp`'s own header already concedes the point:
+*"PREVIEW-ONLY / non-bit-exact by design (GPU float != the f64 oracle path)."*
+
+The budget works out, though, and this is worth stating precisely rather than fearing:
+accumulating 81 fp32 terms carries roughly `√81 × 2⁻²⁴ ≈ 5e-7` relative error against a
+tolerance of `1e-4` — about 100x of headroom. **The risk is not the accumulation, it is the
+transcendentals**: GLSL specifies `pow`/`exp2` only to a vendor-defined ULP bound, and the
+integral calls `pow(10.0, -D)` once per band. That must be **measured on real hardware per
+vendor**, not assumed. fp16 is not an option for this kernel — an 11-bit mantissa is
+~5e-4 relative, which exceeds the tolerance on its own.
+
+**2. Determinism — keep it by construction, not by hope.** Our contract is byte-identical
+output across worker counts. `scan_spectral.comp` satisfies it: every pixel is independent,
+there is no cross-lane reduction, and the 81-term accumulation runs in a fixed order inside
+one invocation. That is a **design rule to keep**, and it is precisely where vkdt's
+`filmsim.glsl` would have hurt us — it reduces with `subgroupAdd`, whose summation order
+depends on `gl_SubgroupSize` and therefore varies by GPU vendor (§8). So: **no
+`subgroupAdd`, no atomics in the numeric path, no shared-memory reductions with
+unspecified order.** Fixed reduction trees if a reduction is unavoidable.
+
+What we cannot keep is byte-equality *with the CPU path*. The GPU contract has to become
+"within parity tolerance of the CPU reference", with byte-equality retained only
+GPU-to-GPU on the same device.
+
+**3. CI cannot run it.** All 38 gates compile with host g++; GitHub runners have no GPU.
+A software Vulkan implementation (Mesa **lavapipe**, or SwiftShader) would give a
+deterministic, GPU-free CI leg that actually executes the SPIR-V — the shaders are already
+compiled to `.spv` and embedded as `_spv.inc`, so the pieces exist. **Untested — nobody has
+tried this here**, and it needs a spike before anyone counts on it.
+
+### 11.5 The order this implies
+
+1. **Validate `scan_spectral.comp` numerically on real hardware.** It exists, it is 81-band,
+   and its accuracy against the CPU reference has never been measured on an arm64 GPU. That
+   is the cheapest possible first GPU result and it de-risks every later shader.
+2. **Measure GPU vs CPU on `scan` at export resolution** (§5) — still the unknown that
+   sizes everything.
+3. **Fix `camera_diffusion`'s algorithm** (#160) — on the CPU first, where the parity suite
+   can see it. It is a parity/product decision and it does not need the GPU.
+4. **Then port the O(n) stages** in contiguous runs, not one at a time: each isolated stage
+   pays an upload + download, which is the round-trip cost §6 named as the real thing a node
+   graph fixes.
+5. **Grain last**, with the branch-free reformulation, against its statistical gate.
