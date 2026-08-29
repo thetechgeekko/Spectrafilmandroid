@@ -734,6 +734,70 @@ correct `spk_big_core_count()` when off. Stated honestly, that scenario gates th
 **plumbing**, not the pinning — on a homogeneous host `detect_big_cores` returns 0
 and the pin is a no-op, so placement can only be observed on a big.LITTLE device.
 
+## 14. The gate itself was measured — CI tested a build nobody installs
+
+§11 removed the Highway f64 tier because a byte-equality claim established at `-O2`
+did not survive the shipping flags. That finding named a second, larger problem in
+passing and then left it open: **the same is true of the entire parity suite.**
+
+| | flags | who compiles it |
+|---|---|---|
+| CI `engine-parity` | `-O2` | `.github/workflows/ci.yml` |
+| CI `engine-native` | `-O2` | same |
+| debug APK | `-O2 -g` | `CMakeLists.txt` (pinned deliberately, so timings mean something) |
+| **release APK** | **`-O3 -ffast-math -fno-finite-math-only`** | `CMAKE_CXX_FLAGS_RELEASE` |
+
+`CMakeLists.txt` calls this "the documented divergence". It was named in three
+places and measured in none. Every parity number this project has ever quoted
+describes a binary that only developers run.
+
+### The measurement
+
+The full 38-test table, recompiled at the shipping flags:
+
+```
+SPK_PARITY_EXTRA_FLAGS="-O3 -ffast-math -fno-finite-math-only" \
+  bash tools/parity/run_engine_parity.sh
+```
+
+**`engine-parity: ALL OK` — 38/38, zero `FAIL` lines.** The release configuration
+sits inside the oracle band.
+
+### Two controls, because a green null result is worthless without them
+
+A passing run is also what you get when the experiment silently did not happen, so
+both failure modes were ruled out before the result was believed:
+
+1. **Do the flags reach the compiler?** The same channel, fed `-fspektra-not-a-real-flag`,
+   produces `g++: error: unrecognized command-line option` and `engine-parity: BUILD
+   FAILURES`. It reaches `g++`.
+2. **Does `-O3` beat the script's own earlier `-O2`?** `test_half` built both ways:
+   different SHA-256, and **706 232 vs 588 520 bytes** — 20% more code, which is what
+   `-O3` inlining and unrolling look like. Materially different codegen, not a no-op.
+
+### What this does and does not establish
+
+- It establishes the **band** (`max_abs ≤ 1e-4`, `rms ≤ 1e-5`) at the shipping flags.
+- It does **not** establish byte-equality between the `-O2` and `-O3` builds. `-ffast-math`
+  reassociates; §11 measured that divergence at 1.1e-16. The byte-identity gates
+  (`test_parallel`) compare a build against itself, so they are unaffected — but
+  cross-optimisation-level byte-identity was never claimed and is still not claimed.
+- It is **host x86-64 g++**. The shipping engine is **NDK clang on arm64**. This closes
+  the *flags* half of the gap; the *toolchain and architecture* half is untested, and
+  `CLAUDE.md` already says bit-exactness is not expected across architectures.
+
+### What was built in response
+
+`engine-parity` is now a two-leg matrix — the same 38 tests at `-O2` and at the
+shipping flags — with `fail-fast: false` so one leg cannot mask the other. The first
+leg keeps its exact old check name, since that is what any branch protection refers
+to. The local runner already supported the second leg through
+`SPK_PARITY_EXTRA_FLAGS`; its header now documents the recipe, because a runner that
+advertises itself as mirroring CI should say when a plain run does not.
+
+The cost is one extra parallel runner for ~13 minutes per push. The thing it protects
+is the prime directive.
+
 ## Running it
 
 ```bash

@@ -72,8 +72,26 @@ jobs:
   # independent of any Python/oracle. Grain tests are statistical and run locally.
   # ---------------------------------------------------------------------------
   engine-parity:
-    name: Engine parity (deterministic goldens)
+    name: Engine parity (${{ matrix.label }})
     runs-on: ubuntu-latest
+    # The engine SHIPS at -O3 -ffast-math -fno-finite-math-only (CMakeLists.txt
+    # CMAKE_CXX_FLAGS_RELEASE), but this gate only ever compiled at -O2, so the
+    # numerics of the binary users actually install were never checked against
+    # the oracle. That gap is not hypothetical: a Highway f64 tier's byte-equality
+    # "proof" was established at -O2 and did not survive the shipping flags,
+    # because -ffast-math reassociates the scalar reference itself. Both legs now
+    # run the same 38-test table. Keep the first label verbatim -- it is the
+    # check name any branch protection refers to.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "deterministic goldens"
+            opt: "-O2"
+          - label: "shipping release flags"
+            opt: "-O3 -ffast-math -fno-finite-math-only"
+    env:
+      SPK_OPT: ${{ matrix.opt }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,7 +109,7 @@ jobs:
           fail=0
           build_run() { # name, binary-args...
             local name="$1"; shift
-            g++ -std=c++17 -O2 -pthread -I. -I"$GITHUB_WORKSPACE/tools/parity" $DEF \
+            g++ -std=c++17 $SPK_OPT -pthread -I. -I"$GITHUB_WORKSPACE/tools/parity" $DEF \
               "tests/$name.cpp" $SRC -o "/tmp/$name"
             echo "::group::$name"
             # Capture the TEST's exit code (PIPESTATUS[0], not tee's). The `if`

@@ -8,6 +8,16 @@
 #
 # Usage:  tools/parity/run_engine_parity.sh [build_dir]
 # Env:    JOBS=<n>   parallel compile jobs (default: CPU count)
+#
+# NOTE: a plain run reproduces the workflow's -O2 leg only. CI runs the same 38
+# tests TWICE, the second at the flags the engine actually ships with. To
+# reproduce that leg locally (measured green, and 20% larger codegen, so it is a
+# genuinely different binary rather than a no-op):
+#
+#   SPK_PARITY_EXTRA_FLAGS="-O3 -ffast-math -fno-finite-math-only" \
+#     bash tools/parity/run_engine_parity.sh
+#
+# The flags land after this script's own -O2, and the last -O wins.
 set -uo pipefail
 shopt -s nullglob
 
