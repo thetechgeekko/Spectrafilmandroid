@@ -1129,6 +1129,29 @@ All four are gone now. Dropping the **read** is what disarms the recipes already
 disk — all 33 on the device still carry `previewMaxSize: 640`. The decisive control
 was a source with no saved recipe: `decode kind=PHOTO 383x510 maxEdge=1019`, honoured.
 
+### 16.5 Two unexamined knobs on the 5093 ms, found by reading the build
+
+Not measured — read from source, and stated as leads rather than findings.
+
+**LibRaw is built without OpenMP.** `lib/libraw/src/main/cpp/CMakeLists.txt` mentions
+`USE_ZLIB`, `USE_JPEG`, `USE_DNGSDK`, `USE_RAWSPEED` — and OpenMP nowhere. LibRaw
+parallelises demosaic and several other loops only when built with it, so on an
+8-core phone the decode is very likely running **single-threaded**. This is the safer
+lever of the two: LibRaw's OpenMP paths are per-pixel deterministic, so it should be
+output-identical, which makes it a pure win if it works. It costs linking libomp on
+the NDK.
+
+**`user_qual` is never set**, so LibRaw's default interpolation applies — AHD, one of
+the slower ones. Unlike threading this is **not free**: changing the demosaic changes
+the decoded image, therefore the engine's input, therefore the output. It is a
+quality/performance trade for the owner to make with pictures in front of him, not a
+silent optimisation. Worth measuring what the alternatives cost and look like; not
+worth changing quietly.
+
+Neither is parity-gated in the oracle sense — the goldens feed the engine fixed RGB,
+so the decoder sits upstream of the gate entirely. That is exactly why it has escaped
+attention for this long.
+
 ### 16.4 #146's preview offload is a null result, across a 16× range
 
 Six renders per config, fresh process and recipe-free source each time, GPU
