@@ -28,6 +28,18 @@ if (NOT CMAKE_CXX_FLAGS_RELEASE)
     set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 endif ()
 
+# DEBUG BUILDS MUST STILL BE OPTIMISED. CMake's default CMAKE_CXX_FLAGS_DEBUG is
+# "-g" with NO -O flag, i.e. -O0. For the per-row filter and
+# deflate-feed loops that is several times slower than the shipping build.
+# This mirrors the guard in engine/spektra-core/src/main/cpp/CMakeLists.txt.
+# Without it every on-device timing taken from a debug APK measures the compiler
+# rather than the code. The same missing flag in lib:libraw was worth 6.6x on
+# SM-S948W (3616 ms debug vs 546 ms release to decode one 12 MP frame), which is
+# how it was found. Release here is -O2, so debug and release now match.
+if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g")
+endif ()
+
 add_library(sfpng SHARED
         png_writer.cpp
         png_writer_jni.cpp

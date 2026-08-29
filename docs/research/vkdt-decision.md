@@ -3,47 +3,56 @@
 *Owner asked for this after the export profile came in. It is a decision document,
 not a plan — nothing here is committed to or started.*
 
+> **Renumbered 2026-08-29.** The first version of this document was costed against a
+> **debug** export (12189 ms), before it was discovered that three of the four native
+> modules compiled at `-O0` in debug (`perf-lab.md` §19). Every figure below is now the
+> **release** measurement. The conclusion did not change — it got sharper: the engine is
+> **88%** of a release export, not 67%.
+
 GPLv3 throughout. Film modeling powered by spektrafilm (GPLv3).
 
 ## 1. Why the question is live now, and what changed
 
 For most of this project the performance work looked inside the engine because the
-engine is what the parity gate covers. The export profile ended that: **67% is the
-engine, 29% is the decoder, and 4% was everything else** — and that last 4% has now
-been taken (`docs/research/perf-lab.md` §17.5, ~1.6 s recovered, none of it
-parity-gated, none of it needing a GPU).
+engine is what the parity gate covers. The export profile ended that — and once the
+debug `-O0` bug was fixed and the same export was measured on a **release** build, it
+ended it far more decisively than the first reading suggested.
 
-So the cheap work is done. What is left, on a 12.5 MP export:
+On a 12.5 MP export, release build, SM-S948W:
 
 ```
-  simulate   8150 ms   66.9%    the engine — parity-gated
-  process    2760 ms   22.6%    dcraw_process, inside decode
-  copy        223 ms    1.8%
-  unaccounted 287 ms    2.4%    inside decode
-  rest       ~770 ms    6.3%    fileread, unpack, memimg, grade, encode, adapt, colour
+  simulate       5504 ms   88.0%    the engine — parity-gated
+  decode          546 ms    8.7%    of which dcraw_process 325
+  everything else 171 ms    2.7%    encode, setup, exif, residual
+  grade            30 ms    0.5%
   ------------------------------
-  total     12189 ms
+  total          6251 ms
 ```
 
 The target is 1–2 s. **That is the whole reason this question exists**: no arrangement
-of the non-engine work reaches it.
+of the non-engine work reaches it. On these numbers that is not an argument, it is
+subtraction — see §2.
 
 ## 2. The arithmetic a rewrite would have to beat
 
-Take the most favourable honest case for staying put — OpenMP lands well and `process`
-drops 4×, `copy` and the unaccounted 287 ms both get the same treatment `grade` just
-got:
+The favourable case for staying put no longer needs constructing, because the
+unfavourable-to-the-CPU case is now trivial. **Delete decode, grade and encode
+entirely** — not optimise them, delete them, a bound no implementation can beat:
 
 ```
-  simulate   8150 ms    unchanged — CPU
-  process     690 ms    optimistic 4x from OpenMP
-  everything else ~900 ms
+  simulate   5504 ms    unchanged — CPU
+  everything else 0 ms  the impossible best case
   -------------------
-  total     ~9740 ms
+  total      5504 ms
 ```
 
-**~9.7 s, and 84% of it is the engine.** Incremental CPU work cannot reach 1–2 s, and
-this is not a close call. Either the engine moves to the GPU or the target moves.
+**5.5 s, against a 1–2 s target, with the entire rest of the pipeline free.** Incremental
+CPU work outside the engine cannot reach the target under *any* assumption; there is no
+close call left to make. Either the engine moves to the GPU or the target moves.
+
+This also retires #158 as a lever: OpenMP on `dcraw_process` (325 ms) is worth ~160 ms
+at an ideal 2×, i.e. 2.6% of the export. It is landed and it stays, but it is not part
+of any route to 1–2 s.
 
 That is the strongest form of the case for a GPU pipeline, and it is a real one.
 
@@ -99,15 +108,25 @@ Vulkan compute host, already validated, already shipping behind a toggle.
 
 The decisive experiment is **one stage, at export resolution**:
 
-- **grain — 3384 ms, 42% of the engine.** The largest single stage, and the one whose
-  parity gate (`test_grain`, `test_grain_sublayer`) is **already statistical** — mean
-  and noise-std against a committed reference, not bytes. So a GPU implementation can be
+- **grain — 42% of the engine.** The largest single stage, and the one whose parity
+  gate (`test_grain`, `test_grain_sublayer`) is **already statistical** — mean and
+  noise-std against a committed reference, not bytes. So a GPU implementation can be
   validated by the gate that already exists rather than needing a new contract.
-- halation (1905 ms) is second and is a separable IIR blur, the classic GPU shape.
+- **halation — 23%** — second, and a separable IIR blur, the classic GPU shape.
 
-If GPU grain at 12.5 MP comes back at 10×, the engine is 8150 → ~5100 ms and the rewrite
-case is overwhelming. If it comes back at 2×, the case collapses, because a full rewrite
-buys maybe 2× on 67% of the export and costs months.
+Those two shares were measured inside the debug engine (3384 ms and 1905 ms of 8150).
+The engine was the one module already compiling at `-O2` in debug, so the *shares* are
+meaningful; the absolute times are not, and scaling them by the engine's 1.48x
+debug→release ratio assumes that ratio is uniform across stages, which nobody has
+checked. Treat "grain is ~40% of the engine" as the finding and re-measure the
+milliseconds on release before sizing anything against them.
+
+**The decision rule, on release numbers.** If GPU grain at 12.5 MP comes back at 10×,
+the engine goes 5504 → ~3100 ms — still not 1–2 s, but it proves the GPU delivers on
+this hardware for this shape of work, and a full-pipeline rewrite becomes the obvious
+route. If it comes back at 2×, grain drops to ~1150 ms, the engine to ~4300 ms, and the
+rewrite case collapses: a whole-engine 2× on 88% of the export lands at ~3.5 s, months
+of work for less than half the target.
 
 **We do not currently know which.** That is the whole decision, and it costs one stage
 to find out.
@@ -117,9 +136,11 @@ to find out.
 Recorded honestly, and flagging where this needs primary-source verification rather than
 recollection.
 
-**Would fix.** A node-graph GPU pipeline puts demosaic on the GPU, which is the 2760 ms
-`dcraw_process`. It also removes the CPU↔GPU round trips that a partial offload pays,
-which is a real cost our incremental path keeps re-paying.
+**Would fix.** A node-graph GPU pipeline puts demosaic on the GPU — though on release
+that is `dcraw_process` at 325 ms, 5% of the export, so this is a rounding error, not a
+reason. The real thing it fixes is that it removes the CPU↔GPU round trips a partial
+offload pays, which is a cost our incremental path keeps re-paying on every stage it
+moves. That argument stands on its own and does not depend on the decoder at all.
 
 **Would not fix.** It does not answer §5's question either — it *assumes* the answer.
 Adopting vkdt is a bet that GPU grain, GPU halation and GPU DIR-couplers are fast, made

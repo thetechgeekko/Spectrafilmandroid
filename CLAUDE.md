@@ -153,6 +153,14 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
   `:lib:libraw`: a changed `.cpp` produced `BUILD SUCCESSFUL in 6s` with a **stale**
   `libsfraw.so`. `./gradlew :lib:libraw:assembleDebug --rerun-tasks` rebuilt it. Verify
   the object actually changed before trusting an on-device measurement of it.
+- **Never size a performance lever from a debug APK, and state the build type on every
+  timing.** Debug and release differ by ~2x overall but *unevenly per module*: an export
+  measured 12189 ms debug / 6251 ms release, while `decode` inside it went 3647 → 546.
+  The cause was that `CMAKE_CXX_FLAGS_DEBUG` defaults to `-g` with **no `-O`** (i.e.
+  `-O0`), and only the engine's CMakeLists guarded against it. All four native modules
+  now carry `if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O") set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g")`
+  — keep it when editing them. An uneven debug→release ratio *across modules* means
+  per-module compiler flags, not slow code. (`docs/research/perf-lab.md` §19.)
 - **Do not use `strings` to check a literal made it into a `.so`.** On the Windows /
   Git-Bash toolchain it returns nothing for these libraries and so reports 0 matches for
   strings that ARE present — it did this for the long-standing `decoded %dx%d` literal,

@@ -1028,6 +1028,12 @@ Either way the next run decides it, which is the point of writing it down first.
 > variable, which inflated `decode` from 3616 ms to 5093 ms. The corrected split, and
 > the 1155 ms rotation surcharge that explains the gap, are in §16.6. The table is
 > kept because the reconciliations and the encode result stand.
+>
+> **Second, larger correction: every absolute number in §16 and §17 is a DEBUG-BUILD
+> number.** Three of the four native modules were compiling at `-O0` in debug. See
+> §19 for the release figures, which are 2-8x smaller and change which levers matter.
+> The *ratios within* a build (rotation 1155 -> 40, grade 650 -> 159) still stand;
+> the *shares of the export* do not.
 
 
 The device came back and the run completed. Same RAW, 3060x4080, Ultra HDR / Q100 /
@@ -1367,6 +1373,12 @@ it is — but a few stage timers overlap or double-count by ~0.3-0.9%, and the
 
 ## 17. Both answers: the transpose holds, and decode is 77% demosaic
 
+> **DEBUG-BUILD NUMBERS.** Same correction as §16: `lib:libraw` compiled at `-O0` in
+> debug, so "`decode` 3647 ms, of which `process` 2760 = 77%" is a measurement of the
+> compiler as much as of the code. On release `decode` is 546 ms and `process` is
+> 325 ms. The *finding* — that decode is demosaic, not I/O — survives; its *size* does
+> not. See §19.
+
 ### 17.1 #159 — the tiled transpose works, and the surcharge is gone
 
 | angle | `rotate ms` | vs the original 1126 ms |
@@ -1479,6 +1491,10 @@ That is why the fix here was read-side only and needed no threading: there was n
 else in the way.
 
 ### 17.6 #158, first lever: OpenMP enabled
+
+> **The sizing below is wrong by ~8.5x** — it is stated against the debug `process` of
+> 2760 ms. On release `dcraw_process` is 325 ms, so an ideal 2x is ~160 ms of a 6251 ms
+> export, not a lever. The change itself is correct and stays landed. See §19.3.
 
 Owner's call was OpenMP first, and it is the right order — it is the one of the two
 that **changes no pixel**, so it can be verified rather than judged.
@@ -1621,9 +1637,10 @@ both things at the point of use, so neither reading recurs.
 
 ### The measurement this demands, before any GPU work
 
-One export per effect, at full resolution, each enabled alone:
+One export per effect, at full resolution, each enabled alone — **on a release build**,
+per §19; a debug ladder would measure `-O0` differences between effects:
 
-1. baseline (all off) — the control, ~12.2 s
+1. baseline (all off) — the control, ~6.3 s on release
 2. **Black Pro-Mist** on
 3. **lens blur** on
 4. **glare** on (print route)
@@ -1632,6 +1649,112 @@ One export per effect, at full resolution, each enabled alone:
 
 Only then is there a profile that describes what users actually run — and only then can
 GPU targets be chosen from evidence rather than from the subset that happened to be on.
+
+## 19. CORRECTION: every number above was a DEBUG build, and three modules were at -O0
+
+This is the largest correction in this dossier, and it invalidates the *sizing* of most
+of §15-§18 while leaving almost all of the *findings* intact. It came from the device
+session re-running the same export on a **release** APK.
+
+### 19.1 The two builds, same RAW, same settings
+
+| phase | debug | release | ratio |
+|---|---|---|---|
+| **total** | 12189 | **6251** | 1.95x |
+| `simulate` | 8150 | **5504** | 1.48x |
+| `decode` | 3647 | **546** | 6.68x |
+| — of which `process` | 2760 | **325** | 8.49x |
+| `grade` | 159 | **30** | 5.3x |
+| everything else | 232 | **171** | — |
+
+("Everything else" is `encode` + `setup` + `exif` + `residual`, taken as the remainder
+`6251 - 5504 - 546 - 30`; the release run reported the three named phases and the total,
+not a separate encode figure, so it is not split further here.)
+
+The engine moved 1.48x. Decode moved 6.68x. That spread is not R8 (R8 does not touch
+native code) and it is not `-O3` vs `-O2` (that is worth tens of percent, not 6.7x).
+
+### 19.2 The cause, found by reading the four CMakeLists
+
+`engine/spektra-core/src/main/cpp/CMakeLists.txt` has carried this since the engine's
+own debug-timing scare:
+
+```cmake
+if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g")
+endif()
+```
+
+**The other three native modules did not.** `lib/libraw`, `lib/tiffwriter` and
+`lib/pngwriter` all set `CMAKE_CXX_FLAGS_RELEASE` and said nothing about debug — so
+CMake's default `CMAKE_CXX_FLAGS_DEBUG` of `-g` applied, which carries **no `-O` flag at
+all, i.e. `-O0`**. The engine was the only module that was optimised in a debug APK.
+1.48x is the engine going `-O2` -> `-O3 -ffast-math`; 6.68x is decode going `-O0` ->
+`-O3`. The uneven ratio column is the diagnosis.
+
+Fixed by copying the engine's guard into all three. Proven by control rather than by
+inspection — configuring `lib/tiffwriter` for `Debug` twice, with and without the guard:
+
+```
+with:     CXX_FLAGS = -O2 -g -std=gnu++17 -fPIC
+without:  CXX_FLAGS = -g -std=gnu++17 -fPIC
+```
+
+(Note `CMakeCache.txt` still shows `CMAKE_CXX_FLAGS_DEBUG:STRING=-g` either way — the
+guard is a directory-scope `set()` that shadows the cache entry. Read `flags.make`, not
+the cache, when checking this.)
+
+### 19.3 What this does to #158, and the honest sizing
+
+The OpenMP work landed in `a184bf5` is still correct: 43 `#pragma omp` in LibRaw were
+inert, they are now live, the probe degrades safely. But **its justification in that
+commit message and in §17.6 was sized against 2760 ms, a number ~8.5x too large.**
+
+On release, `dcraw_process` is **325 ms**. An ideal 2x from OpenMP on the demosaic is
+therefore worth about **160 ms of a 6251 ms export — 2.6%.** That is worth keeping (it
+is already landed and costs nothing at runtime) but it is not a lever, and #158 should
+not be described as one.
+
+The same deflation applies to the rest of the non-engine work. The rotation transpose
+and the grade rewrite were real and are kept — but "~1.6 s off the export" was ~1.6 s
+off a *debug* export. On release the whole of `decode + grade + encode` is 776 ms.
+
+### 19.4 What survives, and it is the part that matters
+
+Every *directional* finding holds, because both builds ranked the phases the same way:
+
+- decode is demosaic, not I/O (`process` is 60% of release decode, was 77% of debug)
+- the rotation surcharge was traversal + scatter, and the tiled transpose removes it
+- `grade` was a JVM per-pixel loop and the bulk rewrite fixed it
+- the byte-identity and parity guarantees are untouched — none of this changed a pixel
+
+And the one number that got *more* decisive:
+
+| release | ms | share |
+|---|---|---|
+| **`simulate`** | **5504** | **88.0%** |
+| `decode` | 546 | 8.7% |
+| everything else | 171 | 2.7% |
+| `grade` | 30 | 0.5% |
+
+**On the build users actually run, the engine is 88% of an export.** Every CPU-side
+micro-optimisation left outside the engine is fighting over 12% of 6.3 s. The 1-2 s
+target cannot be reached from there under any assumption — even deleting decode, grade
+and encode entirely leaves 5.5 s. This is the strongest evidence yet for the GPU
+direction, and it was produced by a build-flag bug that had been hiding it.
+
+### 19.5 The method rule this adds
+
+§15.5 already said to record the variables. This adds one that is cheaper and blunter:
+
+> **Never compare a measurement to a target across build types, and never size a lever
+> from a debug number.** State the build type on every timing in this document. If a
+> phase ratio between two builds is wildly uneven across modules, suspect per-module
+> compiler flags before suspecting the code.
+
+Both prior contaminations in this dossier (the rotated source in §16, the debug build
+here) were unrecorded *variables*, not wrong *measurements*. The instrument was fine
+both times.
 
 ## Running it
 

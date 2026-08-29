@@ -34,6 +34,18 @@ if (NOT CMAKE_CXX_FLAGS_RELEASE)
     set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 endif ()
 
+# DEBUG BUILDS MUST STILL BE OPTIMISED. CMake's default CMAKE_CXX_FLAGS_DEBUG is
+# "-g" with NO -O flag, i.e. -O0. For LibRaw's demosaic and colour
+# loops that is several times slower than the shipping build.
+# This mirrors the guard in engine/spektra-core/src/main/cpp/CMakeLists.txt.
+# Without it every on-device timing taken from a debug APK measures the compiler
+# rather than the code, and the two builds are not comparable: on SM-S948W the
+# same 12 MP frame decoded in 3616 ms on debug and 546 ms on release. Most of
+# that gap is this missing flag (a residual remains: release is -O3, debug -O2).
+if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g")
+endif ()
+
 # --------------------------------------------------------------------------
 # Pinned LibRaw release.
 # --------------------------------------------------------------------------
