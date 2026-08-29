@@ -9,7 +9,7 @@
 # Usage:  tools/parity/run_engine_parity.sh [build_dir]
 # Env:    JOBS=<n>   parallel compile jobs (default: CPU count)
 #
-# NOTE: a plain run reproduces the workflow's -O2 leg only. CI runs the same 38
+# NOTE: a plain run reproduces the workflow's -O2 leg only. CI runs the same 39
 # tests TWICE, the second at the flags the engine actually ships with. To
 # reproduce that leg locally (measured green, and 20% larger codegen, so it is a
 # genuinely different binary rather than a no-op):
@@ -58,6 +58,7 @@ TESTS=(
   "test_small_preview_aa|$ASSET|$G/small_preview_aa|tests/small_preview_aa_input_rgb.f64|$G"
   "test_diffusion|$G"
   "test_diffusion_e2e|$ASSET|$G/scan_diffusion|tests/scan_portra_input_rgb.f64|$G"
+  "test_fft_convolve"
   "test_spectral_blur_e2e|$ASSET|$G/scan_spectral_blur|tests/scan_portra_input_rgb.f64|$G"
   "test_hanatos_surface_e2e|$ASSET|$G/scan_portra_surface|tests/scan_portra_input_rgb.f64|$G"
   "test_camera_uvir_e2e|$ASSET|$G/scan_portra_uvir|tests/scan_portra_input_rgb.f64|$G"

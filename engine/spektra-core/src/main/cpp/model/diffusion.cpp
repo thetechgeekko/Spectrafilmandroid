@@ -15,9 +15,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 #include "kernels/exponential_filter.h"
+#include "kernels/fft_convolve.h"
 #include "kernels/parallel.h"
 
 // M_PI is not in standard C++ <cmath>; some toolchains gate it behind
@@ -328,6 +330,58 @@ double bloom_max_lambda_um(const FamilyCfg& cfg) {
     return cfg.bloom.lambda_um * cfg.bloom.spread;
 }
 
+// Pick the convolution implementation by COST, not by a magic kernel size, because
+// the crossover moves with the image as well as the kernel.
+//
+//   direct : w*h*ks^2 multiply-adds.
+//   FFT    : per tile, two 2D transforms (the image forward, the product inverse)
+//            plus the pointwise multiply. A 2D transform of N x N is 2N line
+//            transforms of length N, each ~5*N*log2(N) flops. The kernel's own
+//            transform is amortised over the tiles and ignored, which biases the
+//            estimate slightly AGAINST the FFT -- the safe direction.
+//
+// Measured crossover on this model is ks ~= 15 at both preview and export sizes,
+// which matches the closed-form estimate in docs/research/perf-lab.md 20. Black
+// Pro-Mist runs ks = 273 at the 640px default preview and ks = 1725 at 12 MP, so
+// it is 20-120x past the crossover and always takes the FFT.
+//
+// SPK_DIFFUSION_FFT=0 forces the direct loop (A/B measurement, and an escape hatch
+// if a device ever mis-measures); =1 forces the FFT even where direct would win.
+// Transform-size cap, overridable so the trade can be MEASURED rather than assumed.
+// Scratch is 2 * N^2 * 16 bytes (two interleaved-complex f64 planes): 134 MB at
+// N = 2048, 537 MB at N = 4096. Raising it is worth a lot when the kernel is large
+// -- at 12 MP Black Pro-Mist has ks = 1725, so N = 2048 leaves a usable block of
+// only 324 (2.5% of each transform) and needs 130 tiles, where N = 4096 gives a
+// block of 2372 and needs 4. See the follow-up note in fft_convolve.h: an r2c f32
+// transform would buy the same block size at N=2048's memory.
+int fft_max_transform() {
+    if (const char* env = std::getenv("SPK_DIFFUSION_FFT_MAX")) {
+        const int v = std::atoi(env);
+        if (v >= 16) return v;
+    }
+    return kFftConvMaxTransform;
+}
+
+bool use_fft(int w, int h, int ks) {
+    if (const char* env = std::getenv("SPK_DIFFUSION_FFT")) {
+        if (env[0] == '0') return false;
+        if (env[0] == '1') return true;
+    }
+    const int n = fft_convolve_transform_size(w, h, ks, fft_max_transform());
+    if (n < ks + 1) return false;                 // no valid block -> direct
+    const int block = n - ks + 1;
+    const double tiles = std::ceil(static_cast<double>(h) / block) *
+                         std::ceil(static_cast<double>(w) / block);
+    const double nn = static_cast<double>(n) * n;
+    const double log2n = std::log2(static_cast<double>(n));
+    const double fft_flops = tiles * (2.0 * (2.0 * 5.0 * nn * log2n) + 6.0 * nn);
+    // Direct MACs are ~2 flops each; require a 2x margin before switching, so a
+    // near-tie keeps the bit-exact path.
+    const double direct_flops =
+        2.0 * static_cast<double>(w) * static_cast<double>(h) * ks * ks;
+    return fft_flops * 2.0 < direct_flops;
+}
+
 }  // namespace
 
 void apply_diffusion_filter_um(double* raw, int w, int h,
@@ -449,10 +503,34 @@ void apply_diffusion_filter_um(double* raw, int w, int h,
             }
         });
         const std::vector<double>& kern = psf[c];
-        // mode='same' direct convolution: out[y,x] = sum_{i,j} padded[y+i, x+j]
+        // mode='same' convolution: out[y,x] = sum_{i,j} padded[y+i, x+j]
         // * flip(kern)[i,j], centred. For a symmetric centred kernel the centre
         // offsets (ks-1)/2 == radius, so out[y,x] over the original window maps
         // to padded[y .. y+ks-1, x .. x+ks-1] convolved with the flipped kernel.
+        //
+        // TWO IMPLEMENTATIONS OF THE SAME SUM. The direct loop below is O(w*h*ks^2),
+        // and ks scales with image width (radius is a fixed size on the FILM, so it
+        // grows as pixel_size_um shrinks) -- which makes this stage QUADRATIC in
+        // pixel count. Measured: 30.7 s for one 640px preview and an extrapolated
+        // 10.9 hours for a 12 MP export, at the app's default Black Pro-Mist
+        // settings (#160, docs/research/perf-lab.md 20). kernels/fft_convolve
+        // computes the identical sum in O(n log n).
+        //
+        // Reassociating a sum changes its last bits, so the FFT result is NOT
+        // byte-identical to the direct loop -- measured drift is ~1e-15 relative,
+        // eleven orders inside the 1e-4 parity bar (tests/test_fft_convolve.cpp).
+        // Both paths ARE byte-identical across worker counts, which is the contract
+        // that matters here.
+        //
+        // The direct loop stays and stays reachable: it wins for small kernels,
+        // it is the reference the FFT path is gated against, and it is the fallback
+        // if the transform buffers cannot be allocated.
+        if (use_fft(w, h, ks) &&
+            fft_convolve_same(padded.data(), pw, ph, kern.data(), ks, w, h,
+                              blurred.data(), /*out_stride=*/3, /*out_offset=*/c,
+                              fft_max_transform())) {
+            continue;
+        }
         // Each output row is an independent O(w*ks^2) accumulation over the
         // read-only padded plane.
         parallel_for_weighted(0, h, w, [&](int lo, int hi) {

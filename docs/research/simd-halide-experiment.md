@@ -174,6 +174,39 @@ Read the result against the per-stage timings that now land in logcat (#146/#152
   lanes on arm64 — exactly what `kernels/exp10.h` already delivers — and which this experiment
   did not target. That would be the next Halide candidate, not a Highway one.
 
+## Third-party Halide projects, evaluated (owner asked)
+
+Two were put forward. Recorded so neither is re-evaluated from scratch.
+
+**NumHalide** (`soufianekhiat/NumHalide`) — header-only C++20, MIT (GPLv3-compatible), a
+NumPy-shaped API over Halide. It has precisely the primitives this engine wanted:
+`fft / ifft / fft2d / ifft2d / fftshift`, real-FFT variants, and 1D/2D convolution, with
+841 tests across 94 suites.
+
+**Not adopted, and the reason is mostly timing.** `kernels/fft.cpp` +
+`kernels/fft_convolve.cpp` already exist, are ~250 lines, are gated by
+`tests/test_fft_convolve.cpp`, and are proven byte-identical across worker counts.
+Taking NumHalide instead would mean:
+
+- promoting Halide from a `tools/` experiment to a hard engine dependency, with an AOT
+  generator to run at build time for every ABI;
+- a build that documents Windows / VS2022 / .NET 6 SDK and says nothing about the Android
+  NDK (#155 did prove `arm-64-android` cross-compiles, but that was Halide itself, not
+  this project);
+- **the determinism problem.** Our contract is byte-identical output for any worker
+  count. Halide's parallel and vectorised reduction schedules do not give that unless
+  scheduled for it specifically, and NumHalide's FFT schedule is unexamined. Our FFT fixes
+  the butterfly order by construction and the test proves 1-vs-8 equality.
+
+At 72 commits it is also not a battle-tested FFT. **Where it stays useful:** as a
+reference for the real-to-complex transform, which is the documented next optimisation on
+`fft_convolve` (it would halve both memory and time).
+
+**Halide-HLS** (`jingpu/Halide-HLS`) — Halide to FPGA via High-Level Synthesis, from the
+Stanford group (arXiv 1610.09405). **A dead end here, for the same reason HVX is:** the
+target hardware does not exist on the device. Phones have no FPGA. It is also inactive —
+last commit June 2017, forked from Halide 2017/05/03, over eight years stale.
+
 ## State of this branch
 
 - Default build unchanged: `SPK_ENABLE_HIGHWAY=OFF` → `gaussian_hwy.cpp` compiles to three

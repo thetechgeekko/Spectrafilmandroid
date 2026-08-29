@@ -157,6 +157,14 @@ jobs:
           build_run test_small_preview_aa "$ASSET" "$G/small_preview_aa" tests/small_preview_aa_input_rgb.f64 "$G"
           build_run test_diffusion "$G"
           build_run test_diffusion_e2e "$ASSET" "$G/scan_diffusion" tests/scan_portra_input_rgb.f64 "$G"
+          # The diffusion PSF convolution has TWO implementations of one sum: the
+          # O(w*h*ks^2) direct loop and kernels/fft_convolve's O(n log n) transform
+          # (#160 — the direct loop is quadratic in pixel count because the kernel
+          # radius scales with image width). This gates the FFT path against the
+          # direct one on both the single-transform and the overlap-save tiling
+          # cases, and asserts 1-vs-8-worker byte-identity. Tolerance, not bytes,
+          # against the direct loop: reassociating a sum moves its last bits.
+          build_run test_fft_convolve
           # Spectral-domain Gaussian blur of the reconstructed-spectra LUT
           # (settings.spectral_gaussian_blur=5): blurs HANATOS2025_SPECTRA_LUT along
           # its spectral axis inside compute_hanatos2025_tc_lut (scipy.ndimage.
