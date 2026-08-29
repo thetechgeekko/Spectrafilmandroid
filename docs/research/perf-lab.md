@@ -915,15 +915,58 @@ The third one has a sting worth keeping: my own reading guide said "no notificat
 appeared → the service never started." On a shipping build that would have been a
 false negative.
 
-### 15.4 Where this leaves the performance work
+### 15.4 Where this leaves the performance work — and a 39% blind spot
 
 The 4× is real, it is the cpuset, and no foreground service can reach the prime cores
 on this device — **that lever is spent**. It is also only ever paid while the user
-leaves the app; the foreground path was never slow.
+leaves the app; the foreground path was never slow. So the target is the **~14 s
+foreground export**.
 
-So the remaining honest target is the **~14 s foreground export**, where **grain is
-3.3 s** and is the one stage nothing has optimised yet. §12's profile of the irregular
-samplers already pointed at the same place from a different direction.
+Summing the stage timings from that run against the total exposes something nothing
+has looked at:
+
+```
+  preprocess    151.7    filming_expose  177.4    halation      2054.8
+  develop        36.0    dir_couplers   1377.1    grain         3620.1
+  print_expose  288.3    scan            728.4    scan_spatial   385.5
+  print_digest    0.4
+                                     engine stages =  8819.7 ms   (61%)
+                                     export total  = 14476.0 ms
+                                     UNACCOUNTED   =  5656.3 ms   (39%)
+```
+
+**39% of an export is outside the engine entirely** — RAW decode, the full-resolution
+bitmap grade (`simResultToBitmapGraded`: saturation, vibrance, gamut compression,
+local adjustments — a per-pixel pass that appears in no stage timing), and the
+Ultra HDR encode plus file I/O.
+
+This governs the GPU question directly. Against a **1–2 s** export target:
+
+- Even if a GPU pipeline made **every engine stage free**, the floor is still
+  **5.66 s** — 3–6× above target. GPU is necessary and **not sufficient**.
+- Within the engine, three stages are 80% of the time: **grain 3620 + halation 2055 +
+  dir_couplers 1377 = 7052 ms**. `scan` and `print_expose` are already offloaded and
+  measured **3.1e-06** against the CPU — 32× inside the 1e-4 band, so GPU float does
+  not break the band, only bit-exactness.
+- Grain is the largest single stage **and** the one whose parity gate is already
+  **statistical** (`test_grain`/`test_grain_sublayer` check mean and noise std, not
+  bytes). It is therefore the highest-value GPU target with the least gate friction.
+- The LUT route (`spk_bake_cube_lut`) cannot substitute: a 3D LUT is *pointwise*, so
+  it carries colour but not grain, halation or glare — precisely the 5.7 s that
+  dominates.
+
+So the decision between an incremental GPU path and adopting a full external GPU
+pipeline cannot be made from current data: nobody knows whether that 5656 ms is
+mostly decode or mostly encode, and the two have completely different answers.
+
+**Instrumented, pending the next device run.** The export now logs
+
+```
+  export phases ms: decode=… simulate=… grade=… encode=…
+```
+
+alongside the existing `stage timings` line. Until that number exists, any plan to
+reach 1–2 s is a guess.
 
 ### 15.5 A method note, because it has now cost time twice
 

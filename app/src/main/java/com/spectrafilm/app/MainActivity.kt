@@ -1821,31 +1821,49 @@ class MainActivity : ComponentActivity() {
                                 val result = runCatching {
                                     withContext(Dispatchers.Default) {
                                         // Full-res off-heap buffers (the OOM fix) — close input/result promptly.
+                                        // Phase breadcrumbs: the engine's own `stage timings` line
+                                        // accounts for only ~61% of an export (8819 ms of 14476 on a
+                                        // 12.5 MP Ultra HDR run). The other ~39% is decode, the
+                                        // full-res bitmap grade and the encode — none of which any
+                                        // measurement has ever separated, which makes it impossible
+                                        // to say what a GPU pipeline could and could not reach.
+                                        val tDecode0 = System.currentTimeMillis()
                                         val image = loadSource(EXPORT_MAX_EDGE_PX)
+                                        val tDecodeMs = System.currentTimeMillis() - tDecode0
                                         if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
                                             // Export the decoded scene-linear INPUT (before the film
                                             // engine) as a 32-bit float TIFF; the engine is skipped.
+                                            val tEnc0 = System.currentTimeMillis()
                                             try {
                                                 withContext(Dispatchers.IO) { saveLinearInputAsTiff32f(ctx, image, baseName) }
                                             } finally {
                                                 image.close()
                                             }
+                                            Diag.i(
+                                                "export phases ms: decode=$tDecodeMs simulate=0 grade=0 " +
+                                                    "encode=${System.currentTimeMillis() - tEnc0}"
+                                            )
                                             null  // no rendered bitmap to preview
                                         } else {
                                             // Copy source EXIF; GPS only when opted in.
                                             val srcExif = withContext(Dispatchers.IO) { readSourceExif(ctx, sourceUri, keepGps = keepGps) }
+                                            val tSim0 = System.currentTimeMillis()
                                             val res = try {
                                                 e.simulate(image, state.toParams())
                                             } finally {
                                                 image.close()
                                             }
+                                            val tSimMs = System.currentTimeMillis() - tSim0
                                             try {
+                                                val tGrade0 = System.currentTimeMillis()
                                                 val bmp0 = simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
                                                 // Post-render downscale for the bitmap formats (high-bit-depth
                                                 // is always full-res → longEdge null). Free the full-res bitmap.
                                                 val bmp = longEdge?.let { edge ->
                                                     scaleBitmapToLongEdge(bmp0, edge).also { if (it !== bmp0) bmp0.recycle() }
                                                 } ?: bmp0
+                                                val tGradeMs = System.currentTimeMillis() - tGrade0
+                                                val tEnc0 = System.currentTimeMillis()
                                                 withContext(Dispatchers.IO) {
                                                     when (exportFmt) {
                                                         ExportFormat.TIFF -> saveSimResultAsTiff(ctx, res, displayName = baseName)
@@ -1854,6 +1872,10 @@ class MainActivity : ComponentActivity() {
                                                         else -> saveToGallery(ctx, bmp, exportFmt, exportOptions.jpegQuality, srcExif, displayName = baseName)
                                                     }
                                                 }
+                                                Diag.i(
+                                                    "export phases ms: decode=$tDecodeMs simulate=$tSimMs " +
+                                                        "grade=$tGradeMs encode=${System.currentTimeMillis() - tEnc0}"
+                                                )
                                                 bmp
                                             } finally {
                                                 res.close()
