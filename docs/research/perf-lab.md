@@ -1928,6 +1928,78 @@ pixels gave 1.15x the time**, which no per-pixel stage can do. The rule this add
 > Before believing any stage share, check that the stage scales with the thing you think
 > drives it. A stage that does not scale with pixel count is not measuring what you think.
 
+## 21. The Halide fusion spike, and a quantisation cliff worth more than the result
+
+Owner raised the Lightroom precedent: Adobe uses Halide, and **pipeline fusion** is one of
+the reasons — instead of writing a full-resolution temporary after every adjustment, Halide
+computes several stages together on small tiles. Our engine does write those temporaries.
+`tools/halide_fusion/` asks what that would buy us. Synthetic pipeline shaped like filming's
+O(n) run, not our real stages; best of 5, shared host.
+
+### 21.1 Fusion is spectacular on the wrong shape
+
+| chain | 1024² | 2048² |
+|---|---|---|
+| elementwise only | **18.4×** | **35.7×** |
+| **with a separable blur — our actual shape** | **0.78× (slower)** | **1.51×** |
+
+**That gap is the answer.** Fusion pays when nothing needs its neighbours, because no
+full-res buffer is ever written. Put a stencil in the middle and it has to recompute the
+producer for every consumer tile, and the win collapses — at 1024 it went *negative*.
+
+Our chain is the second row. Halation, DIR diffusion and scanner unsharp are all stencils,
+and the largest stage (grain) is neither elementwise nor a stencil but a divergent
+per-pixel sampler. Lightroom's sliders — exposure, contrast, curves — are mostly the first
+row, which is why the precedent is real for Adobe and much weaker for us.
+
+### 21.2 The determinism contract holds
+
+Fused, parallel, vectorised, blur in the middle: **byte-identical across `HL_NUM_THREADS`
+1 vs 8**, at both sizes. Same answer the NumHalide FFT gave. Halide's schedules fix their
+reassociation at compile time, so worker count does not enter it. The objection this
+project has repeatedly raised against Halide is, on this evidence, not the real obstacle.
+
+### 21.3 The finding that matters more than either — a LUT-index cliff
+
+The materialised and fused schedules disagreed by **3.648e-03** at 2048² while agreeing
+exactly at 1024². Both cannot be right, and a plain-C++ reference settled it: the
+**materialised** schedule matched to 5.96e-08 and the **fused** one was the outlier.
+
+Counting the differing samples explains it and clears Halide:
+
+| | |
+|---|---|
+| differing samples | **682 of 12,582,912 — 0.0054%** |
+| mean delta on those | **3.648e-03** |
+| one LUT step at that index | **3.980e-03** |
+
+A vanishing fraction of pixels, each off by almost exactly **one table entry**. It is a
+**quantisation cliff**: the schedules differ by ~1 ULP in the index expression (FMA
+contraction differs between the vectorised inline form and the materialised one), and
+`cast<int>` on a value sitting a hair from an integer boundary lands on the neighbouring
+entry. A 1-ULP input difference becomes a **60,000×-larger output difference**. Not a
+Halide bug, and not a scheduling bug — an unguarded nearest-index lookup.
+
+**We are already immune, by design, and that is now a property to protect.** Every LUT in
+the engine interpolates rather than rounding — `kernels/interp.cpp` returns
+`fp[low] + t * (fp[low+1] - fp[low])`, and `kernels/lut3d.cpp` takes `floor` and
+interpolates from there. With interpolation a 1-ULP index shift moves the output by 1 ULP.
+With `cast<int>` it moves by a whole step.
+
+**This is a live hazard for the GLSL route, not a curiosity.** A GPU port differs from the
+CPU path by ~1 ULP *everywhere* by construction — fp32 against f64 (`vkdt-decision.md`
+§11.4). Any nearest-index LUT fetch introduced in a shader (a `texelFetch` on a rounded
+index rather than an interpolating `texture()` sample) would therefore scatter
+single-step errors across the frame: rare, bright, and impossible to attribute later. The
+rule to carry into the shaders: **interpolate every LUT; never round an index.**
+
+### 21.4 Verdict
+
+Fusion is **not** the lever for our pipeline — the shape is wrong, and the honest number
+for our chain is between 0.78× and 1.51×, not the 18–36× a naive spike reports. The
+determinism objection is retired. The spike's real yield is §21.3, which is a constraint on
+how the shaders get written.
+
 ## Running it
 
 ```bash
