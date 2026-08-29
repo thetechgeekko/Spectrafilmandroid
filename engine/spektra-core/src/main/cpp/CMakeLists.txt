@@ -22,6 +22,12 @@ if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O")
 endif()
 
 
+# EVERY SOURCE MUST BE LISTED HERE BY HAND. The host parity build compiles with a
+# glob (`kernels/*.cpp model/*.cpp ...` — see the build line in CLAUDE.md), so a new
+# .cpp picked up there is NOT picked up here. A file missing from this list therefore
+# passes the whole 39-gate parity suite locally and fails only in the Android
+# `ninja ... spektra` step, which is a slow and confusing way to find out. That is
+# exactly how kernels/fft.cpp and kernels/fft_convolve.cpp broke CI on 551c57f.
 add_library(spektra SHARED
         spektra.cpp
         spektra_jni.cpp
@@ -35,6 +41,8 @@ add_library(spektra SHARED
         kernels/lut3d.cpp                   # opt-in PCHIP 3D LUT accel (M7, default OFF)
         kernels/lut3d_cache.cpp             # engine memo for built 3D LUTs (PERF, byte-identical)
         kernels/parallel.cpp                # deterministic fork-join threading (per-pixel stages + spatial/LUT maps)
+        kernels/fft.cpp                     # deterministic radix-2 complex FFT (fixed butterfly order)
+        kernels/fft_convolve.cpp            # O(n log n) diffusion PSF convolution (#160)
         kernels/tonecurve.cpp               # optional 1D tone curve on final display RGB
         kernels/half.cpp                    # fp16 (NEON) <-> f32 conversion (preview proxy storage)
         # LUT/asset loaders:
