@@ -168,6 +168,12 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
   reference. Check a new source the way CI links: `g++ -std=c++17 -O2 -pthread -fPIC
   -shared -I. <CMakeLists sources, minus spektra_jni.cpp> -Wl,--no-undefined -o /tmp/x.so`.
   (Cost a red CI run on `551c57f`.)
+  **Now checkable without a device or gradle:** `tools/arm64_check/check_android_link.sh`
+  links the .so for arm64 with real NDK clang at the shipping flags using the CMakeLists
+  **enumerated** list plus `-Wl,--no-undefined`, and fails if a `.cpp` is on disk but
+  absent from CMakeLists. It also compiles `spektra_jni.cpp`, which the host suite never
+  builds at all. Get the NDK with
+  `curl -sSLo ndk.zip https://dl.google.com/android/repository/android-ndk-r27-linux.zip && unzip -q ndk.zip -d /opt/`.
 - **A native-only edit may not rebuild through `:app:assembleDebug` alone.** Observed on
   `:lib:libraw`: a changed `.cpp` produced `BUILD SUCCESSFUL in 6s` with a **stale**
   `libsfraw.so`. `./gradlew :lib:libraw:assembleDebug --rerun-tasks` rebuilt it. Verify

@@ -25,6 +25,7 @@
 #ifdef __ANDROID__
 #include <android/asset_manager_jni.h>
 #include <android/log.h>
+#include <sys/system_properties.h>   // debug.spektra.dumpparams (dump_marshalled_params)
 #endif
 
 #include "spektra.h"
@@ -262,6 +263,57 @@ int enum_ordinal_int(JNIEnv* env, jobject e, int def) {
     env->DeleteLocalRef(cls);
     if (!m) { env->ExceptionClear(); return def; }
     return static_cast<int>(env->CallIntMethod(e, m));
+}
+
+// One-shot-per-render dump of the marshalled spk_params, gated on a system
+// property so it is inert in a normal release build. See the call site at the end
+// of marshal_params for why this exists.
+void dump_marshalled_params(const spk_params* p) {
+#if defined(__ANDROID__)
+    char on[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.spektra.dumpparams", on) <= 0 || on[0] == '0')
+        return;
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params route: scan_film=%d grain_active=%d halation_active=%d "
+        "dir_couplers_active=%d glare_active=%d auto_exposure=%d ev_comp=%.4f",
+        p->scan_film, p->grain_active, p->halation_active, p->dir_couplers_active,
+        p->glare_active, p->auto_exposure, (double)p->exposure_compensation_ev);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params grain: sublayers=%d n_sub=%d area_um2=%.5f blur=%.5f "
+        "density_min=[%.5f %.5f %.5f] uniformity=[%.5f %.5f %.5f]",
+        p->grain_sublayers_active, p->grain_n_sub_layers,
+        (double)p->grain_particle_area_um2, (double)p->grain_blur,
+        (double)p->grain_density_min[0], (double)p->grain_density_min[1],
+        (double)p->grain_density_min[2],
+        (double)p->grain_uniformity[0], (double)p->grain_uniformity[1],
+        (double)p->grain_uniformity[2]);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params grain2: particle_scale=[%.5f %.5f %.5f] scale_layers=[%.5f %.5f %.5f] "
+        "micro=[%.5f %.5f] blur_dye_um=%.5f",
+        (double)p->grain_particle_scale[0], (double)p->grain_particle_scale[1],
+        (double)p->grain_particle_scale[2],
+        (double)p->grain_particle_scale_layers[0],
+        (double)p->grain_particle_scale_layers[1],
+        (double)p->grain_particle_scale_layers[2],
+        (double)p->grain_micro_structure[0], (double)p->grain_micro_structure[1],
+        (double)p->grain_blur_dye_clouds_um);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params scanner: white_corr=%d black_corr=%d white_level=%.5f "
+        "black_level=%.5f use_scanner_lut=%d use_enlarger_lut=%d lut_res=%d",
+        p->scanner_white_correction, p->scanner_black_correction,
+        (double)p->scanner_white_level, (double)p->scanner_black_level,
+        p->use_scanner_lut, p->use_enlarger_lut, p->lut_resolution);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params misc: film=%s print=%s out_cs=%d cctf=%d gamma=%.5f "
+        "preview_max=%d gpu_preview=%d gpu_export=%d",
+        p->film_profile ? p->film_profile : "(null)",
+        p->print_profile ? p->print_profile : "(null)",
+        (int)p->output_color_space, p->output_cctf_encoding,
+        (double)p->density_curve_gamma, p->preview_max_size,
+        p->gpu_preview, p->gpu_export);
+#else
+    (void)p;
+#endif
 }
 
 bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* store) {
@@ -509,6 +561,22 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
 
     // Tone curve (top-level packed float[]); OFF by default => no-op.
     read_tone_curve(env, params, out);
+
+    // DIAGNOSTIC: dump what actually crossed the boundary.
+    //
+    // Exists because a whole route was reported rendering a flat constant and the
+    // params were read off the UI, which is not the same thing -- #143 is an entire
+    // batch of "params that lie", i.e. controls whose displayed value and marshalled
+    // value disagree. Reading a slider is evidence about the slider. This is evidence
+    // about the engine's input, which is what a repro needs.
+    //
+    // Off unless the system property is set, so it costs a getprop per render and
+    // nothing else:  adb shell setprop debug.spektra.dumpparams 1
+    // Deliberately covers the values a repro has to match: route, the stochastic and
+    // spatial gates, grain (whose density_min feeds the GRAIN MODEL at
+    // spektra.cpp:763, not only the opt-in LUT domain), the scanner corrections and
+    // their levels, and the profiles.
+    dump_marshalled_params(out);
 
     if (camera) env->DeleteLocalRef(camera);
     if (enlarger) env->DeleteLocalRef(enlarger);
