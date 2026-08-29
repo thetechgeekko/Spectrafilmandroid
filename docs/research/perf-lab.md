@@ -1021,7 +1021,14 @@ answer is elsewhere.
 
 Either way the next run decides it, which is the point of writing it down first.
 
-## 16. The phase split — the answer is DECODE, by a factor of 23
+## 16. The phase split — decode is the biggest thing outside the engine
+
+> **The first numbers in this section were contaminated and are corrected in §16.6.**
+> The run below was measured on a **rotated** source without that being noticed as a
+> variable, which inflated `decode` from 3616 ms to 5093 ms. The corrected split, and
+> the 1155 ms rotation surcharge that explains the gap, are in §16.6. The table is
+> kept because the reconciliations and the encode result stand.
+
 
 The device came back and the run completed. Same RAW, 3060x4080, Ultra HDR / Q100 /
 full resolution / sRGB, foreground throughout, `decode kind=RAW 3060x4080` confirmed
@@ -1129,7 +1136,10 @@ All four are gone now. Dropping the **read** is what disarms the recipes already
 disk — all 33 on the device still carry `previewMaxSize: 640`. The decisive control
 was a source with no saved recipe: `decode kind=PHOTO 383x510 maxEdge=1019`, honoured.
 
-### 16.5 Two unexamined knobs on the 5093 ms, found by reading the build
+### 16.5 Two unexamined knobs on the decode, found by reading the build
+
+> Written when decode read 5093 ms; the corrected figure is **3616 ms** (§16.6). The
+> knobs are unaffected — only the size of the prize changes.
 
 Not measured — read from source, and stated as leads rather than findings.
 
@@ -1182,6 +1192,84 @@ no usable speedup at any of them.
 The GPU scan path is genuinely active and genuinely correct. It is simply too small a
 fraction of a frame to matter — grain and halation are filming-stage, on the CPU, and
 dominate. **#146's preview-offload question is closed on this device.**
+
+### 16.6 CORRECTION: decode is 3616 ms, and rotation costs 1155 ms
+
+A second run on the same reference RAW, three clean foreground exports, residual
+6-11 ms:
+
+| | setup | decode | exif | simulate | grade | encode | residual | total |
+|---|---|---|---|---|---|---|---|---|
+| median | 4 | **3616** | 3 | 8291 | 678 | 205 | 10 | **12834** |
+
+```
+  setup         4 ms    0.03%
+  decode     3616 ms   28.2%
+  exif          3 ms    0.02%
+  simulate   8291 ms   64.6%
+  grade       678 ms    5.3%
+  encode      205 ms    1.6%
+  residual     10 ms    0.08%
+```
+
+Spread 12664-13006, 2.7%, and the two unexplained outliers of the earlier run did not
+recur.
+
+**Why the earlier 5093 was wrong: the source was rotated.** The decode boundary is
+byte-identical between the two builds, so it is not the instrumentation.
+
+```
+  rotation NONE   (decode kind=RAW 3060x4080)   3591  3650  3616   median 3616
+  rotation 90     (decode kind=RAW 4080x3060)   4725  4817         median 4771
+  rotation 180    (decode kind=RAW 3060x4080)   4737  4803         median 4770
+
+  penalty  +1155 ms, 1.32x
+```
+
+**180° is the discriminating case**: its dimensions are *not* transposed, yet it costs
+exactly what 90° costs. So this is not a transpose cost and not a dimension-swap cost
+— it is a flat, angle-independent surcharge on any non-zero rotation. `simulate` is
+unchanged across all three (8291 / 8071 / 7937), so nothing else moved.
+
+**The mechanism, read from source after the measurement predicted its shape.**
+`MainActivity.loadSource` ends in `based.rotated(rotation)`, and `Rotation.kt`'s
+`LinearImage.rotated()` early-outs on `NONE` — then, for every other angle, runs a
+**single-threaded Kotlin per-pixel loop over the full-resolution image**, three
+`FloatBuffer.get()` and three scattered indexed `put(d, …)` per pixel. At 12.5 MP that
+is ~75 M bounds-checked buffer operations on one thread.
+
+Every branch is the same shape, which is exactly why 180° costs what 90° costs — the
+measurement predicted the code, and the code confirms it. CW180 in particular is a
+pure reversal that never needed a scatter at all.
+
+### 16.7 The real shape of the non-engine time
+
+Two costs, same class: single-threaded JVM per-pixel loops, downstream of the decoder,
+**upstream of nothing the parity gate covers**, and untouched by any GPU port of the
+engine.
+
+| | cost | when |
+|---|---|---|
+| `LinearImage.rotated` | **1155 ms** | any non-zero rotation — i.e. most phone photos |
+| `gradeBufferToBitmap` | **678 ms** | always; §15.6's prediction, confirmed |
+
+That is **~1.8 s of a 12.8 s export** sitting outside the engine and outside the gate.
+Neither needs a GPU, a new dependency, or an architecture decision.
+
+**§15.6's prediction is confirmed, and its framing corrected.** `grade` measured 678 ms
+across seven runs — not the "few tens of ms" that would have falsified it. But the
+falsifier was written as a false dichotomy: it said a small `grade` "would mean the
+missing time is in decode or encode instead." Both are true at once. `grade` is
+materially non-zero *and* decode is the bulk; 678 ms never could have been the bulk.
+The prediction was right; the either/or was not.
+
+**Encode is settled at 205 ms** — 1.6%, a rounding error, not worth touching.
+
+**And the reconciliation-2 sign is now reproducible.** Stage sums exceed `simulate`'s
+wall clock by 24-48 ms here and 40-75 ms before: two builds, eight runs, consistently
+negative. Nothing near the ~140 MB allocation scale, so the boundary is where we think
+it is — but a few stage timers overlap or double-count by ~0.3-0.9%, and the
+`stage timings` line should not be quoted as exact.
 
 ## Running it
 
