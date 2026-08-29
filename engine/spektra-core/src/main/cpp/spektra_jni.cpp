@@ -28,6 +28,8 @@
 #include <sys/system_properties.h>   // debug.spektra.dumpparams (dump_marshalled_params)
 #endif
 
+#include <atomic>
+
 #include "spektra.h"
 
 #define JNI(ret, name) extern "C" JNIEXPORT ret JNICALL \
@@ -137,32 +139,92 @@ float unbox_float(JNIEnv* env, jobject boxed) {
     return env->CallFloatMethod(boxed, m);
 }
 
-// Read a kotlin.Triple<Float,Float,Float> via getFirst/getSecond/getThird (each
-// returns java.lang.Object -> java.lang.Float). Writes the three components to
-// out[3]. Leaves out untouched on null (keeps the default already there).
+// Read one component of a kotlin.Triple/Pair.
+//
+// THE BUG THIS EXISTS FOR. R8 REMOVES kotlin.Triple.getFirst/getSecond/getThird
+// and kotlin.Pair.getFirst/getSecond from the release dex. proguard-rules.pro
+// keeps com.spectrafilm.engine.** so GrainParams.getAgxParticleScale() survives
+// and returns a real Triple -- but `kotlin.**` was not kept, and NO BYTECODE
+// anywhere calls Triple.getFirst. The only caller is this file, by literal
+// string, which R8 cannot see. So it shrank them as unreachable.
+//
+// `-dontobfuscate` does not save you: it prevents RENAMING, not REMOVAL. That
+// distinction shipped 19 wrong parameters in every release APK -- every
+// Triple/Pair-valued param (grain particle scale, density min, uniformity,
+// halation scatter/strength, all four coupler gammas, camera UV/IR filters,
+// scanner unsharp, AND crop centre/size) marshalled as 0.0.
+//
+// Two independent defects made that silent, and both are fixed here:
+//   1. the getter vanished  -> fall back to the BACKING FIELD, which R8 keeps
+//      (dexdump shows `fields: first, second, third` intact). JNI GetFieldID
+//      reaches private fields, so this works without any keep rule.
+//   2. failure OVERWROTE the caller's value with 0.0 -- unbox_float(nullptr)
+//      returns 0.0f, so a failed read did not leave spk_default_params' seed in
+//      place, it destroyed it. Now a component that cannot be read leaves `out`
+//      alone and reports, so the default survives and the failure is visible.
+jobject tuple_component(JNIEnv* env, jobject t, const char* getter,
+                        const char* field) {
+    jobject v = call_obj(env, t, getter, "()Ljava/lang/Object;");
+    if (v) return v;
+    jclass cls = env->GetObjectClass(t);
+    jfieldID f = env->GetFieldID(cls, field, "Ljava/lang/Object;");
+    env->DeleteLocalRef(cls);
+    if (!f) { env->ExceptionClear(); return nullptr; }
+    return env->GetObjectField(t, f);
+}
+
+// One-time complaint that a tuple could not be read. Rate-limited to once per
+// process: this runs per param per render, and a silent wrong number is exactly
+// what went unnoticed before -- but a log line per render per param would be its
+// own kind of unreadable.
+void warn_tuple_unreadable_once(const char* getter) {
+#if defined(__ANDROID__)
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (!warned.compare_exchange_strong(expected, true)) return;
+    __android_log_print(ANDROID_LOG_ERROR, "Spektra",
+        "PARAM MARSHALLING BROKEN: could not read the components of '%s' by "
+        "getter OR by field. Every Triple/Pair-valued param is therefore at its "
+        "built-in default, not the value you set. This is what R8 shrinking "
+        "kotlin.Triple/kotlin.Pair looks like -- check the keep rules.", getter);
+#else
+    (void)getter;
+#endif
+}
+
+// Read a kotlin.Triple<Float,Float,Float> into out[3]. Leaves `out` UNTOUCHED if
+// the tuple or any component cannot be read, so the caller's default survives.
 void read_triple_f(JNIEnv* env, jobject obj, const char* getter, float out[3]) {
     jobject t = call_obj(env, obj, getter, "()Lkotlin/Triple;");
     if (!t) return;
-    jobject a = call_obj(env, t, "getFirst", "()Ljava/lang/Object;");
-    jobject b = call_obj(env, t, "getSecond", "()Ljava/lang/Object;");
-    jobject c = call_obj(env, t, "getThird", "()Ljava/lang/Object;");
-    out[0] = unbox_float(env, a);
-    out[1] = unbox_float(env, b);
-    out[2] = unbox_float(env, c);
+    jobject a = tuple_component(env, t, "getFirst", "first");
+    jobject b = tuple_component(env, t, "getSecond", "second");
+    jobject c = tuple_component(env, t, "getThird", "third");
+    if (a && b && c) {
+        out[0] = unbox_float(env, a);
+        out[1] = unbox_float(env, b);
+        out[2] = unbox_float(env, c);
+    } else {
+        warn_tuple_unreadable_once(getter);   // out keeps its default
+    }
     if (a) env->DeleteLocalRef(a);
     if (b) env->DeleteLocalRef(b);
     if (c) env->DeleteLocalRef(c);
     env->DeleteLocalRef(t);
 }
 
-// Read a kotlin.Pair<Float,Float> via getFirst/getSecond. Writes to out[2].
+// Read a kotlin.Pair<Float,Float> into out[2]. Same contract as read_triple_f.
 void read_pair_f(JNIEnv* env, jobject obj, const char* getter, float out[2]) {
     jobject t = call_obj(env, obj, getter, "()Lkotlin/Pair;");
     if (!t) return;
-    jobject a = call_obj(env, t, "getFirst", "()Ljava/lang/Object;");
-    jobject b = call_obj(env, t, "getSecond", "()Ljava/lang/Object;");
-    out[0] = unbox_float(env, a);
-    out[1] = unbox_float(env, b);
+    jobject a = tuple_component(env, t, "getFirst", "first");
+    jobject b = tuple_component(env, t, "getSecond", "second");
+    if (a && b) {
+        out[0] = unbox_float(env, a);
+        out[1] = unbox_float(env, b);
+    } else {
+        warn_tuple_unreadable_once(getter);   // out keeps its default
+    }
     if (a) env->DeleteLocalRef(a);
     if (b) env->DeleteLocalRef(b);
     env->DeleteLocalRef(t);

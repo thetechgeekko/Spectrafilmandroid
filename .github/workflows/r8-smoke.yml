@@ -64,6 +64,31 @@ jobs:
           [ "$bad" = 0 ] && echo "All 64-bit native libs are 16 KB-aligned."
           exit $bad
 
+      - name: Verify the shrunk dex still has the JNI-resolved members
+        # THIS IS WHY THIS WORKFLOW EXISTS, and it used to be done only by hand.
+        #
+        # R8 removed kotlin.Triple.getFirst/getSecond/getThird (and the
+        # kotlin.Pair pair) from every release APK this project shipped.
+        # proguard-rules.pro kept com.spectrafilm.engine.**, so the engine's own
+        # getters survived and returned real Triples -- but NO BYTECODE calls
+        # Triple.getFirst. Its only caller is spektra_jni.cpp, by literal string,
+        # which R8 cannot see, so it shrank them as unreachable. `-dontobfuscate`
+        # does not help: it prevents renaming, not removal.
+        #
+        # Result: 19 engine params marshalled as 0.0 on every release render --
+        # no crash, no log, just wrong numbers. Zero grain particle scale is
+        # degenerate, which is why the slide route rendered a flat constant.
+        #
+        # Nothing that compiles or links can see this: the native build is fine,
+        # the Kotlin build is fine, and the host parity suite runs neither R8 nor
+        # JNI. The defect exists only in the shrunk dex, so the check reads the
+        # dex. The script fails loudly (never silently skips) if dexdump is
+        # missing or the class cannot be parsed.
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          tools/r8_check/check_release_dex.sh "$APK" "$ANDROID_HOME/build-tools/35.0.0"
+
       - name: Upload R8 smoke APK
         uses: actions/upload-artifact@v4
         with:

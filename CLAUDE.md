@@ -194,7 +194,17 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
   in the repo root; absent it, release falls back to debug signing.
 - Release `isMinifyEnabled = true` (R8 shrink via `proguard-rules.pro`: `-dontobfuscate` + JNI/enum
   keep-rules). The R8 release path is **not exercised by CI** (the `android` job builds debug, where
-  minify is off), and a wrong keep-rule fails only as a runtime crash — so smoke-test a release build
+  minify is off). **A wrong keep-rule does NOT only fail as a runtime crash — that claim was
+  wrong and it cost us a shipped defect.** R8 removed `kotlin.Triple.getFirst/getSecond/getThird`
+  and the `kotlin.Pair` pair, because `com.spectrafilm.engine.**` was kept but `kotlin.**` was
+  not, and no *bytecode* ever calls those getters — the only caller is `spektra_jni.cpp`, by
+  literal string, which R8 cannot see. `-dontobfuscate` does not save you: it prevents
+  RENAMING, not REMOVAL. The result was 19 engine params marshalling as **0.0** on every
+  release render, silently — no crash, no log, just wrong numbers, in every APK ever shipped.
+  So the real failure mode is a **silently wrong image**, which is worse than a crash because
+  nothing announces it. `tools/r8_check/check_release_dex.sh` now reads the shrunk dex and
+  fails if any JNI-resolved member is gone (wired into `r8-smoke.yml`; validated against both
+  a good and a deliberately shrunk dex). Still smoke-test a release build
   on a device before tagging. (Last validated 2026-06-04 on SM-S948W/Android 16: minified build did
   full RAW import → render → 12 MP PNG/TIFF export, JNI libs load under R8 — see `docs/AUDIT.md` §D.)
 - **Attribution "Film modeling powered by spektrafilm" must stay** (GPLv3 requirement).
