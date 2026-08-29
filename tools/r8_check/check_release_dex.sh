@@ -31,7 +31,17 @@ set -euo pipefail
 
 APK="${1:-}"
 BT="${2:-${ANDROID_HOME:-/opt/android-sdk}/build-tools/35.0.0}"
-[ -n "$APK" ] || { echo "usage: $0 <apk> [build-tools-dir]"; exit 2; }
+
+# With no APK argument, look where :app:assembleRelease puts one. A tool that
+# prints a usage line when the obvious artifact is sitting right there invites
+# being run once, ignored, and forgotten -- and this check exists precisely
+# because a silent absence shipped.
+if [ -z "$APK" ]; then
+    GUESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/app/build/outputs/apk/release"
+    APK=$(ls -1 "$GUESS"/*.apk 2>/dev/null | head -1 || true)
+    [ -n "$APK" ] && echo "no APK given; using $APK"
+fi
+[ -n "$APK" ] || { echo "usage: $0 <apk> [build-tools-dir]"; echo "  (and no APK found under app/build/outputs/apk/release/ to fall back on)"; exit 2; }
 [ -f "$APK" ] || { echo "FAIL: no such APK: $APK"; exit 2; }
 
 DEXDUMP="$BT/dexdump"
