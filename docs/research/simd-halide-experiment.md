@@ -179,28 +179,55 @@ Read the result against the per-stage timings that now land in logcat (#146/#152
 Two were put forward. Recorded so neither is re-evaluated from scratch.
 
 **NumHalide** (`soufianekhiat/NumHalide`) — header-only C++20, MIT (GPLv3-compatible), a
-NumPy-shaped API over Halide. It has precisely the primitives this engine wanted:
-`fft / ifft / fft2d / ifft2d / fftshift`, real-FFT variants, and 1D/2D convolution, with
-841 tests across 94 suites.
+NumPy-shaped API over Halide. **Evaluated by building and running it, not by reading the
+README**, after the owner asked for it to be tried properly. Halide 21.0.0 from the `halide`
+pip wheel; it compiled and ran on Linux/x86-64 despite the project documenting a
+Windows/VS2022 build, so the "Windows-only" worry was unfounded.
 
-**Not adopted, and the reason is mostly timing.** `kernels/fft.cpp` +
-`kernels/fft_convolve.cpp` already exist, are ~250 lines, are gated by
-`tests/test_fft_convolve.cpp`, and are proven byte-identical across worker counts.
-Taking NumHalide instead would mean:
+**The determinism objection was WRONG, and the measurement says so.** The concern was that
+Halide's parallel/vectorised schedules reassociate and would break our byte-identical-across-
+worker-counts contract. Measured on a 256x256 2D transform at `HL_NUM_THREADS` 1 and 8:
 
-- promoting Halide from a `tools/` experiment to a hard engine dependency, with an AOT
-  generator to run at build time for every ABI;
-- a build that documents Windows / VS2022 / .NET 6 SDK and says nothing about the Android
-  NDK (#155 did prove `arm-64-android` cross-compiles, but that was Halide itself, not
-  this project);
-- **the determinism problem.** Our contract is byte-identical output for any worker
-  count. Halide's parallel and vectorised reduction schedules do not give that unless
-  scheduled for it specifically, and NumHalide's FFT schedule is unexamined. Our FFT fixes
-  the butterfly order by construction and the test proves 1-vs-8 equality.
+| check | result |
+|---|---|
+| `fft2d_fast`, 1 vs 8 Halide threads | **byte-identical** |
+| same transform as `kernels/fft`? | `max_abs` 2.27e-13 on values up to 641 (3.5e-16 relative) — yes |
 
-At 72 commits it is also not a battle-tested FFT. **Where it stays useful:** as a
-reference for the real-to-complex transform, which is the documented next optimisation on
-`fft_convolve` (it would halve both memory and time).
+So it would not have broken the contract. That objection is retracted.
+
+**Three findings that decide it anyway, all from the source and the bench:**
+
+1. **`conv.h`'s `convolve2d` does not use an FFT at all** — there is no `fft`/`dft` reference
+   in the file; it is a direct convolution. So NumHalide would replace `kernels/fft.cpp`
+   (the transform) and *not* `kernels/fft_convolve.cpp` (the overlap-save, the index
+   derivation, the reflect-padding contract). Its convolution is the same O(ks^2) algorithm
+   we just replaced — adopting it for convolution would have re-introduced the quadratic
+   cost with a 2-3x schedule on top, which is exactly the mistake section 20.6 names.
+
+2. **The obviously-named entry points are O(N^2) DFTs.** `fft()` and `fft2d()` in `fft.h`
+   build a direct DFT matrix — `RDom n(0, N)` summed for every `k` — and the header says why:
+   *"compute the direct DFT matrix (O(N^2), avoids Halide scheduling issues)"*. The real
+   O(N log N) radix-2 lives separately as `fft_fast()` / `fft2d_fast()`. Anyone reaching for
+   the obvious name gets the quadratic one. That is a live trap, not a style quibble.
+
+3. **Ours is faster as-is.** 2D complex transform, N = 1024:
+
+   | | ms |
+   |---|---|
+   | `kernels/fft`, single-threaded | **41.5** |
+   | NumHalide `fft2d_fast`, after JIT | 273.8 |
+   | NumHalide `fft2d_fast`, first call | 2330.8 (includes JIT compile) |
+
+   **6.6x, and that is ours single-threaded against Halide's.** Stated fairly: this is
+   NumHalide's DEFAULT schedule. A tuned schedule could close or reverse it — but tuning it
+   is precisely the work adopting a scheduling library was meant to avoid, and nobody has
+   done it.
+
+**Verdict: not adopted, on speed and scope rather than on determinism.** It would replace
+250 lines that are already written, gated, and 6.6x faster, while making Halide a hard engine
+dependency with an AOT generator per ABI. **Where it stays genuinely useful:** `src/rfft.h`
+is a reference for the real-to-complex transform, which is the documented next optimisation
+on `fft_convolve` (half the memory and half the time).
 
 **Halide-HLS** (`jingpu/Halide-HLS`) — Halide to FPGA via High-Level Synthesis, from the
 Stanford group (arXiv 1610.09405). **A dead end here, for the same reason HVX is:** the
