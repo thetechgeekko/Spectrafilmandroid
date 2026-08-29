@@ -16,8 +16,10 @@
  */
 package com.spectrafilm.app
 
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -27,6 +29,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -51,6 +54,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -167,51 +171,63 @@ class MainActivity : ComponentActivity() {
         // Back from a pushed sub-screen returns to the editor (root).
         BackHandler(enabled = screen != Screen.EDITOR) { screen = Screen.EDITOR }
 
+        val screenState = rememberSaveableStateHolder()
+
         Box(
             Modifier
                 .fillMaxSize()
                 .background(SpectraIcons.nearBlackCanvas),
         ) {
-            when (screen) {
-                Screen.EDITOR -> EditorScreen(
-                    settings = settings,
-                    activeCategoryState = editorCategory,
-                    onOpenSettings = { screen = Screen.SETTINGS },
-                    onOpenAbout = { screen = Screen.ABOUT },
-                    onProfileGroups = { f, p -> settingsFilmGroups = f; settingsPrintGroups = p },
-                    onOpenFilmCurves = { id, name ->
-                        curvesFilmId = id; curvesFilmName = name; screen = Screen.CURVES_FILM
-                    },
-                    onOpenPrintCurves = { id, name ->
-                        curvesPrintId = id; curvesPrintName = name; screen = Screen.CURVES_PRINT
-                    },
-                )
-                Screen.SETTINGS -> NavScaffold("Settings", onBack = { screen = Screen.EDITOR }) {
-                    SettingsScreen(
+            // Each destination keeps its own rememberSaveable bucket, keyed by screen.
+            // Without this the `when` below simply drops EditorScreen out of composition
+            // when the user opens Settings, discarding sourceUri/sourceKind/sourceName/
+            // rotation with it — so coming back from Settings silently landed on the
+            // synthetic demo image instead of the photo being edited. Those four are
+            // declared rememberSaveable precisely so source identity is durable; the nav
+            // swap was defeating that, and it also made any in-app A/B of a render
+            // setting impossible, since reaching the toggle destroyed the subject.
+            screenState.SaveableStateProvider(screen) {
+                when (screen) {
+                    Screen.EDITOR -> EditorScreen(
                         settings = settings,
-                        filmGroups = settingsFilmGroups,
-                        printGroups = settingsPrintGroups,
-                        onThemeChanged = onThemeChanged,
-                        onShowOnboarding = { showOnboarding = true; screen = Screen.EDITOR },
-                        onOpenDiagnostics = { screen = Screen.DIAGNOSTICS },
+                        activeCategoryState = editorCategory,
+                        onOpenSettings = { screen = Screen.SETTINGS },
+                        onOpenAbout = { screen = Screen.ABOUT },
+                        onProfileGroups = { f, p -> settingsFilmGroups = f; settingsPrintGroups = p },
+                        onOpenFilmCurves = { id, name ->
+                            curvesFilmId = id; curvesFilmName = name; screen = Screen.CURVES_FILM
+                        },
+                        onOpenPrintCurves = { id, name ->
+                            curvesPrintId = id; curvesPrintName = name; screen = Screen.CURVES_PRINT
+                        },
+                    )
+                    Screen.SETTINGS -> NavScaffold("Settings", onBack = { screen = Screen.EDITOR }) {
+                        SettingsScreen(
+                            settings = settings,
+                            filmGroups = settingsFilmGroups,
+                            printGroups = settingsPrintGroups,
+                            onThemeChanged = onThemeChanged,
+                            onShowOnboarding = { showOnboarding = true; screen = Screen.EDITOR },
+                            onOpenDiagnostics = { screen = Screen.DIAGNOSTICS },
+                        )
+                    }
+                    Screen.DIAGNOSTICS -> NavScaffold("Diagnostics", onBack = { screen = Screen.SETTINGS }) {
+                        DiagnosticsScreen()
+                    }
+                    Screen.ABOUT -> NavScaffold("About", onBack = { screen = Screen.EDITOR }) {
+                        AboutScreen()
+                    }
+                    Screen.CURVES_FILM -> ProfileCurvesScreen(
+                        profileId = curvesFilmId,
+                        displayName = curvesFilmName,
+                        onBack = { screen = Screen.EDITOR },
+                    )
+                    Screen.CURVES_PRINT -> ProfileCurvesScreen(
+                        profileId = curvesPrintId,
+                        displayName = curvesPrintName,
+                        onBack = { screen = Screen.EDITOR },
                     )
                 }
-                Screen.DIAGNOSTICS -> NavScaffold("Diagnostics", onBack = { screen = Screen.SETTINGS }) {
-                    DiagnosticsScreen()
-                }
-                Screen.ABOUT -> NavScaffold("About", onBack = { screen = Screen.EDITOR }) {
-                    AboutScreen()
-                }
-                Screen.CURVES_FILM -> ProfileCurvesScreen(
-                    profileId = curvesFilmId,
-                    displayName = curvesFilmName,
-                    onBack = { screen = Screen.EDITOR },
-                )
-                Screen.CURVES_PRINT -> ProfileCurvesScreen(
-                    profileId = curvesPrintId,
-                    displayName = curvesPrintName,
-                    onBack = { screen = Screen.EDITOR },
-                )
             }
 
             if (showOnboarding && screen == Screen.EDITOR) {
@@ -586,6 +602,17 @@ class MainActivity : ComponentActivity() {
                 dngFallbackNotice = false
             }
         }
+
+        // The export runs under a foreground service, and on API 33+ that service's
+        // ongoing notification is silently suppressed unless POST_NOTIFICATIONS is
+        // granted. The manifest has declared the permission since the service landed,
+        // but nothing ever requested it — so on a real install the export notification
+        // never appeared at all. Asked in context at the first export, and never
+        // blocking: the service's kill-resistance (oom_score_adj 50 vs 700) works
+        // whether or not the notification can be drawn.
+        val notificationPermission = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* granted or denied, the export proceeds either way */ }
 
         // --- source pickers ---
         val photoPicker = rememberLauncherForActivityResult(
@@ -1777,9 +1804,18 @@ class MainActivity : ComponentActivity() {
                             val exportStartMs = System.currentTimeMillis()
                             Diag.i("export start format=${exportFmt.name}")
                             exporting = true; exportDone = false; status = "rendering full resolution…"
-                            // Hold the process in the foreground scheduling group for the whole
-                            // render. Leaving the app mid-export otherwise drops it to the little
-                            // cluster and costs ~4x (13894 ms -> 55631 ms on a 12.5 MP export).
+                            // Keep the process alive across the whole render: a long
+                            // backgrounded export is a kill candidate for Samsung's
+                            // device-health manager, and the service takes oom_score_adj
+                            // from 700 to 50. It does NOT recover the ~4x background
+                            // slowdown — no service-tier cpuset on the measured device
+                            // contains the prime cores. See ExportForegroundService.
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.POST_NOTIFICATIONS)
+                                != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
+                            }
                             ExportForegroundService.start(ctx)
                             scope.launch {
                                 val result = runCatching {

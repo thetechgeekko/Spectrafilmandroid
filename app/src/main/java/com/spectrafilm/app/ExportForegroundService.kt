@@ -17,34 +17,53 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 
 /**
- * Holds the process in the foreground scheduling group for the duration of an export.
+ * Keeps a running export alive when the user leaves the app.
  *
- * ## Why this exists
+ * ## Why this exists: kill-resistance, NOT speed
  *
- * The export coroutine runs in the Activity's scope. When the user leaves the app
- * mid-export, Android moves the whole process to the `background` cpuset — on the
- * measured device (SM-S948W) that is the efficiency cluster — and the render slows
- * down by roughly **4x**, uniformly across every stage:
+ * A long backgrounded export is a kill candidate for Samsung's device-health
+ * manager (`com.sec.android.sdhms`). Measured on SM-S948W, this service is what
+ * stops that:
  *
  * ```
- *   12.5 MP export, same image, same settings:
- *     foreground   13894 ms          background   55631 ms     (4.00x)
- *   per stage, foreground -> background:
- *     preprocess 5.5x   grain 5.1x   filming_expose 5.0x   develop 4.0x
- *     print_expose 3.8x  scan 3.2x   scan_spatial 3.0x
- *     halation 2.1x      dir_couplers 2.1x
+ *   with the service running:  oom_score_adj =  50
+ *   after it stops:            oom_score_adj = 700
  * ```
  *
- * That 4x is larger than every kernel optimisation on this branch combined (which
- * measured 1.12x foreground), which is what makes this the highest-value change
- * available. A long backgrounded export is also a kill candidate for Samsung's
- * device-health manager (`com.sec.android.sdhms`); a foreground service with a
- * visible notification is exempt from that reaper.
+ * That is the whole of its value, and it is real — it is the fix for #153.
+ *
+ * ## It does NOT fix the 4x background slowdown. Measured, not assumed.
+ *
+ * This service was written believing it would. It does not, and the device run
+ * that proved it also explained why. Backgrounding still costs ~3.9x (backgrounded
+ * median 55063 ms vs foreground 14102 ms over 7 runs) even though the service
+ * starts every single time and the notification posts every single time.
+ *
+ * The cpuset is the mechanism, and it predicts the result exactly — but a
+ * foreground service does not determine which cpuset the process lands in:
+ *
+ * ```
+ *   cpu0-5  max 3.63 GHz        cpu6-7  max 4.74 GHz   (prime pair)
+ *
+ *   /top-app          cpus=0-7      <- 14214 ms   foreground
+ *   /foreground-boost cpus=0-7      <- 14927 ms   transient interaction boost
+ *   /foreground       cpus=0-5      <- no prime cores; best an FGS normally rates
+ *   /moderate         cpus=0-1,4-5  <- 55357 ms   where backgrounded exports land
+ *   /background       cpus=0-1,4-5  <- identical mask to /moderate
+ * ```
+ *
+ * `/moderate` is byte-identical to `/background` in CPU terms: half the cores and
+ * zero prime cores. **No service-tier cpuset on this device contains cpu6/7**, so
+ * changing `foregroundServiceType` cannot rescue it either. The perf half of #153
+ * is not solvable with a foreground service on this hardware.
+ *
+ * The 4x is also only ever paid while the user leaves the app — the foreground
+ * path was never slow. The remaining honest lever is the ~14 s foreground export.
  *
  * ## What it does NOT do
  *
  * It runs no work of its own. The export stays exactly where it is, in the caller's
- * coroutine — this service only pins the process's scheduling class while it runs.
+ * coroutine — this service only holds the process's lifecycle class while it runs.
  * That keeps the change off the render path entirely, so it carries no parity risk.
  *
  * Every failure path is swallowed: an export that would have succeeded slowly must

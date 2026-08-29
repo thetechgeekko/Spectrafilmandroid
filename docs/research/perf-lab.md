@@ -722,6 +722,12 @@ reported was wrong. A stale checkout is the cause of all three discrepancies.
 
 ### 13.4 What was built in response
 
+> **SUPERSEDED BY §15.** Both changes below were built on predictions that the next
+> device run falsified. The foreground service does **not** recover the 4× (no
+> service-tier cpuset on that device contains the prime cores), and the pinning
+> setting is a **1.41× regression** on a whole render. Left as written, because the
+> reasoning is the record of what was believed and why.
+
 | Finding | Change |
 |---|---|
 | Backgrounding costs 4× | `ExportForegroundService` — holds the process in the foreground scheduling group for the duration of an export (#153). Runs no work of its own, so it touches nothing on the render path. |
@@ -797,6 +803,138 @@ advertises itself as mirroring CI should say when a plain run does not.
 
 The cost is one extra parallel runner for ~13 minutes per push. The thing it protects
 is the prime directive.
+
+## 15. Third device run — both §13 changes were wrong, and the data says why
+
+§13 built two things off two predictions. A device run on `e1063dc` tested both.
+**Both predictions failed**, and in each case the same run explains the failure.
+
+### 15.1 The foreground service does not recover the 4×
+
+7 runs, 12.5 MP, SM-S948W. Backgrounded median **55063 ms** vs foreground **14102 ms**
+= **3.90×**. The pre-fix number was 4.00×. Nothing meaningful changed.
+
+The service is not failing to start. It starts every run, and the notification posts
+every run: `isForeground=true foregroundId=1001 types=0x1`, `Background started FGS:
+Allowed`, and no warning in any run.
+
+**My reading guide for this test was wrong and the run corrected it.** I wrote that
+4× *with* the notification showing "would mean the cpuset was never the mechanism."
+That inference does not follow, and the counter-evidence is direct — same APK, same
+image, same action, only the cpuset differing:
+
+```
+  cpuset /foreground-boost -> 14927 ms   (1.06x, fully fixed)
+  cpuset /moderate         -> 53-56 s    (3.9x)
+```
+
+The cpuset predicts the result perfectly. **The cpuset IS the mechanism.** What fails
+is the assumption that a foreground service determines which cpuset you get.
+
+Why it cannot work on this hardware:
+
+```
+  cpu0-5  max 3.63 GHz          cpu6-7  max 4.74 GHz   (prime pair)
+
+  /top-app          cpus=0-7
+  /foreground-boost cpus=0-7        <- transient interaction boost, not FGS-earned
+  /foreground       cpus=0-5        <- NO prime cores; best an FGS normally rates
+  /moderate         cpus=0-1,4-5    <- where backgrounded exports land
+  /background       cpus=0-1,4-5    <- IDENTICAL mask to /moderate
+```
+
+`/moderate` is byte-identical to `/background` in CPU terms: half the cores, zero
+prime cores. That is the entire 4×. **No service-tier cpuset on this device contains
+cpu6/7**, so changing `foregroundServiceType` cannot rescue it either.
+
+**The service is still worth keeping, for the other half of #153:**
+
+```
+  with FGS running:  oom_score_adj =  50
+  after it stops:    oom_score_adj = 700
+```
+
+That is the anti-SIGKILL protection, and it works. Keep the service for
+kill-resistance; stop attributing speed to it. Its KDoc now says so.
+
+### 15.2 The 1.51× pinning win is a 1.41× regression on a whole render
+
+`big cores set=true detected=2` — detection is correct (0.80 × 4.74 GHz = 3.79 GHz,
+and cpu0-5 at 3.63 GHz fall below it), so the test is valid.
+
+```
+  big_cores=false : 14254  14476  14745   median 14476 ms
+  big_cores=true  : 19621  20458  21759   median 20458 ms     ON is 1.41x SLOWER
+```
+
+Per stage, medians of 3, ON/OFF:
+
+| stage | OFF | ON | ratio |
+|---|---|---|---|
+| **grain** | 3620.1 | **8612.4** | **2.38×** |
+| filming_expose | 177.4 | 390.6 | 2.20× |
+| print_expose | 300.7 | 555.2 | 1.85× |
+| develop | 35.5 | 54.2 | 1.53× |
+| scan | 737.6 | 947.4 | 1.28× |
+| scan_spatial | 385.5 | 481.1 | 1.25× |
+| dir_couplers | 1348.9 | 1465.9 | 1.09× |
+| halation | 2054.8 | 2158.9 | 1.05× |
+| preprocess | 150.0 | 149.2 | 0.99× |
+
+**Grain is the regression**: +4992 ms of a +5982 ms total delta. Clean split —
+compute-bound pointwise stages lose badly, spatial/bandwidth-bound stages barely
+notice.
+
+Mechanism, read from source: `parallel.cpp` caps the pool to the big-core count when
+pinning is on, and `grain.cpp` inherits it via `parallel_num_threads()`. So ON is
+**2 workers on 2 prime cores** against OFF's **8 workers across all 8** — 9.48 GHz of
+aggregate clock against 31.26 GHz. A 1.31× per-core clock edge cannot cover a 3.3×
+compute deficit. The `e1063dc` commit message predicted this exact failure mode as a
+risk; it is what happened.
+
+The bench was unrepresentative: one spatial filter on a small fixture is
+thread-spawn-overhead dominated, where 2 workers legitimately beat 8. A 12.5 MP
+render is not that.
+
+**The Settings row is removed.** Its copy read "measured 1.5x faster on the test
+device" — on a whole render, on the device it was measured on, it is 1.41× slower.
+The pref and the native API stay for experiments (which is how this A/B was actually
+run); there is simply no user-facing switch promising a win that does not exist.
+
+The bit-exactness half held up: checksums identical in every configuration.
+
+### 15.3 Three bugs the run surfaced, all verified against source and fixed
+
+| Bug | Verified | Fix |
+|---|---|---|
+| Opening Settings destroys the loaded image — `screen = Screen.SETTINGS` swaps the top-level composable, so `EditorScreen` leaves composition and its `rememberSaveable` source identity goes with it. Coming back, you are silently on the demo image. | `MainActivity` nav `when (screen)`; `sourceUri`/`sourceKind`/`sourceName`/`rotation` are all `rememberSaveable` | Nav wrapped in `rememberSaveableStateHolder()` + `SaveableStateProvider(screen)`, so each destination keeps its own bucket. |
+| "Preview max size" inert for real photos — honoured for the demo, ignored for RAW. | `ParamsState.loadFrom` restored `previewMaxSize` from the incoming params, and recipes are keyed by source uri, so opening a RAW replayed its saved value | `loadFrom` no longer reads it back — matching `gpuEngine`/`gpuExport`, whose docs two lines below already state that policy. Unblocks the 1–2 MP sweep for #146. |
+| `POST_NOTIFICATIONS` declared but never requested, so the export notification is invisible on a real install. | manifest declares it; zero `requestPermission` calls in app source | Requested in context at the first export, non-blocking. |
+
+The third one has a sting worth keeping: my own reading guide said "no notification
+appeared → the service never started." On a shipping build that would have been a
+false negative.
+
+### 15.4 Where this leaves the performance work
+
+The 4× is real, it is the cpuset, and no foreground service can reach the prime cores
+on this device — **that lever is spent**. It is also only ever paid while the user
+leaves the app; the foreground path was never slow.
+
+So the remaining honest target is the **~14 s foreground export**, where **grain is
+3.3 s** and is the one stage nothing has optimised yet. §12's profile of the irregular
+samplers already pointed at the same place from a different direction.
+
+### 15.5 A method note, because it has now cost time twice
+
+The previous run was measured against a stale checkout and produced three false
+findings. This run produced two contaminated results before the tester noticed that
+opening Settings had swapped the subject to the demo image — the first four A/B
+attempts "succeeded" in 2.2 s and looked like a spectacular win.
+
+**Both classes of error look exactly like clean data.** Anything that changes app
+state between A and B needs a positive confirmation in the log that the subject is
+still what you think it is — here, grepping `decode kind=RAW 383x510` on every run.
 
 ## Running it
 

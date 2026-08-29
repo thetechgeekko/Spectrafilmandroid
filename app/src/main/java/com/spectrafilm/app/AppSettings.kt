@@ -57,23 +57,32 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     /**
      * Pin the render pool to the device's performance cores.
      *
-     * A fork-join is only as fast as its slowest chunk, so one worker parked on an
-     * efficiency core paces the whole map however many big cores sit idle. Measured
-     * on an SM-S948W, halation path, 1024x768:
+     * MEASURED A REGRESSION ON A WHOLE RENDER. Kept as a pref-only experiment
+     * switch; there is deliberately no Settings UI for it.
+     *
+     * The microbenchmark said 1.51x (SM-S948W, halation path, 1024x768: 71.86 ms
+     * unpinned vs 47.58 ms pinned), and capping the pool without pinning did NOT
+     * reproduce it, so core placement really was the mechanism THERE. It did not
+     * survive the end-to-end pipeline. A 12.5 MP export on the same device:
      *
      * ```
-     *   no pinning        71.86 ms      1.00x
-     *   pinned (2 prime)  47.58 ms      1.51x
+     *   OFF  median 14476 ms          ON  median 20458 ms      1.41x SLOWER
+     *   grain          3620 -> 8612 ms  (2.38x) = 83% of the regression
+     *   filming_expose  177 ->  391 ms  (2.20x)
+     *   dir_couplers   1349 -> 1466 ms  (1.09x) — essentially immune
+     *   halation       2055 -> 2159 ms  (1.05x) — essentially immune
      * ```
      *
-     * Capping the pool WITHOUT pinning does not do it (SPK_NUM_THREADS=2 measured
-     * 68.70 ms, essentially baseline), so this is about which cores run the work,
-     * not how many workers there are.
+     * Why: pinning also caps the pool to the big-core count (parallel.cpp), so ON is
+     * 2 workers on 2 prime cores against OFF's 8 workers across all 8 — 9.48 GHz of
+     * aggregate clock against 31.26 GHz. A 1.31x per-core clock edge cannot cover a
+     * 3.3x compute deficit. The microbenchmark was one spatial filter on a small
+     * fixture, where thread-spawn overhead dominates and 2 workers legitimately beat
+     * 8; a full-resolution render is nothing like that.
      *
-     * Output is unaffected by construction — affinity moves only WHERE a chunk runs,
-     * and every worker count is byte-identical under the parity gate's thread-
-     * invariance contract. Default OFF pending an A/B over a whole render: the 1.51x
-     * is one spatial filter on one device, not the end-to-end pipeline.
+     * Output is unaffected either way — affinity moves only WHERE a chunk runs, and
+     * every worker count is byte-identical under the parity gate's thread-invariance
+     * contract. That half held up. Default OFF, and it should stay off.
      */
     var bigCores: Boolean
         get() = prefs.getBoolean(KEY_BIG_CORES, false)

@@ -234,6 +234,19 @@ class ParamsState {
     var toneCurveBlue by mutableStateOf<List<Pair<Float, Float>>>(emptyList())
 
     // --- Display / settings ---
+
+    /**
+     * Long edge of the interactive preview. Device/app-level setting seeded from
+     * AppSettings.previewMaxSize (NOT preset/recipe state — loadFrom leaves it
+     * alone, exactly like [gpuEngine] and [gpuExport] below).
+     *
+     * loadFrom USED to restore this from the incoming params. Because recipes are
+     * keyed by source uri, opening a RAW replayed its saved recipe and put this
+     * straight back to whatever was stored — so Settings' "Preview max size" moved
+     * the demo image and was silently inert for every real photo, which in turn
+     * blocked the 1-2 MP preview sweep (#146). It is still WRITTEN by toParams, as
+     * gpuPreview/gpuExport also are; it is simply no longer read back.
+     */
     var previewMaxSize by mutableIntStateOf(640)
 
     /**
@@ -369,8 +382,6 @@ class ParamsState {
         toneCurveRed = tc.red.points
         toneCurveGreen = tc.green.points
         toneCurveBlue = tc.blue.points
-
-        previewMaxSize = p.settings.previewMaxSize
     }
 
     /** Build an immutable SpektraParams from current state. */
