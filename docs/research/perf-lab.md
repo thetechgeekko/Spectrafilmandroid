@@ -1546,6 +1546,93 @@ nothing: `fileread` 119/140/137, `unpack` 42/46/46, `process` 2745/2760/2786, `m
 - **`unaccounted` 287 ms** inside decode — `open_buffer`, the `result.rgb` allocation
   and the JNI marshalling.
 
+## 18. The blind spot: every optional effect is unmeasured
+
+Owner's catch, and it is the most consequential one in this whole dossier. Every number
+in §16 and §17 was taken at **default settings**. `stage_timings_format` **skips zero
+slots**, so a gated-off filter does not appear as `0.0` — it does not appear at all. The
+export profile is therefore silent about anything a user might switch on.
+
+Reading the enum against the export line:
+
+| stage slot | gate | default | ever measured? |
+|---|---|---|---|
+| `camera_diffusion` — **Black Pro-Mist** | `diffusion_filter.active` | **false** | **never** |
+| `lens_blur` | `lens_blur_um > 0` | **0** | **never** |
+| `glare_field` | `glare_active && glare_percent > 0` | off | **never — and it had no slot at all** |
+| `highlight_boost` | `boost_ev > 0` | 0 | printed 0.0 |
+| `tc_lut_build` | cold start | warm | printed 0.0 |
+
+**Glare had no timer whatsoever.** Even switched on it cost nothing visible, because
+`compute_random_glare_amount` — a stochastic full-resolution field plus a blur — was
+never bracketed. That is fixed here: `STG_GLARE` now measures the field build. The
+per-pixel add is folded into the scan loops and is not separable from them.
+
+### Why this is the dangerous kind of gap
+
+All three unmeasured effects live in `filming.expose`, on the **float64 irradiance at
+full resolution** — the same place, and the same shape, as `halation`. Halation costs
+**1905 ms**. There is no reason in the code to expect Pro-Mist or lens blur to be
+cheaper, and one reason to expect worse: §12 measured a Gaussian-mixture approximation
+of the diffusion PSF at **109×** faster than the exact path, which only pays off if the
+exact path is very expensive.
+
+So a user who turns on Pro-Mist may be paying seconds that no profile has ever seen, on
+top of a 12.2 s export.
+
+**And it invalidates the GPU targeting, not just the totals.** Picking GPU stages from a
+defaults-only profile ranks grain first and never sees diffusion at all. If Pro-Mist is
+4 s when enabled, the ranking is wrong.
+
+### A third case, different from the other two
+
+The **print route has its own diffusion filter** (`printing.cpp`, inside
+`print_expose`). It is not missing a timer and it is not gated off by the export
+profile — it is simply *folded into* `print_expose` with no separate slot. So enabling
+Pro-Mist on the print route makes `print_expose` swell with no way to see why.
+
+Three distinct failure modes, then, and they need different fixes:
+
+| | example | symptom |
+|---|---|---|
+| no slot at all | `glare_field` (until now) | costs nothing visible even when ON |
+| slot exists, effect off | `camera_diffusion`, `lens_blur` | absent from the line entirely |
+| slot exists, work folded in | print-route diffusion | parent stage swells, cause invisible |
+
+### A second thing the enum reading fixed
+
+`scan_spatial` — and now `glare_field` — are **nested inside** the `scan` bracket: all
+three `ScopedStage`s live in the same `scan()` function. So the printed slots **must not
+be summed**.
+
+That resolves §16.2's loose end. The apparent "stage timers exceed the native call's
+wall clock by 40-75 ms" was an artifact of adding a nested sub-measure twice:
+
+```
+  naive sum          8391.5 ms
+  minus scan_spatial  412.9 ms   (nested inside scan)
+  true stage total   7978.6 ms   vs simulate 8342 ms
+  -> 363 ms genuinely outside every stage: JNI entry, param marshalling, result alloc
+```
+
+Which is the ~140 MB-allocation-scale gap that was predicted in the first place, and is
+a far more sensible picture than timers outrunning the clock. `stage_timer.h` now says
+both things at the point of use, so neither reading recurs.
+
+### The measurement this demands, before any GPU work
+
+One export per effect, at full resolution, each enabled alone:
+
+1. baseline (all off) — the control, ~12.2 s
+2. **Black Pro-Mist** on
+3. **lens blur** on
+4. **glare** on (print route)
+5. highlight boost on
+6. and the same for anything else the UI can switch on that does not appear above
+
+Only then is there a profile that describes what users actually run — and only then can
+GPU targets be chosen from evidence rather than from the subset that happened to be on.
+
 ## Running it
 
 ```bash

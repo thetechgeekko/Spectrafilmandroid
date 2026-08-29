@@ -41,6 +41,9 @@ enum StageSlot {
     STG_PRINT_EXPOSE,     // enlarger expose + print develop (print route)
     STG_SCAN,             // scan(): whole stage, density -> display RGB (CPU or GPU)
     STG_SCAN_SPATIAL,     // SUB-MEASURE of scan: gamut compress / lens blur / unsharp
+    STG_GLARE,            // SUB-MEASURE of scan: viewing-glare FIELD build (print
+                          // route). The per-pixel add is folded into the scan loops
+                          // and is not separable from them.
     STG_COUNT
 };
 
@@ -60,6 +63,7 @@ inline const char* stage_name(int s) {
         case STG_PRINT_EXPOSE:  return "print_expose";
         case STG_SCAN:          return "scan";
         case STG_SCAN_SPATIAL:  return "scan_spatial";
+        case STG_GLARE:         return "glare_field";
         default:                return "?";
     }
 }
@@ -77,8 +81,21 @@ inline void stage_timings_reset() {
 }
 
 // Format the non-zero slots as "stage=1.23 other=4.56" into buf; returns the
-// count of bytes written (excluding the NUL). Skips zero slots to keep the line
-// short (a gated-off filter contributes nothing).
+// count of bytes written (excluding the NUL).
+//
+// TWO THINGS THE OUTPUT DOES NOT SAY, and both have already misled a reading:
+//
+//  1. Zero slots are SKIPPED, so a gated-off filter is invisible rather than shown
+//     as 0. An export profile taken at default settings therefore says nothing
+//     about camera_diffusion (Black Pro-Mist), lens_blur or glare_field — all
+//     three default off. Absence here is not evidence of cheapness.
+//  2. SUB-MEASURE slots are NESTED inside their parent, so the printed numbers
+//     MUST NOT simply be added up. scan_spatial and glare_field both sit inside
+//     the scan bracket, so a naive total double-counts them. Summing the line and
+//     comparing against the native call's wall clock produced an apparent
+//     "timers exceed wall clock by 40-75 ms"; subtracting the nested
+//     scan_spatial turns that into the ~363 ms of JNI entry, param marshalling
+//     and result allocation that genuinely is outside every stage.
 inline int stage_timings_format(char* buf, int cap) {
     const double* t = stage_timings();
     int off = 0;

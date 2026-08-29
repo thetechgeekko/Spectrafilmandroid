@@ -381,6 +381,13 @@ void scan(const Profile& film, const ScanningParams& params,
             illuminant_xyz[2] += w * kCieCmf1931[l][2];
         }
         glare_field.assign(static_cast<size_t>(npix), 0.0f);
+        // The field build is glare's expensive half — a stochastic full-resolution
+        // field plus a blur. The per-pixel add below is folded into the scan loops and
+        // is not separable from them, so this slot measures the build only. Like
+        // scan_spatial it is NESTED inside the STG_SCAN bracket, so it must not be
+        // added to a stage total. Until now glare had no slot at all and so cost
+        // nothing visible even when switched on (perf-lab §18).
+        ScopedStage _tg(STG_GLARE);
         compute_random_glare_amount(params.glare_percent, params.glare_roughness,
                                     params.glare_blur, width, height,
                                     params.glare_seed, glare_field.data());
