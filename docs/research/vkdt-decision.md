@@ -245,3 +245,111 @@ our grain model, and our parity gate intact.
 
 What it does not tell us is still §5's question: what GPU actually buys on our biggest
 stage. Nothing here substitutes for measuring that.
+
+## 9. MEASURED: what 44 bands would actually cost the picture
+
+§8 turned "adopt vkdt" into "ship a 44-band model instead of an 81-band one" and called
+it a product decision. A product decision still needs a number, and this one is
+answerable on a laptop: **band-limit our own profiles and render the same fixture.**
+
+`tools/spectral_bands/` does it with **no engine change, no device, no GPU**. The
+film/paper spectral arrays are partitioned into blocks of N samples, each block replaced
+by its band value (averaged on the *linear* physical quantity — sensitivity, not log
+sensitivity; transmittance, not density) and replicated back across the block. The tree
+still has 81 samples, so the unmodified engine runs it, but it carries only the
+information a 41-band / 10 nm model would. The NaN mask is preserved exactly, so band
+width is the only variable.
+
+**The control is exact.** Rendering the shipped assets against a tree that went through
+the identical copy + JSON round-trip returns 0.00 codes on every case, and the untouched
+`test_simulate_e2e` still reports `max_abs = 5.96e-08` against the goldens. Every number
+below is band width and nothing else.
+
+Output is sRGB-encoded, so these are **8-bit display codes** — the unit the question is
+actually asked in.
+
+### 81 bands @ 5 nm vs 41 bands @ 10 nm — the vkdt-comparable case
+
+| case | median | p90 | p99 | max | rms | ≥1 code | ≥5 codes |
+|---|---|---|---|---|---|---|---|
+| scan, portra 400 | 0.23 | 0.58 | 0.86 | **1.50** | 0.33 | 0.26% | 0.00% |
+| scan, provia 100f | 0.12 | 0.71 | 2.25 | **9.49** | 0.60 | 6.39% | 0.22% |
+| print, portra 400 → endura | 0.21 | 1.30 | 3.86 | **15.08** | 0.99 | 14.26% | 0.55% |
+| print, ektar 100 → supra | 0.16 | 1.23 | 3.54 | **16.78** | 0.91 | 12.43% | 0.31% |
+
+**The two routes answer differently, and that is the finding.**
+
+- **The scan (slide) route survives 10 nm.** Portra at 1.5 codes worst-case, a quarter
+  of a code typically, 0.26% of samples off by even one code. That is invisible.
+- **The print (enlarger) route does not.** 15–17 codes at the worst pixel, one sample in
+  eight off by a code or more, one in two hundred off by five or more. Not catastrophic,
+  but not something you could ship as "the same picture".
+
+The print route is ~10× worse on the same profiles, and the reason is structural: the
+enlarger multiplies the negative's spectral transmittance against dichroic filters and
+then against the paper's sensitivity, so a band-averaging error is applied three times
+in series instead of once. Positive film through the scan route pays it once.
+
+### The trend, which rules out going further
+
+| bands | scan portra max | print portra max | print portra ≥5 codes |
+|---|---|---|---|
+| 41 @ 10 nm | 1.50 | 15.08 | 0.55% |
+| 27 @ 15 nm | 3.62 | 27.22 | 4.67% |
+| 21 @ 20 nm | 7.83 | 46.02 | 17.78% |
+
+Error grows faster than linearly in band width on the print route — 46 codes at 20 nm,
+with 18% of samples off by 5 or more. Whatever else is true, **10 nm is the floor**, not
+a waypoint to something coarser.
+
+### What this settles
+
+1. **44 bands is not free, and it is not fatal.** Anyone claiming either without a
+   number was guessing. The honest statement is: free on the slide route, visibly
+   different on the print route.
+2. **The halving is worth ~2× on the spectral loops only** — the stages that iterate
+   over bands. It does nothing for grain, which is ~40% of the engine and does not touch
+   the spectral axis. So the *speed* case for 44 bands is much weaker than the
+   band-count ratio suggests, while the *quality* cost is real and concentrated in the
+   route most of our profiles target.
+3. **This strengthens route three** (§8): write our own **81-band** GPU shaders with
+   vkdt as the architecture guide. We would be giving up measurable print-route accuracy
+   for a speedup that does not apply to the largest stage. There is no reason to pay it.
+
+The experiment is committed and re-runnable: `bash tools/spectral_bands/run_band_probe.sh`.
+
+## 10. The RAW decoder: what vkdt uses, and why swapping ours would not help
+
+Owner's question — our decode is slow, what does vkdt use, and what about darktable's
+`rawspeed`?
+
+**What vkdt uses.** `src/pipe/modules/i-raw` links either **rawspeed** (darktable's,
+pinned at commit `ae217c0`, cloned at build time — `i-raw/flat.mk`) or **rawloader**
+(the Rust `rawler` crate), selected by `VKDT_USE_RAWINPUT`. Never LibRaw.
+
+**But that is not the interesting part.** `i-raw/main.cc` calls `decodeRaw()` and then
+passes the **CFA mosaic** downstream — `mod->img_param.filters =
+ColorFilterArray::shiftDcrawFilter(...)`. Demosaic is a **separate GPU module**:
+`src/pipe/modules/demosaic/` is a set of compute shaders (`rcd_conv.comp`,
+`rcd_fill.comp`, `halfsize.comp`, `down.comp`, `splat.comp`, `gauss.comp`, `fix.comp`)
+implementing RCD. rawspeed's job in vkdt is **unpacking and decompression only.**
+
+**Why that matters for us.** Our release decode is 546 ms, and 325 of it (60%) is
+`dcraw_process` — which *is* the demosaic (AHD; `raw_decoder.cpp` never sets
+`user_qual`, so LibRaw's default applies). rawspeed does not demosaic at all. Swapping
+LibRaw for rawspeed would replace our `unpack` phase, which was 46 ms even on the
+`-O0` debug build. **It would buy approximately nothing**, at the cost of a C++20
+dependency with pugixml/libjpeg/zlib, a runtime `cameras.xml`, and a licence review.
+The Rust option is worse for us — a cargo toolchain inside an NDK build.
+
+The lever vkdt actually pulls here is **GPU demosaic**, not a different CPU decoder.
+
+**And the honest size of the prize.** On release, decode is **546 ms of a 6251 ms
+export — 8.7%.** Perfect GPU demosaic saves at most 325 ms, ~5%. This looked like a
+much bigger problem when decode read 3647 ms, and that number was an artefact of the
+debug `-O0` bug (`perf-lab.md` §19). The decoder is no longer where the time is.
+
+**The one cheap CPU lever that does exist** is `user_qual`: LibRaw defaults to AHD, and
+PPG or VNG are materially faster. It moves pixels, so it is a quality call and it sits
+outside the parity gate — the same shape of decision as §9, and about a 5% prize. It is
+recorded, not recommended.

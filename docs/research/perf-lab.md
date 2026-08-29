@@ -1495,6 +1495,8 @@ else in the way.
 > **The sizing below is wrong by ~8.5x** — it is stated against the debug `process` of
 > 2760 ms. On release `dcraw_process` is 325 ms, so an ideal 2x is ~160 ms of a 6251 ms
 > export, not a lever. The change itself is correct and stays landed. See §19.3.
+> For what a *different decoder* would buy — and why rawspeed would not help, since it
+> does not demosaic — see `vkdt-decision.md` §10.
 
 Owner's call was OpenMP first, and it is the right order — it is the one of the two
 that **changes no pixel**, so it can be verified rather than judged.
