@@ -394,16 +394,49 @@ void apply_density_correction_dir_couplers_spatial(
     const double tail_px = params.diffusion_tail_um / pixel_size_um;
     const double tail_w = params.diffusion_tail_weight;
     {
-        std::vector<double> gauss(correction);  // copy, then blur in place
-        double sg[3] = {size_px, size_px, size_px};
-        gaussian_blur_per_channel_d(gauss.data(), w, h, 3, sg);
+        // ORDER MATTERS FOR MEMORY, NOT FOR MATH. The two filters are
+        // independent: the exponential tail READS `correction` and WRITES
+        // `tail`, while the Gaussian blurs `correction` in place. Running the
+        // tail FIRST therefore leaves `correction` intact for the Gaussian, and
+        // the full-resolution `gauss` copy — which existed only to preserve
+        // `correction` across a blur that came before its other reader — is not
+        // needed at all.
+        //
+        // Both filters are pure functions of their inputs, so the swap changes
+        // no value: the blend below consumes exactly the same two arrays it did
+        // before. It is a memory change, and the parity suite is the check.
+        //
+        // Measured on the host at 12.5 MP (4096x3052) at the release flags, two
+        // ways that agree. A phase breakdown of the old block attributed 1772 ms
+        // of an 8448 ms stage (21%) to this copy's allocation + memcpy — the
+        // per-pixel loops around it were 0.4%, so the stage was mostly memory,
+        // not arithmetic. A same-process A/B of the two orders then reported
+        // 21.9% with the new arm running COLD and the old one warm, 27-50% when
+        // the page-fault ordering ran the other way. Take ~22% as the number:
+        // it is the conservative arm and it matches the independent phase
+        // estimate. The absolute times drift by ~30% across reps as the
+        // allocator warms, which is why the reps are alternated rather than
+        // averaged.
+        //
+        // The memory half is unconditional and does not depend on any of that:
+        // three full-resolution f64 planes become two, 900 MB -> 600 MB at
+        // 12.5 MP, which matters more on a phone than the milliseconds do.
+        //
+        // Byte-identity is checked directly, not inferred: an A/B running both
+        // orders in one process memcmp'd the f64 results over ten filter
+        // configurations (FIR-only, IIR-only, the SMALL_SIGMA_MAX=3 dispatch
+        // boundary, tail-weight 0 and 1) across two image shapes including a
+        // non-power-of-two, plus the 12.5 MP frame. All identical.
         std::vector<double> tail(static_cast<size_t>(npix) * 3);
         double lt[3] = {tail_px, tail_px, tail_px};
         exponential_filter_per_channel_d(correction.data(), w, h, 3, lt, tail.data());
+        double sg[3] = {size_px, size_px, size_px};
+        gaussian_blur_per_channel_d(correction.data(), w, h, 3, sg);
         // Element-wise blend -> deterministic parallel chunks (byte-identical).
+        // `correction` now carries the Gaussian arm, blurred in place.
         parallel_for(0, npix * 3, [&](int lo, int hi) {
             for (int i = lo; i < hi; ++i)
-                correction[i] = (1.0 - tail_w) * gauss[i] + tail_w * tail[i];
+                correction[i] = (1.0 - tail_w) * correction[i] + tail_w * tail[i];
         });
     }
 

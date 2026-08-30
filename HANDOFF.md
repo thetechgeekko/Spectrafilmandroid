@@ -2,6 +2,78 @@
 
 ---
 
+## THE COUPLER STAGE IS 44% ALLOCATION AND 0.4% ARITHMETIC (2026-08-30)
+
+Owner asked to start on the ~79% of an export that is `grain + halation + dir_couplers`,
+beginning with couplers as the lowest-risk GPU target. **The plan did not survive the
+measurement, and that is the result worth keeping.** Full write-up: `perf-lab.md` §23.
+
+### The GPU kernel was built, never ran once, and was removed
+
+`gpu/dir_couplers.comp` + Vulkan kernel + one-time self-check + partial-progress reporting
++ `spk_gpu_couplers_*` counters. It worked — `test_gpu_host` went green under lavapipe.
+
+Then the engagement assertion said `state=0 pixels=0`. **Production takes the SPATIAL
+coupler variant** (`digest_filming_params(..., spatial_effects=true)` sets
+`dir_couplers.diffusion_size_um = 20.0`); the pointwise fused loop the shader replaced is
+only reached if a user zeroes `dir_diffusion_size_um`. Every `max_abs` the test printed
+would have passed unchanged on a silent CPU fallback — without the engagement check this
+would have shipped as a "validated offload" no render ever entered.
+
+Reverted in full, on the precedent this branch already set with the Highway f64 halation
+tier: built, measured, taken out. The patch is preserved at
+`scratchpad/gpu_couplers_attempt.patch` if it is ever wanted.
+
+### Where the time actually is (host, 12.5 MP, release flags)
+
+| phase | ms | share |
+|---|---|---|
+| alloc `correction` (300 MB) | 1246.2 | 14.8% |
+| **loop 1** silver → correction | **12.9** | **0.2%** |
+| copy `gauss(correction)` (300 MB) | 1772.1 | 21.0% |
+| gaussian filter | 1538.4 | 18.2% |
+| alloc `tail` (300 MB) | 685.7 | 8.1% |
+| exponential filter | 3171.9 | 37.5% |
+| **blend** | **21.1** | **0.2%** |
+
+Allocation + one copy **43.8%**; the two filters **55.8%**; the per-pixel loops — the whole
+GPU target — **0.4%**. A perfect offload of both loops removes 34 ms of an 8448 ms stage.
+The 1246 ms is page faults, not the memset: loop 1 writes the same 300 MB in 12.9 ms once
+the pages are resident.
+
+### What shipped: one reordering, no copy
+
+The two filters are independent, so running the exponential tail FIRST leaves `correction`
+intact for the Gaussian, which can then blur it in place. The full-resolution copy existed
+only to preserve `correction` across a blur that came before its other reader.
+
+- **~22% off the stage.** A single old-then-new pass said 59.3%; that is a page-fault
+  ordering artifact. Alternating the arms gives 50.4% / **21.9%** / 27.4%, and 21.9% (new
+  arm cold, old arm warm) is the conservative one — it matches the independent phase
+  estimate of 21%. Fifth time on this branch a number described an unwritten condition;
+  first time it was caught before publishing rather than after.
+- **900 MB → 600 MB peak** at 12.5 MP (three f64 planes → two). Unconditional.
+- **Byte-identical, proved directly:** both orders run in one process, `memcmp` on the f64
+  results, ten filter configurations (FIR-only, IIR-only, the `SMALL_SIGMA_MAX=3` boundary,
+  tail-weight 0 and 1) across two image shapes incl. a non-power-of-two, plus 12.5 MP.
+- Gated by `test_spatial`, which digests with `spatial_effects=true` and so runs its golden
+  at the production `diffusion_size_um = 20.0`. Parity 39/39 ALL OK, both legs.
+
+### What this redirects (the part the owner should read)
+
+1. **Halation does NOT have the same win** — checked, not assumed. `apply_halation_um`'s
+   blend consumes the *original* `raw`, so its `core` copy is genuinely required.
+2. **The remaining 23% of the stage is still allocation** and cannot be reordered away. It
+   needs an engine-level f64 scratch pool surviving across renders;
+   `exponential_filter_per_channel_d` allocates its own 300 MB `comp` per call too.
+3. **The GPU case for this stage is much weaker than "19% of an export" suggested.** 19% is
+   the STAGE; the part a per-pixel shader can touch is 0.4% of it. Serious GPU work here has
+   to target the separable f64 filters — and those are the *same two functions* halation
+   uses, so `gaussian_blur_per_channel_d` + `exponential_filter_per_channel_d` is a single
+   target worth roughly **47% of an export**, not two separate ones.
+
+---
+
 ## ROOT CAUSE FOUND, AND THE PRINT ROUTE WAS NEVER FINE (2026-08-29, `7387879`)
 
 **R8 removed `kotlin.Triple.getFirst/getSecond/getThird` and the `kotlin.Pair` pair from

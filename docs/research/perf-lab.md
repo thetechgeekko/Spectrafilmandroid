@@ -2113,6 +2113,112 @@ Recorded rather than quietly restated, because it is the fourth time on this bra
 number turned out to describe a condition nobody had written down: a debug build (S19), a
 degenerate frame (S2), a file size (S1), and now a slider position.
 
+## 23. The DIR-coupler stage is 44% allocation, 0.4% arithmetic
+
+Starting point: `grain + halation + dir_couplers` is ~79% of a 12.5 MP export (§2 of
+[#156](https://github.com/thetechgeekko/Spektrafilm-android/pull/156)), and the plan was to
+take them to the GPU in ascending order of risk — couplers first, being pure per-pixel work
+with no RNG.
+
+That plan died on contact with a measurement, and the measurement is the useful part.
+
+### 23.1 The GPU kernel was built, engaged nothing, and was removed
+
+`gpu/dir_couplers.comp` plus its Vulkan kernel, a one-time self-check, partial-progress
+reporting and the `spk_gpu_couplers_*` counters were written and worked: `test_gpu_host`
+went green under lavapipe with the offload wired to the existing `allow_gpu_scan` latch.
+
+**It never ran.** The engagement assertion — added on the same principle as the print-expose
+one, that a gate which cannot distinguish "passed" from "never ran" is not a gate — reported
+`state=0 pixels=0`. The cause: `run_scan_film` calls `digest_filming_params(..., spatial_effects
+= true)`, which sets `dir_couplers.diffusion_size_um = 20.0`, so production takes the
+**spatial** variant. The pointwise fused loop the shader replaced is only reached when a user
+zeroes `dir_diffusion_size_um`.
+
+Every `max_abs` `test_gpu_host` printed would have passed unchanged on a silent CPU fallback.
+Without the engagement check this would have shipped as a "validated GPU offload" that no
+render ever entered.
+
+### 23.2 Where the stage actually spends its time
+
+Phase breakdown of `apply_density_correction_dir_couplers_spatial`, host, 12.5 MP
+(4096×3052), release flags:
+
+| phase | ms | share |
+|---|---|---|
+| alloc `correction` (300 MB) | 1246.2 | 14.8% |
+| **loop 1** — silver → correction | **12.9** | **0.2%** |
+| copy `gauss(correction)` (300 MB) | 1772.1 | 21.0% |
+| gaussian filter | 1538.4 | 18.2% |
+| alloc `tail` (300 MB) | 685.7 | 8.1% |
+| exponential filter | 3171.9 | 37.5% |
+| **blend** | **21.1** | **0.2%** |
+
+- **Allocation and one copy: 43.8%.**
+- **The two filters: 55.8%.**
+- **The per-pixel loops — the entire GPU target: 0.4%.**
+
+A perfect GPU offload of both loops would have removed 34 ms of an 8448 ms stage. Even on the
+pointwise path, where those loops *are* the whole stage, it is ~1.3% of an export. It does not
+meet this branch's bar, so it was removed, exactly as the Highway f64 halation tier was.
+
+The 1246 ms "allocation" is page faults, not the `memset`: loop 1 writes the same 300 MB in
+12.9 ms (23 GB/s) once the pages are resident. Zero-fill is a rounding error; **first touch is
+the cost.**
+
+### 23.3 What shipped instead: one reordering, no copy
+
+The two filters are independent — the exponential tail reads `correction` and writes `tail`,
+the Gaussian blurs `correction` in place. The old code blurred a full-resolution **copy**
+purely to keep `correction` alive for the call that followed it. Run the tail **first** and
+the copy is unnecessary:
+
+```
+old:  gauss = copy(correction); blur(gauss); exp(correction -> tail); blend(gauss, tail)
+new:  exp(correction -> tail);  blur(correction in place);            blend(correction, tail)
+```
+
+**Byte-identical, proved directly rather than inferred:** an A/B running both orders in one
+process `memcmp`'d the f64 results over ten filter configurations (FIR-only, IIR-only, the
+`SMALL_SIGMA_MAX = 3` dispatch boundary, tail-weight 0 and 1) across two image shapes
+including a non-power-of-two, plus the 12.5 MP frame. All identical. `test_spatial` gates it
+in CI — it digests with `spatial_effects = true`, so its golden runs at
+`diffusion_size_um = 20.0`, the production value.
+
+**Timing, and a controlled one.** A single old-then-new pass reported 59.3%, which is wrong:
+the first arm page-faults the heap in and the second inherits warm pages. Alternating the
+order exposes it:
+
+| rep | first arm | old | new | saved |
+|---|---|---|---|---|
+| 0 | old | 6754.8 ms | 3351.1 ms | 50.4% |
+| **1** | **new** | **5894.3 ms** | **4605.1 ms** | **21.9%** |
+| 2 | old | 4550.8 ms | 3305.6 ms | 27.4% |
+
+**Take ~22%** — rep 1 is the conservative arm (new cold, old warm), and it matches the
+independent phase estimate of 21% from §23.2. Absolute times drift ~30% across reps as the
+allocator warms, which is why the reps alternate rather than average. That is the fifth time
+on this branch a number described an unwritten condition; this one was caught before it was
+published rather than after.
+
+The memory half needs no such hedging: **three full-resolution f64 planes become two,
+900 MB → 600 MB at 12.5 MP.** On a phone that matters more than the milliseconds.
+
+### 23.4 What this redirects
+
+1. **The remaining 23% of the stage is still allocation** (`correction` 1246 ms + `tail`
+   686 ms of page faults). It cannot be reordered away — it needs the buffers to survive
+   across renders, i.e. an engine-level f64 scratch pool. `exponential_filter_per_channel_d`
+   allocates its own 300 MB `comp` internally on every call, so the pool would serve it too.
+2. **Halation does NOT have the same win.** Checked, not assumed: `apply_halation_um`'s blend
+   is `raw = (1-s)*raw + s*scattered`, which consumes the *original* `raw`, so its `core`
+   copy is genuinely required. Its redundant `tail` zero-fill is real but small.
+3. **The GPU case for this stage is weaker than the 19% headline suggested.** 19% of an
+   export is the *stage*; the part a per-pixel shader can touch is 0.4% of it. Any serious
+   GPU work here has to target the separable f64 filters — which are the *same two functions*
+   halation uses, making `gaussian_blur_per_channel_d` + `exponential_filter_per_channel_d`
+   a single target worth roughly 47% of an export rather than two separate ones.
+
 ## Running it
 
 ```bash
