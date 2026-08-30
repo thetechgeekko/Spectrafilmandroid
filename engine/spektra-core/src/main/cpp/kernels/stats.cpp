@@ -66,6 +66,31 @@ int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
     double u = rng.uniform();
     double cdf = 0.0;
     double prob = std::pow(1.0 - p, static_cast<double>(n));
+
+    // DEGENERATE WALK, SHORT-CIRCUITED. `prob` is pow(1-p, n), and this branch is
+    // only reached when var = n*p*(1-p) <= 10 with n >= 25 — i.e. p is pinned to one
+    // end of [0,1]. At the p->1 end (a pixel at maximum density, where saturation
+    // collapses to ~1-uniformity and the Poisson rate explodes) that pow underflows
+    // to exactly 0. Then `cdf += prob` can never advance, so the loop below is
+    // GUARANTEED to run to k = n+1 and return n — after up to n useless iterations.
+    //
+    // That is not a corner case, it is the whole cost of the grain stage. Census at
+    // 12.58 MP export geometry (pixel_size_um 8.545): 55.47% of the calls reaching
+    // here have prob == 0, and they account for 40,767,030,234 iterations — 99.62%
+    // of every iteration this branch runs, averaging 1892 each. The other 0.38%
+    // averages 8.9. The sampler is 94.6% of the sublayer grain stage, and grain is
+    // the largest item in an export (perf-lab.md §22: 4340-4540 ms of ~10 s).
+    // Coarser pixels make it worse, not better — n scales with pixel area, so at
+    // 35 um/px the same census reads 100% of calls, avg 30877 iterations, max n
+    // 41643. Removing them measured 8.4x on the stage at export geometry (§25).
+    //
+    // Returning n directly is BYTE-IDENTICAL, not an approximation: the loop draws
+    // no randomness (u is already drawn above), so both the result and the RNG
+    // stream are unchanged. The u > 0.0 guard preserves the one case where the loop
+    // does something else — uniform() can return exactly 0.0, and then `cdf < u` is
+    // false at k = 0, so the original returns k-1 = -1. That path is left intact.
+    if (prob == 0.0 && u > 0.0) return n;
+
     int64_t k = 0;
     while (cdf < u && k <= n) {
         cdf += prob;

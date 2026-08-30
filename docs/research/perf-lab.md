@@ -2353,6 +2353,150 @@ What this does NOT change: the per-pixel loops are 1.4% here and 0.4% there — 
 every measurement — so §23.1's verdict on the GPU kernel holds. And the filter is now **71%
 of the coupler block**, so §24 landed its 36% on the largest part.
 
+## 25. Grain was one degenerate loop: 40.8 billion iterations that computed nothing
+
+§22 measured grain at **4340-4540 ms of a ~10 s device export** — the largest single item
+in the baseline, and the one thing on the perf list that had never been looked at. Following
+§23's lesson, it was decomposed before anything was written.
+
+### 25.1 The whole stage is one phase
+
+Phase timers inside `apply_grain_to_density_layers` (the production path: `sublayers_active`
+is the schema default and portra carries `density_curves_layers`), host, 12.58 MP,
+4 threads, shipping flags, parts summing to a directly measured total:
+
+| phase | ms | share |
+|---|---|---|
+| **RNG sampling (9x `layer_particle_model`)** | **29491.1** | **94.6%** |
+| final blur | 747.3 | 2.4% |
+| dye-cloud blur (9x) | 285.1 | 0.9% |
+| shifted fill (9x) | 166.8 | 0.5% |
+| accumulate (9x) | 134.3 | 0.4% |
+| `-= density_min`, acc->out | 45.6 | 0.2% |
+| `add_micro_structure` (3 phases) | **0.0** | **0.0%** |
+| sum of phases | 30870.2 | 99.0% |
+| **measured total** | **31179.1** | |
+
+Two things fall out immediately. Every structural idea worth having — parallelising the
+serial loops, hoisting the loop-invariant `log`/`sqrt` out of the lognormal sampler — targets
+the 5.4% that is not the sampler. And `add_micro_structure` costs **exactly zero**, because
+it early-returns: its `sigma = micro_structure[1] * 0.001 / pixel_size_um` needs
+`pixel_size_um < 0.6 um` to clear the 0.05 threshold, i.e. a 35 mm frame sampled wider than
+58,000 px. It is inert at every real resolution including a 100 MP export — correctly so,
+since sub-pixel clumping averages out — but it means the hoist spotted there before measuring
+would have optimised code that never runs.
+
+### 25.2 Census: where the sampler's time actually goes
+
+Counting branch regimes (single-threaded, same 12.58 MP geometry):
+
+| binomial branch | calls | share |
+|---|---|---|
+| normal approximation | 74,388,548 | 65.69% |
+| **CDF inversion** | **38,840,540** | **34.30%** |
+| Bernoulli (n < 25) | 17,120 | 0.02% |
+
+Poisson is 99.99% normal approximation and never matters. The CDF-inversion branch does,
+and not because of its call count:
+
+- **21,543,383** of those calls (55.47%) have `pow(1-p, n)` **underflowed to exactly 0**;
+- they account for **40,767,030,234 loop iterations — 99.62% of every iteration the branch
+  runs**, averaging **1892 per call**;
+- the remaining 0.38% averages **8.9** iterations per call.
+
+### 25.3 Why: a walk whose answer underflow has already decided
+
+`fast_binomial_one` reaches CDF inversion when `var = n*p*(1-p) <= 10` with `n >= 25`, which
+pins `p` to one end of [0,1]. At the `p -> 1` end — a pixel at maximum density, where
+`saturation = 1 - p*uniformity` collapses toward 0.03 and so the Poisson rate
+`n_ppp/saturation` explodes — `pow(1-p, n)` underflows to exactly 0. Then:
+
+```cpp
+double prob = std::pow(1.0 - p, n);   // == 0.0
+while (cdf < u && k <= n) {
+    cdf += prob;                       // stays 0.0, forever
+    if (k < n) prob = prob * ... ;     // 0 * finite == 0
+    k += 1;
+}
+return k - 1;                          // therefore always n, after n+1 iterations
+```
+
+The accumulator can never advance, so the loop is *guaranteed* to run to `k = n+1` and return
+`n`. Up to 2629 iterations per pixel at export resolution (41,643 at coarser pixel sizes),
+computing a value underflow settled before the first one. The upstream Numba loop has the
+same structure and the same underflow, so this was a faithful port of a degenerate walk.
+
+### 25.4 The change
+
+```cpp
+if (prob == 0.0 && u > 0.0) return n;
+```
+
+**Byte-identical, not an approximation.** The loop draws no randomness — `u` is drawn above
+it — so both the variate and the surviving RNG stream are unchanged. The `u > 0.0` guard
+preserves the one case that behaves differently: `uniform()` can return exactly 0.0, and then
+`cdf < u` is false at `k = 0` and the original returns -1.
+
+Measured with the two arms in ONE process behind a runtime flag, **alternated** so neither
+ordering can favour either (§24.5's method rule), at the engine's own
+`pixel_size_um = film_format_mm*1000/max(w,h)`:
+
+| geometry | pixel | before | after | speedup |
+|---|---|---|---|---|
+| 4096x3072 (12.58 MP, export) | 8.545 um | 30225-32893 ms | 3601-3895 ms | **8.4-8.8x** |
+| 2048x1536 (3.15 MP) | 17.090 um | 19204-19287 ms | 749-762 ms | 25.3-25.7x |
+| 640x480 (0.31 MP) | 54.688 um | 4750-4813 ms | 75-81 ms | 58.6-64.0x |
+
+Every rep byte-identical, in both orderings. The multiplier *rises* as pixels get coarser,
+because `n` scales with pixel area and `n` is the length of the wasted walk — so the table is
+a scaling law, not a preview claim: the app's fit preview and live draft already skip grain
+entirely (`ParamsState.skipGrainHalation`). What does run grain is the 100% zoom ROI, the
+magnifier, and export — all at native pixel size, i.e. the 8.4x row.
+
+After the change the stage decomposes as sampler 2430.4 ms (67.3%), dye-cloud blur 285.4,
+final blur 259.7, everything else 342, total 3611.1 ms. The sampler alone went
+**29491 -> 2430 ms (12.1x)**; what is left of it is genuine work — ~113 M Poisson normal
+draws plus ~74 M binomial normal draws.
+
+### 25.5 The gate, and why the existing ones were not enough
+
+The two grain tests are **statistical** (mean preservation, noise std +/-15%): they cannot
+see an element-wise change in a sampler, so they would have passed just as happily had this
+been subtly wrong. That is the §23 trap in a different costume — an assertion that cannot
+fail is not a gate.
+
+`tests/test_binomial_shortcircuit.cpp` gates it element-wise against a **verbatim
+transcription** of the loop it replaces (the pattern `test_fft_convolve` uses), checking both
+the variate and the surviving RNG stream over ~21,500 cases: the degenerate region, the
+ordinary small-p region that must still walk, the `n = 24/25/26` and `var = 10` boundaries,
+constructed cases straddling the underflow edge, and a randomised sweep. It refuses to pass
+if the sweep failed to enter any of the three regions, so it cannot silently stop testing
+what it claims to test.
+
+It was mutation-checked. `return n-1`, an extra RNG draw, and a short-circuit loosened to
+`prob < 1e-300` are all caught. Two mutations survive, both understood: `prob < 1e-320` is
+caught at -O2 but not at the shipping flags, because `-ffast-math` flushes denormals to zero
+and the two conditions become the same program there — which is precisely why the parity job
+runs both legs; and the `u > 0.0` half of the guard, which would need `uniform()` to return
+exactly 0.0 (~2^-53) and is therefore documented as uncovered rather than papered over.
+
+One harness detail worth knowing: `run_engine_parity.sh` marks a test failed when its stdout
+matches `/fail/i`, so a summary counter printed as `failures=0` fails the gate. It is
+`mismatches=` now.
+
+Parity **40/40 ALL OK on both legs** (39 + this one).
+
+### 25.6 What is left
+
+Grain is now 3.6 s of a 12.58 MP host render, 67% of it the surviving normal-approximation
+draws — ~190 M `std::normal_distribution` variates, which is rejection sampling with a
+`sqrt` and a `log` apiece. Replacing that generator would be the next lever and it is **not**
+byte-identical: it changes the RNG stream and therefore the grain field. That is survivable
+by the same argument the block-seeding change already relies on (goldens are grain-off; the
+grain gates assert statistics plus reproducibility) but it is a deliberate change to output,
+not a free one, so it is an owner call rather than something to take unilaterally.
+
+
 ## Running it
 
 ```bash

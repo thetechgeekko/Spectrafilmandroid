@@ -2,6 +2,88 @@
 
 ---
 
+## GRAIN WAS ONE DEGENERATE LOOP — 8.4x ON THE BIGGEST STAGE IN AN EXPORT (2026-08-30)
+
+`perf-lab.md` §25. Grain was §22's largest baseline item (**4340-4540 ms of a ~10 s device
+export**) and the only big export-side thing never examined. Decomposed before touching it,
+per the §23 lesson.
+
+### The finding
+
+At 12.58 MP the sublayer grain path is **94.6% one phase** — the 9x `layer_particle_model`
+RNG sampling. Everything else, all six other phases together, is 5.4%. And
+`add_micro_structure` costs **exactly 0.0 ms**: it early-returns unless
+`pixel_size_um < 0.6 um` (a 35 mm frame wider than 58,000 px), so it is inert at every real
+resolution up to 100 MP. The loop-invariant `log`/`sqrt` hoist visible in that function is a
+hoist in dead code — measuring first is what caught it, again.
+
+Inside the sampler, a census found the cost is **not** spread over the pixels:
+
+- `fast_binomial_one` takes CDF inversion for 34.30% of calls;
+- **55.47% of those have `pow(1-p, n)` underflowed to exactly 0**;
+- those account for **40,767,030,234 iterations — 99.62% of every iteration the branch runs**
+  (avg 1892 each). The other 0.38% averages 8.9.
+
+When `prob == 0.0` the accumulator `cdf += prob` can never advance, so the loop is guaranteed
+to walk to `k = n+1` and return `n` — computing a value that underflow had already decided.
+Upstream's Numba loop has the same structure, so this was a faithful port of a degenerate
+walk.
+
+### The change
+
+`if (prob == 0.0 && u > 0.0) return n;` in `kernels/stats.cpp`. **Byte-identical**: the loop
+draws no randomness (`u` is drawn before it), so the variate and the surviving RNG stream are
+both unchanged. The `u > 0.0` guard preserves the `uniform() == 0.0` case, where the original
+exits at `k = 0` and returns -1.
+
+Measured with both arms in ONE process behind a runtime flag, **alternated** (the §24.5
+method rule), at the engine's own `pixel_size_um = film_format_mm*1000/max(w,h)`:
+
+| geometry | pixel | before | after | speedup |
+|---|---|---|---|---|
+| 4096x3072 (12.58 MP, export) | 8.545 um | 30225-32893 ms | 3601-3895 ms | **8.4-8.8x** |
+| 2048x1536 (3.15 MP) | 17.090 um | 19204-19287 ms | 749-762 ms | 25.3-25.7x |
+| 640x480 (0.31 MP) | 54.688 um | 4750-4813 ms | 75-81 ms | 58.6-64.0x |
+
+Byte-identical in every rep, in both orderings. The multiplier rises as pixels coarsen
+because `n` — the length of the wasted walk — scales with pixel area. **That table is a
+scaling law, not a preview claim**: the fit preview and live draft already skip grain
+(`ParamsState.skipGrainHalation`). Grain runs on the 100% zoom ROI, the magnifier and
+export, all at native pixel size — the 8.4x row.
+
+### The gate the existing tests could not provide
+
+`test_grain` / `test_grain_sublayer` are **statistical** (mean, noise std ±15%) and cannot
+see an element-wise sampler change — they would have passed had this been subtly wrong.
+New `tests/test_binomial_shortcircuit.cpp` gates it against a **verbatim transcription** of
+the replaced loop (the `test_fft_convolve` pattern), checking the variate **and** the
+surviving RNG stream over ~21,500 cases, and refusing to pass if the sweep missed any of the
+three regions it claims to cover. Mutation-checked: `return n-1`, an extra RNG draw and
+`prob < 1e-300` are all caught; `prob < 1e-320` survives only at the shipping flags (where
+`-ffast-math` FTZ makes it the same program — caught at -O2, which is why both legs run), and
+the `u > 0.0` half is documented as uncovered rather than papered over.
+
+Wired into `ci.yml` + `run_engine_parity.sh`: **40 gates now, ALL OK on both legs.**
+
+Gotcha worth keeping: the runner marks a test failed on `/fail/i` in its stdout, so a
+counter printed `failures=0` fails the gate. It is `mismatches=` now.
+
+### What is left in grain
+
+3.6 s at 12.58 MP on this 4-core host, 67% of it the surviving normal-approximation draws
+(~190 M `std::normal_distribution` variates — rejection sampling with a `sqrt` and `log`
+each). Replacing that generator is the next lever and it is **not** byte-identical: it
+changes the grain field. Defensible by the same argument block-seeding already relies on,
+but it is a deliberate output change — owner call, not a unilateral one.
+
+### Still host-only
+
+Like the two wins below, this is host-measured. The 99.62% iteration removal is geometry, not
+hardware, so it transfers to arm64 exactly; only the wall-clock ratio is host-specific. Three
+landed engine wins now await one on-device confirmation.
+
+---
+
 ## THE SEPARABLE f64 FILTER WAS 42% DATA MOVEMENT (2026-08-30)
 
 Follow-on from the coupler finding below, and the target it named. `perf-lab.md` §24.
