@@ -2,6 +2,69 @@
 
 ---
 
+## THE SEPARABLE f64 FILTER WAS 42% DATA MOVEMENT (2026-08-30)
+
+Follow-on from the coupler finding below, and the target it named. `perf-lab.md` §24.
+
+`exponential_filter_per_channel_d` is called by **both** heavy spatial stages —
+`model/diffusion.cpp:92` (halation scatter tail) and `model/couplers.cpp:432` (DIR coupler
+diffusion) — so one change reaches both.
+
+### Correct the record first
+
+An initial decomposition put the filter at **2799 ms** with a **65%** zero/copy/axpy share.
+**Both are wrong** — process-state artifacts from a bench holding 1.1 GB live across
+unrelated arms. A direct A/B measured the same old code at 1270 ms. Re-run with internal
+timers that sum to the function's own total:
+
+| part | ms | share |
+|---|---|---|
+| zero `out` | 20.1 | 1.6% |
+| 3× copy `img` → `comp` | 58.2 | 4.5% |
+| **3× `gaussian_blur_per_channel_d`** | **958.5** | **74.1%** |
+| 3× axpy | 52.2 | 4.0% |
+| residual — allocating the 300 MB `comp` | 204.2 | 15.8% |
+| **total, measured directly** | **1293.2** | |
+
+Agrees with the A/B's 1270.4 ms. That agreement is the check the first attempt failed, and
+the reason it is safe to build on this one.
+
+### The actual problem
+
+`gaussian_blur_per_channel_d` deinterleaves a channel, blurs the plane, reinterleaves — on
+every call. The old filter called it once per mixture component, so three components × three
+channels was **nine strided gathers and nine strided scatters** at stride 3 doubles. At
+σ=34.68 that de/re-interleave is 157.5 ms of a 279.1 ms call — **56.5%**, and about **42% of
+the whole filter**, flat across σ because it is pure data movement.
+
+### The change
+
+Deinterleave once per channel, run all three mixture components in planar space,
+reinterleave once. Three gathers and three scatters instead of nine and nine; every other
+pass contiguous.
+
+- **1293.2 ms → 824.8 ms, 36.2% faster**, corroborated by a separate A/B at 34.3% median.
+  The *new-first* rep (new arm cold) was the best of the three, so unlike the coupler
+  reorder this is not flattered by page-fault ordering.
+- Scratch four planes → three (the old path held a 3-plane `comp` **plus** the 1-plane
+  deinterleave buffer inside every blur call).
+- **Byte-identical**, proved directly over 16 configurations: 4 shapes (1-channel,
+  4-channel, non-power-of-two) × 4 decay regimes (FIR-only, the `SMALL_SIGMA_MAX=3`
+  boundary, production 22.76, wide 90), each with **unequal per-channel decays** so a bug
+  collapsing the σ vector would fail rather than pass. `memcmp`, all identical.
+- Parity **39/39 ALL OK both legs**. `test_parallel` scenarios 3–4 cover thread-invariance
+  (both routes, `halation_active=1`, 1 vs 8 workers), which matters since the parallel
+  structure changed.
+
+### Still open here
+
+At 824.8 ms the biggest remaining part is the actual plane blurs (~417 ms), which is the
+right place to be. Two unmeasured levers: the last mixture component could blur `src` in
+place rather than copying it (three of nine plane copies), and the three plane buffers are
+still allocated per call — the scratch-pool idea from §23.4 applies here too.
+
+---
+
 ## THE COUPLER STAGE IS 44% ALLOCATION AND 0.4% ARITHMETIC (2026-08-30)
 
 Owner asked to start on the ~79% of an export that is `grain + halation + dir_couplers`,

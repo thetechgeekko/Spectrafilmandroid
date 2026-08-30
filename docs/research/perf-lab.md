@@ -2219,6 +2219,90 @@ The memory half needs no such hedging: **three full-resolution f64 planes become
    halation uses, making `gaussian_blur_per_channel_d` + `exponential_filter_per_channel_d`
    a single target worth roughly 47% of an export rather than two separate ones.
 
+## 24. The separable f64 filter was 42% data movement
+
+§23.4 named the real target: `gaussian_blur_per_channel_d` and
+`exponential_filter_per_channel_d`, the two separable f64 filters that **halation and the
+DIR couplers both call** (`model/diffusion.cpp:92` and `model/couplers.cpp:432`). Measuring
+before writing anything — the explicit lesson of §23 — found the cost was not the blur.
+
+### 24.1 A correction first
+
+An initial decomposition reported the exponential filter at **2799 ms** with a **65%**
+zero/copy/axpy share. **Both numbers are wrong.** They came from a bench whose process held
+1.1 GB live across several unrelated arms; a direct A/B measured the same old code at
+1270 ms. A decomposition whose total disagrees 2.2× with a direct measurement of the same
+function is not publishable, so it was re-run with internal timers whose parts sum to the
+function's own total, in a minimal process. The reconciled figures are below and supersede
+the first set.
+
+### 24.2 Where the time was (host, 12.5 MP, release flags, decay 22.76)
+
+| part of `exponential_filter_per_channel_d` | ms | share |
+|---|---|---|
+| zero `out` | 20.1 | 1.6% |
+| 3× copy `img` → `comp` | 58.2 | 4.5% |
+| **3× `gaussian_blur_per_channel_d`** | **958.5** | **74.1%** |
+| 3× axpy `out += a*comp` | 52.2 | 4.0% |
+| residual — allocating the 300 MB `comp` | 204.2 | 15.8% |
+| **total (measured directly)** | **1293.2** | |
+
+That total agrees with the independent A/B's 1270.4 ms, which is the check the first attempt
+failed.
+
+The cost sits *inside* the blur calls — and inside those, most of it is not blurring:
+
+| σ | 3× `gaussian_blur_plane_d` | `gaussian_blur_per_channel_d` | de/re-interleave |
+|---|---|---|---|
+| 34.68 | 121.5 ms | 279.1 ms | **157.5 ms (56.5%)** |
+
+`gaussian_blur_per_channel_d` deinterleaves one channel into a plane, blurs it, and
+reinterleaves — on **every call**. The old exponential filter called it once per mixture
+component, so three components × three channels was **nine strided gathers and nine strided
+scatters**, at stride 3 doubles (24 B), where a 64 B cache line yields under three useful
+values. Roughly **42% of the whole filter was moving data**, not blurring it, and that share
+is flat across σ because the IIR blur itself is O(1) per pixel.
+
+### 24.3 The change: stay planar for the whole mixture
+
+Deinterleave once per channel, run all three components in planar space, reinterleave once —
+three gathers and three scatters instead of nine and nine, and every remaining pass
+contiguous.
+
+```
+old:  for k in 0..2 { copy interleaved img; per_channel_blur (deinterleave/reinterleave x3); axpy }
+new:  for c in 0..2 { deinterleave once; for k in 0..2 { plane copy; blur_plane; axpy }; reinterleave once }
+```
+
+**1293.2 ms → 824.8 ms, 36.2% faster**, corroborated by a separate A/B at 34.3% median
+(34.3% / 44.8% / 26.9% across alternated reps — note the *new-first* rep, where the new arm
+runs cold, is the best of the three, so this win is not the page-fault artifact that inflated
+§23.3's first reading). Scratch drops from four planes to three: the old path held a
+3-plane `comp` **plus** the 1-plane deinterleave buffer inside every
+`gaussian_blur_per_channel_d` call; the new one holds `src` + `comp` + `acc`.
+
+**Byte-identical**, and proved directly: 16 configurations — 4 shapes (including 1-channel,
+4-channel, and a non-power-of-two) × 4 decay regimes (FIR-only at 0.4, the
+`SMALL_SIGMA_MAX = 3` boundary, production 22.76, wide 90), each with **unequal per-channel
+decays** so that a bug collapsing the per-channel σ vector would fail rather than pass.
+`memcmp` on the f64 results, all identical. Each component is still
+`gaussian_blur_plane_d` over exactly `img[:, c]` at `ratio_k * decay[c]`, and the
+accumulation still runs k ascending with the same operands in the same order; only the order
+memory is visited changed.
+
+Parity 39/39 ALL OK on both legs. `test_parallel` scenarios 3–4 cover it for
+thread-invariance (scan and print routes with `halation_active = 1`, 1 vs 8 workers,
+byte-identical required), which matters because the parallel structure changed.
+
+### 24.4 What is left in this filter
+
+At 824.8 ms the remaining shape is ~417 ms of actual plane blurs plus the gathers, scatters,
+plane copies and axpy around them. The blurs are now the largest single part, which is the
+right place to be. Two further levers, neither yet measured: the last mixture component could
+blur `src` in place instead of copying it (saving three of nine plane copies), and the three
+plane buffers are still allocated per call, so the scratch-pool idea from §23.4 applies here
+too.
+
 ## Running it
 
 ```bash
