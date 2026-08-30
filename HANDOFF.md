@@ -103,8 +103,13 @@ the in-tree reference for a four-binding per-pixel kernel.
 
 Allocation + one copy **43.8%**; the two filters **55.8%**; the per-pixel loops — the whole
 GPU target — **0.4%**. A perfect offload of both loops removes 34 ms of an 8448 ms stage.
-The 1246 ms is page faults, not the memset: loop 1 writes the same 300 MB in 12.9 ms once
-the pages are resident.
+
+**CORRECTED (see the newer entry above and `perf-lab.md` §24.5):** that table is a COLD
+measurement — the bench never faulted its pages in before timing, so the allocation rows
+carry first-touch cost and are inflated ~4.6x against a warmed run. A reconciled re-measure
+puts the current block at **allocation 13.5% / filters 85.1% / per-pixel loops 1.4%**.
+Allocation here is a **cold-start** cost, not steady state. The verdict on the GPU kernel is
+untouched: the loops are trivial under every measurement.
 
 ### What shipped: one reordering, no copy
 

@@ -2141,6 +2141,15 @@ render ever entered.
 
 ### 23.2 Where the stage actually spends its time
 
+> **CORRECTED in §24.5.** The table below is a COLD-start measurement — the bench never
+> faulted its pages in before timing, so every allocation row also carries the first-touch
+> cost. It is a real condition (it is what the first render after a launch pays) but it is
+> not steady state, and the shares below over-attribute allocation by roughly 4.6x against a
+> warmed run. The conclusion it drove — that the per-pixel loops are not worth offloading —
+> survives unchanged and is re-grounded in §24.5. Left in place rather than edited, because
+> the cold/warm split is the point.
+
+
 Phase breakdown of `apply_density_correction_dir_couplers_spatial`, host, 12.5 MP
 (4096×3052), release flags:
 
@@ -2302,6 +2311,47 @@ right place to be. Two further levers, neither yet measured: the last mixture co
 blur `src` in place instead of copying it (saving three of nine plane copies), and the three
 plane buffers are still allocated per call, so the scratch-pool idea from §23.4 applies here
 too.
+
+### 24.5 Correcting §23.2: allocation is a COLD cost, and cross-bench absolutes do not compare
+
+Re-measuring the coupler block after both changes landed, in a minimal process that warms
+every buffer first and whose parts reconcile against a directly measured total (residual
+13.1 ms on 3119.9 ms — 0.4%, the check §23.2's bench never had):
+
+| phase, current block | ms | share |
+|---|---|---|
+| alloc `correction` (300 MB) | 192.2 | 6.2% |
+| loop 1 — silver → correction | 12.8 | 0.4% |
+| alloc `tail` (300 MB) | 226.5 | 7.3% |
+| **`exponential_filter_per_channel_d`** | **2202.2** | **70.9%** |
+| `gaussian_blur_per_channel_d` | 442.7 | 14.2% |
+| blend | 15.4 | 0.5% |
+| loop 2 | 14.9 | 0.5% |
+| **allocation 13.5% · filters 85.1% · per-pixel loops 1.4%** | | |
+
+Against §23.2's cold table (43.8% / 55.8% / 0.4%), two things changed and only one of them is
+my code:
+
+- The `gauss` copy is gone — that is §23.3, as intended.
+- **Allocation fell from 1932 ms to 419 ms, and nothing in the diff touches those two
+  allocations.** That drop is the bench, not the code: §23.2 timed fresh anonymous pages on
+  first touch, this run warms them first. Both are real; they describe different conditions.
+  **Allocation cost here is a cold-start cost, not a steady-state one** — which reframes the
+  scratch-pool idea from §23.4 as a fix for the first render (#152's ~8.8 s cold versus
+  ~562 ms steady) rather than for repeated exports.
+
+**The method rule this establishes, and it invalidates several numbers on this branch:**
+absolute timings from different bench processes in this container **do not compare**. The
+same planar exponential filter measured 824.8 ms in §24.2's dedicated bench and 2202.2 ms
+here; the same coupler replication measured 3119.9 ms while the real function measured
+1652.8 ms *in the same process*, because the replication ran first and handed the real call
+its warmed pages. Only two kinds of number survive: a **within-process A/B with alternated
+arms**, and a **decomposition whose parts sum to a directly measured total**. Every claim in
+§23.3 and §24.3 is of one of those kinds, which is why they stand.
+
+What this does NOT change: the per-pixel loops are 1.4% here and 0.4% there — trivial under
+every measurement — so §23.1's verdict on the GPU kernel holds. And the filter is now **71%
+of the coupler block**, so §24 landed its 36% on the largest part.
 
 ## Running it
 
