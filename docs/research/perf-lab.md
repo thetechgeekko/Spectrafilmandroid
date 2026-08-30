@@ -2056,6 +2056,45 @@ half grain+halation+couplers**, with the three small effects as rounding error.
 If effect cost is the target there are two candidates, `camera_diffusion` and `grain`, and
 nothing else on this list is worth engineering time.
 
+### 22.2b The rows were validated against #163, and they pass
+
+#163 is the finding that the native stage timer is a process-global reset per top-level
+render, with no serialization behind it — so a preview/ROI/draft render overlapping an
+export can zero the export's accumulator mid-flight. That would corrupt a ladder row
+silently, and the corrupted row would still look plausible beside its neighbours.
+
+Protocol used (before the warning was even circulated): `logcat -c` -> tap Export -> wait
+-> read, with no slider, pan, zoom, magnifier or overlay touched between the tap and the
+timings line, and all param changes >= 3 s before the export sheet opened. `ExportMask`
+also swallows pointer input for the duration, so nothing could reach the UI mid-export.
+
+Then the arithmetic check, sum of top-level stages against that row's `simulate`
+(`scan_spatial` and `glare_field` excluded — they nest inside `scan`):
+
+| row | stages / simulate | | unaccounted |
+|---|---:|---:|---:|
+| L1 baseline | 8909.7 / 9235 | 96.48% | 325.3 ms |
+| L2 +Pro-Mist | 18634.7 / 18983 | 98.17% | 348.3 ms |
+| L3 +lens blur | 8838.0 / 9128 | 96.82% | 290.0 ms |
+| L4 +glare | 8846.2 / 9149 | 96.69% | 302.8 ms |
+| L5 +boost | 8924.5 / 9230 | 96.69% | 305.5 ms |
+| L6 ALL ON | 18979.0 / 19313 | 98.27% | 334.0 ms |
+
+**The unaccounted term holds a 290-348 ms band across all six rows, including both 19 s
+ones.** That is the signature of fixed untimed overhead, not corruption: a mid-flight
+reset drops a whole stage and blows one row's gap wide open, and the band would not stay
+flat while `simulate` more than doubles.
+
+It also matches an independently-derived figure. `stage_timer.h:97` records "~363 ms of
+JNI entry, param marshalling and result allocation that genuinely is outside every stage",
+reached from a different reconciliation entirely. Two measurements, taken months and
+methods apart, landing on the same ~300 ms of boundary cost is the strongest evidence
+available that these rows are clean.
+
+Nothing to re-run. The check is worth keeping as the standard ladder gate: **stages should
+account for ~96-98% of `simulate`, and the remainder should be flat across rows.** A row
+that breaks either half of that is suspect regardless of how reasonable its total looks.
+
 ### 22.3 CORRECTION: the 39 s Pro-Mist figure was a SETTING, not a resolution property
 
 Section 20 and PR #156 quoted `camera_diffusion` at **39127 ms**, and derived from it that
