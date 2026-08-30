@@ -21,8 +21,10 @@ would have passed unchanged on a silent CPU fallback — without the engagement 
 would have shipped as a "validated offload" no render ever entered.
 
 Reverted in full, on the precedent this branch already set with the Highway f64 halation
-tier: built, measured, taken out. The patch is preserved at
-`scratchpad/gpu_couplers_attempt.patch` if it is ever wanted.
+tier: built, measured, taken out. Nothing of it is preserved on disk — it lived only in an
+ephemeral session scratchpad — so `perf-lab.md` §23.1 is the record. Rebuilding it would be
+a day's work at most, and `gpu/scan_spectral_lin.comp` plus its dispatch already serve as
+the in-tree reference for a four-binding per-pixel kernel.
 
 ### Where the time actually is (host, 12.5 MP, release flags)
 
