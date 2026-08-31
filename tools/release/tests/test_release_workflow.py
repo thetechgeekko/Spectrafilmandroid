@@ -26,6 +26,9 @@ ENGINE_BOUNDARY_RUNNER = (
     / "engine/spektra-core/src/androidTest/kotlin/com/spectrafilm/engine/EngineBoundaryInstrumentationTest.kt"
 ).read_text(encoding="utf-8")
 RELEASE_DEVICE_GATE = ROOT / "tools/android/run_release_device_gate.ps1"
+SPEKTRA_CPP = (ROOT / "engine/spektra-core/src/main/cpp/spektra.cpp").read_text(
+    encoding="utf-8"
+)
 
 
 def workflow_job_block(workflow: str, name: str) -> str:
@@ -439,6 +442,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             (
                 "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety",
                 "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation",
+                "asan-ubsan|engine-npy-hostile-inputs|engine-npy",
                 "asan-ubsan|png-writer-hostile-jni-helpers|png-writer",
                 "asan-ubsan|tiff-writer-hostile-jni-helpers|tiff-writer",
                 "tsan|engine-c-cancellation-race|engine-c-cancellation",
@@ -447,6 +451,12 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 "tsan|tiff-writer-cancellation-race|tiff-writer",
             ),
             actual,
+        )
+        self.assertIn('"$ENGINE_CPP/tests/test_npy_lut.cpp"', runner)
+        self.assertIn('"$ENGINE_CPP/io/npy_lut.cpp"', runner)
+        self.assertIn(
+            '"$ENGINE_CPP/../assets/spektra/luts/spectral_upsampling/irradiance_xy_tc.npy"',
+            runner,
         )
         self.assertIn('for spec in "${SUITE_SPECS[@]}"', runner)
         self.assertIn('run_suite "$spec"', runner)
@@ -466,6 +476,21 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("NATIVE_SAFETY_RUNNER: PASS", runner)
         self.assertNotIn("spektra_jni.cpp", runner)
         self.assertNotIn("|| true", runner)
+
+    def test_engine_rejects_wrong_spectra_lut_shape_before_cache_publication(self) -> None:
+        bounded_read = (
+            "spk_read_asset(eng, kSpectraLutRel, buf,\n"
+            "                            spk::kMaxNpyFileBytes)"
+        )
+        validation = (
+            "eng->spectra_lut.shape != std::vector<int>({192, 192, 81}) ||\n"
+            "            eng->spectra_lut.data.size() != 2'985'984u"
+        )
+        self.assertIn(bounded_read, SPEKTRA_CPP)
+        self.assertIn(validation, SPEKTRA_CPP)
+        self.assertIn("spektra: spectra LUT shape must be 192x192x81", SPEKTRA_CPP)
+        self.assertLess(SPEKTRA_CPP.index(bounded_read), SPEKTRA_CPP.index("spk::parse_npy"))
+        self.assertLess(SPEKTRA_CPP.index(validation), SPEKTRA_CPP.index("eng->lut_loaded = true;"))
 
     def test_ci_and_release_delegate_native_safety_to_the_same_runner(self) -> None:
         ci_qualifier = workflow_job_block(CI, "native-safety-writers")

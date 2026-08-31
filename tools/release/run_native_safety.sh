@@ -20,6 +20,7 @@ cd -- "$repo_root"
 readonly SUITE_SPECS=(
   "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety"
   "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation"
+  "asan-ubsan|engine-npy-hostile-inputs|engine-npy"
   "asan-ubsan|png-writer-hostile-jni-helpers|png-writer"
   "asan-ubsan|tiff-writer-hostile-jni-helpers|tiff-writer"
   "tsan|engine-c-cancellation-race|engine-c-cancellation"
@@ -112,6 +113,16 @@ run_suite() {
       run_args+=(
         "$ENGINE_CPP/../assets/spektra"
         "$ENGINE_CPP/tests/scan_portra_input_rgb.f64"
+      )
+      ;;
+    engine-npy)
+      command+=(
+        -I "$ENGINE_CPP"
+        "$ENGINE_CPP/tests/test_npy_lut.cpp"
+        "$ENGINE_CPP/io/npy_lut.cpp"
+      )
+      run_args+=(
+        "$ENGINE_CPP/../assets/spektra/luts/spectral_upsampling/irradiance_xy_tc.npy"
       )
       ;;
     png-writer)

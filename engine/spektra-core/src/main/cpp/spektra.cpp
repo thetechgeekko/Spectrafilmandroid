@@ -320,7 +320,8 @@ uint64_t spk_test_lut_cache_misses(spk_engine* eng) {
 // reads asset_dir/<rel_path> with std::ifstream (the historical, parity-gated
 // behavior). Throws nothing.
 static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
-                           std::vector<char>& out) {
+                           std::vector<char>& out,
+                           size_t max_bytes = std::numeric_limits<size_t>::max()) {
     if (!eng) return false;
 #ifdef __ANDROID__
     if (eng->use_asset_mgr()) {
@@ -330,12 +331,20 @@ static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
         AAsset* a = AAssetManager_open(eng->asset_mgr, full.c_str(),
                                        AASSET_MODE_BUFFER);
         if (!a) return false;
-        off_t len = AAsset_getLength(a);
-        out.resize(len > 0 ? static_cast<size_t>(len) : 0);
+        const off_t len = AAsset_getLength(a);
+        if (len < 0 || static_cast<uintmax_t>(len) > max_bytes ||
+            static_cast<uintmax_t>(len) > std::numeric_limits<size_t>::max() ||
+            static_cast<uintmax_t>(len) >
+                static_cast<uintmax_t>(std::numeric_limits<int>::max())) {
+            AAsset_close(a);
+            return false;
+        }
+        const size_t size = static_cast<size_t>(len);
+        out.resize(size);
         bool ok = true;
-        if (len > 0) {
-            int read = AAsset_read(a, out.data(), static_cast<size_t>(len));
-            ok = (read == static_cast<int>(len));
+        if (size > 0) {
+            const int read = AAsset_read(a, out.data(), size);
+            ok = read >= 0 && static_cast<size_t>(read) == size;
         }
         AAsset_close(a);
         return ok;
@@ -349,6 +358,11 @@ static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
     if (!in) return false;
     std::streamsize size = in.tellg();
     if (size < 0) return false;
+    const uintmax_t unsigned_size = static_cast<uintmax_t>(size);
+    if (unsigned_size > max_bytes ||
+        unsigned_size > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
     in.seekg(0, std::ios::beg);
     out.resize(static_cast<size_t>(size));
     if (size > 0 && !in.read(out.data(), size)) return false;
@@ -362,9 +376,15 @@ static const spk::NdArray& engine_spectra(spk_engine* eng) {
     std::lock_guard<std::mutex> g(eng->lut_mutex);
     if (!eng->lut_loaded) {
         std::vector<char> buf;
-        if (!spk_read_asset(eng, kSpectraLutRel, buf))
+        if (!spk_read_asset(eng, kSpectraLutRel, buf,
+                            spk::kMaxNpyFileBytes))
             throw std::runtime_error("spektra: cannot read spectra LUT asset");
         eng->spectra_lut = spk::parse_npy(buf.data(), buf.size(), kSpectraLutRel);
+        if (eng->spectra_lut.shape != std::vector<int>({192, 192, 81}) ||
+            eng->spectra_lut.data.size() != 2'985'984u) {
+            eng->spectra_lut = {};
+            throw std::runtime_error("spektra: spectra LUT shape must be 192x192x81");
+        }
         eng->lut_loaded = true;
     }
     return eng->spectra_lut;

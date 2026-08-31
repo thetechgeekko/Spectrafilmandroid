@@ -20,11 +20,16 @@
 #ifndef SPK_IO_NPY_LUT_H
 #define SPK_IO_NPY_LUT_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace spk {
+
+// Shared by file-backed and APK-asset callers so hostile input is rejected
+// before either path allocates its byte buffer.
+inline constexpr size_t kMaxNpyFileBytes = 32u * 1024u * 1024u;
 
 // A dense float64 array decoded from disk: flat C-order (row-major) data plus its
 // shape. float64 is used internally so LUT values match the Python oracle, which

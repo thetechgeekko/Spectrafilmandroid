@@ -15,16 +15,35 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace spk {
 namespace {
 
-std::vector<char> read_all(const std::string& path) {
+constexpr size_t kMaxNpyHeaderBytes = 10'000u;
+constexpr size_t kMaxNpyRank = 8u;
+constexpr size_t kMaxNpyDimension = 4096u;
+constexpr size_t kMaxNpyElements = 8u * 1024u * 1024u;
+constexpr size_t kMaxNpyPayloadBytes = 32u * 1024u * 1024u;
+
+bool checked_add(size_t a, size_t b, size_t* out) {
+    if (b > std::numeric_limits<size_t>::max() - a) return false;
+    *out = a + b;
+    return true;
+}
+
+std::vector<char> read_all(const std::string& path,
+                           size_t max_bytes = std::numeric_limits<size_t>::max()) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) throw std::runtime_error(path + ": cannot open for reading");
     std::streamsize size = in.tellg();
     if (size < 0) throw std::runtime_error(path + ": cannot determine size");
+    const uintmax_t unsigned_size = static_cast<uintmax_t>(size);
+    if (unsigned_size > static_cast<uintmax_t>(max_bytes))
+        throw std::runtime_error(path + ": file exceeds limit");
+    if (unsigned_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max()))
+        throw std::runtime_error(path + ": file size cannot be represented");
     in.seekg(0, std::ios::beg);
     std::vector<char> buf(static_cast<size_t>(size));
     if (size > 0 && !in.read(buf.data(), size))
@@ -93,111 +112,253 @@ double rd_f16le(const char* p) {
     return static_cast<double>(f);
 }
 
-// Extract the value of a key like 'shape' or 'descr' from the .npy header dict
-// string (a Python literal). Minimal parser: finds "key':" then reads until the
-// matching value delimiter.
-std::string header_value(const std::string& hdr, const std::string& key) {
-    std::string needle = "'" + key + "'";
-    size_t k = hdr.find(needle);
-    if (k == std::string::npos) throw std::runtime_error(".npy: missing key " + key);
-    size_t colon = hdr.find(':', k);
-    if (colon == std::string::npos) throw std::runtime_error(".npy: malformed header");
-    size_t i = colon + 1;
-    while (i < hdr.size() && (hdr[i] == ' ' || hdr[i] == '\t')) ++i;
-    if (i < hdr.size() && hdr[i] == '(') {  // tuple value (shape)
-        size_t close = hdr.find(')', i);
-        return hdr.substr(i + 1, close - i - 1);
+struct ParsedNpyHeader {
+    std::string descr;
+    std::string fortran_order;
+    std::string shape;
+    bool has_descr = false;
+    bool has_fortran_order = false;
+    bool has_shape = false;
+};
+
+void skip_header_space(const std::string& header, size_t end, size_t* cursor) {
+    while (*cursor < end &&
+           (header[*cursor] == ' ' || header[*cursor] == '\t')) {
+        ++*cursor;
     }
-    if (i < hdr.size() && hdr[i] == '\'') {  // quoted value (descr)
-        size_t close = hdr.find('\'', i + 1);
-        return hdr.substr(i + 1, close - i - 1);
+}
+
+std::string parse_header_string(const std::string& header, size_t end,
+                                size_t* cursor) {
+    if (*cursor >= end || header[*cursor] != '\'')
+        throw std::runtime_error(".npy: malformed header");
+    const size_t start = ++*cursor;
+    while (*cursor < end && header[*cursor] != '\'') {
+        // Escapes are unnecessary for the fixed NPY keys/dtypes accepted here;
+        // rejecting them keeps delimiter handling unambiguous.
+        if (header[*cursor] == '\\')
+            throw std::runtime_error(".npy: malformed header");
+        ++*cursor;
     }
-    // bareword (e.g. True/False)
-    size_t end = hdr.find_first_of(",}", i);
-    return hdr.substr(i, end - i);
+    if (*cursor >= end) throw std::runtime_error(".npy: malformed header");
+    const std::string value = header.substr(start, *cursor - start);
+    ++*cursor;
+    return value;
+}
+
+// Parse the deliberately small NPY dictionary grammar instead of searching for
+// key-like substrings. This keeps fake/duplicate fields, delayed colons and
+// quoted bool/shape values from being interpreted differently from NumPy.
+ParsedNpyHeader parse_header_dict(const std::string& header, size_t dict_end) {
+    if (dict_end < 2 || header[0] != '{' || header[dict_end - 1] != '}')
+        throw std::runtime_error(".npy: malformed header");
+
+    ParsedNpyHeader result;
+    size_t cursor = 1;
+    skip_header_space(header, dict_end, &cursor);
+    while (cursor < dict_end && header[cursor] != '}') {
+        const std::string key = parse_header_string(header, dict_end, &cursor);
+        skip_header_space(header, dict_end, &cursor);
+        if (cursor >= dict_end || header[cursor] != ':')
+            throw std::runtime_error(".npy: malformed header");
+        ++cursor;
+        skip_header_space(header, dict_end, &cursor);
+
+        if (key == "descr") {
+            if (result.has_descr)
+                throw std::runtime_error(".npy: malformed header");
+            result.descr = parse_header_string(header, dict_end, &cursor);
+            result.has_descr = true;
+        } else if (key == "fortran_order") {
+            if (result.has_fortran_order)
+                throw std::runtime_error(".npy: malformed header");
+            const size_t start = cursor;
+            while (cursor < dict_end &&
+                   ((header[cursor] >= 'A' && header[cursor] <= 'Z') ||
+                    (header[cursor] >= 'a' && header[cursor] <= 'z'))) {
+                ++cursor;
+            }
+            if (cursor == start)
+                throw std::runtime_error(".npy: malformed header");
+            result.fortran_order = header.substr(start, cursor - start);
+            result.has_fortran_order = true;
+        } else if (key == "shape") {
+            if (result.has_shape || cursor >= dict_end || header[cursor] != '(')
+                throw std::runtime_error(".npy: malformed header");
+            const size_t start = ++cursor;
+            while (cursor < dict_end && header[cursor] != ')') ++cursor;
+            if (cursor >= dict_end)
+                throw std::runtime_error(".npy: malformed header");
+            result.shape = header.substr(start, cursor - start);
+            ++cursor;
+            result.has_shape = true;
+        } else {
+            throw std::runtime_error(".npy: malformed header");
+        }
+
+        skip_header_space(header, dict_end, &cursor);
+        if (cursor >= dict_end)
+            throw std::runtime_error(".npy: malformed header");
+        if (header[cursor] == ',') {
+            ++cursor;
+            skip_header_space(header, dict_end, &cursor);
+            if (cursor < dict_end && header[cursor] == '}') break;
+        } else if (header[cursor] != '}') {
+            throw std::runtime_error(".npy: malformed header");
+        }
+    }
+
+    if (cursor >= dict_end || header[cursor] != '}')
+        throw std::runtime_error(".npy: malformed header");
+    ++cursor;
+    skip_header_space(header, dict_end, &cursor);
+    if (cursor != dict_end || !result.has_descr || !result.has_fortran_order ||
+        !result.has_shape) {
+        throw std::runtime_error(".npy: malformed header");
+    }
+    return result;
 }
 
 }  // namespace
 
 NdArray parse_npy(const char* data, size_t len, const std::string& path) {
-    if (len < 12) throw std::runtime_error(path + ": too small for .npy");
+    if (len > kMaxNpyFileBytes)
+        throw std::runtime_error(path + ": file exceeds limit");
+    if (data == nullptr && len != 0)
+        throw std::runtime_error(path + ": null .npy input");
+    if (len < 8) throw std::runtime_error(path + ": too small for .npy");
 
     static const char kMagic[6] = {'\x93', 'N', 'U', 'M', 'P', 'Y'};
     if (std::memcmp(data, kMagic, 6) != 0)
         throw std::runtime_error(path + ": not a .npy file (bad magic)");
 
-    uint8_t major = static_cast<uint8_t>(data[6]);
-    size_t header_len;
-    size_t data_off;
-    if (major == 1) {
-        header_len = rd_u16le(data + 8);
-        data_off = 10 + header_len;
-    } else if (major == 2) {
-        header_len = rd_u32le(data + 8);
-        data_off = 12 + header_len;
+    const uint8_t major = static_cast<uint8_t>(data[6]);
+    const uint8_t minor = static_cast<uint8_t>(data[7]);
+    size_t prefix_bytes;
+    uint32_t header_len_wire;
+    if (major == 1 && minor == 0) {
+        prefix_bytes = 10;
+        if (len < prefix_bytes) throw std::runtime_error(path + ": truncated header");
+        header_len_wire = rd_u16le(data + 8);
+    } else if (major == 2 && minor == 0) {
+        prefix_bytes = 12;
+        if (len < prefix_bytes) throw std::runtime_error(path + ": truncated header");
+        header_len_wire = rd_u32le(data + 8);
     } else {
         throw std::runtime_error(path + ": unsupported .npy version");
     }
+    if (header_len_wire > kMaxNpyHeaderBytes)
+        throw std::runtime_error(path + ": header exceeds limit");
+    const size_t header_len = static_cast<size_t>(header_len_wire);
+    size_t data_off;
+    if (!checked_add(prefix_bytes, header_len, &data_off))
+        throw std::runtime_error(path + ": header offset overflow");
     if (data_off > len) throw std::runtime_error(path + ": truncated header");
 
-    std::string hdr(data + (data_off - header_len), header_len);
+    std::string hdr(data + prefix_bytes, header_len);
+    if (hdr.empty() || hdr.back() != '\n')
+        throw std::runtime_error(path + ": malformed header");
+    size_t dict_end = hdr.size() - 1;
+    while (dict_end > 0 && (hdr[dict_end - 1] == ' ' || hdr[dict_end - 1] == '\t'))
+        --dict_end;
+    if (dict_end < 2 || hdr.front() != '{' || hdr[dict_end - 1] != '}')
+        throw std::runtime_error(path + ": malformed header");
 
-    std::string descr = header_value(hdr, "descr");
-    std::string fortran = header_value(hdr, "fortran_order");
-    if (fortran.find("True") != std::string::npos)
+    const ParsedNpyHeader parsed_header = parse_header_dict(hdr, dict_end);
+    const std::string& descr = parsed_header.descr;
+    const std::string& fortran = parsed_header.fortran_order;
+    if (fortran == "True")
         throw std::runtime_error(path + ": fortran_order not supported");
+    if (fortran != "False")
+        throw std::runtime_error(path + ": invalid fortran_order");
+
+    // Only explicitly little-endian IEEE floating-point arrays are accepted.
+    // The bundled LUT is <f2; <f4/<f8 remain supported for upstream parity.
+    size_t itemsize;
+    int kind;  // 2=f16, 4=f32, 8=f64
+    if (descr == "<f2") { itemsize = 2; kind = 2; }
+    else if (descr == "<f4") { itemsize = 4; kind = 4; }
+    else if (descr == "<f8") { itemsize = 8; kind = 8; }
+    else throw std::runtime_error(path + ": unsupported dtype '" + descr + "'");
 
     // Parse shape tuple, e.g. "192, 192, 81" or "192, 192, 81," (trailing comma).
-    std::string shp = header_value(hdr, "shape");
+    const std::string& shp = parsed_header.shape;
     NdArray arr;
     {
         size_t i = 0;
+        bool saw_comma = false;
         while (i < shp.size()) {
-            while (i < shp.size() && (shp[i] == ' ' || shp[i] == ',')) ++i;
+            while (i < shp.size() && (shp[i] == ' ' || shp[i] == '\t')) ++i;
             if (i >= shp.size()) break;
-            size_t j = i;
-            while (j < shp.size() && shp[j] >= '0' && shp[j] <= '9') ++j;
-            if (j > i) arr.shape.push_back(std::stoi(shp.substr(i, j - i)));
-            i = j;
+            if (shp[i] < '0' || shp[i] > '9')
+                throw std::runtime_error(path + ": malformed shape");
+            size_t dimension = 0;
+            while (i < shp.size() && shp[i] >= '0' && shp[i] <= '9') {
+                const size_t digit = static_cast<size_t>(shp[i] - '0');
+                if (dimension > (kMaxNpyDimension - digit) / 10u)
+                    throw std::runtime_error(path + ": dimension exceeds limit");
+                dimension = dimension * 10u + digit;
+                ++i;
+            }
+            if (dimension == 0)
+                throw std::runtime_error(path + ": zero dimension");
+            if (arr.shape.size() >= kMaxNpyRank)
+                throw std::runtime_error(path + ": rank exceeds limit");
+            arr.shape.push_back(static_cast<int>(dimension));
+            while (i < shp.size() && (shp[i] == ' ' || shp[i] == '\t')) ++i;
+            if (i >= shp.size()) break;
+            if (shp[i] != ',')
+                throw std::runtime_error(path + ": malformed shape");
+            saw_comma = true;
+            ++i;
         }
+        if (arr.shape.size() == 1u && !saw_comma)
+            throw std::runtime_error(path + ": malformed shape");
     }
     if (arr.shape.empty()) throw std::runtime_error(path + ": empty/scalar shape");
 
-    size_t n = arr.count();
+    size_t n = 1;
+    for (int dimension : arr.shape) {
+        const size_t d = static_cast<size_t>(dimension);
+        if (n > kMaxNpyElements / d)
+            throw std::runtime_error(path + ": element count exceeds limit");
+        n *= d;
+    }
+    if (n > kMaxNpyPayloadBytes / itemsize)
+        throw std::runtime_error(path + ": payload exceeds limit");
+    const size_t payload_bytes = n * itemsize;
+    const size_t available_bytes = len - data_off;
+    if (payload_bytes > available_bytes)
+        throw std::runtime_error(path + ": truncated payload");
+    if (payload_bytes < available_bytes)
+        throw std::runtime_error(path + ": trailing payload");
+
+    // Every hostile-input check above precedes the decoded-double allocation.
     arr.data.resize(n);
     const char* p = data + data_off;
 
-    // Supported little-endian float dtypes. '<f2'/'|f2', '<f4', '<f8'.
-    int itemsize;
-    int kind;  // 2=f16, 4=f32, 8=f64
-    if (descr == "<f2" || descr == "|f2" || descr == "f2") { itemsize = 2; kind = 2; }
-    else if (descr == "<f4" || descr == "=f4" || descr == "f4") { itemsize = 4; kind = 4; }
-    else if (descr == "<f8" || descr == "=f8" || descr == "f8") { itemsize = 8; kind = 8; }
-    else throw std::runtime_error(path + ": unsupported dtype '" + descr + "'");
-
-    if (data_off + n * static_cast<size_t>(itemsize) > len)
-        throw std::runtime_error(path + ": truncated payload");
-
     for (size_t idx = 0; idx < n; ++idx) {
-        const char* q = p + idx * static_cast<size_t>(itemsize);
+        const char* q = p + idx * itemsize;
+        double value;
         if (kind == 2) {
-            arr.data[idx] = rd_f16le(q);
+            value = rd_f16le(q);
         } else if (kind == 4) {
-            arr.data[idx] = static_cast<double>(rd_f32le(q));
+            value = static_cast<double>(rd_f32le(q));
         } else {
             uint64_t lo = rd_u32le(q);
             uint64_t hi = rd_u32le(q + 4);
             uint64_t bits = lo | (hi << 32);
-            double d;
-            std::memcpy(&d, &bits, sizeof(d));
-            arr.data[idx] = d;
+            std::memcpy(&value, &bits, sizeof(value));
         }
+        if (!std::isfinite(value))
+            throw std::runtime_error(path + ": non-finite payload");
+        arr.data[idx] = value;
     }
     return arr;
 }
 
 NdArray load_npy(const std::string& path) {
-    std::vector<char> buf = read_all(path);
+    std::vector<char> buf = read_all(path, kMaxNpyFileBytes);
     return parse_npy(buf.data(), buf.size(), path);
 }
 
