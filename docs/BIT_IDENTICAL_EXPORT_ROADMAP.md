@@ -265,23 +265,29 @@ The “LUTs” in this graph do not mean a baked whole-look 3D cube. Scientific 
 density curves and an explicitly selected user LUT may be resident resources; the normal Fast GPU
 render must evaluate the direct shader graph. `.cube`/CLF baking remains an export operation.
 
-### 2026-08-31 resident pointwise checkpoint
+### 2026-08-31 resident pointwise product-route checkpoint
 
-Ticket #148 now has a code-reviewed low-level filming -> printing -> scan Vulkan chain with one
-frame upload, exactly three compute dispatches, device-local ping-pong intermediates and one final
-readback. It has overflow-safe 2D dispatch planning, keyed static-table residency, copy-last
-failure behavior, explicit NaN/Inf containment, O(log n) curve lookup and completion diagnostics.
+[Expand the full-chain Vulkan preview DAG under the canonical baseline](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
+now routes eligible production `run_print` renders through one resident filming -> printing -> scan
+Vulkan pointwise chain: one frame upload, three compute dispatches, device-local intermediates and
+one final readback. It folds the live film, DIR, print and scan tables, applies direct-input gain
+exactly once, and reuses prepared tables under full-byte cache keys. GPU output stays private until
+the whole chain succeeds; unavailable, allocation, dispatch or cancellation failures therefore
+fall back to Strict Exact CPU without exposing partial pixels or partially bypassing CPU memos.
 
-The current shaders pass O2 and shipping-flag software-Vulkan runs against an asymmetric f64
-reference (`max_abs` approximately `1.8e-7`), changed-table cache invalidation, 100 warm
-byte-determinism repeats and an executed 4,194,241-pixel two-row dispatch. Android native builds
-pass for all three configured ABIs, and the full native engine suite passes 39/39 at both O2 and
-shipping flags. This is **not** yet the application route: live profile folding,
-capability caching/self-test, render-local engagement reporting, cancellation integration and
-spatial/stochastic stages remain open. The final revised O2 and shipping binaries now pass the
-connected Adreno gate, including 100 warm byte-identical runs and the actual 4,194,241-pixel
-two-row dispatch. The 12/50/200 MP checks remain planner-only and no 1-2 s timing claim follows
-from this checkpoint.
+The keyed capability verdict exercises a 512-point 8 x 8 x 8 lattice three times against the direct
+f64 CPU stages at `max_abs <= 1e-4` and `RMS <= 1e-5`. Render-local diagnostics report route
+engagement, fallback and frame resource counters while keeping self-test state, duration and work
+separate. The frozen implementation received an independent `APPROVED` review, builds as Android
+Release for all three configured ABIs, and passes the full native parity matrix 39/39 at both O2 and
+the shipping `-O3 -ffast-math -fno-finite-math-only` flags. Final post-freeze phone execution
+remains pending after ADB disconnected; earlier connected-Adreno evidence does not certify the
+frozen product route.
+
+This checkpoint covers eligible pointwise work only. Spatial and stochastic stages, including
+halation, diffusion, Pro-Mist and grain, remain open. Fast GPU is tolerance-bounded and intended to
+be repeatable on the same approved device/driver; it is not CPU-byte-identical. The 12/50/200 MP
+cases remain planner-only, and no 1-2 s export claim follows from these functional gates.
 
 Vulkan's specification does not promise cross-implementation pixel identity. A device that fails the
 self-test simply cannot expose Fast GPU export.

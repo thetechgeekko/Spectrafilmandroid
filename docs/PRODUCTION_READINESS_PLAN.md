@@ -257,11 +257,25 @@ Owners:
 - [Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
 - [Bound and fuzz NPY, JSON, profile, recipe, mask, and RAW parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173)
 
-Ticket #172 implements checked allocation geometry, direct-buffer range and byte-order validation,
-contained C++ exceptions, one-shot native release, an explicit render/close lease state machine,
+[Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
+implements checked allocation geometry, direct-buffer range and byte-order validation, contained
+C++ exceptions, one-shot native release, an explicit render/close lease state machine,
 generation-safe foreground-service teardown, and exact cross-APK R8 ABI checks. Its offline and
-connected arm64 API 36 device evidence is complete. Ticket #173 must ensure parser failure never
-commits partial state.
+connected arm64 API 36 device evidence is complete.
+
+[Bound and fuzz NPY, JSON, profile, recipe, mask, and RAW parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173)
+now has a frozen, independently approved native JSON/profile/neutral-filter slice. JSON input is
+capped at 1 MiB before allocation, with depth 8, 16,384 nodes, 512 array elements, 64 object
+members, 4,096 decoded bytes per string/key and 128 bytes per number token. The parser rejects
+duplicate decoded keys, malformed UTF-8 and surrogate pairs, unescaped controls, trailing data,
+invalid number grammar and non-finite overflow. Profile V1 validation enforces required fields,
+allowlists, dimensions and finite float range while retaining upstream-compatible nullable spectral
+values and bounded dynamic 3 x N density models (`N=0..512`). All 28 bundled profiles load.
+Neutral-filter lookup is failure-atomic, and render/probe callers explicitly own the zero fallback.
+
+Ordinary hostile-input tests, ASan/UBSan, a 1,000-run bounded libFuzzer smoke, native-safety and
+release-policy tests are wired into CI; the frozen slice passes those gates. The broader ticket
+remains open for recipe, mask, RAW/DNG, Kotlin/import and updater/download boundaries.
 
 ## Phase 2 — color and file-output truth
 
@@ -380,6 +394,19 @@ quantization, with one upload and one download. A scan-only shader cannot solve 
 simulation. Require fixed per-pixel accumulation order, explicit NaN/Inf/index behavior, shader and
 driver fingerprints, same-device repeat tests, CPU-oracle sweeps, watchdog, remote kill switch and
 fail-closed CPU fallback.
+
+[Expand the full-chain Vulkan preview DAG under the canonical baseline](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
+now has an independently approved, frozen product route for eligible pointwise filming, printing
+and scan work. It uses one upload, three resident dispatches and one readback; folds live tables;
+keeps prepared tables under full-byte keys; runs a keyed CPU-oracle capability self-test; reports
+render-local engagement; and falls back to Strict Exact CPU without publishing partial output. The
+three-ABI Android Release build and full native parity matrix 39/39 pass at both O2 and the shipping
+`-O3 -ffast-math -fno-finite-math-only` flags. The final post-freeze phone run remains pending after
+ADB disconnected.
+
+This is a tolerance-bounded, same-device-deterministic Fast GPU route, not a CPU-byte-identical
+route. Spatial/stochastic stages remain open, 12/50/200 MP coverage remains planner-only, and no
+1-2 s export result has been measured.
 
 GPU results are never inserted into the strict exact cache unless the owner explicitly changes the
 numeric contract. VkFFT is an optional Pro-Mist experiment after the DAG and memory system exist.
