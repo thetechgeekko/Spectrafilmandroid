@@ -12,9 +12,10 @@
  */
 #include "runtime/print_digest.h"
 
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
-#include <sstream>
 #include <vector>
 
 #include "kernels/spectral_upsampling.h"
@@ -62,31 +63,35 @@ bool resolve_neutral_cc_string(const std::string& json_text,
                                const std::string& illuminant,
                                const std::string& film_stock,
                                double cc_out[3]) {
-    // Schema default: enlarger.{c,m,y}_filter_neutral == 0 (params_schema.py).
-    cc_out[0] = cc_out[1] = cc_out[2] = 0.0;
-
-    json::ValuePtr root;
+    if (cc_out == nullptr) return false;
     try {
-        root = json::parse(json_text);
-    } catch (const std::exception&) {
+        const json::ValuePtr root = json::parse(json_text);
+        const json::Value& r = *root;
+
+        // filters.get(print_stock, {}).get(illuminant, {}).get(film_stock)
+        if (!r.has(print_stock)) return false;
+        const json::Value& by_illum = r.at(print_stock);
+        if (!by_illum.has(illuminant)) return false;
+        const json::Value& by_film = by_illum.at(illuminant);
+        if (!by_film.has(film_stock)) return false;
+        const json::Value& triple = by_film.at(film_stock);
+        if (!triple.is_array() || triple.size() != 3) return false;
+
+        // Validate into private storage first. No syntax/schema/allocation error
+        // may partially publish a replacement triple to the caller.
+        std::array<double, 3> parsed{};
+        for (size_t i = 0; i < parsed.size(); ++i) {
+            if (!triple[i].is_number() || triple[i].is_null_number) return false;
+            parsed[i] = triple[i].number;
+            if (!std::isfinite(parsed[i])) return false;
+        }
+        for (size_t i = 0; i < parsed.size(); ++i) cc_out[i] = parsed[i];
+        return true;
+    } catch (...) {
+        // Existing bool API: malformed input and allocation failures are
+        // represented as false, with caller storage left byte-for-byte alone.
         return false;
     }
-    const json::Value& r = *root;
-
-    // filters.get(print_stock, {}).get(illuminant, {}).get(film_stock)
-    if (!r.has(print_stock)) return false;
-    const json::Value& by_illum = r.at(print_stock);
-    if (!by_illum.has(illuminant)) return false;
-    const json::Value& by_film = by_illum.at(illuminant);
-    if (!by_film.has(film_stock)) return false;
-    const json::Value& triple = by_film.at(film_stock);
-    if (!triple.is_array() || triple.size() != 3) return false;
-
-    // c_filter, m_filter, y_filter = (float(value) for value in stock_filters)
-    cc_out[0] = triple[0].as_number();  // C
-    cc_out[1] = triple[1].as_number();  // M
-    cc_out[2] = triple[2].as_number();  // Y
-    return true;
 }
 
 bool resolve_neutral_cc(const std::string& json_path,
@@ -94,19 +99,27 @@ bool resolve_neutral_cc(const std::string& json_path,
                         const std::string& illuminant,
                         const std::string& film_stock,
                         double cc_out[3]) {
-    // Thin file-reading wrapper around resolve_neutral_cc_string: read the JSON
-    // database from disk then delegate. A missing/unreadable file -> defaults
-    // {0,0,0} and false, mirroring the Python FileNotFoundError "use defaults"
-    // branch (the string overload also returns false on parse failure).
-    std::ifstream in(json_path, std::ios::binary);
-    if (!in) {  // FileNotFoundError -> {} -> defaults.
-        cc_out[0] = cc_out[1] = cc_out[2] = 0.0;
+    if (cc_out == nullptr) return false;
+    try {
+        std::ifstream in(json_path, std::ios::binary);
+        if (!in) return false;
+        in.seekg(0, std::ios::end);
+        const std::streamoff end = in.tellg();
+        if (end < 0 || static_cast<uintmax_t>(end) > json::kMaxInputBytes)
+            return false;
+        const size_t size = static_cast<size_t>(end);
+        std::string text(size, '\0');
+        in.seekg(0, std::ios::beg);
+        if (size != 0) {
+            in.read(text.data(), static_cast<std::streamsize>(size));
+            if (!in || static_cast<size_t>(in.gcount()) != size) return false;
+        }
+        if (in.peek() != std::char_traits<char>::eof()) return false;
+        return resolve_neutral_cc_string(text, print_stock, illuminant, film_stock,
+                                         cc_out);
+    } catch (...) {
         return false;
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return resolve_neutral_cc_string(ss.str(), print_stock, illuminant, film_stock,
-                                     cc_out);
 }
 
 namespace {

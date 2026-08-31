@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Offline host sanitizer qualification shared by CI and release.
 #
-# This executes JNI safety helpers and the engine C cancellation ABI. The actual
-# Android JNI bridge is exercised separately by EngineBoundaryInstrumentation;
-# this host runner must never be described as runtime sanitizer coverage of that
-# bridge.
+# This executes JSON/profile/neutral-filter hostile-input regressions, JNI safety
+# helpers, and the engine C cancellation ABI. The actual Android JNI bridge is
+# exercised separately by EngineBoundaryInstrumentation; this host runner must
+# never be described as runtime sanitizer coverage of that bridge.
 
 set -euo pipefail
 shopt -s nullglob
@@ -20,6 +20,7 @@ cd -- "$repo_root"
 readonly SUITE_SPECS=(
   "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety"
   "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation"
+  "asan-ubsan|engine-json-profile-hostile-inputs|engine-json-profile"
   "asan-ubsan|engine-npy-hostile-inputs|engine-npy"
   "asan-ubsan|png-writer-hostile-jni-helpers|png-writer"
   "asan-ubsan|tiff-writer-hostile-jni-helpers|tiff-writer"
@@ -123,6 +124,24 @@ run_suite() {
       )
       run_args+=(
         "$ENGINE_CPP/../assets/spektra/luts/spectral_upsampling/irradiance_xy_tc.npy"
+      )
+      ;;
+    engine-json-profile)
+      command+=(
+        -I "$ENGINE_CPP"
+        "$ENGINE_CPP/tests/test_json_profile.cpp"
+        "$ENGINE_CPP/profiles/profile.cpp"
+        "$ENGINE_CPP/runtime/print_digest.cpp"
+        "$ENGINE_CPP/model/color_output.cpp"
+        "$ENGINE_CPP/model/density_curves.cpp"
+        "$ENGINE_CPP/model/gamut_compression.cpp"
+        "$ENGINE_CPP/kernels/spectral_upsampling.cpp"
+        "$ENGINE_CPP/kernels/interp.cpp"
+        "$ENGINE_CPP/kernels/parallel.cpp"
+      )
+      run_args+=(
+        "$ENGINE_CPP/../assets/spektra/profiles"
+        "$ENGINE_CPP/../assets/spektra/filters/neutral_print_filters.json"
       )
       ;;
     png-writer)

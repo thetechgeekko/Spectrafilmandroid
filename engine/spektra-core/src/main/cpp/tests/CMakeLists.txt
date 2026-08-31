@@ -1,9 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
-project(spektra_npy_host_tests LANGUAGES CXX)
+project(spektra_native_input_host_tests LANGUAGES CXX)
 
 include(CTest)
 
-option(SPK_NPY_TEST_SANITIZERS "Enable ASan and UBSan for the NPY host test" OFF)
+option(SPK_NPY_TEST_SANITIZERS "Enable ASan and UBSan for native input tests" OFF)
+option(SPK_NATIVE_INPUT_TEST_SANITIZERS
+    "Enable ASan and UBSan for all native hostile-input regressions" OFF)
+option(SPK_JSON_PROFILE_FUZZER "Build the bounded JSON/profile libFuzzer target" OFF)
+
+find_package(Threads REQUIRED)
 
 add_executable(spektra_npy_lut_regression
     test_npy_lut.cpp
@@ -12,15 +17,36 @@ add_executable(spektra_npy_lut_regression
 target_compile_features(spektra_npy_lut_regression PRIVATE cxx_std_17)
 target_include_directories(spektra_npy_lut_regression PRIVATE ..)
 
-if(SPK_NPY_TEST_SANITIZERS)
+set(SPK_JSON_PROFILE_SOURCES
+    ../profiles/profile.cpp
+    ../runtime/print_digest.cpp
+    ../model/color_output.cpp
+    ../model/density_curves.cpp
+    ../model/gamut_compression.cpp
+    ../kernels/spectral_upsampling.cpp
+    ../kernels/interp.cpp
+    ../kernels/parallel.cpp
+)
+
+add_executable(spektra_json_profile_regression
+    test_json_profile.cpp
+    ${SPK_JSON_PROFILE_SOURCES}
+)
+target_compile_features(spektra_json_profile_regression PRIVATE cxx_std_17)
+target_include_directories(spektra_json_profile_regression PRIVATE ..)
+target_link_libraries(spektra_json_profile_regression PRIVATE Threads::Threads)
+
+if(SPK_NPY_TEST_SANITIZERS OR SPK_NATIVE_INPUT_TEST_SANITIZERS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(spektra_npy_lut_regression PRIVATE
-            -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
-            -fno-sanitize-recover=all)
-        target_link_options(spektra_npy_lut_regression PRIVATE
-            -fsanitize=address,undefined -fno-sanitize-recover=all)
+        foreach(target spektra_npy_lut_regression spektra_json_profile_regression)
+            target_compile_options(${target} PRIVATE
+                -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+                -fno-sanitize-recover=all)
+            target_link_options(${target} PRIVATE
+                -fsanitize=address,undefined -fno-sanitize-recover=all)
+        endforeach()
     else()
-        message(FATAL_ERROR "SPK_NPY_TEST_SANITIZERS requires Clang or GCC")
+        message(FATAL_ERROR "Native input sanitizers require Clang or GCC")
     endif()
 endif()
 
@@ -28,3 +54,27 @@ add_test(NAME spektra.npy-lut.hostile-inputs
     COMMAND spektra_npy_lut_regression
         "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/spektra/luts/spectral_upsampling/irradiance_xy_tc.npy")
 set_tests_properties(spektra.npy-lut.hostile-inputs PROPERTIES TIMEOUT 5)
+
+add_test(NAME spektra.json-profile.hostile-inputs
+    COMMAND spektra_json_profile_regression
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/spektra/profiles"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/spektra/filters/neutral_print_filters.json")
+set_tests_properties(spektra.json-profile.hostile-inputs PROPERTIES TIMEOUT 30)
+
+if(SPK_JSON_PROFILE_FUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "SPK_JSON_PROFILE_FUZZER requires Clang")
+    endif()
+    add_executable(spektra_json_profile_fuzzer
+        fuzz_json_profile.cpp
+        ${SPK_JSON_PROFILE_SOURCES}
+    )
+    target_compile_features(spektra_json_profile_fuzzer PRIVATE cxx_std_17)
+    target_include_directories(spektra_json_profile_fuzzer PRIVATE ..)
+    target_link_libraries(spektra_json_profile_fuzzer PRIVATE Threads::Threads)
+    target_compile_options(spektra_json_profile_fuzzer PRIVATE
+        -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined
+        -fno-sanitize-recover=all)
+    target_link_options(spektra_json_profile_fuzzer PRIVATE
+        -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
+endif()

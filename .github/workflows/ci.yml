@@ -2,9 +2,10 @@
 #
 # Eight jobs run on every push / PR / manual dispatch:
 #   • engine-native   — compiles C++ engine + JNI bridge into libspektra.so (host toolchain)
-#   • native-safety-writers — offline ASan/UBSan + TSan gates for JNI safety helpers,
-#                        the engine C cancellation ABI, and PNG/TIFF hostile-input,
-#                        cancellation, and JNI-helper tests
+#   • native-safety-writers — ordinary + ASan/UBSan + bounded fuzz gates for native
+#                        JSON/profile/neutral-filter hostile input; ASan/UBSan + TSan
+#                        for JNI safety helpers, the engine C cancellation ABI, and
+#                        PNG/TIFF hostile-input, cancellation, and JNI-helper tests
 #   • engine-parity   — deterministic stage parity tests against committed goldens (bit-exact
 #                        gate: scan_portra, print_portra, print_ektar + spatial/crop/autoexp/
 #                        diffusion; runs on push/PR)
@@ -144,6 +145,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Run ordinary JSON/profile hostile-input regression
+        run: |
+          set -euo pipefail
+          cmake -S engine/spektra-core/src/main/cpp/tests \
+            -B build/engine-native-input-tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/engine-native-input-tests --parallel \
+            --target spektra_json_profile_regression
+          ctest --test-dir build/engine-native-input-tests --output-on-failure \
+            --no-tests=error \
+            -R '^spektra\.json-profile\.hostile-inputs$'
+
       - name: Run shared host-native sanitizer qualification
         working-directory: ${{ github.workspace }}
         env:
@@ -153,6 +166,32 @@ jobs:
         run: |
           set -euo pipefail
           bash tools/release/run_native_safety.sh
+
+      - name: Run bounded JSON/profile libFuzzer smoke
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          cmake -S engine/spektra-core/src/main/cpp/tests \
+            -B build/engine-json-profile-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DSPK_JSON_PROFILE_FUZZER=ON
+          cmake --build build/engine-json-profile-fuzz --parallel \
+            --target spektra_json_profile_fuzzer
+          mkdir -p build/engine-json-profile-corpus
+          cp engine/spektra-core/src/main/assets/spektra/profiles/kodak_portra_400.json \
+            build/engine-json-profile-corpus/profile.json
+          cp engine/spektra-core/src/main/assets/spektra/filters/neutral_print_filters.json \
+            build/engine-json-profile-corpus/neutral.json
+          build/engine-json-profile-fuzz/spektra_json_profile_fuzzer \
+            -runs=1000 \
+            -max_total_time=30 \
+            -max_len=1048577 \
+            -rss_limit_mb=1024 \
+            -timeout=10 \
+            build/engine-json-profile-corpus
 
   # ---------------------------------------------------------------------------
   # LibRaw hostile-input gate. This builds the exact official 0.22.2 archive

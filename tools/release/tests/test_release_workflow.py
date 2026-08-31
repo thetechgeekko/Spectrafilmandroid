@@ -442,6 +442,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             (
                 "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety",
                 "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation",
+                "asan-ubsan|engine-json-profile-hostile-inputs|engine-json-profile",
                 "asan-ubsan|engine-npy-hostile-inputs|engine-npy",
                 "asan-ubsan|png-writer-hostile-jni-helpers|png-writer",
                 "asan-ubsan|tiff-writer-hostile-jni-helpers|tiff-writer",
@@ -454,6 +455,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         )
         self.assertIn('"$ENGINE_CPP/tests/test_npy_lut.cpp"', runner)
         self.assertIn('"$ENGINE_CPP/io/npy_lut.cpp"', runner)
+        self.assertIn('"$ENGINE_CPP/tests/test_json_profile.cpp"', runner)
+        self.assertIn('"$ENGINE_CPP/profiles/profile.cpp"', runner)
+        self.assertIn('"$ENGINE_CPP/runtime/print_digest.cpp"', runner)
         self.assertIn(
             '"$ENGINE_CPP/../assets/spektra/luts/spectral_upsampling/irradiance_xy_tc.npy"',
             runner,
@@ -506,6 +510,19 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             self.assertNotIn("test_cancellation_api.cpp", qualifier)
         self.assertIn("JNI safety helpers + engine C cancellation ABI", CI)
         self.assertIn("JNI safety helpers + engine C cancellation ABI", RELEASE)
+
+    def test_ci_json_profile_gates_are_fail_closed_and_bounded(self) -> None:
+        qualifier = workflow_job_block(CI, "native-safety-writers")
+        self.assertIn("--no-tests=error", qualifier)
+        self.assertIn("-R '^spektra\\.json-profile\\.hostile-inputs$'", qualifier)
+        for bound in (
+            "-runs=1000",
+            "-max_total_time=30",
+            "-max_len=1048577",
+            "-rss_limit_mb=1024",
+            "-timeout=10",
+        ):
+            self.assertEqual(1, qualifier.count(bound))
 
     def test_engine_boundary_instrumentation_is_a_recurring_ci_gate(self) -> None:
         android = workflow_job_block(CI, "android")

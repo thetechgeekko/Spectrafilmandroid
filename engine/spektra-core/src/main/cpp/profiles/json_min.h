@@ -20,16 +20,31 @@
 #ifndef SPK_PROFILES_JSON_MIN_H
 #define SPK_PROFILES_JSON_MIN_H
 
+#include <cerrno>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace spk {
 namespace json {
+
+// V1 hostile-input ceilings. They are deliberately above every bundled
+// profile/neutral-filter asset while keeping parser work and allocations
+// bounded for untrusted imported content.
+inline constexpr size_t kMaxInputBytes = 1u << 20;
+inline constexpr size_t kMaxDepth = 8;
+inline constexpr size_t kMaxNodes = 16'384;
+inline constexpr size_t kMaxArrayElements = 512;
+inline constexpr size_t kMaxObjectMembers = 64;
+inline constexpr size_t kMaxDecodedStringBytes = 4'096;
+inline constexpr size_t kMaxNumberTokenBytes = 128;
 
 class Value;
 using ValuePtr = std::shared_ptr<Value>;
@@ -86,8 +101,10 @@ public:
     explicit Parser(const std::string& text) : s_(text), n_(text.size()) {}
 
     ValuePtr parse() {
+        if (n_ > kMaxInputBytes)
+            throw std::runtime_error("JSON: input exceeds 1 MiB limit");
         skip_ws();
-        ValuePtr v = parse_value();
+        ValuePtr v = parse_value(/*depth=*/1);
         skip_ws();
         if (pos_ != n_) throw std::runtime_error("JSON: trailing characters");
         return v;
@@ -97,6 +114,7 @@ private:
     const std::string& s_;
     size_t pos_ = 0;
     size_t n_;
+    size_t nodes_ = 0;
 
     [[noreturn]] void fail(const std::string& msg) {
         throw std::runtime_error("JSON parse error at " + std::to_string(pos_) + ": " + msg);
@@ -112,33 +130,53 @@ private:
         }
     }
 
-    ValuePtr parse_value() {
+    ValuePtr make_value(Type type) {
+        if (nodes_ >= kMaxNodes) fail("node limit exceeded");
+        ++nodes_;
+        auto value = std::make_shared<Value>();
+        value->type = type;
+        return value;
+    }
+
+    ValuePtr parse_value(size_t depth) {
+        if (depth > kMaxDepth) fail("nesting depth limit exceeded");
+        // Fail before string/token decoding can allocate when the next value
+        // would exceed the global node budget.
+        if (nodes_ >= kMaxNodes) fail("node limit exceeded");
         skip_ws();
         char c = peek();
         switch (c) {
-            case '{': return parse_object();
-            case '[': return parse_array();
+            case '{': return parse_object(depth);
+            case '[': return parse_array(depth);
             case '"': return parse_string_value();
             case 't': case 'f': return parse_bool();
             case 'n': return parse_null();
-            default: return parse_number();
+            default:
+                if (c == '-' || (c >= '0' && c <= '9')) return parse_number();
+                fail("unexpected token");
         }
     }
 
-    ValuePtr parse_object() {
-        auto v = std::make_shared<Value>();
-        v->type = Type::Object;
+    ValuePtr parse_object(size_t depth) {
+        auto v = make_value(Type::Object);
         get();  // '{'
         skip_ws();
         if (peek() == '}') { get(); return v; }
+        size_t members = 0;
         while (true) {
+            // Check before parsing/allocating the next key or child value.
+            if (members >= kMaxObjectMembers) fail("object member limit exceeded");
+            if (nodes_ >= kMaxNodes) fail("node limit exceeded");
             skip_ws();
             if (peek() != '"') fail("expected string key");
             std::string key = parse_raw_string();
+            if (v->object.find(key) != v->object.end())
+                fail("duplicate object key");
             skip_ws();
             if (get() != ':') fail("expected ':'");
-            ValuePtr val = parse_value();
-            v->object[key] = val;
+            ValuePtr val = parse_value(depth + 1);
+            v->object.emplace(std::move(key), std::move(val));
+            ++members;
             skip_ws();
             char d = get();
             if (d == ',') continue;
@@ -148,15 +186,17 @@ private:
         return v;
     }
 
-    ValuePtr parse_array() {
-        auto v = std::make_shared<Value>();
-        v->type = Type::Array;
+    ValuePtr parse_array(size_t depth) {
+        auto v = make_value(Type::Array);
         get();  // '['
         skip_ws();
         if (peek() == ']') { get(); return v; }
         while (true) {
-            ValuePtr val = parse_value();
-            v->array.push_back(val);
+            // Check before allocating the next child and before push_back.
+            if (v->array.size() >= kMaxArrayElements)
+                fail("array element limit exceeded");
+            ValuePtr val = parse_value(depth + 1);
+            v->array.push_back(std::move(val));
             skip_ws();
             char d = get();
             if (d == ',') continue;
@@ -166,71 +206,168 @@ private:
         return v;
     }
 
+    void append_byte(std::string* out, char byte) {
+        if (out->size() >= kMaxDecodedStringBytes)
+            fail("decoded string limit exceeded");
+        out->push_back(byte);
+    }
+
+    void append_codepoint(std::string* out, uint32_t codepoint) {
+        char encoded[4];
+        size_t count = 0;
+        if (codepoint <= 0x7f) {
+            encoded[count++] = static_cast<char>(codepoint);
+        } else if (codepoint <= 0x7ff) {
+            encoded[count++] = static_cast<char>(0xc0 | (codepoint >> 6));
+            encoded[count++] = static_cast<char>(0x80 | (codepoint & 0x3f));
+        } else if (codepoint <= 0xffff) {
+            encoded[count++] = static_cast<char>(0xe0 | (codepoint >> 12));
+            encoded[count++] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f));
+            encoded[count++] = static_cast<char>(0x80 | (codepoint & 0x3f));
+        } else {
+            encoded[count++] = static_cast<char>(0xf0 | (codepoint >> 18));
+            encoded[count++] = static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f));
+            encoded[count++] = static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f));
+            encoded[count++] = static_cast<char>(0x80 | (codepoint & 0x3f));
+        }
+        if (out->size() > kMaxDecodedStringBytes - count)
+            fail("decoded string limit exceeded");
+        out->append(encoded, count);
+    }
+
+    unsigned hex_digit(char c) {
+        if (c >= '0' && c <= '9') return static_cast<unsigned>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<unsigned>(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return static_cast<unsigned>(c - 'A' + 10);
+        fail("bad unicode escape");
+    }
+
+    uint32_t parse_hex4() {
+        if (n_ - pos_ < 4) fail("bad unicode escape");
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) value = (value << 4) | hex_digit(s_[pos_++]);
+        return value;
+    }
+
+    bool is_continuation(size_t offset) const {
+        return pos_ + offset < n_ &&
+               (static_cast<unsigned char>(s_[pos_ + offset]) & 0xc0u) == 0x80u;
+    }
+
+    void append_raw_utf8(std::string* out, unsigned char lead) {
+        const size_t start = pos_ - 1;
+        size_t count = 0;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            if (!is_continuation(0)) fail("invalid UTF-8 in string");
+            count = 2;
+        } else if (lead == 0xe0) {
+            if (pos_ + 1 >= n_ || static_cast<unsigned char>(s_[pos_]) < 0xa0 ||
+                static_cast<unsigned char>(s_[pos_]) > 0xbf || !is_continuation(1))
+                fail("invalid UTF-8 in string");
+            count = 3;
+        } else if ((lead >= 0xe1 && lead <= 0xec) || (lead >= 0xee && lead <= 0xef)) {
+            if (!is_continuation(0) || !is_continuation(1))
+                fail("invalid UTF-8 in string");
+            count = 3;
+        } else if (lead == 0xed) {
+            if (pos_ + 1 >= n_ || static_cast<unsigned char>(s_[pos_]) < 0x80 ||
+                static_cast<unsigned char>(s_[pos_]) > 0x9f || !is_continuation(1))
+                fail("invalid UTF-8 in string");
+            count = 3;
+        } else if (lead == 0xf0) {
+            if (pos_ + 2 >= n_ || static_cast<unsigned char>(s_[pos_]) < 0x90 ||
+                static_cast<unsigned char>(s_[pos_]) > 0xbf ||
+                !is_continuation(1) || !is_continuation(2))
+                fail("invalid UTF-8 in string");
+            count = 4;
+        } else if (lead >= 0xf1 && lead <= 0xf3) {
+            if (!is_continuation(0) || !is_continuation(1) || !is_continuation(2))
+                fail("invalid UTF-8 in string");
+            count = 4;
+        } else if (lead == 0xf4) {
+            if (pos_ + 2 >= n_ || static_cast<unsigned char>(s_[pos_]) < 0x80 ||
+                static_cast<unsigned char>(s_[pos_]) > 0x8f ||
+                !is_continuation(1) || !is_continuation(2))
+                fail("invalid UTF-8 in string");
+            count = 4;
+        } else {
+            fail("invalid UTF-8 in string");
+        }
+        if (out->size() > kMaxDecodedStringBytes - count)
+            fail("decoded string limit exceeded");
+        out->append(s_, start, count);
+        pos_ += count - 1;
+    }
+
     std::string parse_raw_string() {
         get();  // opening quote
         std::string out;
         while (pos_ < n_) {
-            char c = s_[pos_++];
+            const unsigned char byte = static_cast<unsigned char>(s_[pos_++]);
+            char c = static_cast<char>(byte);
             if (c == '"') return out;
             if (c == '\\') {
                 char e = pos_ < n_ ? s_[pos_++] : '\0';
                 switch (e) {
-                    case '"': out += '"'; break;
-                    case '\\': out += '\\'; break;
-                    case '/': out += '/'; break;
-                    case 'b': out += '\b'; break;
-                    case 'f': out += '\f'; break;
-                    case 'n': out += '\n'; break;
-                    case 'r': out += '\r'; break;
-                    case 't': out += '\t'; break;
+                    case '"': append_byte(&out, '"'); break;
+                    case '\\': append_byte(&out, '\\'); break;
+                    case '/': append_byte(&out, '/'); break;
+                    case 'b': append_byte(&out, '\b'); break;
+                    case 'f': append_byte(&out, '\f'); break;
+                    case 'n': append_byte(&out, '\n'); break;
+                    case 'r': append_byte(&out, '\r'); break;
+                    case 't': append_byte(&out, '\t'); break;
                     case 'u': {
-                        // Minimal \uXXXX handling: decode to UTF-8 (BMP only).
-                        if (pos_ + 4 > n_) fail("bad unicode escape");
-                        unsigned code = (unsigned)std::strtoul(s_.substr(pos_, 4).c_str(), nullptr, 16);
-                        pos_ += 4;
-                        if (code < 0x80) out += (char)code;
-                        else if (code < 0x800) {
-                            out += (char)(0xC0 | (code >> 6));
-                            out += (char)(0x80 | (code & 0x3F));
-                        } else {
-                            out += (char)(0xE0 | (code >> 12));
-                            out += (char)(0x80 | ((code >> 6) & 0x3F));
-                            out += (char)(0x80 | (code & 0x3F));
+                        uint32_t code = parse_hex4();
+                        if (code >= 0xd800 && code <= 0xdbff) {
+                            if (n_ - pos_ < 6 || s_[pos_] != '\\' || s_[pos_ + 1] != 'u')
+                                fail("unpaired high surrogate");
+                            pos_ += 2;
+                            const uint32_t low = parse_hex4();
+                            if (low < 0xdc00 || low > 0xdfff)
+                                fail("unpaired high surrogate");
+                            code = 0x10000u + ((code - 0xd800u) << 10) +
+                                   (low - 0xdc00u);
+                        } else if (code >= 0xdc00 && code <= 0xdfff) {
+                            fail("unpaired low surrogate");
                         }
+                        append_codepoint(&out, code);
                         break;
                     }
                     default: fail("bad escape");
                 }
             } else {
-                out += c;
+                if (byte < 0x20) fail("unescaped control character in string");
+                if (byte < 0x80) append_byte(&out, c);
+                else append_raw_utf8(&out, byte);
             }
         }
         fail("unterminated string");
     }
 
     ValuePtr parse_string_value() {
-        auto v = std::make_shared<Value>();
-        v->type = Type::String;
-        v->str = parse_raw_string();
+        std::string decoded = parse_raw_string();
+        auto v = make_value(Type::String);
+        v->str = std::move(decoded);
         return v;
     }
 
     ValuePtr parse_bool() {
-        auto v = std::make_shared<Value>();
-        v->type = Type::Bool;
-        if (s_.compare(pos_, 4, "true") == 0) { v->boolean = true; pos_ += 4; }
-        else if (s_.compare(pos_, 5, "false") == 0) { v->boolean = false; pos_ += 5; }
+        bool boolean = false;
+        if (s_.compare(pos_, 4, "true") == 0) { boolean = true; pos_ += 4; }
+        else if (s_.compare(pos_, 5, "false") == 0) { pos_ += 5; }
         else fail("invalid literal");
+        auto v = make_value(Type::Bool);
+        v->boolean = boolean;
         return v;
     }
 
     ValuePtr parse_null() {
-        auto v = std::make_shared<Value>();
         if (s_.compare(pos_, 4, "null") == 0) { pos_ += 4; }
         else fail("invalid literal");
         // Represent null as a Number leaf carrying NaN so numeric arrays parse
         // uniformly; as_number() yields NaN either way.
-        v->type = Type::Number;
+        auto v = make_value(Type::Number);
         v->is_null_number = true;
         v->number = std::nan("");
         return v;
@@ -238,18 +375,37 @@ private:
 
     ValuePtr parse_number() {
         size_t start = pos_;
-        if (peek() == '-' || peek() == '+') get();
-        while (pos_ < n_) {
-            char c = s_[pos_];
-            if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' ||
-                c == '+' || c == '-') {
-                ++pos_;
-            } else break;
+        if (peek() == '-') ++pos_;
+        if (peek() == '0') {
+            ++pos_;
+            if (peek() >= '0' && peek() <= '9') fail("leading zero in number");
+        } else if (peek() >= '1' && peek() <= '9') {
+            do { ++pos_; } while (peek() >= '0' && peek() <= '9');
+        } else {
+            fail("invalid number");
         }
-        if (pos_ == start) fail("invalid number");
-        auto v = std::make_shared<Value>();
-        v->type = Type::Number;
-        v->number = std::strtod(s_.substr(start, pos_ - start).c_str(), nullptr);
+        if (peek() == '.') {
+            ++pos_;
+            if (peek() < '0' || peek() > '9') fail("missing fractional digit");
+            do { ++pos_; } while (peek() >= '0' && peek() <= '9');
+        }
+        if (peek() == 'e' || peek() == 'E') {
+            ++pos_;
+            if (peek() == '+' || peek() == '-') ++pos_;
+            if (peek() < '0' || peek() > '9') fail("missing exponent digit");
+            do { ++pos_; } while (peek() >= '0' && peek() <= '9');
+        }
+        const size_t token_size = pos_ - start;
+        if (token_size > kMaxNumberTokenBytes) fail("number token limit exceeded");
+        const std::string token = s_.substr(start, token_size);
+        char* end = nullptr;
+        errno = 0;
+        const double number = std::strtod(token.c_str(), &end);
+        if (errno == ERANGE || end != token.c_str() + token.size() ||
+            !std::isfinite(number))
+            fail("number is out of range");
+        auto v = make_value(Type::Number);
+        v->number = number;
         return v;
     }
 };
