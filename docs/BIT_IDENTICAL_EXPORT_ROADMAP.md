@@ -278,8 +278,9 @@ byte-determinism repeats and an executed 4,194,241-pixel two-row dispatch. Andro
 pass for all three configured ABIs, and the full native engine suite passes 39/39 at both O2 and
 shipping flags. This is **not** yet the application route: live profile folding,
 capability caching/self-test, render-local engagement reporting, cancellation integration and
-spatial/stochastic stages remain open. The final revised Adreno-device rerun is also pending after
-the phone disconnected. The 12/50/200 MP checks are planner-only and no 1-2 s timing claim follows
+spatial/stochastic stages remain open. The final revised O2 and shipping binaries now pass the
+connected Adreno gate, including 100 warm byte-identical runs and the actual 4,194,241-pixel
+two-row dispatch. The 12/50/200 MP checks remain planner-only and no 1-2 s timing claim follows
 from this checkpoint.
 
 Vulkan's specification does not promise cross-implementation pixel identity. A device that fails the

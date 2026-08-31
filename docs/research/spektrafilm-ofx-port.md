@@ -3,8 +3,8 @@
 Status: the low-level resident pointwise Vulkan slice is implemented and independently
 code-reviewed under [#148](https://github.com/thetechgeekko/Spektrafilm-android/issues/148).
 [#149](https://github.com/thetechgeekko/Spektrafilm-android/issues/149) remains the future
-tolerance-bounded GPU-export/product-routing track. Capability persistence, spatial stages and
-the final current-binary Adreno rerun remain open.
+tolerance-bounded GPU-export/product-routing track. Capability persistence and spatial stages
+remain open; the current-binary Adreno Phase A gate passes.
 
 ## Source pin and license
 
@@ -88,9 +88,10 @@ Current frozen-slice evidence:
 - current shaders pass both O2 and shipping-flag WSL/lavapipe runtime gates, including an
   asymmetric combined f64 oracle (`max_abs` about `1.8e-7`), changed-key/table re-upload,
   100 byte-identical warm repeats and a real 4,194,241-pixel two-row dispatch; and
-- the final revised O2/shipping binaries are prepared for the connected Android device, but that
-  rerun is still pending because ADB disconnected. Earlier device results do not substitute for
-  this current-binary gate.
+- the final revised O2 and shipping binaries also pass on the connected Adreno device: combined
+  f64 `max_abs=1.99819717e-7` (`rms=1.00289698e-7`), changed-table
+  `max_abs=2.06780449e-7` (`rms=1.01780053e-7`), 100 warm byte-identical runs with zero resource
+  churn, and an executed 4,194,241-pixel boundary with `3 dispatch / 1 upload / 1 readback`.
 
 This checkpoint proves the low-level direct renderer, not app/export engagement and not a 1-2 s
 SLO. The next slice must build exact folded tables from live profiles, apply conservative route
