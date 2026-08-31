@@ -43,6 +43,24 @@ shared device-resident pointwise chain with explicit compute barriers, cached st
 and one final readback. The existing Strict Exact CPU route remains unchanged and authoritative;
 Fast GPU is opt-in, device-self-tested, tolerance-bounded, and fails closed to CPU.
 
+## LUT audit: 65 is an export choice, not the engine's universal grid
+
+There are four different tables in play and their sizes must not be conflated:
+
+| Purpose | Android behavior | Pinned OFX behavior | Port decision |
+|---|---|---|---|
+| User `.cube`/CLF export | UI offers `17^3`, `33^3`, and `65^3`; the default selection is `33^3`. The exact pointwise film/print pipeline evaluates every lattice point. | UI offers `33^3` and `65^3`; the default selection is `65^3`. It renders a `N^2 x N` identity lattice through the normal renderer after disabling non-pointwise effects. | Keep Android's three explicit choices. Do not silently force every export to 65; label 65 as highest-quality/largest/slowest. |
+| Interactive GLES LUT preview | Always bakes a shaped `33^3` lattice and samples it trilinearly. | Not the OFX renderer's primary interactive path. | Temporary preview fallback only; the resident Vulkan DAG should replace it stage by stage. |
+| Scanner/enlarger spectral acceleration | Opt-in, default `17^3`, PCHIP-interpolated, cached, and intentionally approximate; Strict Exact bypasses it. | The full Vulkan renderer evaluates its native shader pipeline rather than using this Android PCHIP accelerator. | Never use this approximate LUT on Strict Exact. Keep it only behind the Fast/tolerance gate until the resident shaders supersede it. |
+| Color transfer functions | Analytic/native paths plus the spectral-upsample table `192 x 192 x 81` stored as finite f16 and expanded for computation. | Precomputed 1D decode/encode tables contain 4096 samples per color space. | These are not 3D creative LUTs. Evaluate a future 4096-entry transfer-table port separately against the local oracle before adoption. |
+
+Both projects correctly omit auto exposure and spatial/stochastic operations from exported 3D
+LUTs: a pointwise RGB cube cannot encode image-wide metering, grain, halation, diffusion, glare,
+geometry, or scanner sharpening. The Android bake keeps spectral upsampling, density curves,
+pointwise DIR couplers, printing, scanning and output conversion, emits blue-fastest `.cube`
+ordering, and uses the regular engine route. The OFX exporter follows the same high-level method,
+but its GPL implementation is only a design reference; no exported OFX LUT data is copied.
+
 Later spatial stages may adapt individual GPL shader techniques only after their Android stage
 semantics, halo/tiling law, NaN behavior, deterministic seed law, memory budget and CPU-oracle
 error are independently gated. A wholesale renderer transplant is not permitted by this plan.
