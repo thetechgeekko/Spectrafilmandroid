@@ -401,8 +401,12 @@ and scan work. It uses one upload, three resident dispatches and one readback; f
 keeps prepared tables under full-byte keys; runs a keyed CPU-oracle capability self-test; reports
 render-local engagement; and falls back to Strict Exact CPU without publishing partial output. The
 three-ABI Android Release build and full native parity matrix 39/39 pass at both O2 and the shipping
-`-O3 -ffast-math -fno-finite-math-only` flags. The final post-freeze phone run remains pending after
-ADB disconnected.
+`-O3 -ffast-math -fno-finite-math-only` flags. The exact frozen O2 and shipping arm64 hashes also
+pass on the connected Android 16 device with `test_gpu_host: ALL OK`: the product materialized,
+direct-gain and tone maxima are `1.66893005e-6` / `1.73598528e-6` / `9.01520252e-7` at O2 and
+`1.73598528e-6` / `1.73598528e-6` / `9.79751348e-7` at shipping flags. Both runs engage the
+resident route, remain byte-identical on warm repeats, and pass cache, cancellation and exact-CPU
+fallback coverage.
 
 This is a tolerance-bounded, same-device-deterministic Fast GPU route, not a CPU-byte-identical
 route. Spatial/stochastic stages remain open, 12/50/200 MP coverage remains planner-only, and no

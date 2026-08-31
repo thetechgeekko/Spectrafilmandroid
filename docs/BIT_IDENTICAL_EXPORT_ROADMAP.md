@@ -280,9 +280,13 @@ f64 CPU stages at `max_abs <= 1e-4` and `RMS <= 1e-5`. Render-local diagnostics 
 engagement, fallback and frame resource counters while keeping self-test state, duration and work
 separate. The frozen implementation received an independent `APPROVED` review, builds as Android
 Release for all three configured ABIs, and passes the full native parity matrix 39/39 at both O2 and
-the shipping `-O3 -ffast-math -fno-finite-math-only` flags. Final post-freeze phone execution
-remains pending after ADB disconnected; earlier connected-Adreno evidence does not certify the
-frozen product route.
+the shipping `-O3 -ffast-math -fno-finite-math-only` flags. The exact frozen arm64 artifacts
+(`89854375...39C` at O2 and `EDDB82CE...5B1` at shipping flags) also pass the connected Android 16
+Adreno gate with `test_gpu_host: ALL OK`. O2 reports combined-pointwise `max_abs=1.00188277e-7`
+and product materialized/direct-gain/tone maxima of `1.66893005e-6`, `1.73598528e-6` and
+`9.01520252e-7`; shipping reports `9.23373584e-8`, `1.73598528e-6`, `1.73598528e-6` and
+`9.79751348e-7` respectively. Both runs engage the resident `3 dispatch / 1 upload / 1 readback`
+route, keep warm output byte-identical, and pass cache, cancellation and exact-CPU-fallback gates.
 
 This checkpoint covers eligible pointwise work only. Spatial and stochastic stages, including
 halation, diffusion, Pro-Mist and grain, remain open. Fast GPU is tolerance-bounded and intended to
