@@ -1,0 +1,139 @@
+diff --git a/src/decoders/dng.cpp b/src/decoders/dng.cpp
+--- a/src/decoders/dng.cpp
++++ b/src/decoders/dng.cpp
+@@ -60,6 +60,37 @@ void LibRaw::lossless_dng_load_raw()
+   struct jhead jh;
+   ushort *rp;
+ 
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++  /* A tiny tiled DNG can otherwise turn a bounded raw plane into millions of
++   * ljpeg_start/calloc/free cycles. TIFF's compliant minimum tile is 16x16;
++   * retain twice that stream count plus a 4096-stream floor for compatibility,
++   * but keep an absolute application-defined operational ceiling. */
++  if (!raw_width || !raw_height || !tile_width || !tile_length)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  const INT64 work_tile_width =
++      tile_width < INT_MAX ? INT64(tile_width) : INT64(raw_width);
++  const INT64 work_tile_height =
++      tile_length < INT_MAX ? INT64(tile_length) : INT64(raw_height);
++  const INT64 tile_streams_across =
++      1 + (INT64(raw_width) - 1) / work_tile_width;
++  const INT64 tile_streams_down =
++      1 + (INT64(raw_height) - 1) / work_tile_height;
++  const INT64 compliant_streams_across =
++      1 + (INT64(raw_width) - 1) / 16;
++  const INT64 compliant_streams_down =
++      1 + (INT64(raw_height) - 1) / 16;
++  INT64 permitted_tile_streams =
++      compliant_streams_across * compliant_streams_down * 2;
++  permitted_tile_streams = MAX(permitted_tile_streams, INT64(4096));
++  permitted_tile_streams =
++      MIN(permitted_tile_streams, INT64(LIBRAW_MAX_TILE_STREAM_COUNT));
++  if (tile_streams_down < 1 ||
++      tile_streams_across > permitted_tile_streams / tile_streams_down)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  INT64 remaining_dng_tile_streams =
++      tile_streams_across * tile_streams_down;
++#endif
++
+   int ss = shot_select;
+   shot_select = libraw_internal_data.unpacker_data.dng_frames[LIM(ss,0,(LIBRAW_IFD_MAXCOUNT*2-1))] & 0xff;
+ 
+@@ -76,6 +107,15 @@ void LibRaw::lossless_dng_load_raw()
+   while (trow < raw_height)
+   {
+     checkCancel();
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++    if (remaining_dng_tile_streams < 1)
++    {
++      shot_select = ss;
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    }
++    remaining_dng_tile_streams--;
++#endif
++
+     save = ftell(ifp);
+     if (tile_length < INT_MAX)
+       fseek(ifp, get4(), SEEK_SET);
+diff --git a/src/decoders/decoders_libraw_dcrdefs.cpp b/src/decoders/decoders_libraw_dcrdefs.cpp
+--- a/src/decoders/decoders_libraw_dcrdefs.cpp
++++ b/src/decoders/decoders_libraw_dcrdefs.cpp
+@@ -27,6 +27,29 @@ void LibRaw::packed_tiled_dng_load_raw()
+   ushort *rp;
+   unsigned row, col;
+ 
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++  if (!raw_width || !raw_height || !tile_width || !tile_length)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  const INT64 tile_streams_across =
++      1 + (INT64(raw_width) - 1) / INT64(tile_width);
++  const INT64 tile_streams_down =
++      1 + (INT64(raw_height) - 1) / INT64(tile_length);
++  const INT64 compliant_streams_across =
++      1 + (INT64(raw_width) - 1) / 16;
++  const INT64 compliant_streams_down =
++      1 + (INT64(raw_height) - 1) / 16;
++  INT64 permitted_tile_streams =
++      compliant_streams_across * compliant_streams_down * 2;
++  permitted_tile_streams = MAX(permitted_tile_streams, INT64(4096));
++  permitted_tile_streams =
++      MIN(permitted_tile_streams, INT64(LIBRAW_MAX_TILE_STREAM_COUNT));
++  if (tile_streams_down < 1 ||
++      tile_streams_across > permitted_tile_streams / tile_streams_down)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  INT64 remaining_dng_tile_streams =
++      tile_streams_across * tile_streams_down;
++#endif
++
+   int ss = shot_select;
+   shot_select = libraw_internal_data.unpacker_data.dng_frames[LIM(ss, 0, (LIBRAW_IFD_MAXCOUNT * 2 - 1))] & 0xff;
+   std::vector<ushort> pixel;
+@@ -48,6 +71,14 @@ void LibRaw::packed_tiled_dng_load_raw()
+       while (trow < raw_height)
+       {
+         checkCancel();
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++        if (remaining_dng_tile_streams < 1)
++        {
++          shot_select = ss;
++          throw LIBRAW_EXCEPTION_TOOBIG;
++        }
++        remaining_dng_tile_streams--;
++#endif
+         save = ftell(ifp);
+         if (tile_length < INT_MAX)
+           fseek(ifp, get4(), SEEK_SET);
+diff --git a/src/decoders/fp_dng.cpp b/src/decoders/fp_dng.cpp
+--- a/src/decoders/fp_dng.cpp
++++ b/src/decoders/fp_dng.cpp
+@@ -282,13 +282,25 @@ void tile_stripe_data_t::init(tiff_ifd_t *ifd, const libraw_image_sizes_t& sizes,
+ 
+     tileWidth = tiled ? unpacker_data.tile_width : sizes.raw_width;
+     tileHeight = tiled ? unpacker_data.tile_length :(striped ? ifd->rows_per_strip : sizes.raw_height);
+-    tilesH = tiled ? (sizes.raw_width + tileWidth - 1) / tileWidth : 1;
+-    tilesV = tiled ? (sizes.raw_height + tileHeight - 1) / tileHeight :
+-        (striped ? ((sizes.raw_height + ifd->rows_per_strip - 1) / ifd->rows_per_strip) : 1);
+-    tileCnt = tilesH * tilesV;
++    tilesH = tiled ? unsigned((INT64(sizes.raw_width) + tileWidth - 1) / tileWidth) : 1;
++    tilesV = tiled ? unsigned((INT64(sizes.raw_height) + tileHeight - 1) / tileHeight) :
++        (striped ? unsigned((INT64(sizes.raw_height) + ifd->rows_per_strip - 1) /
++                            ifd->rows_per_strip) : 1);
++    const INT64 tileCnt64 = INT64(tilesH) * INT64(tilesV);
+ 
+-    if (tileCnt < 1 || tileCnt > 1000000)
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++    const INT64 compliantTilesH = 1 + (INT64(sizes.raw_width) - 1) / 16;
++    const INT64 compliantTilesV = 1 + (INT64(sizes.raw_height) - 1) / 16;
++    INT64 permittedTileCnt = compliantTilesH * compliantTilesV * 2;
++    permittedTileCnt = MAX(permittedTileCnt, INT64(4096));
++    permittedTileCnt = MIN(permittedTileCnt, INT64(LIBRAW_MAX_TILE_STREAM_COUNT));
++    if (tileCnt64 < 1 || tileCnt64 > permittedTileCnt)
++        throw LIBRAW_EXCEPTION_TOOBIG;
++#else
++    if (tileCnt64 < 1 || tileCnt64 > 1000000)
+         throw LIBRAW_EXCEPTION_DECODE_RAW;
++#endif
++    tileCnt = int(tileCnt64);
+ 
+     tOffsets = std::vector<INT64>(tileCnt,0);
+     tBytes = std::vector <INT64>(tileCnt,0);

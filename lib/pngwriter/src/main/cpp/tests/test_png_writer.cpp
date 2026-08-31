@@ -39,13 +39,20 @@
  *   "
  */
 #include "png_writer.h"
+#include "png_writer_jni_boundary.h"
 
+#include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <zlib.h>
+#include <dirent.h>
 
 using namespace spectrafilm;
 
@@ -314,6 +321,180 @@ void runCase(const char* label,
     std::printf("    file: %s (%zu bytes)\n", path.c_str(), wr.bytesWritten);
 }
 
+struct CancelAfterPolls {
+    int polls = 0;
+    int cancelAt = 1;
+};
+
+bool cancelAfter(void* opaque) noexcept {
+    auto* state = static_cast<CancelAfterPolls*>(opaque);
+    return ++state->polls >= state->cancelAt;
+}
+
+struct TempStageCancellation {
+    const char* directory;
+    const char* filePrefix;
+};
+
+bool tempStageExists(void* opaque) noexcept {
+    const auto* state = static_cast<const TempStageCancellation*>(opaque);
+    DIR* directory = opendir(state->directory);
+    if (directory == nullptr) return false;
+    bool found = false;
+    const size_t prefixLength = std::strlen(state->filePrefix);
+    while (const dirent* entry = readdir(directory)) {
+        if (std::strncmp(entry->d_name, state->filePrefix, prefixLength) == 0) {
+            found = true;
+            break;
+        }
+    }
+    closedir(directory);
+    return found;
+}
+
+struct ConcurrentCancellation {
+    std::atomic<int> polls{0};
+    std::atomic<bool> cancelled{false};
+};
+
+bool blockUntilConcurrentCancel(void* opaque) noexcept {
+    auto* state = static_cast<ConcurrentCancellation*>(opaque);
+    const int poll = state->polls.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (poll == 2) {
+        while (!state->cancelled.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    }
+    return state->cancelled.load(std::memory_order_acquire);
+}
+
+void runSafetyCases() {
+    std::printf("[safety]\n");
+    const uint16_t onePixel[3] = {1, 2, 3};
+    PngMetadata meta;
+    std::vector<uint8_t> out = {0xAA};
+
+    auto huge = writePng16ToMemory(onePixel, INT_MAX, INT_MAX, meta, out);
+    CHECK(!huge.ok, "overflow dimensions are rejected before allocation");
+    CHECK(out.empty(), "overflow failure publishes no partial memory output");
+
+    auto invalidPath = writePng16ToFile(
+        reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(1)),
+        1, 1, meta, "");
+    CHECK(!invalidPath.ok && invalidPath.error == "empty output path",
+          "empty path is rejected before any pixel read");
+    static constexpr char kNulPath[] = "/tmp/sf_png_nul\0ignored.png";
+    const std::string nulPath(kNulPath, sizeof(kNulPath) - 1u);
+    invalidPath = writePng16ToFile(onePixel, 1, 1, meta, nulPath);
+    CHECK(!invalidPath.ok && invalidPath.error == "output path contains NUL",
+          "embedded-NUL path is rejected deterministically");
+
+    std::vector<uint16_t> pixels(4u * 8u * 3u, 0x1234);
+    CancelAfterPolls state{0, 3};
+    PngCancellation cancellation{&state, cancelAfter};
+    auto cancelled = writePng16ToMemory(
+        pixels.data(), 4, 8, meta, out, &cancellation);
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancellation is reported distinctly from write failure");
+    CHECK(state.polls == 3, "cancellation is polled while encoding rows");
+    CHECK(out.empty(), "cancelled encode publishes no partial memory output");
+
+    const std::string path = "/tmp/sf_png_cancelled.png";
+    {
+        FILE* existing = std::fopen(path.c_str(), "wb");
+        const uint8_t sentinel[] = {0x51, 0x52, 0x53};
+        std::fwrite(sentinel, 1, sizeof(sentinel), existing);
+        std::fclose(existing);
+    }
+    state = {0, 3};
+    cancelled = writePng16ToFile(
+        pixels.data(), 4, 8, meta, path, &cancellation);
+    std::vector<uint8_t> unchanged;
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancelled file write returns cancellation");
+    CHECK(readFile(path, unchanged) && unchanged == std::vector<uint8_t>({0x51, 0x52, 0x53}),
+          "cancelled file write leaves the published destination unchanged");
+    std::remove(path.c_str());
+
+    const std::string stagedPath = "/tmp/sf_png_staged_cancel.png";
+    {
+        FILE* existing = std::fopen(stagedPath.c_str(), "wb");
+        const uint8_t sentinel[] = {0x41, 0x42, 0x43};
+        std::fwrite(sentinel, 1, sizeof(sentinel), existing);
+        std::fclose(existing);
+    }
+    TempStageCancellation stagedState{"/tmp", "sf_png_staged_cancel.png.tmp."};
+    PngCancellation stagedCancellation{&stagedState, tempStageExists};
+    cancelled = writePng16ToFile(
+        pixels.data(), 4, 8, meta, stagedPath, &stagedCancellation);
+    unchanged.clear();
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancellation during staged output is reported");
+    CHECK(readFile(stagedPath, unchanged) && unchanged == std::vector<uint8_t>({0x41, 0x42, 0x43}),
+          "staged cancellation never replaces the destination");
+    CHECK(!tempStageExists(&stagedState),
+          "staged cancellation removes the incomplete temporary file");
+    std::remove(stagedPath.c_str());
+
+    ConcurrentCancellation concurrentState;
+    PngCancellation concurrentCancellation{
+        &concurrentState, blockUntilConcurrentCancel,
+    };
+    PngWriteResult concurrentResult;
+    out = {0xAA};
+    std::thread writer([&]() {
+        concurrentResult = writePng16ToMemory(
+            pixels.data(), 4, 8, meta, out, &concurrentCancellation);
+    });
+    while (concurrentState.polls.load(std::memory_order_acquire) < 2)
+        std::this_thread::yield();
+    concurrentState.cancelled.store(true, std::memory_order_release);
+    writer.join();
+    CHECK(!concurrentResult.ok && concurrentResult.cancelled && out.empty(),
+          "concurrent cancellation is race-free and publishes no memory output");
+}
+
+void runExceptionTranslationCases() {
+    using spectrafilm::pngjni::NativeExceptionKind;
+    using spectrafilm::pngjni::BufferWindow;
+    using spectrafilm::pngjni::BufferWindowError;
+    using spectrafilm::pngjni::containNativeExceptions;
+    using spectrafilm::pngjni::stableMessage;
+
+    std::printf("[jni-exception-translation]\n");
+    NativeExceptionKind kind = NativeExceptionKind::None;
+    int value = containNativeExceptions<int>([]() -> int { throw std::bad_alloc(); }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::OutOfMemory,
+          "bad_alloc is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "PNG write failed: out of memory") == 0,
+          "bad_alloc maps to a stable Kotlin error message");
+
+    value = containNativeExceptions<int>([]() -> int { throw std::runtime_error("unstable detail"); }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::Standard,
+          "std::exception is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "PNG write failed: native exception") == 0,
+          "std::exception maps to a stable Kotlin error message");
+
+    value = containNativeExceptions<int>([]() -> int { throw 7; }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::Unknown,
+          "unknown exception is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "PNG write failed: unknown native exception") == 0,
+          "unknown exception maps to a stable Kotlin error message");
+
+    BufferWindow window;
+    auto windowError = spectrafilm::pngjni::validateBufferWindow(
+        4, 16, 20, 20, 12, window);
+    CHECK(windowError == BufferWindowError::None && window.offset == 4 && window.length == 12,
+          "direct-buffer validation honours the logical position and limit");
+    windowError = spectrafilm::pngjni::validateBufferWindow(
+        4, 15, 20, 20, 12, window);
+    CHECK(windowError == BufferWindowError::TooSmall,
+          "direct-buffer validation rejects a short logical window");
+    windowError = spectrafilm::pngjni::validateBufferWindow(
+        4, 16, 20, 19, 12, window);
+    CHECK(windowError == BufferWindowError::Malformed,
+          "direct-buffer validation rejects inconsistent capacities");
+}
+
 }  // namespace
 
 int main() {
@@ -362,6 +543,9 @@ int main() {
         meta.iccProfile = icc;
         runCase("no_software", pixels, W, H, meta);
     }
+
+    runSafetyCases();
+    runExceptionTranslationCases();
 
     std::printf("\n%s (%d failure%s)\n",
                 g_failures == 0 ? "PASS" : "FAIL",

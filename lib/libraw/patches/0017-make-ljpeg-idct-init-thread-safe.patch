@@ -1,0 +1,26 @@
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -931,7 +931,12 @@ void LibRaw::ljpeg_idct(struct jhead *jh)
+ {
+   int c, i, j, len, skip, coef;
+   float work[3][8][8];
+-  static float cs[106] = {0};
++  static const std::vector<float> cs = []() {
++    std::vector<float> values(106);
++    for (int index = 0; index < 106; ++index)
++      values[index] = float(cos((index & 31) * M_PI / 16) / 2);
++    return values;
++  }();
+   static const uchar zigzag[80] = {
+       0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
+       12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
+@@ -939,8 +944,6 @@ void LibRaw::ljpeg_idct(struct jhead *jh)
+       58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+       63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63};
+ 
+-  if (!cs[0])
+-    FORC(106) cs[c] = float(cos((c & 31) * M_PI / 16) / 2);
+   memset(work, 0, sizeof work);
+   const INT64 dc = INT64(jh->vpred[0]) +
+       INT64(ljpeg_diff(jh->huff[0])) * INT64(jh->quant[0]);

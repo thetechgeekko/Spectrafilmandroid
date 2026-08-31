@@ -26,7 +26,7 @@ Gradle modules actually built (`settings.gradle.kts`):
 - **`:engine:spektra-core`** — `com.spectrafilm.engine`. NDK C++ engine (`libspektra.so`) + the
   Kotlin facade `SpektraEngine` / `SpektraParams`. Bundles film/paper profiles, spectral LUTs,
   and ICC profiles under `src/main/assets/spektra/`.
-- **`:lib:libraw`** — `libsfraw.so`, LibRaw → linear ACES RGB for RAW/DNG import.
+- **`:lib:libraw`** — `libsfraw.so`, LibRaw via an ACES intermediate → linear ProPhoto RGB for RAW/DNG import.
 - **`:lib:tiffwriter`** (`libsftiff.so`) and **`:lib:pngwriter`** (`libsfpng.so`) — 16-bit
   TIFF/PNG export writers.
 
@@ -142,9 +142,14 @@ per-test argv is in `.github/workflows/ci.yml` — copy from there rather than g
 `engine-native` (host C++ build of libspektra), `engine-parity` (stage parity gate, two legs: `-O2` and the shipping release flags), `parity`
 (.spkvec comparator self-test), `python-lint`, `android` (`:app:testDebugUnitTest` + `:app:lint` +
 full assemble for all ABIs + the 16 KB `zipalign -P 16`/`readelf` alignment gate),
-`android-emulator` (manual dispatch only). `release.yml` builds a signed APK from keystore secrets
-on a `v*` tag push and creates the GitHub Release. `r8-smoke.yml` (manual dispatch) builds the
-R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
+`android-emulator` (manual dispatch only). `release.yml` builds and hash-binds an unsigned candidate
+without secrets, reruns both parity flag legs plus release JVM/lint/R8/16 KiB gates, then a protected
+Environment downloads by exact artifact database ID, signs that exact app/instrumentation pair,
+proves installed-byte identity on API 35, and verifies immutable remote release/assets by numeric IDs
+before publication. Candidate identity is bound to source/version/run ID/run attempt/artifact digest,
+all six Gradle locks, both SPDX documents, mapping, symbols, runtime classpath, and provenance.
+`r8-smoke.yml` (manual dispatch) builds the R8-minified unsigned candidate,
+explicitly signs it with the committed public debug key, and runs the 16 KB pre-tag smoke checks.
 
 ## Conventions / gotchas
 
@@ -190,11 +195,17 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
   Git-Bash toolchain it returns nothing for these libraries and so reports 0 matches for
   strings that ARE present — it did this for the long-standing `decoded %dx%d` literal,
   which is what exposed the tool rather than the build. Use `grep -ac '<literal>' lib.so`.
-- Release signing: drop `keystore.properties` (`storeFile`/`storePassword`/`keyAlias`/`keyPassword`)
-  in the repo root; absent it, release falls back to debug signing.
+- Release signing: local maintainers may explicitly provide `keystore.properties`
+  (`storeFile`/`storePassword`/`keyAlias`/`keyPassword`). Without it,
+  `assembleRelease` deliberately emits an unsigned APK and never falls back to the debug key.
+  Production signing occurs only in `release.yml`'s protected signing job, after qualification.
+  That Environment also needs `RELEASE_GITHUB_TOKEN` with repository Administration (read) and
+  Contents (write), immutable releases enabled, a protected immutable `refs/tags/v*` ruleset, and
+  maintainer approval. The temporary key must be absent before verification/publication; never
+  replace these fail-closed requirements with the ordinary workflow token or a debug-key fallback.
 - Release `isMinifyEnabled = true` (R8 shrink via `proguard-rules.pro`: `-dontobfuscate` + JNI/enum
-  keep-rules). The R8 release path is **not exercised by CI** (the `android` job builds debug, where
-  minify is off). **A wrong keep-rule does NOT only fail as a runtime crash — that claim was
+  keep-rules). The standing `android` job builds debug (minify off); the exact release workflow and
+  manual R8 smoke both exercise the minified path. **A wrong keep-rule does NOT only fail as a runtime crash — that claim was
   wrong and it cost us a shipped defect.** R8 removed `kotlin.Triple.getFirst/getSecond/getThird`
   and the `kotlin.Pair` pair, because `com.spectrafilm.engine.**` was kept but `kotlin.**` was
   not, and no *bytecode* ever calls those getters — the only caller is `spektra_jni.cpp`, by
@@ -203,7 +214,7 @@ R8-minified release APK + 16 KB check, for the pre-tag on-device smoke test.
   release render, silently — no crash, no log, just wrong numbers, in every APK ever shipped.
   So the real failure mode is a **silently wrong image**, which is worse than a crash because
   nothing announces it. `tools/r8_check/check_release_dex.sh` now reads the shrunk dex and
-  fails if any JNI-resolved member is gone (wired into `r8-smoke.yml`; validated against both
+  fails if any JNI-resolved member is gone (wired into `release.yml` and `r8-smoke.yml`; validated against both
   a good and a deliberately shrunk dex). Still smoke-test a release build
   on a device before tagging. (Last validated 2026-06-04 on SM-S948W/Android 16: minified build did
   full RAW import → render → 12 MP PNG/TIFF export, JNI libs load under R8 — see `docs/AUDIT.md` §D.)

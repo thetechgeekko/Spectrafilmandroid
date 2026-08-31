@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Spektrafilm mask-set v1",
+  "description": "Canonical JSON emitted for an ordered Spektrafilm local-adjustment mask set.",
+  "type": "object",
+  "required": ["schema", "version", "adjustments"],
+  "properties": {
+    "schema": {
+      "const": "org.spektrafilm.mask-set"
+    },
+    "version": {
+      "const": 1
+    },
+    "adjustments": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/adjustment"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "float": {
+      "type": "number",
+      "minimum": -3.4028235e38,
+      "maximum": 3.4028235e38,
+      "description": "A finite value representable by the Android runtime's 32-bit Float conversion."
+    },
+    "adjustment": {
+      "type": "object",
+      "required": ["delta", "mask"],
+      "properties": {
+        "delta": {
+          "$ref": "#/$defs/delta"
+        },
+        "mask": {
+          "$ref": "#/$defs/mask"
+        }
+      },
+      "additionalProperties": false
+    },
+    "delta": {
+      "type": "object",
+      "required": [
+        "exposureEv",
+        "temp",
+        "tint",
+        "saturation",
+        "contrast",
+        "hue",
+        "whites",
+        "blacks",
+        "clarity",
+        "sharpness",
+        "texture",
+        "highlights",
+        "shadows"
+      ],
+      "properties": {
+        "exposureEv": { "$ref": "#/$defs/float" },
+        "temp": { "$ref": "#/$defs/float" },
+        "tint": { "$ref": "#/$defs/float" },
+        "saturation": { "$ref": "#/$defs/float" },
+        "contrast": { "$ref": "#/$defs/float" },
+        "hue": { "$ref": "#/$defs/float" },
+        "whites": { "$ref": "#/$defs/float" },
+        "blacks": { "$ref": "#/$defs/float" },
+        "clarity": { "$ref": "#/$defs/float" },
+        "sharpness": { "$ref": "#/$defs/float" },
+        "texture": { "$ref": "#/$defs/float" },
+        "highlights": { "$ref": "#/$defs/float" },
+        "shadows": { "$ref": "#/$defs/float" }
+      },
+      "additionalProperties": false
+    },
+    "mask": {
+      "type": "object",
+      "required": ["invert", "opacity", "components"],
+      "properties": {
+        "invert": { "type": "boolean" },
+        "opacity": { "$ref": "#/$defs/float" },
+        "components": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/component"
+          }
+        },
+        "lumRange": {
+          "$ref": "#/$defs/luminanceRange"
+        },
+        "colorRange": {
+          "$ref": "#/$defs/colorRange"
+        }
+      },
+      "additionalProperties": false
+    },
+    "component": {
+      "type": "object",
+      "required": ["mode", "invert", "value", "shape"],
+      "properties": {
+        "mode": {
+          "enum": ["ADD", "SUBTRACT", "INTERSECT"]
+        },
+        "invert": { "type": "boolean" },
+        "value": { "$ref": "#/$defs/float" },
+        "shape": {
+          "oneOf": [
+            { "$ref": "#/$defs/linear" },
+            { "$ref": "#/$defs/radial" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "linear": {
+      "type": "object",
+      "required": ["type", "x0", "y0", "x1", "y1"],
+      "properties": {
+        "type": { "const": "linear" },
+        "x0": { "$ref": "#/$defs/float" },
+        "y0": { "$ref": "#/$defs/float" },
+        "x1": { "$ref": "#/$defs/float" },
+        "y1": { "$ref": "#/$defs/float" }
+      },
+      "additionalProperties": false
+    },
+    "radial": {
+      "type": "object",
+      "required": ["type", "cx", "cy", "rx", "ry", "feather", "angleDeg"],
+      "properties": {
+        "type": { "const": "radial" },
+        "cx": { "$ref": "#/$defs/float" },
+        "cy": { "$ref": "#/$defs/float" },
+        "rx": { "$ref": "#/$defs/float" },
+        "ry": { "$ref": "#/$defs/float" },
+        "feather": { "$ref": "#/$defs/float" },
+        "angleDeg": { "$ref": "#/$defs/float" }
+      },
+      "additionalProperties": false
+    },
+    "luminanceRange": {
+      "type": "object",
+      "required": ["min", "max", "feather", "invert"],
+      "properties": {
+        "min": { "$ref": "#/$defs/float" },
+        "max": { "$ref": "#/$defs/float" },
+        "feather": { "$ref": "#/$defs/float" },
+        "invert": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "colorRange": {
+      "type": "object",
+      "required": ["r", "g", "b", "tolerance", "feather", "invert"],
+      "properties": {
+        "r": { "$ref": "#/$defs/float" },
+        "g": { "$ref": "#/$defs/float" },
+        "b": { "$ref": "#/$defs/float" },
+        "tolerance": { "$ref": "#/$defs/float" },
+        "feather": { "$ref": "#/$defs/float" },
+        "invert": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

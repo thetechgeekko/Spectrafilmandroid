@@ -17,6 +17,20 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 
 /**
+ * Prevents a delayed completion command for export N from stopping the service after export N+1
+ * has started. Service start IDs protect command ordering; this gate protects export ordering.
+ */
+internal class ExportForegroundServiceGenerationGate {
+    private var newestStartedRunId = Long.MIN_VALUE
+
+    fun recordStart(runId: Long) {
+        if (runId > newestStartedRunId) newestStartedRunId = runId
+    }
+
+    fun mayStop(runId: Long): Boolean = runId >= newestStartedRunId
+}
+
+/**
  * Keeps a running export alive when the user leaves the app.
  *
  * ## Why this exists: kill-resistance, NOT speed
@@ -60,16 +74,18 @@ import androidx.core.content.ContextCompat
  * The 4x is also only ever paid while the user leaves the app — the foreground
  * path was never slow. The remaining honest lever is the ~14 s foreground export.
  *
- * ## What it does NOT do
+ * ## Ownership split
  *
- * It runs no work of its own. The export stays exactly where it is, in the caller's
- * coroutine — this service only holds the process's lifecycle class while it runs.
- * That keeps the change off the render path entirely, so it carries no parity risk.
+ * It runs no rendering code of its own. [ExportWorkRuntime]'s process-owned coroutine
+ * owns the export across Activity recreation; this service only holds the process's
+ * lifecycle/scheduling class while that work runs. The service therefore remains off
+ * the render path and carries no image-parity risk.
  *
  * Every failure path is swallowed: an export that would have succeeded slowly must
  * never fail because a notification channel or an OEM background-start rule said no.
  */
 class ExportForegroundService : Service() {
+    private val generationGate = ExportForegroundServiceGenerationGate()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -94,6 +110,29 @@ class ExportForegroundService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+
+        val runId = intent?.getLongExtra(EXTRA_RUN_ID, INVALID_RUN_ID) ?: INVALID_RUN_ID
+        when (intent?.action) {
+            ACTION_START -> {
+                if (runId > INVALID_RUN_ID) generationGate.recordStart(runId)
+            }
+            ACTION_STOP -> {
+                // Never call stopService() from the worker completion path. A tiny or
+                // pre-cancelled export can finish before Android dispatches the original
+                // start command; stopping it externally in that gap triggers
+                // ForegroundServiceDidNotStartInTimeException. This queued command reaches
+                // startForeground above first, then lets the service stop itself. The
+                // startId and run generation both prevent an old completion from stopping
+                // a newer export.
+                if (runId > INVALID_RUN_ID && generationGate.mayStop(runId)) {
+                    stopSelfResult(startId)
+                }
+            }
+            else -> {
+                Diag.w("export foreground service received an invalid command")
+                stopSelfResult(startId)
+            }
+        }
         // Not sticky: if the process dies the export died with it, and restarting a
         // service with no work to do would only show a notification for nothing.
         return START_NOT_STICKY
@@ -116,6 +155,10 @@ class ExportForegroundService : Service() {
     companion object {
         private const val CHANNEL_ID = "export"
         private const val NOTIFICATION_ID = 1001
+        private const val ACTION_START = "com.spectrafilm.app.action.START_EXPORT_FOREGROUND"
+        private const val ACTION_STOP = "com.spectrafilm.app.action.STOP_EXPORT_FOREGROUND"
+        private const val EXTRA_RUN_ID = "com.spectrafilm.app.extra.EXPORT_RUN_ID"
+        private const val INVALID_RUN_ID = 0L
 
         private fun ensureChannel(ctx: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -135,26 +178,35 @@ class ExportForegroundService : Service() {
          * Never throws: if the service cannot start, the export proceeds at whatever
          * priority the scheduler gives it, which is the pre-existing behaviour.
          */
-        fun start(ctx: Context) {
+        fun start(ctx: Context, runId: Long) {
             try {
                 ContextCompat.startForegroundService(
                     ctx.applicationContext,
-                    Intent(ctx.applicationContext, ExportForegroundService::class.java),
+                    commandIntent(ctx, ACTION_START, runId),
                 )
             } catch (t: Throwable) {
                 Diag.w("export foreground service start refused: ${t.message}")
             }
         }
 
-        /** Leave the foreground group. Safe to call when not running. */
-        fun stop(ctx: Context) {
+        /**
+         * Queue service-owned shutdown after foreground promotion. Safe when the original start
+         * command is still pending and safe against a later export generation.
+         */
+        fun stop(ctx: Context, runId: Long) {
             try {
-                ctx.applicationContext.stopService(
-                    Intent(ctx.applicationContext, ExportForegroundService::class.java),
+                ContextCompat.startForegroundService(
+                    ctx.applicationContext,
+                    commandIntent(ctx, ACTION_STOP, runId),
                 )
             } catch (t: Throwable) {
-                Diag.w("export foreground service stop failed: ${t.message}")
+                Diag.w("export foreground service stop command refused: ${t.message}")
             }
         }
+
+        private fun commandIntent(ctx: Context, action: String, runId: Long): Intent =
+            Intent(ctx.applicationContext, ExportForegroundService::class.java)
+                .setAction(action)
+                .putExtra(EXTRA_RUN_ID, runId)
     }
 }

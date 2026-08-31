@@ -34,6 +34,8 @@ import com.spectrafilm.engine.LinearImage
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -115,14 +117,103 @@ fun GpuLutPreview(
     )
 }
 
+/** Immutable renderer-owned copy of one proxy's exact logical pixel window. */
+internal class ProxySnapshot private constructor(
+    val width: Int,
+    val height: Int,
+    private val pixels: ByteBuffer,
+) {
+    /** Each GL/test reader gets independent position/limit state. */
+    fun pixelsView(): ByteBuffer = pixels.asReadOnlyBuffer()
+        .order(ByteOrder.nativeOrder())
+        .apply {
+            position(0)
+            limit(pixels.capacity())
+        }
+
+    companion object {
+        fun capture(image: LinearImage): ProxySnapshot {
+            val limitMessage =
+                "GPU proxy ${image.width}x${image.height} exceeds direct-buffer limits"
+            val requiredLong = try {
+                Math.multiplyExact(
+                    Math.multiplyExact(image.width.toLong(), image.height.toLong()),
+                    3L * Float.SIZE_BYTES.toLong(),
+                )
+            } catch (overflow: ArithmeticException) {
+                throw IllegalArgumentException(limitMessage, overflow)
+            }
+            require(requiredLong in 1..Int.MAX_VALUE.toLong()) {
+                limitMessage
+            }
+            val required = requiredLong.toInt()
+            return image.acquireDataLease().use { lease ->
+                val leased = lease.data
+                require(leased.remaining() >= required) {
+                    "GPU proxy logical window has ${leased.remaining()} bytes; requires $required"
+                }
+                val source = leased.slice().order(ByteOrder.nativeOrder()).apply {
+                    limit(required)
+                }
+                val owned = ByteBuffer.allocateDirect(required).order(ByteOrder.nativeOrder())
+                owned.put(source)
+                owned.flip()
+                ProxySnapshot(image.width, image.height, owned)
+            }
+        }
+    }
+}
+
+/**
+ * One-entry identity cache: Compose may call submit on every recomposition, while
+ * a proxy's pixels are immutable. A weak source key avoids retaining a closed
+ * LinearImage; the renderer retains only its bounded, independently owned copy.
+ */
+internal class ProxySnapshotCache {
+    private var source: WeakReference<LinearImage>? = null
+    private var snapshot: ProxySnapshot? = null
+
+    @Synchronized
+    fun snapshotOf(image: LinearImage): ProxySnapshot {
+        val cached = snapshot
+        if (source?.get() === image && cached != null) return cached
+        return ProxySnapshot.capture(image).also {
+            source = WeakReference(image)
+            snapshot = it
+        }
+    }
+}
+
+/** One immutable GPU upload generation. Its proxy, LUT, and gain are never mixed. */
+internal data class GpuSubmission(
+    val proxy: ProxySnapshot,
+    val lut: CubeLut,
+    val exposureGain: Float,
+)
+
+/** Single-consumer latest-submission slot with atomic take and context restoration. */
+internal class PendingGpuSubmission {
+    private val pending = AtomicReference<GpuSubmission?>()
+
+    fun publish(submission: GpuSubmission) {
+        pending.set(submission)
+    }
+
+    fun restoreIfEmpty(submission: GpuSubmission?) {
+        if (submission != null) pending.compareAndSet(null, submission)
+    }
+
+    fun take(): GpuSubmission? = pending.getAndSet(null)
+}
+
 /**
  * GLES 3.0 renderer: full-screen quad samples the linear proxy texture, looks the
  * colour up in the 3D LUT (trilinear), writes display RGB. Texture uploads are
- * deferred to the GL thread via [submit] + pending flags.
+ * deferred to the GL thread via [submit] + one pending submission.
  */
 private class LutRenderer(private val onUnavailable: () -> Unit) : GLSurfaceView.Renderer {
-    @Volatile private var pendingProxy: LinearImage? = null
-    @Volatile private var pendingLut: CubeLut? = null
+    private val proxySnapshots = ProxySnapshotCache()
+    private val pendingSubmission = PendingGpuSubmission()
 
     // Exposure gain (2^ev) applied to the proxy BEFORE the LUT lookup. The baked
     // LUT carries no auto-exposure — it cannot, since AE meters a whole image and
@@ -130,12 +221,11 @@ private class LutRenderer(private val onUnavailable: () -> Unit) : GLSurfaceView
     // here or the render sits in the film curve's toe (dark, lifted shadows).
     // Comes from SpektraEngine.exposureGain, i.e. the engine's own metering, so it
     // matches what simulate() would apply. Not a texture, so no upload needed.
-    @Volatile private var gain: Float = 1f
+    private var gain: Float = 1f
 
-    // Last successfully submitted inputs, kept so a recreated GL context (surface
+    // Last successfully submitted generation, kept so a recreated GL context (surface
     // destroyed/recreated, e.g. backgrounding) can re-upload instead of staying black.
-    @Volatile private var lastProxy: LinearImage? = null
-    @Volatile private var lastLut: CubeLut? = null
+    @Volatile private var lastSubmission: GpuSubmission? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var reportedFail = false
@@ -151,20 +241,33 @@ private class LutRenderer(private val onUnavailable: () -> Unit) : GLSurfaceView
     private var haveLut = false
 
     fun submit(proxy: LinearImage, lut: CubeLut, exposureGain: Float) {
-        pendingProxy = proxy
-        pendingLut = lut
-        gain = if (exposureGain.isFinite() && exposureGain > 0f) exposureGain else 1f
-        lastProxy = proxy
-        lastLut = lut
+        // Snapshot synchronously while the caller still owns a valid LinearImage
+        // lease. The GL thread and context-recreation path never retain or reopen
+        // that image, so closing/swapping its cache lease cannot free pixels that
+        // a deferred texture upload is about to read.
+        val snapshot = proxySnapshots.snapshotOf(proxy)
+        val submission = GpuSubmission(
+            proxy = snapshot,
+            lut = lut,
+            exposureGain = if (exposureGain.isFinite() && exposureGain > 0f) {
+                exposureGain
+            } else {
+                1f
+            },
+        )
+        // Publish the restoration value first. A concurrent context recreation may
+        // restore this generation early, while the following atomic set ensures the
+        // next requested frame still observes it as the latest pending generation.
+        lastSubmission = submission
+        pendingSubmission.publish(submission)
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         // A fresh GL context lost every texture: forget the uploads and re-arm the
-        // pending slots from the last submission so onDrawFrame re-uploads.
+        // pending slot from the last submission so onDrawFrame re-uploads.
         haveProxy = false
         haveLut = false
-        pendingProxy = pendingProxy ?: lastProxy
-        pendingLut = pendingLut ?: lastLut
+        pendingSubmission.restoreIfEmpty(lastSubmission)
         program = buildProgram(VERT, FRAG)
         if (program == 0) {
             // Shader compile/link failed on this device/driver — tell the caller so it can
@@ -185,8 +288,11 @@ private class LutRenderer(private val onUnavailable: () -> Unit) : GLSurfaceView
     }
 
     override fun onDrawFrame(gl: GL10?) {
-        pendingProxy?.let { uploadProxy(it); pendingProxy = null }
-        pendingLut?.let { uploadLut(it); pendingLut = null }
+        pendingSubmission.take()?.let { submission ->
+            uploadProxy(submission.proxy)
+            uploadLut(submission.lut)
+            gain = submission.exposureGain
+        }
 
         GLES30.glClearColor(0f, 0f, 0f, 1f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
@@ -214,12 +320,12 @@ private class LutRenderer(private val onUnavailable: () -> Unit) : GLSurfaceView
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
     }
 
-    private fun uploadProxy(img: LinearImage) {
-        proxyW = img.width
-        proxyH = img.height
+    private fun uploadProxy(snapshot: ProxySnapshot) {
+        proxyW = snapshot.width
+        proxyH = snapshot.height
         // Interleaved RGB float32 -> RGB16F texture (filterable in GLES3). The driver
         // converts GL_FLOAT source to the half-float internal format on upload.
-        val fb = img.data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val fb = snapshot.pixelsView().asFloatBuffer()
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, proxyTex)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)

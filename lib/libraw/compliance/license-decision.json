@@ -1,0 +1,14 @@
+{
+  "approval_reference": null,
+  "decision_date": null,
+  "decision_owner": null,
+  "patch_contributions": {
+    "authorization_reference": null,
+    "license": null,
+    "rights_confirmed": false
+  },
+  "rationale": null,
+  "recorded_at": "2026-08-30T00:00:00Z",
+  "route": "UNRESOLVED",
+  "schema": "spektrafilm.libraw-license-decision/v1"
+}

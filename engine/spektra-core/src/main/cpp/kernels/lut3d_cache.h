@@ -32,8 +32,8 @@
  * there is no hash-collision risk. Anything the sample function reads that is
  * NOT folded into the key is a latent wrong-render bug, so fold conservatively:
  * a superset of what is read is safe, a subset is not. Compile-time constants
- * (the CIE CMFs, the D50 scan illuminant) cannot vary between calls and need
- * no fold.
+ * (the CIE CMFs) cannot vary between calls and need no fold. Profile-selected
+ * viewing spectra and normalizations are not constants and must be folded.
  *
  * FRAMING RULE: every appended segment (tag or value block) is LENGTH-PREFIXED
  * with a 4-byte little-endian byte count ahead of its payload. Bare

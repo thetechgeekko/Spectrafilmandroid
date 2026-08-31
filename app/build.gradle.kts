@@ -1,5 +1,7 @@
 // Spektrafilm for Android — app. GPLv3.
 import java.util.Properties
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
 
 plugins {
     alias(libs.plugins.android.application)
@@ -7,9 +9,11 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// Release signing is read from keystore.properties in the project root when present.
-// Expected keys: storeFile, storePassword, keyAlias, keyPassword. When the file is
-// absent (e.g. CI without secrets) the release build falls back to debug signing.
+// Optional local release signing is read from keystore.properties in the project root.
+// Expected keys: storeFile, storePassword, keyAlias, keyPassword. Without that file,
+// assembleRelease deliberately emits an unsigned APK; it never falls back to the
+// public debug key. The protected release workflow signs that qualified artifact
+// later with pinned Android build-tools, outside Gradle's dependency graph.
 val keystorePropsFile = rootProject.file("keystore.properties")
 val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
@@ -34,6 +38,7 @@ android {
         targetSdk = 34
         versionCode = 11
         versionName = "0.9.0"
+        testInstrumentationRunner = "com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
 
@@ -62,16 +67,20 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            ndk {
+                // Retain complete native symbols for the exact shipping build.
+                // release.yml hash-binds and publishes AGP's symbols ZIP.
+                debugSymbolLevel = "FULL"
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Use the real release keystore when keystore.properties is present,
-            // otherwise fall back to debug signing so assembleRelease works in CI.
-            signingConfig = if (hasReleaseKeystore) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            // Local maintainers may opt in to a release key. CI intentionally leaves
+            // this unset and transfers the unsigned, minified candidate to the
+            // protected signing job.
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
             }
         }
     }
@@ -81,6 +90,9 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    // The gate APK must target the minified release variant that is later
+    // externally signed, not AGP's default debug app.
+    testBuildType = "release"
 
     lint {
         baseline = file("lint-baseline.xml")
@@ -109,4 +121,34 @@ dependencies {
     // Real org.json on the unit-test classpath (the android.jar stub throws "not
     // mocked"); lets Presets JSON round-trip be tested on the plain JVM.
     testImplementation("org.json:json:20231013")
+}
+
+// Canonical provenance input: Gradle's `dependencies` console report includes
+// timing/task footers, so its bytes are not reproducible across identical runs.
+val releaseRuntimeClasspath = providers.provider {
+    configurations.getByName("releaseRuntimeClasspath")
+}
+val releaseRuntimeReport = rootProject.layout.buildDirectory.file(
+    "release-runtime-classpath.txt"
+)
+tasks.register("writeReleaseRuntimeClasspath") {
+    outputs.file(releaseRuntimeReport)
+    outputs.upToDateWhen { false }
+    doLast {
+        val components = releaseRuntimeClasspath.get()
+            .incoming.resolutionResult.allComponents
+            .map { component ->
+                when (val id = component.id) {
+                    is ModuleComponentIdentifier ->
+                        "module\t${id.group}\t${id.module}\t${id.version}"
+                    is ProjectComponentIdentifier -> "project\t${id.projectPath}"
+                    else -> "component\t${id.displayName}"
+                }
+            }
+            .toSortedSet()
+        releaseRuntimeReport.get().asFile.apply {
+            parentFile.mkdirs()
+            writeText(components.joinToString("\n", postfix = "\n"), Charsets.UTF_8)
+        }
+    }
 }

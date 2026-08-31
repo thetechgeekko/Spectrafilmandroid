@@ -36,10 +36,11 @@ So "exact result par GPU pe" decomposes into:
   construction (integer emulation or correctly-rounded math on both sides, §6) — this would
   actually make the CPU cross-architecture byte-stable too, which today it is not. Cost: large
   (§6); it also means abandoning `-ffast-math` on CPU, whose own cost is unmeasured.
-- **E3 — GPU within the oracle tolerance, deterministically.** The same bar every shipped
-  approximation already meets (the opt-in spectral LUTs are "within ~5e-5 of the direct path
-  (NOT bit-exact by design)", `spektra.h`). Plausible in fp32; the deciding number (81-band
-  fp32 accumulation error vs `1e-4`) is unmeasured and needs device hardware (§9).
+- **E3 — GPU within the oracle tolerance, deterministically.** The opt-in spectral LUT
+  precedent is approximate by design, although scanner LUT error is profile/domain dependent
+  (LUT17: locked D50 <=5e-5; K75P 2383/2393 about 0.0040/0.0073 vs direct). Plausible in
+  fp32; the deciding number (81-band fp32 accumulation error vs `1e-4`) is unmeasured and
+  needs device hardware (§9).
 
 ## 2. What the Vulkan/SPIR-V specs actually guarantee (very little)
 

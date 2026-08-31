@@ -1,0 +1,68 @@
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -558,6 +558,27 @@ void LibRaw::lossless_jpeg_load_raw()
+   if(cr2_slice[0] && !cr2_slice[1])
+     throw LIBRAW_EXCEPTION_IO_CORRUPT;
+ 
++  /* The TIFF geometry bounds the destination allocation, but an embedded SOF3
++   * may advertise much more decode work while invalid stores are skipped. Keep
++   * normal padding/slice slack (2x, with a 4 Mi-sample floor for small RAWs),
++   * then fail before the row/column loops if the JPEG is an availability bomb. */
++  const INT64 raw_samples = INT64(raw_width) * INT64(raw_height);
++  const INT64 jpeg_samples =
++      INT64(jh.wide) * INT64(jh.high) * INT64(jh.clrs);
++  const INT64 geometry_limit =
++      raw_samples * INT64(jh.clrs) * 2 > INT64(4) * INT64(1024 * 1024)
++          ? raw_samples * INT64(jh.clrs) * 2
++          : INT64(4) * INT64(1024 * 1024);
++  const INT64 memory_limit =
++      INT64(imgdata.rawparams.max_raw_memory_mb) * INT64(1024 * 1024) /
++      INT64(sizeof(ushort));
++  if (raw_samples < 1 || jpeg_samples > geometry_limit ||
++      jpeg_samples > memory_limit)
++  {
++    ljpeg_end(&jh);
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  }
++
+   jwide = jh.wide * jh.clrs;
+   jhigh = jh.high;
+   if (jh.clrs == 4 && jwide >= raw_width * 2)
+diff --git a/src/decoders/dng.cpp b/src/decoders/dng.cpp
+--- a/src/decoders/dng.cpp
++++ b/src/decoders/dng.cpp
+@@ -63,6 +63,16 @@ void LibRaw::lossless_dng_load_raw()
+   int ss = shot_select;
+   shot_select = libraw_internal_data.unpacker_data.dng_frames[LIM(ss,0,(LIBRAW_IFD_MAXCOUNT*2-1))] & 0xff;
+ 
++  INT64 remaining_ljpeg_samples =
++      INT64(raw_width) * INT64(raw_height) *
++      INT64(MAX(tiff_samples, 1U)) * 2;
++  const INT64 minimum_ljpeg_samples = INT64(4) * INT64(1024 * 1024);
++  const INT64 memory_ljpeg_samples =
++      INT64(imgdata.rawparams.max_raw_memory_mb) * INT64(1024 * 1024) /
++      INT64(sizeof(ushort));
++  remaining_ljpeg_samples = MAX(remaining_ljpeg_samples, minimum_ljpeg_samples);
++  remaining_ljpeg_samples = MIN(remaining_ljpeg_samples, memory_ljpeg_samples);
++
+   while (trow < raw_height)
+   {
+     checkCancel();
+@@ -71,6 +80,16 @@ void LibRaw::lossless_dng_load_raw()
+       fseek(ifp, get4(), SEEK_SET);
+     if (!ljpeg_start(&jh, 0))
+       break;
++    const INT64 jpeg_samples =
++        INT64(jh.wide) * INT64(jh.high) * INT64(jh.clrs);
++    if (jpeg_samples < 1 || jpeg_samples > remaining_ljpeg_samples)
++    {
++      ljpeg_end(&jh);
++      shot_select = ss;
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    }
++    remaining_ljpeg_samples -= jpeg_samples;
++
+     jwide = jh.wide;
+     if (filters || colors == 1)
+       jwide *= jh.clrs;

@@ -61,4 +61,5 @@ dependencies {
     // takes a 16-bit RGB buffer + optional ICC bytes + output path. The caller
     // (feature:film-emulation, a later wave) quantises the engine's display-
     // referred float output and supplies the matching ICC profile asset.
+    testImplementation(libs.junit)
 }

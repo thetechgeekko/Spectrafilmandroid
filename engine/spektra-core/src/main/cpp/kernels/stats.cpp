@@ -14,13 +14,32 @@
 #include "kernels/stats.h"
 
 #include <cmath>
+#include <limits>
 
 namespace spk {
+
+namespace {
+
+// 2^63 is exactly representable as double, unlike INT64_MAX. Guarding against
+// this exclusive upper bound before llround avoids a range-error/unspecified
+// conversion result while leaving every representable finite sample unchanged.
+constexpr double kInt64UpperExclusive = 0x1p63;
+
+int64_t round_nonnegative_i64(double sample) {
+    if (!(sample > 0.0)) return 0;  // non-positive and NaN
+    if (!std::isfinite(sample) || sample >= kInt64UpperExclusive)
+        return std::numeric_limits<int64_t>::max();
+    return static_cast<int64_t>(std::llround(sample));
+}
+
+}  // namespace
 
 int64_t fast_poisson_one(double lam, StatsRng& rng) {
     // fast_poisson: lam <= 0 -> 0; lam < 30 -> Knuth; else Normal approx.
     const double lam_threshold = 30.0;
-    if (lam <= 0.0) return 0;
+    if (!(lam > 0.0)) return 0;  // non-positive and NaN
+    if (!std::isfinite(lam) || lam >= kInt64UpperExclusive)
+        return std::numeric_limits<int64_t>::max();
     if (lam < lam_threshold) {
         // Knuth: multiply uniforms until the product drops below exp(-lam).
         double L = std::exp(-lam);
@@ -35,9 +54,7 @@ int64_t fast_poisson_one(double lam, StatsRng& rng) {
     // Normal approximation N(lam, sqrt(lam)), rounded, clamped >= 0.
     double z = rng.normal();
     double sample = lam + std::sqrt(lam) * z;
-    int64_t s = static_cast<int64_t>(std::llround(sample));
-    if (s < 0) s = 0;
-    return s;
+    return round_nonnegative_i64(sample);
 }
 
 int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
@@ -57,8 +74,7 @@ int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
     if (var > 10.0) {
         double z = rng.normal();
         double approx = mean + std::sqrt(var) * z;
-        int64_t a = static_cast<int64_t>(std::llround(approx));
-        if (a < 0) a = 0;
+        int64_t a = round_nonnegative_i64(approx);
         if (a > n) a = n;
         return a;
     }
@@ -66,6 +82,10 @@ int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
     double u = rng.uniform();
     double cdf = 0.0;
     double prob = std::pow(1.0 - p, static_cast<double>(n));
+    // If P(X=0) underflowed, the recurrence remains exactly zero for every k,
+    // so the loop's numerical result can only be n. The uniform above is still
+    // consumed to preserve the deterministic RNG stream of the original path.
+    if (prob == 0.0) return n;
     int64_t k = 0;
     while (cdf < u && k <= n) {
         cdf += prob;

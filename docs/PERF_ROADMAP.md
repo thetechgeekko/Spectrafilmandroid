@@ -1,13 +1,20 @@
 # Performance roadmap — toward Lightroom-class speed
 
+> **Current plan (2026-08-29):** use
+> [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md) for the 1–2 second export
+> architecture, exactness levels, current ticket graph and OSS decisions. This file preserves the
+> shipped/historical performance narrative. The 6.251 s device run predates current-HEAD exact CPU
+> changes and must not be presented as a fresh baseline until the release/R8 matrix is rerun.
+
 Goal: interactive speed comparable to Lightroom mobile. This records **measured** numbers, the
 **measured bottleneck**, and a staged plan — with the hard constraint called out up front.
 
-## The constraint (read first)
+## The constraint (historical wording; read the current exactness matrix first)
 Spektrafilm's headline value is **bit-exact parity** with the spektrafilm oracle (the whole
 CI `engine-parity` gate). The techniques that make Lightroom fast — **GPU**, **fp16**, and
 **LUT-accelerating the spectral integrals** — are **not bit-identical** (GPU/fp16 differ in the
-last bits; LUTs trade ~5e-5 for speed). So they cannot be the *default* path without redefining
+last bits; LUT interpolation error is profile/domain dependent—at LUT17 the locked D50 scanner
+case is <=5e-5 while K75P 2383/2393 are about 0.0040/0.0073). So they cannot be the *default* path without redefining
 "correct". The viable model is Lightroom's own: **approximate for the interactive proxy, exact
 for export.** Which precision policy to adopt is a product decision (see end).
 

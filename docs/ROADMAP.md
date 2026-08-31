@@ -1,21 +1,27 @@
 # Roadmap
 
+> **Production/readiness execution moved (2026-08-29):** see
+> [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md),
+> [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md), and the
+> [Wayfinder map](https://github.com/thetechgeekko/Spektrafilm-android/issues/164). The milestone
+> history below is retained, but it is not the release-blocker or 1–2 second export plan.
+
 > **ℹ️ Status synced to v0.9.0 (versionCode 11) — read `CHANGELOG.md` + `HANDOFF.md` +
 > `docs/AUDIT.md` for the live snapshot.** The milestone *structure* below is still a useful
 > overview, and the per-item status markers have been corrected to match the merged state:
 > - ✅ **v0.8.0 wave:** masking v1, Lightroom-style export sheet (incl. TIFF32F/scene-linear),
 >   `.cube`/CLF LUT export, WB wave, opt-in gamut compression (output ACES-RGC + Oklch
 >   perceptual, input xy-locus), per-effect spatial gating + print-route spatial/grain,
->   engine memos, parity suite now 38 gates.
+>   engine memos, parity suite now 39 cases.
 > - ✅ **`use_enlarger_lut` is wired** (2026-06-01) — opt-in/default-off, default path
 >   byte-identical, gated by `test_enlarger_lut_e2e`. No reserved engine LUT flag remains.
 > - ✅ **AAssetManager APK-direct asset load is done** (2026-06-01) — the engine reads profiles,
 >   the spectral LUT, and neutral filters straight from the APK; the first-run extraction to
 >   `filesDir` is skipped. This was the last M3 remainder; it is closed.
-> - ✅ **Release signing is in place** — `release.yml` builds and publishes a signed APK on a
->   `v*` tag from keystore secrets; locally, release signing reads `keystore.properties` and only
->   falls back to debug signing when that file is **absent**. The signing mechanism exists; there
->   is no "debug-signed release" blocker.
+> - ⚠️ **Release signing is now fail-closed, but release qualification remains open** — a local
+>   `assembleRelease` without an explicit keystore emits an unsigned APK. `release.yml` hash-binds
+>   that non-secret candidate, then aligns/signs only inside the protected Environment and verifies
+>   the remote draft before publication. The next release still needs the remaining map gates.
 >
 > Treat M3 and M4 as complete (see the v0.7.0 progress note below).
 
@@ -45,11 +51,13 @@ Milestones are vertical slices. Each ends with something demonstrable and a pari
 > Ektar baked-only; `print_ektar` golden proves the second pair). App features: 16-bit TIFF
 > export (live), Lightroom-style Auto-exposure UI, profile-curve browser, non-destructive
 > recipe/sidecar layer, engine/render status pill, full source EXIF copy on export, Google Ultra
-> HDR export, Expert RAW DEFLATE fix, and a **major Lightroom-style UI redesign** (edge-to-edge,
+> HDR export, the qualified floating-point Compression-8 DNG subset (integer/0x80B2 remains
+> typed fallback), and a **major Lightroom-style UI redesign** (edge-to-edge,
 > pinned preview + 90° rotate, horizontal scrollable category bar, inline panel, back navigation).
 > Issue #6 is essentially resolved: lens blur (camera+scanner) and scanner LUT acceleration are
 > now wired too (the latter opt-in/default-off, default path byte-identical). Glare-on-print is
-> wired but default-off (stochastic, so not bit-exact). No UI-exposed param is falsely gated anymore.
+> wired but default-off (stochastic, so not bit-exact). That wave's “no false UI surface” claim has
+> since been reopened by the current inert/control-semantics audit ticket.
 >
 > **Progress note (v0.7.0, `versionCode 9`):** the two remaining "reserved" items from the v0.3.0
 > wave have since landed. **`use_enlarger_lut` is wired** (2026-06-01) — the enlarger-side 3D LUT
@@ -58,13 +66,13 @@ Milestones are vertical slices. Each ends with something demonstrable and a pari
 > unchanged at 5.11e-07), and it is parity-gated by `test_enlarger_lut_e2e`. **The AAssetManager
 > APK-direct asset path is done** (2026-06-01) — the engine loads profiles/LUT/filters from the
 > APK with no first-run extraction (on-device arm64 parity still `ALL PASS`). On the release side,
-> `release.yml` ships a signed APK on a `v*` tag and local release builds read `keystore.properties`
-> (debug fallback only when it is absent) — so there is no debug-signed release blocker. **R8 is now
+> `release.yml` ships a signed APK on a `v*` tag; local release builds use an explicitly supplied
+> `keystore.properties` or remain unsigned, never debug-signed. **R8 is now
 > enabled** (2026-06-04) — `isMinifyEnabled = true`, Stage 1 *shrink only* (`-dontobfuscate`) with
 > keep-rules for the four name-based JNI boundaries and enum persistence (`app/proguard-rules.pro`);
-> Stage 2 obfuscation is deferred. Only minor, by-design items remain: bit-exact glare-on-print is
-> impossible (stochastic), and enlarger lens blur stays unwired by design (no oracle call site;
-> GatedBlock-disclosed). The `apply_hanatos2025_*` window/surface toggles are WIRED
+> Stage 2 obfuscation is deferred. Glare, enlarger blur and other exposed/control semantics now
+> require the explicit implement/remove decisions in the production-readiness map rather than a
+> blanket “by design” closure. The `apply_hanatos2025_*` window/surface toggles are WIRED
 > (`test_hanatos_surface_e2e`) — tracked in `docs/AUDIT.md` + `docs/ENGINE_WIRING_PLAN.md`.
 >
 > **Milestone progress (v0.5.0 → v0.6.x → v0.7.0):** v0.5.0 landed the Lightroom-feel editor wave;
@@ -236,19 +244,17 @@ The "do this when literally everything else is done" list:
 - **GitHub repo "About"** — repository description, topics, and homepage must be set manually
   at https://github.com/thetechgeekko/Spectrafilmandroid/ by the maintainer (the env cannot
   push via the API). Ready-to-paste text is in `docs/RELEASE_CHECKLIST.md`.
-- **Remaining (M7/polish):** the gated engine stages are now live (crop, auto-exposure,
-  diffusion, lens blur, scanner LUT accel, **enlarger LUT**). Only bit-exact glare-on-print
-  (stochastic) remains by-design, plus enlarger lens blur (unwired by design, no oracle call
-  site; GatedBlock-disclosed) — see `docs/AUDIT.md`.
-  Release signing is **in place**: `release.yml` publishes a signed APK on a `v*` tag, and local
-  release builds read `keystore.properties` (debug fallback only when that file is absent), so
-  there is no debug-signed release blocker. **R8 is enabled** (Stage-1 shrink, no obfuscation,
+- **Remaining (M7/polish):** the gated engine stages are live, but the current audit has reopened
+  glare/enlarger-lens and other exposed-control semantics as explicit implement/remove decisions.
+  Release signing infrastructure exists: `release.yml` publishes a production-signed APK on a
+  `v*` tag. Local release builds without an explicit release keystore are unsigned; the protected
+  workflow signs only a qualified, hash-bound candidate. **R8 is enabled** (Stage-1 shrink, no obfuscation,
   JNI/enum keep-rules); R8 Stage-2 + `shrinkResources`: see `docs/AUDIT.md` §D (which owns that
   open item).
 
 ## Cross-cutting
 - CI: build all ABIs; run golden-vector parity tests; lint.
   → Implemented in `.github/workflows/ci.yml` (see `.github/workflows/README.md`): the standing
-  jobs are `engine-native`, `engine-parity` (38 gates), `parity`, `python-lint`, `android`
+  jobs are `engine-native`, `engine-parity` (39 cases), `parity`, `python-lint`, `android`
   (`testDebugUnitTest` + assemble + 16 KB check), and `android-emulator` (manual dispatch only).
 - Each engine PR cites which golden vectors it turned green.

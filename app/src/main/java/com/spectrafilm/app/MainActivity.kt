@@ -16,6 +16,7 @@
  */
 package com.spectrafilm.app
 
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
@@ -73,17 +74,23 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
+import com.spectrafilm.engine.AppRenderOutcome
 import com.spectrafilm.engine.ColorSpace
 import com.spectrafilm.engine.InputGamutCompress
 import com.spectrafilm.engine.LinearImage
 import com.spectrafilm.engine.OutputGamutCompress
+import com.spectrafilm.engine.RenderKind
 import com.spectrafilm.engine.Rgb2Raw
+import com.spectrafilm.engine.SimResult
 import com.spectrafilm.engine.SpektraEngine
-import com.spectrafilm.libraw.DecodeStatus
 import com.spectrafilm.libraw.RawDecodeException
+import com.spectrafilm.libraw.DecodeStatus
 import com.spectrafilm.libraw.WhiteBalance
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
@@ -92,6 +99,158 @@ import kotlinx.coroutines.withContext
 
 /** Which kind of source image is loaded. */
 private enum class SourceKind { DEMO, PHOTO, RAW }
+
+private fun Throwable.isSourceAuthorizationFailure(): Boolean =
+    generateSequence(this) { it.cause }
+        .any { it is SecurityException || it is java.io.FileNotFoundException }
+
+private data class SourceDecodeRequest(
+    val context: Context,
+    val uri: Uri?,
+    val kind: SourceKind,
+    val authorizationRequired: Boolean,
+    val rawWhiteBalance: WhiteBalance,
+    val rawTemperature: Float,
+    val rawTint: Float,
+    val rotation: SourceRotation,
+    val creativeTemp: Float,
+    val creativeTint: Float,
+    val balanceToFilmStock: Boolean,
+    val filmProfile: String,
+)
+
+private data class SourceDecodeResult(
+    val image: LinearImage,
+    val usedPlatformFallback: Boolean,
+)
+
+private data class CachedSourceDecodeRequest(
+    val decode: SourceDecodeRequest,
+    val ticket: DecodedSourceCache.Ticket,
+)
+
+/** Activity-free decoder used by previews and the process-owned export runtime. */
+private suspend fun decodeSourceRequest(
+    request: SourceDecodeRequest,
+    maxEdge: Int,
+): SourceDecodeResult = withOwnedContext(
+    context = Dispatchers.IO,
+    dispose = { decoded -> decoded.image.close() },
+) {
+    val decodeJob = currentCoroutineContext()[Job]
+    val isCancelled = { decodeJob?.isActive == false }
+    if (isCancelled()) throw CancellationException("source decode cancelled")
+    check(!request.authorizationRequired || request.kind == SourceKind.DEMO) {
+        "Source authorization required"
+    }
+    val uri = request.uri
+    val exif = if (uri != null && request.kind != SourceKind.DEMO) {
+        readExifOrientation(request.context, uri)
+    } else {
+        ExifOrientation.NONE
+    }
+    var applyExifBaseline = request.kind != SourceKind.RAW
+    var usedPlatformFallback = false
+    val image = when (request.kind) {
+        SourceKind.RAW -> try {
+            runCancellableRawDecode(onLateResult = { late -> late.close() }) { cancellation ->
+                decodeRawToLinear(
+                    request.context,
+                    requireNotNull(uri),
+                    request.rawWhiteBalance,
+                    request.rawTemperature.toDouble(),
+                    request.rawTint.toDouble(),
+                    maxEdge,
+                    cancellation,
+                )
+            }
+        } catch (failure: RawDecodeException) {
+            if (failure.status == DecodeStatus.CANCELLED) {
+                throw CancellationException("RAW decode cancelled").also {
+                    it.initCause(failure)
+                }
+            }
+            val fallbackSupported = when (failure.status) {
+                DecodeStatus.DEFLATE_DNG,
+                DecodeStatus.LOSSY_JPEG_DNG,
+                DecodeStatus.JPEGXL_DNG,
+                -> true
+                DecodeStatus.FILE_UNSUPPORTED ->
+                    uri?.lastPathSegment?.endsWith(".dng", ignoreCase = true) == true
+                else -> false
+            }
+            if (!fallbackSupported) throw failure
+            usedPlatformFallback = true
+            applyExifBaseline = true
+            decodeViaPlatform(
+                request.context,
+                requireNotNull(uri),
+                maxEdge,
+                isCancelled,
+            )
+        }
+        SourceKind.PHOTO -> decodeToLinearProPhoto(
+            request.context,
+            requireNotNull(uri),
+            maxEdge,
+            isCancelled,
+        )
+        SourceKind.DEMO -> syntheticLinearImage(256)
+    }
+    var ownedImage: LinearImage? = image
+    try {
+        val based = if (applyExifBaseline) image.applyExif(exif, isCancelled) else image
+        ownedImage = based
+        val rotW = based.width
+        val rotH = based.height
+        val rotT0 = if (request.rotation == SourceRotation.NONE) 0L else System.currentTimeMillis()
+        val rotated = based.rotated(request.rotation, isCancelled)
+        ownedImage = rotated
+        if (request.rotation != SourceRotation.NONE) {
+            Diag.i(
+                "rotate ms=${System.currentTimeMillis() - rotT0} angle=${request.rotation.degrees} " +
+                    "${rotW}x$rotH workers=${defaultRotWorkers(rotW.toLong() * rotH)}",
+            )
+        }
+        val pixelCount = try {
+            Math.multiplyExact(rotated.width, rotated.height)
+        } catch (failure: ArithmeticException) {
+            throw IllegalArgumentException(
+                "decoded image dimensions overflow: ${rotated.width}x${rotated.height}",
+                failure,
+            )
+        }
+        rotated.acquireDataLease().use { lease ->
+            val data = lease.data
+            if (!CreativeWhiteBalance.isNeutral(request.creativeTemp, request.creativeTint)) {
+                CreativeWhiteBalance.applyInPlace(
+                    data,
+                    pixelCount,
+                    CreativeWhiteBalance.matrix(request.creativeTemp, request.creativeTint),
+                    isCancelled,
+                )
+            }
+            if (request.balanceToFilmStock &&
+                FilmStockBalance.isMeaningful(request.context, request.filmProfile)
+            ) {
+                CreativeWhiteBalance.applyInPlace(
+                    data,
+                    pixelCount,
+                    FilmStockBalance.matrix(request.context, request.filmProfile),
+                    isCancelled,
+                )
+            }
+        }
+        if (isCancelled()) throw CancellationException("source decode cancelled")
+        Diag.i("decode kind=${request.kind.name} ${rotated.width}x${rotated.height} maxEdge=$maxEdge")
+        val decoded = SourceDecodeResult(rotated, usedPlatformFallback)
+        ownedImage = null
+        decoded
+    } catch (failure: Throwable) {
+        ownedImage?.close()
+        throw failure
+    }
+}
 
 /** Top-level navigation destinations. */
 private enum class Screen { EDITOR, SETTINGS, ABOUT, CURVES_FILM, CURVES_PRINT, DIAGNOSTICS }
@@ -131,6 +290,35 @@ class MainActivity : ComponentActivity() {
         // Persist the last fatal stack trace so the in-app Diagnostics screen can show it
         // after a restart (no permission needed; chains to the platform handler).
         Diagnostics.installCrashHandler(this)
+        // Register synchronously: even if this lifecycle coroutine is canceled before dispatch,
+        // a replacement Activity cannot advance the prior-process stage-cleanup cutoff.
+        val priorProcessStageCutoffMillis = registerExportProcessStageCutoff(
+            System.currentTimeMillis(),
+        )
+        // Reconcile export journal entries left by process death before a new export can start.
+        // Once-per-process guarding prevents Activity recreation from racing a live transaction.
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                recoverPendingMediaStoreExportsOnce(
+                    applicationContext,
+                    priorProcessStageCutoffMillis,
+                )
+            }
+                .onSuccess { report ->
+                    if (
+                        report != null &&
+                        (report.examined > 0 || report.removedAbandonedStages > 0 || report.retainedAbandonedStages > 0)
+                    ) {
+                        Diag.i(
+                            "export recovery examined=${report.examined} removed=${report.removedPending} " +
+                                "retired=${report.retiredCommittedOrMissing} retry=${report.retainedForRetry} " +
+                                "stagesRemoved=${report.removedAbandonedStages} " +
+                                "stagesRetry=${report.retainedAbandonedStages}",
+                        )
+                    }
+                }
+                .onFailure { Diag.w("export recovery failed: ${it.message}") }
+        }
         val settings = AppSettings.from(this)
         setContent {
             var themeMode by remember { mutableStateOf(settings.theme) }
@@ -288,7 +476,7 @@ class MainActivity : ComponentActivity() {
         val state = remember { ParamsState() }
 
         // PERF: decoded proxy-source cache. The interactive preview path re-uses this decoded
-        // LinearImage across look/film param edits instead of re-running loadSource() (LibRaw
+        // LinearImage across look/film param edits instead of re-running source decode (LibRaw
         // RAW decode or bitmap decode + sRGB→ProPhoto linearization + EXIF/manual rotation) on
         // every previewTick. Keyed by the decode-affecting inputs only (URI + kind + RAW WB/
         // temp/tint + manual rotation + target edge); any change to one of those invalidates it
@@ -315,8 +503,8 @@ class MainActivity : ComponentActivity() {
         val zoomSourceCache = remember { DecodedSourceCache() }
         // Single-flight guards: a cancelled zoom/preview render's still-running native decode is
         // reused by the next gesture instead of triggering an overlapping re-decode (battery).
-        val zoomDecodeFlight = remember { SingleFlight<LinearImage>() }
-        val previewDecodeFlight = remember { SingleFlight<LinearImage>() }
+        val zoomDecodeFlight = remember { SingleFlight<Unit>() }
+        val previewDecodeFlight = remember { SingleFlight<Unit>() }
         DisposableEffect(Unit) { onDispose { zoomSourceCache.invalidate() } }
 
         // bundled catalog (friendly stock names + grouping) and built-in presets
@@ -332,6 +520,11 @@ class MainActivity : ComponentActivity() {
         var sourceUri by rememberSaveable { mutableStateOf<Uri?>(null) }
         var sourceKind by rememberSaveable { mutableStateOf(SourceKind.DEMO) }
         var sourceName by rememberSaveable { mutableStateOf("synthetic demo image") }
+        val sourceRuntime = remember(ctx.applicationContext) { sourceAccessRuntime(ctx) }
+        val sourceAccess = sourceRuntime.coordinator
+        val sourceMutationGate = sourceRuntime.mutations
+        var sourceAuthorizationRequired by rememberSaveable { mutableStateOf(false) }
+        var sourceRestoreChecked by remember { mutableStateOf(false) }
         var preview by remember { mutableStateOf<Bitmap?>(null) }
         var beforePreview by remember { mutableStateOf<Bitmap?>(null) }
         var status by remember { mutableStateOf("initializing…") }
@@ -351,6 +544,8 @@ class MainActivity : ComponentActivity() {
         }
         var exportKeepGps by remember { mutableStateOf(settings.exportKeepGps) }
         var previewTick by remember { mutableIntStateOf(0) }
+        val publicationGate = remember { RenderPublicationGate() }
+        val previewRevision = remember(previewTick) { publicationGate.nextRevision() }
         // Slider drag tracking (Lightroom's ICBSliderTrackingBegin/End): true while a slider is
         // being dragged, so the live DRAFT pass runs only during a drag and a discrete edit
         // (switch/dropdown) goes straight to the crisp settle render — no draft flicker, and the
@@ -386,11 +581,15 @@ class MainActivity : ComponentActivity() {
         // GPU-samples them instead of the CPU bitmap. Read at composition — toggling in
         // Settings applies on the next return to the editor.
         val gpuEnabled = settings.gpuPreview
-        var gpuProxy by remember { mutableStateOf<LinearImage?>(null) }
+        var gpuProxyLease by remember { mutableStateOf<DecodedSourceCache.Lease?>(null) }
+        val gpuProxy = gpuProxyLease?.image
         var gpuLut by remember { mutableStateOf<CubeLut?>(null) }
         // Auto-exposure gain (2^ev) for the GPU path: the LUT is baked AE-off at unity
         // gain, so the shader multiplies this in before the lookup (see LutGpuPreview).
         var gpuGain by remember { mutableFloatStateOf(1f) }
+        DisposableEffect(Unit) {
+            onDispose { gpuProxyLease?.close() }
+        }
 
         // interactive crop overlay (Lightroom-style); hosts on top of everything.
         var cropOverlayOpen by remember { mutableStateOf(false) }
@@ -412,11 +611,29 @@ class MainActivity : ComponentActivity() {
         // request (last-tap-wins) instead of racing N full-res renders into magnifierBitmap.
         // Held in a remember box (not Compose state — we never read it during composition).
         val magnifierJobRef = remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+        val magnifierPublicationGate = remember { RoiRenderPublicationGate() }
 
         // Lightroom-style zoom: the sharp render of the currently-visible region (rendered at
         // ~screen resolution from a native-pixel crop), overlaid on the scaled proxy.
         var roiOverlay by remember { mutableStateOf<RoiOverlay?>(null) }
         val roiJobRef = remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+        val roiPublicationGate = remember { RoiRenderPublicationGate() }
+        val latestRoiRenderKey by rememberUpdatedState(previewTick)
+        val latestMagnifierRenderKey by rememberUpdatedState(previewTick)
+        // Invalidate an old edit generation before its next main-thread publication, cancel its
+        // remaining native work, and retire its overlay while the replacement preview is pending.
+        LaunchedEffect(previewTick) {
+            roiPublicationGate.invalidate()
+            roiJobRef.value?.cancel()
+            roiOverlay = null
+            magnifierPublicationGate.invalidate()
+            magnifierJobRef.value?.cancel()
+            if (magnifierOpen) {
+                magnifierBitmap = null
+                magnifierRendering = false
+                magnifierStatus = "edit changed · tap preview again"
+            }
+        }
         // Cancel any in-flight ROI / magnifier render job when the editor leaves composition
         // (navigation), so a superseded job doesn't keep rendering into a gone Composable.
         DisposableEffect(Unit) {
@@ -473,6 +690,100 @@ class MainActivity : ComponentActivity() {
         var defaultsJson by remember { mutableStateOf<String?>(null) }
         val snackbarHost = remember { SnackbarHostState() }
         val recipeKey = remember(sourceUri) { Recipes.keyFor(sourceUri) }
+        val exportRuntimeState by ExportWorkRuntime.state.collectAsState()
+        var lastHandledExportRun by remember { mutableLongStateOf(0L) }
+        var exportPublication by remember {
+            mutableStateOf<Pair<Long, RenderPublicationTicket>?>(null)
+        }
+
+        // The process-owned export survives this Activity. A recreated UI observes exactly one
+        // retained terminal outcome instead of turning a committed MediaStore row into CANCELLED.
+        LaunchedEffect(exportRuntimeState) {
+            when (val runtime = exportRuntimeState) {
+                ExportRuntimeState.Idle -> Unit
+                is ExportRuntimeState.Running -> {
+                    if (exportPublication?.first != runtime.runId) {
+                        exportPublication = runtime.runId to publicationGate.begin(
+                            publicationGate.nextRevision(),
+                            RenderPublicationPriority.EXPORT,
+                        )
+                    }
+                    exporting = true
+                    exportDone = false
+                    status = "rendering full resolution…"
+                }
+                is ExportRuntimeState.Finished -> {
+                    if (runtime.runId == lastHandledExportRun) return@LaunchedEffect
+                    lastHandledExportRun = runtime.runId
+                    val publicationTicket = exportPublication
+                        ?.takeIf { it.first == runtime.runId }
+                        ?.second
+                        ?: publicationGate.begin(
+                            publicationGate.nextRevision(),
+                            RenderPublicationPriority.EXPORT,
+                        )
+                    val publicationAllowed = publicationGate.tryClaim(publicationTicket)
+                    val claimedOutcome = ExportWorkRuntime.claimFinished(runtime.runId)
+                        ?: return@LaunchedEffect
+                    exportPublication = null
+                    when (val outcome = claimedOutcome) {
+                        is ExportTerminalOutcome.Success -> {
+                            outcome.bitmap?.let { bitmap ->
+                                if (publicationAllowed) {
+                                    preview = bitmap
+                                } else if (!bitmap.isRecycled) {
+                                    bitmap.recycle()
+                                }
+                            }
+                            val phases = outcome.phases
+                            val accounted = phases.setupMs + phases.decodeMs + phases.exifMs +
+                                phases.simulateMs + phases.gradeMs + phases.encodeMs
+                            Diag.i(
+                                "export phases ms: setup=${phases.setupMs} decode=${phases.decodeMs} " +
+                                    "exif=${phases.exifMs} simulate=${phases.simulateMs} " +
+                                    "grade=${phases.gradeMs} encode=${phases.encodeMs} " +
+                                    "residual=${outcome.totalMs - accounted} total=${outcome.totalMs}",
+                            )
+                            Diag.i("export format=${outcome.format.name} ok in ${outcome.totalMs}ms")
+                            exporting = true
+                            exportDone = true
+                            status = "saved to Pictures/Spektrafilm"
+                        }
+                        is ExportTerminalOutcome.Failure -> {
+                            Diag.w(
+                                "export format=${outcome.format.name} failed after " +
+                                    "${outcome.elapsedMs}ms: ${outcome.cause.message}",
+                            )
+                            exporting = false
+                            if (outcome.cause is ExportReconciliationPendingException) {
+                                status = "export outcome pending reconciliation · restart before retry"
+                                Toast.makeText(
+                                    ctx,
+                                    "Export outcome is being reconciled. Restart before retrying.",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            } else {
+                                status = "export failed: ${outcome.cause.message}"
+                                Toast.makeText(
+                                    ctx,
+                                    "Export failed: ${outcome.cause.message}",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        }
+                        is ExportTerminalOutcome.Cancelled -> {
+                            Diag.i(
+                                "export format=${outcome.format.name} cancelled after " +
+                                    "${outcome.elapsedMs}ms",
+                            )
+                            exporting = false
+                            exportDone = false
+                            status = "export cancelled"
+                        }
+                    }
+                }
+            }
+        }
 
         // --- double-back-to-exit on the root editor ---
         var backArmed by remember { mutableStateOf(false) }
@@ -549,10 +860,17 @@ class MainActivity : ComponentActivity() {
 
         // --- Non-destructive recipe: restore-on-open ---
         var lastRestoredKey by remember { mutableStateOf<String?>(null) }
+        var recipeWriteBlockedKey by remember { mutableStateOf<String?>(null) }
+        // A key becomes writable only after its read/classification has completed. Starting at
+        // null closes the launch-order race between this restore effect and the autosave effect.
+        var recipeWritableKey by remember { mutableStateOf<String?>(null) }
+        val recipeEditEpoch = remember { RecipeEditEpoch() }
         LaunchedEffect(recipeKey, recipeReady) {
             if (!recipeReady) return@LaunchedEffect
             if (recipeKey == null) {
                 hasRecipe = false
+                recipeWritableKey = null
+                recipeWriteBlockedKey = null
                 // Switched to a keyless source (the demo image): still drop cross-image
                 // history and re-baseline once for the demo's current state.
                 if (lastRestoredKey != null) {
@@ -565,6 +883,7 @@ class MainActivity : ComponentActivity() {
             }
             if (recipeKey == lastRestoredKey) return@LaunchedEffect
             lastRestoredKey = recipeKey
+            recipeWritableKey = null
             // New source: undo must never cross images. Drop the history and re-baseline so
             // the just-restored/default state for THIS image is the empty-history baseline
             // (canUndo=false). `restoring` makes the next capture settle adopt the new
@@ -572,22 +891,88 @@ class MainActivity : ComponentActivity() {
             editHistory.clear()
             committedSnapshot = null
             restoring = true
-            val restored = runCatching { Recipes.load(ctx, recipeKey, state) }.getOrDefault(false)
-            hasRecipe = restored
-            if (restored) {
-                // Restore the persisted manual rotation (EXIF baseline is re-derived on load).
-                rotation = runCatching { Recipes.loadRotation(ctx, recipeKey) }
-                    .getOrDefault(SourceRotation.NONE)
-                previewTick++
-                snackbarHost.currentSnackbarData?.dismiss()
-                snackbarHost.showSnackbar(
-                    message = "Restored saved edit for this image",
-                    withDismissAction = true,
-                )
-            } else {
-                Recipes.resetToDefaults(state, settings, profiles)
-                rotation = SourceRotation.NONE
-                previewTick++
+            // Submission itself happens on Main and is process-owned. If an old Activity already
+            // submitted an autosave, FIFO guarantees this recreated restore reads after its commit.
+            val pendingRestore = RecipeWorkRuntime.submit {
+                val before = Recipes.generation(recipeKey)
+                val result = Recipes.readResult(ctx, recipeKey)
+                Triple(before, result, Recipes.generation(recipeKey))
+            }
+            val (restoreGeneration, restored, generationAfterRead) = pendingRestore.await()
+            // Reset increments the per-recipe generation before deleting. If it overlapped this
+            // read, the reset owns the final state and a late read must not resurrect old edits.
+            if (restoreGeneration != generationAfterRead) return@LaunchedEffect
+            when (restored) {
+                is RecipeReadResult.Loaded -> {
+                    recipeWriteBlockedKey = null
+                    recipeWritableKey = recipeKey
+                    Presets.decode(restored.document.params, state)
+                    hasRecipe = true
+                    rotation = SourceRotation.fromDegrees(restored.document.manualRotationDeg)
+                    previewTick++
+                    snackbarHost.currentSnackbarData?.dismiss()
+                    snackbarHost.showSnackbar(
+                        message = "Restored saved edit for this image",
+                        withDismissAction = true,
+                    )
+                }
+                is RecipeReadResult.CorruptQuarantined -> {
+                    recipeWriteBlockedKey = null
+                    recipeWritableKey = recipeKey
+                    hasRecipe = false
+                    Recipes.resetToDefaults(state, settings, profiles)
+                    rotation = SourceRotation.NONE
+                    previewTick++
+                    Diag.w("recipe quarantined: ${restored.reason}")
+                    snackbarHost.currentSnackbarData?.dismiss()
+                    snackbarHost.showSnackbar(
+                        message = "Damaged saved edit was quarantined; defaults restored",
+                        withDismissAction = true,
+                    )
+                }
+                RecipeReadResult.Missing -> {
+                    recipeWriteBlockedKey = null
+                    recipeWritableKey = recipeKey
+                    hasRecipe = false
+                    Recipes.resetToDefaults(state, settings, profiles)
+                    rotation = SourceRotation.NONE
+                    previewTick++
+                }
+                is RecipeReadResult.Unsupported -> {
+                    hasRecipe = true
+                    recipeWriteBlockedKey = recipeKey
+                    recipeWritableKey = null
+                    Recipes.resetToDefaults(state, settings, profiles)
+                    rotation = SourceRotation.NONE
+                    previewTick++
+                    status = "saved edit uses newer recipe version ${restored.version}"
+                    snackbarHost.currentSnackbarData?.dismiss()
+                    snackbarHost.showSnackbar(
+                        message = "Saved edit is from a newer app version; it was left untouched",
+                        withDismissAction = true,
+                    )
+                }
+                is RecipeReadResult.CorruptQuarantineFailed,
+                is RecipeReadResult.IoFailure -> {
+                    hasRecipe = true
+                    recipeWriteBlockedKey = recipeKey
+                    recipeWritableKey = null
+                    Recipes.resetToDefaults(state, settings, profiles)
+                    rotation = SourceRotation.NONE
+                    previewTick++
+                    val reason = when (restored) {
+                        is RecipeReadResult.CorruptQuarantineFailed -> restored.reason
+                        is RecipeReadResult.IoFailure -> restored.reason
+                        else -> error("unreachable")
+                    }
+                    Diag.w("recipe unavailable and writes paused: $reason")
+                    status = "saved edit unavailable; writes paused"
+                    snackbarHost.currentSnackbarData?.dismiss()
+                    snackbarHost.showSnackbar(
+                        message = "Saved edit could not be safely opened; reset it explicitly to continue saving",
+                        withDismissAction = true,
+                    )
+                }
             }
         }
 
@@ -613,15 +998,101 @@ class MainActivity : ComponentActivity() {
         val notificationPermission = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { /* granted or denied, the export proceeds either way */ }
+        val legacyStoragePermission = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            if (!granted) {
+                status = "storage permission required to export on this Android version"
+                Toast.makeText(
+                    ctx,
+                    "Allow Photos and media access to save exports.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+
+        fun reconcileVisibleSourceAfterFailure(durable: SourceRestoreResult?) {
+            when (durable) {
+                is SourceRestoreResult.Ready -> {
+                    val switched = sourceUri?.toString() != durable.ref.uri
+                    sourceUri = Uri.parse(durable.ref.uri)
+                    sourceKind = SourceKind.valueOf(durable.ref.kind)
+                    sourceName = durable.ref.displayName
+                    sourceAuthorizationRequired = false
+                    if (switched) rotation = SourceRotation.NONE
+                    status = "selection failed · previous source restored"
+                }
+                is SourceRestoreResult.NeedsAuthorization -> {
+                    val switched = sourceUri?.toString() != durable.ref.uri
+                    sourceUri = Uri.parse(durable.ref.uri)
+                    sourceKind = SourceKind.valueOf(durable.ref.kind)
+                    sourceName = durable.ref.displayName
+                    sourceAuthorizationRequired = true
+                    if (switched) rotation = SourceRotation.NONE
+                    status = "selection failed · previous source needs authorization"
+                }
+                SourceRestoreResult.None -> {
+                    sourceUri = null
+                    sourceKind = SourceKind.DEMO
+                    sourceName = "synthetic demo image"
+                    sourceAuthorizationRequired = false
+                    rotation = SourceRotation.NONE
+                    status = "source unavailable · using demo image"
+                }
+                is SourceRestoreResult.Invalid, null -> {
+                    sourceAuthorizationRequired = sourceUri != null && sourceKind != SourceKind.DEMO
+                    status = "source state unavailable · choose the file again"
+                }
+            }
+            previewTick++
+        }
+
+        fun adoptSource(uri: Uri, kind: SourceKind, displayName: String, readyStatus: String) {
+            val selectionGeneration = sourceMutationGate.begin()
+            // The mutation starts in the process-owned runtime before this Activity awaits it.
+            // Activity recreation may cancel the waiter, but it cannot drop the grant/store write.
+            val pendingAcquire = sourceRuntime.submitReconciled(selectionGeneration) {
+                sourceAccess.acquire(uri.toString(), kind.name, displayName.take(512))
+            }
+            scope.launch {
+                val outcome = pendingAcquire.await() ?: return@launch
+                if (!sourceMutationGate.isCurrent(selectionGeneration)) return@launch
+                when (outcome) {
+                    is ReconciledSourceMutation.Applied -> {
+                        val ref = outcome.value
+                        sourceUri = uri
+                        sourceKind = kind
+                        sourceName = displayName
+                        sourceAuthorizationRequired = false
+                        rotation = SourceRotation.NONE
+                        status = if (ref.accessMode == SourceAccessMode.PERSISTED) {
+                            readyStatus
+                        } else {
+                            "$readyStatus · access is temporary"
+                        }
+                        previewTick++
+                    }
+                    is ReconciledSourceMutation.Rejected -> {
+                        Diag.w("source adoption failed: ${outcome.failure.message}")
+                        reconcileVisibleSourceAfterFailure(outcome.durableState)
+                        snackbarHost.currentSnackbarData?.dismiss()
+                        snackbarHost.showSnackbar(
+                            "Could not open that source. The previous source state was restored.",
+                            withDismissAction = true,
+                        )
+                    }
+                }
+            }
+        }
 
         // --- source pickers ---
         val photoPicker = rememberLauncherForActivityResult(
             ActivityResultContracts.PickVisualMedia()
         ) { uri ->
             if (uri != null) {
-                sourceUri = uri; sourceKind = SourceKind.PHOTO; sourceName = "picked photo"
-                rotation = SourceRotation.NONE
-                status = "photo selected"; previewTick++
+                val displayName = uri.lastPathSegment?.substringAfterLast('/')
+                    ?.takeIf { it.isNotBlank() } ?: "picked photo"
+                adoptSource(uri, SourceKind.PHOTO, displayName, "photo selected")
             }
         }
         val rawPicker = rememberLauncherForActivityResult(
@@ -639,12 +1110,6 @@ class MainActivity : ComponentActivity() {
                         snackbarHost.showSnackbar("MotionCam .mcraw import is coming — single RAW/DNG works today")
                     }
                 } else {
-                    runCatching {
-                        ctx.contentResolver.takePersistableUriPermission(
-                            uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                        )
-                    }.onFailure { Diag.w("persistable uri permission not granted: ${it.message}") }
-                    rotation = SourceRotation.NONE
                     val mime = runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
                     if (isNonRawImage(name, mime)) {
                         // A JPEG/HEIC chosen via the RAW document picker: process it on the normal
@@ -652,13 +1117,14 @@ class MainActivity : ComponentActivity() {
                         // fall back to a lossy display-referred decode). RAW/DNG and ambiguous
                         // content URIs (e.g. MIUI document IDs with no extension) fall through to
                         // the RAW path below, so a genuine DNG is never misrouted.
-                        sourceUri = uri; sourceKind = SourceKind.PHOTO
-                        sourceName = "picked photo"
-                        status = "photo selected"; previewTick++
+                        adoptSource(uri, SourceKind.PHOTO, name.substringAfterLast('/'), "photo selected")
                     } else {
-                        sourceUri = uri; sourceKind = SourceKind.RAW
-                        sourceName = "RAW: ${name.substringAfterLast('/')}"
-                        status = "RAW selected"; previewTick++
+                        adoptSource(
+                            uri,
+                            SourceKind.RAW,
+                            "RAW: ${name.substringAfterLast('/')}",
+                            "RAW selected",
+                        )
                     }
                 }
             }
@@ -673,7 +1139,14 @@ class MainActivity : ComponentActivity() {
                         runCatching { Presets.readUri(ctx, uri) }.getOrNull()
                     }
                     if (text == null) { status = "import failed"; return@launch }
-                    runCatching { Presets.decode(org.json.JSONObject(text), state) }
+                    runCatching {
+                        // Decode into a detached clone first. The live Compose state changes only
+                        // after the entire bounded/versioned import has validated successfully.
+                        val candidate = ParamsState()
+                        Presets.decode(Presets.encode(state), candidate)
+                        Presets.decode(org.json.JSONObject(text), candidate)
+                        Presets.decode(Presets.encode(candidate), state)
+                    }
                         .onSuccess { status = "preset imported"; previewTick++ }
                         .onFailure { status = "import failed: ${it.message}" }
                 }
@@ -708,6 +1181,84 @@ class MainActivity : ComponentActivity() {
             pendingLutText = null
         }
 
+        // Restore the last durable source reference on a cold process start. A saved-state URI
+        // is trusted only when it matches a still-readable persisted grant; moved/revoked and
+        // temporary-picker sources enter an explicit reauthorization state instead of failing
+        // later inside a native decoder with a generic render error.
+        LaunchedEffect(Unit) {
+            if (sourceRestoreChecked) return@LaunchedEffect
+            val restoreGeneration = sourceMutationGate.snapshot()
+            val restored = sourceRuntime.submit(restoreGeneration) { sourceAccess.restore() }
+                .await()
+                ?: run {
+                    sourceRestoreChecked = true
+                    return@LaunchedEffect
+                }
+            if (!sourceMutationGate.isCurrent(restoreGeneration)) {
+                sourceRestoreChecked = true
+                return@LaunchedEffect
+            }
+            when (restored) {
+                is SourceRestoreResult.Ready -> {
+                    // The FIFO restore and generation post-check make this durable result
+                    // authoritative. A recreated SavedState may still name source A when a
+                    // process-owned acquisition of B committed after the old Activity died.
+                    val switched = sourceUri?.toString() != restored.ref.uri
+                    sourceUri = Uri.parse(restored.ref.uri)
+                    sourceKind = SourceKind.valueOf(restored.ref.kind)
+                    sourceName = restored.ref.displayName
+                    sourceAuthorizationRequired = false
+                    if (switched) rotation = SourceRotation.NONE
+                    status = "source access restored"
+                    previewTick++
+                }
+                is SourceRestoreResult.NeedsAuthorization -> {
+                    sourceUri = Uri.parse(restored.ref.uri)
+                    sourceKind = SourceKind.valueOf(restored.ref.kind)
+                    sourceName = restored.ref.displayName
+                    sourceAuthorizationRequired = true
+                    status = "source access expired or file moved · choose it again"
+                }
+                is SourceRestoreResult.Invalid -> {
+                    // Clear in the process-owned scope as well: recreation must not cancel the
+                    // cleanup and leave the next Activity repeatedly restoring a poisoned record.
+                    sourceRuntime.submit(restoreGeneration) {
+                        runCatching { sourceAccess.clear() }
+                    }
+                        .await()
+                    if (sourceUri != null) sourceAuthorizationRequired = true
+                    status = "stored source was invalid · choose a file again"
+                }
+                SourceRestoreResult.None -> {
+                    if (sourceUri != null && sourceKind != SourceKind.DEMO) {
+                        sourceAuthorizationRequired = true
+                        status = "source access expired · choose the file again"
+                    }
+                }
+            }
+            sourceRestoreChecked = true
+        }
+
+        LaunchedEffect(sourceAuthorizationRequired, sourceKind) {
+            if (!sourceAuthorizationRequired) return@LaunchedEffect
+            snackbarHost.currentSnackbarData?.dismiss()
+            val result = snackbarHost.showSnackbar(
+                message = "Source access expired or the file moved",
+                actionLabel = "Choose again",
+                withDismissAction = true,
+                duration = SnackbarDuration.Indefinite,
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                if (sourceKind == SourceKind.RAW) {
+                    rawPicker.launch(arrayOf("*/*"))
+                } else {
+                    photoPicker.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                }
+            }
+        }
+
         // Decode the current source to a LinearImage capped to [maxEdge], applying the
         // EXIF orientation baseline THEN the user's manual rotate steps so imports appear
         // upright in both the preview and the export. The demo image has no EXIF.
@@ -716,96 +1267,82 @@ class MainActivity : ComponentActivity() {
         // LibRaw throw RawDecodeException; we fall back to the platform ImageDecoder
         // (display-referred) and flag a one-shot snackbar. EXIF is then applied to the
         // fallback bitmap too.
-        suspend fun loadSource(maxEdge: Int): LinearImage = withContext(Dispatchers.IO) {
-            val uri = sourceUri
-            // EXIF baseline read once from the original source stream.
-            val exif = if (uri != null && sourceKind != SourceKind.DEMO) {
-                readExifOrientation(ctx, uri)
-            } else {
-                ExifOrientation.NONE
+        fun currentSourceDecodeRequest(): SourceDecodeRequest = SourceDecodeRequest(
+            context = ctx.applicationContext,
+            uri = sourceUri,
+            kind = sourceKind,
+            authorizationRequired = sourceAuthorizationRequired,
+            rawWhiteBalance = state.rawWhiteBalance,
+            rawTemperature = state.rawTemperature,
+            rawTint = state.rawTint,
+            rotation = rotation,
+            creativeTemp = state.creativeWbTemp,
+            creativeTint = state.creativeWbTint,
+            balanceToFilmStock = state.balanceToFilmStock,
+            filmProfile = state.filmProfile,
+        )
+
+        suspend fun cachedSourceDecodeRequest(
+            cache: DecodedSourceCache,
+            maxEdge: Int,
+        ): CachedSourceDecodeRequest =
+            withContext(Dispatchers.Main.immediate) {
+                val decode = currentSourceDecodeRequest()
+                val filmBalance = if (
+                    decode.balanceToFilmStock &&
+                    FilmStockBalance.isMeaningful(decode.context, decode.filmProfile)
+                ) {
+                    decode.filmProfile
+                } else {
+                    ""
+                }
+                val cacheRequest = DecodedSourceCache.Request(
+                    uri = decode.uri?.toString(),
+                    kind = decode.kind.name,
+                    authorizationRequired = decode.authorizationRequired,
+                    whiteBalance = decode.rawWhiteBalance,
+                    temperature = decode.rawTemperature,
+                    tint = decode.rawTint,
+                    creativeTemp = decode.creativeTemp,
+                    creativeTint = decode.creativeTint,
+                    filmBalance = filmBalance,
+                    rotationDegrees = decode.rotation.degrees,
+                    maxEdge = maxEdge,
+                )
+                // Begin publication authority in the same main-thread turn as the snapshot. An
+                // older caller cannot resume later and reorder itself ahead of a newer UI state.
+                CachedSourceDecodeRequest(decode, cache.beginRequest(cacheRequest))
             }
-            // applyExifBaseline guards the RAW double-rotation case: LibRaw already
-            // uprights its linear output (it honours the DNG Orientation tag during
-            // dcraw_process), so applying the file's EXIF on top would double-rotate.
-            // The platform ImageDecoder fallback does NOT upright by default for DNG, so
-            // the fallback path opts back in.
-            var applyExifBaseline = sourceKind != SourceKind.RAW
-            val img = when (sourceKind) {
-                SourceKind.RAW -> try {
-                    decodeRawToLinear(
-                        ctx, uri!!, state.rawWhiteBalance,
-                        state.rawTemperature.toDouble(), state.rawTint.toDouble(), maxEdge,
-                    )
-                } catch (e: RawDecodeException) {
-                    when (e.status) {
-                        DecodeStatus.LOSSY_JPEG_DNG,
-                        DecodeStatus.FILE_UNSUPPORTED -> {
-                            // Compressed Expert-RAW DNG: platform decoder fallback, which
-                            // does NOT auto-upright DNGs -> apply the EXIF baseline.
-                            dngFallbackNotice = true
-                            applyExifBaseline = true
-                            decodeViaPlatform(ctx, uri!!, maxEdge)
-                        }
-                        else -> {
-                            // Any other LibRaw decode verdict: still try the downsampling
-                            // platform decoder rather than failing the load outright.
-                            dngFallbackNotice = true
-                            applyExifBaseline = true
-                            decodeViaPlatform(ctx, uri!!, maxEdge)
+
+        suspend fun loadSourceCached(
+            cache: DecodedSourceCache,
+            flight: SingleFlight<Unit>,
+            maxEdge: Int,
+            label: String,
+        ): DecodedSourceCache.Lease {
+            // Capture both the decoder inputs and cache identity in one main-thread snapshot.
+            // The detached lifecycle flight below must never re-read mutable Compose state.
+            val snapshot = cachedSourceDecodeRequest(cache, maxEdge)
+            val ticket = snapshot.ticket
+            cache.acquire(ticket)?.let { return it }
+            flight.run(ticket, scope) {
+                val existing = cache.acquire(ticket)
+                if (existing != null) {
+                    existing.close()
+                } else {
+                    val decoded = decodeSourceRequest(snapshot.decode, maxEdge)
+                    // publish() consumes the image even when this ticket became stale. An old
+                    // detached decode therefore cannot evict the newest source generation.
+                    val accepted = cache.publish(ticket, decoded.image)
+                    if (accepted && decoded.usedPlatformFallback) {
+                        withContext(Dispatchers.Main.immediate) {
+                            if (cache.isCurrent(ticket)) dngFallbackNotice = true
                         }
                     }
-                } catch (e: RuntimeException) {
-                    // Defensive: any other native decode failure on a DNG/RAW still tries
-                    // the platform decoder before giving up (e.g. an untyped error on a
-                    // lossy DNG with no typed status).
-                    dngFallbackNotice = true
-                    applyExifBaseline = true
-                    decodeViaPlatform(ctx, uri!!, maxEdge)
                 }
-                SourceKind.PHOTO -> decodeToLinearProPhoto(ctx, uri!!, maxEdge)
-                SourceKind.DEMO -> syntheticLinearImage(256)
             }
-            // EXIF baseline (when applicable) first, then the user's manual rotate steps.
-            val based = if (applyExifBaseline) img.applyExif(exif) else img
-            // Rotation is a measured cost (perf-lab §16.6/§16.9), so it gets a permanent
-            // breadcrumb rather than a local patch every time someone re-measures it.
-            // Logged HERE and not inside rotated(): Diag wraps android.util.Log, which
-            // throws in a plain JVM unit test, and RotationTest exercises rotated()
-            // directly. Dimensions are read before the call because rotated() closes its
-            // input.
-            val rotW = based.width
-            val rotH = based.height
-            val rotT0 = if (rotation == SourceRotation.NONE) 0L else System.currentTimeMillis()
-            val rotatedImg = based.rotated(rotation)
-            if (rotation != SourceRotation.NONE) {
-                Diag.i(
-                    "rotate ms=${System.currentTimeMillis() - rotT0} angle=${rotation.degrees} " +
-                        "${rotW}x$rotH workers=${defaultRotWorkers(rotW.toLong() * rotH)}"
-                )
-            }
-            rotatedImg.also {
-                // Creative white balance: bake a pre-engine Bradford CAT into the linear input here
-                // (parity-free — engine/spektra-core is untouched). No-op when neutral; it's part of
-                // the decode-cache key so a change re-decodes, like raw temp/tint.
-                if (!CreativeWhiteBalance.isNeutral(state.creativeWbTemp, state.creativeWbTint)) {
-                    CreativeWhiteBalance.applyInPlace(
-                        it.data, it.width * it.height,
-                        CreativeWhiteBalance.matrix(state.creativeWbTemp, state.creativeWbTint),
-                    )
-                }
-                // "Balance to film stock" (virtual 85-filter): adapt the D50 input to the film's reference
-                // illuminant so a tungsten stock renders neutral. Same parity-free bake as Creative WB;
-                // keyed on filmProfile + the toggle in the decode cache below. Gated on isMeaningful so
-                // daylight stocks (already neutral) are a true no-op — no shift, no extra decode.
-                if (state.balanceToFilmStock && FilmStockBalance.isMeaningful(ctx, state.filmProfile)) {
-                    CreativeWhiteBalance.applyInPlace(
-                        it.data, it.width * it.height,
-                        FilmStockBalance.matrix(ctx, state.filmProfile),
-                    )
-                }
-                // Breadcrumb: source KIND + result dims only (no URI/path — see Diag policy).
-                Diag.i("decode kind=${sourceKind.name} ${it.width}x${it.height} maxEdge=$maxEdge")
-            }
+            return cache.acquire(ticket)
+                ?: throw CancellationException("decoded $label source was superseded")
         }
 
         // PERF: proxy-source loader used ONLY by the interactive preview path. Consults the
@@ -813,42 +1350,19 @@ class MainActivity : ComponentActivity() {
         // RAW WB/temp/tint + manual rotation + target edge). On a hit we re-feed the SAME
         // cached LinearImage to the engine — proven safe because spk_simulate/_preview take
         // `const spk_image* in` and only read it (see DecodedSourceCache for the full proof),
-        // so no defensive copy is required. On a miss we run the full loadSource() decode and
+        // so no defensive copy is required. On a miss we run the captured decode request and
         // store the result, dropping any previous cached source (one entry only). When ONLY
         // look/film params change (the common case while editing sliders) the key is unchanged
         // and we skip the expensive LibRaw/bitmap decode + linearization + rotation entirely.
-        // EXPORT calls loadSource(EXPORT_MAX_EDGE_PX) directly — full-resolution, never cached;
-        // the 100% magnifier calls loadSource(MAX_EDGE_PX) (a capped whole-image load it then
-        // crops). Neither uses this preview cache.
-        suspend fun loadSourceCachedForPreview(maxEdge: Int): LinearImage {
-            // Profile id when "balance to film stock" is on (its CAT is baked into the decode), "" off.
-            val filmBalance =
-                if (state.balanceToFilmStock && FilmStockBalance.isMeaningful(ctx, state.filmProfile)) state.filmProfile else ""
-            fun cacheGet() = sourceCache.get(
-                uri = sourceUri?.toString(), kind = sourceKind.name,
-                whiteBalance = state.rawWhiteBalance, temperature = state.rawTemperature,
-                tint = state.rawTint, creativeTemp = state.creativeWbTemp, creativeTint = state.creativeWbTint,
-                filmBalance = filmBalance, rotationDegrees = rotation.degrees, maxEdge = maxEdge,
+        // EXPORT calls decodeSourceRequest(EXPORT_MAX_EDGE_PX) directly — full-resolution, never
+        // cached. The magnifier uses the separate zoom cache, so neither path uses this cache.
+        suspend fun loadSourceCachedForPreview(maxEdge: Int): DecodedSourceCache.Lease {
+            return loadSourceCached(
+                cache = sourceCache,
+                flight = previewDecodeFlight,
+                maxEdge = maxEdge,
+                label = "preview",
             )
-            cacheGet()?.let { return it }
-            // Single-flight the decode in the stable lifecycleScope so two renders that both miss
-            // (e.g. the settle pass + the GPU LUT bake) decode once, not twice.
-            val key = listOf(
-                sourceUri?.toString(), sourceKind.name, state.rawWhiteBalance,
-                state.rawTemperature, state.rawTint, state.creativeWbTemp, state.creativeWbTint,
-                filmBalance, rotation.degrees, maxEdge,
-            ).joinToString("|")
-            return previewDecodeFlight.run(key, scope) {
-                cacheGet() ?: loadSource(maxEdge).also { decoded ->
-                    sourceCache.put(
-                        uri = sourceUri?.toString(), kind = sourceKind.name,
-                        whiteBalance = state.rawWhiteBalance, temperature = state.rawTemperature,
-                        tint = state.rawTint, creativeTemp = state.creativeWbTemp, creativeTint = state.creativeWbTint,
-                        filmBalance = filmBalance, rotationDegrees = rotation.degrees, maxEdge = maxEdge,
-                        img = decoded,
-                    )
-                }
-            }
         }
 
         // PERF/OOM: cached counterpart of loadSourceCachedForPreview for the MAX_EDGE_PX zoom/
@@ -857,36 +1371,13 @@ class MainActivity : ComponentActivity() {
         // settle re-decoded it (LibRaw + 36MB managed alloc) and the pileup OOM'd the ART heap.
         // Same read-only-reuse proof as the preview cache (the engine treats `in` as const), so the
         // single cached LinearImage is safely re-fed to every crop.
-        suspend fun loadSourceCachedForZoom(maxEdge: Int): LinearImage {
-            // Profile id when "balance to film stock" is on (its CAT is baked into the decode), "" off.
-            val filmBalance =
-                if (state.balanceToFilmStock && FilmStockBalance.isMeaningful(ctx, state.filmProfile)) state.filmProfile else ""
-            fun cacheGet() = zoomSourceCache.get(
-                uri = sourceUri?.toString(), kind = sourceKind.name,
-                whiteBalance = state.rawWhiteBalance, temperature = state.rawTemperature,
-                tint = state.rawTint, creativeTemp = state.creativeWbTemp, creativeTint = state.creativeWbTint,
-                filmBalance = filmBalance, rotationDegrees = rotation.degrees, maxEdge = maxEdge,
+        suspend fun loadSourceCachedForZoom(maxEdge: Int): DecodedSourceCache.Lease {
+            return loadSourceCached(
+                cache = zoomSourceCache,
+                flight = zoomDecodeFlight,
+                maxEdge = maxEdge,
+                label = "zoom",
             )
-            cacheGet()?.let { return it }
-            // Single-flight the 2048px zoom/magnifier decode in the stable lifecycleScope: a
-            // cancelled ROI render's native LibRaw decode keeps running, so the next gesture awaits
-            // THAT decode instead of starting an overlapping one (the "5 decodes per pinch" drain).
-            val key = listOf(
-                sourceUri?.toString(), sourceKind.name, state.rawWhiteBalance,
-                state.rawTemperature, state.rawTint, state.creativeWbTemp, state.creativeWbTint,
-                filmBalance, rotation.degrees, maxEdge,
-            ).joinToString("|")
-            return zoomDecodeFlight.run(key, scope) {
-                cacheGet() ?: loadSource(maxEdge).also { decoded ->
-                    zoomSourceCache.put(
-                        uri = sourceUri?.toString(), kind = sourceKind.name,
-                        whiteBalance = state.rawWhiteBalance, temperature = state.rawTemperature,
-                        tint = state.rawTint, creativeTemp = state.creativeWbTemp, creativeTint = state.creativeWbTint,
-                        filmBalance = filmBalance, rotationDegrees = rotation.degrees, maxEdge = maxEdge,
-                        img = decoded,
-                    )
-                }
-            }
         }
 
         // 100% grain magnifier: render a real FULL-RESOLUTION crop around a tapped point.
@@ -901,32 +1392,66 @@ class MainActivity : ComponentActivity() {
         fun openMagnifier(nx: Float, ny: Float) {
             val e = engine ?: return
             magnifierJobRef.value?.cancel()
+            val renderSnapshot = state.captureInteractiveRenderSnapshot(previewTick)
+            val publicationTicket = magnifierPublicationGate.begin(renderSnapshot.renderKey)
             magnifierOpen = true
             magnifierBitmap = null
             magnifierRendering = true
             magnifierStatus = "rendering 100% crop…"
             magnifierJobRef.value = scope.launch {
+                var renderId = 0L
                 val result = runCatching {
-                    withContext(Dispatchers.Default) {
-                        val full = loadSourceCachedForZoom(MAX_EDGE_PX)
-                        val crop = cropLinearImage(full, nx, ny, MAGNIFIER_CROP_PX)
-                        // Effective film format so the crop's pixel_size_um matches the proxy it was
-                        // cut from (the crop spans only cropFrac of the frame). Without it the engine
-                        // treats the crop as a whole 35mm frame and grain/halation (µm-based) render
-                        // too weak even at 1:1. See toParams(filmFormatMmOverride).
-                        val cropFrac = maxOf(crop.width, crop.height).toFloat() /
-                            maxOf(full.width, full.height).coerceAtLeast(1)
-                        // SimResult holds a native off-heap buffer; close() frees it once the
-                        // bitmap copy is made.
-                        e.simulate(
-                            crop,
-                            state.toParams(filmFormatMmOverride = state.filmFormatMm * cropFrac),
-                        ).use { res ->
-                            simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
+                    withOwnedContext(
+                        context = Dispatchers.Default,
+                        dispose = { bitmap: Bitmap ->
+                            if (!bitmap.isRecycled) bitmap.recycle()
+                        },
+                    ) {
+                        loadSourceCachedForZoom(MAX_EDGE_PX).use { fullLease ->
+                            val full = fullLease.image
+                            cropLinearImage(full, nx, ny, MAGNIFIER_CROP_PX).use { crop ->
+                                // Effective film format so the crop's pixel_size_um matches the proxy it was
+                                // cut from (the crop spans only cropFrac of the frame). Without it the engine
+                                // treats the crop as a whole 35mm frame and grain/halation (µm-based) render
+                                // too weak even at 1:1. See toParams(filmFormatMmOverride).
+                                val cropFrac = maxOf(crop.width, crop.height).toFloat() /
+                                    maxOf(full.width, full.height).coerceAtLeast(1)
+                                // SimResult holds a native off-heap buffer; close() frees it once the
+                                // bitmap copy is made.
+                                runCancellableNative(
+                                    onLateResult = { late ->
+                                        late.reportOutcome(AppRenderOutcome.SUPERSEDED)
+                                        late.close()
+                                    },
+                                ) { cancellation ->
+                                    e.simulate(
+                                        crop,
+                                        renderSnapshot.paramsForCrop(cropFrac),
+                                        RenderKind.MAGNIFIER,
+                                        cancellation,
+                                    )
+                                }.use { res ->
+                                    renderId = res.renderId
+                                    simResultToBitmapGraded(
+                                        res,
+                                        renderSnapshot.cctfEncoded,
+                                        renderSnapshot.saturation,
+                                        renderSnapshot.vibrance,
+                                        renderSnapshot.gamutCompress,
+                                        renderSnapshot.localAdjustments,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                if (!isActive) {
+                if (
+                    !isActive || !magnifierPublicationGate.canPublish(
+                        publicationTicket,
+                        latestMagnifierRenderKey,
+                    )
+                ) {
+                    SimResult.reportOutcome(renderId, AppRenderOutcome.SUPERSEDED)
                     // Superseded by a newer tap (this job was cancelled): drop our render so
                     // it neither overwrites the latest request nor leaks an orphaned bitmap.
                     result.getOrNull()?.let { if (!it.isRecycled) it.recycle() }
@@ -934,8 +1459,10 @@ class MainActivity : ComponentActivity() {
                 }
                 result.onSuccess {
                     magnifierBitmap = it
+                    SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
                     magnifierStatus = "${it.width}×${it.height}px · 1:1 full-res render"
                 }.onFailure {
+                    SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
                     magnifierStatus = "crop render failed: ${it.message}"
                 }
                 magnifierRendering = false
@@ -952,56 +1479,109 @@ class MainActivity : ComponentActivity() {
             val e = engine ?: return
             if (cropOverlayOpen || maskOverlayOpen || sampleOverlayOpen || compareMode) return
             roiJobRef.value?.cancel()
+            val renderSnapshot = state.captureInteractiveRenderSnapshot(previewTick)
+            val roiPublicationTicket = roiPublicationGate.begin(renderSnapshot.renderKey)
             roiJobRef.value = scope.launch {
+                val pendingOutcomes = PendingRenderOutcomes()
                 val result = runCatching {
-                    val full = loadSourceCachedForZoom(MAX_EDGE_PX)
-                    val cw = (roi.wN * full.width).toInt().coerceAtLeast(8)
-                    val ch = (roi.hN * full.height).toInt().coerceAtLeast(8)
-                    val crop = withContext(Dispatchers.Default) {
-                        cropLinearImageRect(full, roi.cxN, roi.cyN, cw, ch)
+                    loadSourceCachedForZoom(MAX_EDGE_PX).use { fullLease ->
+                        val full = fullLease.image
+                        val cw = (roi.wN * full.width).toInt().coerceAtLeast(8)
+                        val ch = (roi.hN * full.height).toInt().coerceAtLeast(8)
+                        withOwnedContext(
+                            context = Dispatchers.Default,
+                            dispose = LinearImage::close,
+                        ) {
+                            cropLinearImageRect(full, roi.cxN, roi.cyN, cw, ch)
+                        }.use { crop ->
+                            // Effective film format so the crop's pixel_size_um matches the proxy (the crop
+                            // spans only cropFrac of the frame); keeps grain/halation at the right strength
+                            // when zoomed instead of treating the crop as a whole frame.
+                            val cropFrac = maxOf(crop.width, crop.height).toFloat() /
+                                maxOf(full.width, full.height).coerceAtLeast(1)
+                            suspend fun renderAt(edge: Int): Pair<Bitmap, Long> =
+                                withOwnedContext(
+                                    context = Dispatchers.Default,
+                                    dispose = { rendered: Pair<Bitmap, Long> ->
+                                        if (!rendered.first.isRecycled) rendered.first.recycle()
+                                    },
+                                ) {
+                                    runCancellableNative(
+                                        onLateResult = { late ->
+                                            late.reportOutcome(AppRenderOutcome.SUPERSEDED)
+                                            late.close()
+                                        },
+                                    ) { cancellation ->
+                                        e.simulatePreview(
+                                            crop,
+                                            renderSnapshot.paramsForCrop(
+                                                cropFraction = cropFrac,
+                                                previewMaxSize = edge,
+                                            ),
+                                            RenderKind.ROI,
+                                            cancellation,
+                                        )
+                                    }.use { res ->
+                                        pendingOutcomes.add(res.renderId)
+                                        simResultToBitmapGraded(
+                                            res,
+                                            renderSnapshot.cctfEncoded,
+                                            renderSnapshot.saturation,
+                                            renderSnapshot.vibrance,
+                                            renderSnapshot.gamutCompress,
+                                            renderSnapshot.localAdjustments,
+                                        ) to res.renderId
+                                    }
+                                }
+                            // DRAFT pass: a fast low-res sharp crop so the zoomed region resolves ~5x sooner,
+                            // then refine to ROI_RENDER_MAX_PX. Every bitmap is published (then owned by the
+                            // DisposableEffect(roiOverlay), which recycles the prior one) OR recycled here —
+                            // so a cancel mid-flight never leaks one.
+                            val (draft, draftRenderId) = renderAt(ROI_DRAFT_MAX_PX)
+                            if (
+                                isActive && roiPublicationGate.canPublish(
+                                    roiPublicationTicket,
+                                    latestRoiRenderKey,
+                                )
+                            ) {
+                                roiOverlay = RoiOverlay(draft, roi.cxN, roi.cyN, roi.wN, roi.hN)
+                                pendingOutcomes.resolve(draftRenderId, AppRenderOutcome.CONSUMED)
+                            } else {
+                                pendingOutcomes.resolveAll(AppRenderOutcome.SUPERSEDED)
+                                if (!draft.isRecycled) draft.recycle()
+                                return@runCatching null
+                            }
+                            renderAt(ROI_RENDER_MAX_PX)
+                        }
                     }
-                    // Effective film format so the crop's pixel_size_um matches the proxy (the crop
-                    // spans only cropFrac of the frame); keeps grain/halation at the right strength
-                    // when zoomed instead of treating the crop as a whole frame.
-                    val cropFrac = maxOf(crop.width, crop.height).toFloat() /
-                        maxOf(full.width, full.height).coerceAtLeast(1)
-                    suspend fun renderAt(edge: Int): Bitmap = withContext(Dispatchers.Default) {
-                        e.simulatePreview(
-                            crop,
-                            state.toParams(
-                                previewMaxSizeOverride = edge,
-                                filmFormatMmOverride = state.filmFormatMm * cropFrac,
-                            ),
-                        ).use { res -> simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments) }
-                    }
-                    // DRAFT pass: a fast low-res sharp crop so the zoomed region resolves ~5x sooner,
-                    // then refine to ROI_RENDER_MAX_PX. Every bitmap is published (then owned by the
-                    // DisposableEffect(roiOverlay), which recycles the prior one) OR recycled here —
-                    // so a cancel mid-flight never leaks one.
-                    val draft = renderAt(ROI_DRAFT_MAX_PX)
-                    if (isActive) {
-                        roiOverlay = RoiOverlay(draft, roi.cxN, roi.cyN, roi.wN, roi.hN)
-                    } else {
-                        if (!draft.isRecycled) draft.recycle()
-                        return@runCatching null
-                    }
-                    renderAt(ROI_RENDER_MAX_PX)
                 }
-                if (!isActive) {
+                if (
+                    !isActive || !roiPublicationGate.canPublish(
+                        roiPublicationTicket,
+                        latestRoiRenderKey,
+                    )
+                ) {
+                    pendingOutcomes.resolveAll(AppRenderOutcome.SUPERSEDED)
                     // Superseded (cancelled): drop the final render (the draft, if published, stays
                     // and is recycled by the DisposableEffect when the next overlay replaces it).
-                    result.getOrNull()?.let { if (!it.isRecycled) it.recycle() }
+                    result.getOrNull()?.first?.let { if (!it.isRecycled) it.recycle() }
                     return@launch
                 }
                 // On success publish the sharp final; the prior overlay (the draft) is recycled by
                 // the DisposableEffect(roiOverlay) below. On failure keep the scaled proxy.
-                result.onSuccess { bmp ->
-                    if (bmp != null) roiOverlay = RoiOverlay(bmp, roi.cxN, roi.cyN, roi.wN, roi.hN)
+                result.onSuccess { rendered ->
+                    rendered?.let { (bmp, renderId) ->
+                        roiOverlay = RoiOverlay(bmp, roi.cxN, roi.cyN, roi.wN, roi.hN)
+                        pendingOutcomes.resolve(renderId, AppRenderOutcome.CONSUMED)
+                    }
+                }.onFailure {
+                    pendingOutcomes.resolveAll(AppRenderOutcome.FAILED)
                 }
             }
         }
 
         fun clearRoi() {
+            roiPublicationGate.invalidate()
             roiJobRef.value?.cancel()
             roiOverlay = null  // bitmap recycled by DisposableEffect(roiOverlay)
         }
@@ -1027,17 +1607,19 @@ class MainActivity : ComponentActivity() {
         // Live DRAFT pass — the Lightroom-style render-system "port": on EVERY edit (a slider drag,
         // a preset/dropdown/toggle, a rotation), paint a small fast proxy so the image tracks the
         // change in ~hundreds of ms instead of sitting on the stale frame until the full settle
-        // render lands ~1s later. Conflated (snapshotFlow.collect, NOT collectLatest): an in-flight
-        // draft is never cancelled — it finishes, then immediately re-renders the latest params
-        // (snapshotFlow conflates the bumps that arrived meanwhile), giving back-to-back updates.
+        // render lands ~1s later. A new revision cancels the prior coroutine; native cancellation
+        // cooperates where supported, and the publication ticket rejects any late return.
         // Cheap by construction: it renders ONLY when the full-edge proxy is already decoded (a
         // cache peek — never decodes here, so it cannot race the settle pass's first decode) and
         // just asks the engine for a smaller DRAFT_RENDER_MAX_PX pass. Quiet: it touches only
         // `preview`, never status/previewBusy; the crisp full pass still lands on settle below.
-        LaunchedEffect(Unit) {
-            snapshotFlow { previewTick }.collect {
-                val e = engine ?: return@collect
-                if (cropOverlayOpen || maskOverlayOpen || sampleOverlayOpen || compareMode) return@collect
+        LaunchedEffect(previewTick) {
+                val publicationTicket = publicationGate.begin(
+                    previewRevision,
+                    RenderPublicationPriority.DRAFT,
+                )
+                val e = engine ?: return@LaunchedEffect
+                if (cropOverlayOpen || maskOverlayOpen || sampleOverlayOpen || compareMode) return@LaunchedEffect
                 // Lightroom's ICBSliderTrackingBegin/End gate. `interacting` has been
                 // written by SliderInteraction since the widget shipped but was never
                 // read, so the draft pass fired on EVERY edit — including discrete ones
@@ -1047,7 +1629,7 @@ class MainActivity : ComponentActivity() {
                 //
                 // Reading it here is what the widget's own doc comment always described:
                 // draft while a slider is actually moving, straight to crisp otherwise.
-                if (!interacting.value) return@collect
+                if (!interacting.value) return@LaunchedEffect
                 val fullEdge = state.previewMaxSize.coerceAtLeast(256)
                 // Grade-only edit? Re-grade the retained full-quality settle result in
                 // pure Kotlin — zero native work, and it beats a low-res draft on quality.
@@ -1059,9 +1641,17 @@ class MainActivity : ComponentActivity() {
                                 state.saturation, state.vibrance, state.gamutCompress,
                                 state.localAdjustments)
                         }
-                    }.onSuccess { bmp -> withContext(Dispatchers.Main) { preview = bmp } }
+                    }.onSuccess { bmp ->
+                        withContext(Dispatchers.Main) {
+                            if (publicationGate.tryClaim(publicationTicket)) {
+                                preview = bmp
+                            } else if (!bmp.isRecycled) {
+                                bmp.recycle()
+                            }
+                        }
+                    }
                         .onFailure { Diag.w("render mode=draft failed: ${it.message}") }
-                    return@collect
+                    return@LaunchedEffect
                 }
                 // Progressive ladder rung. The edge is a setting rather than a constant
                 // so the coarse/fine trade can be swept on a real device: lower = the
@@ -1069,24 +1659,51 @@ class MainActivity : ComponentActivity() {
                 // to what the settle pass will show. Defaults to DRAFT_RENDER_MAX_PX, so
                 // an untouched install renders exactly as before.
                 val draftEdge = minOf(settings.draftRenderMaxPx, fullEdge)
-                if (draftEdge >= fullEdge) return@collect       // no meaningful step-down to draft
-                val proxy = sourceCache.get(
-                    uri = sourceUri?.toString(), kind = sourceKind.name,
-                    whiteBalance = state.rawWhiteBalance, temperature = state.rawTemperature,
-                    tint = state.rawTint, creativeTemp = state.creativeWbTemp, creativeTint = state.creativeWbTint,
-                    filmBalance = if (state.balanceToFilmStock && FilmStockBalance.isMeaningful(ctx, state.filmProfile)) state.filmProfile else "",
-                    rotationDegrees = rotation.degrees, maxEdge = fullEdge,
-                ) ?: return@collect                             // proxy not cached yet — settle owns the decode
-                runCatching {
-                    withContext(Dispatchers.Default) {
-                        e.simulatePreview(
-                            proxy,
-                            state.toParams(previewMaxSizeOverride = draftEdge, skipGrainHalation = true),
-                        ).use { res -> simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments) }
+                if (draftEdge >= fullEdge) return@LaunchedEffect // no meaningful step-down to draft
+                val proxyRequest = cachedSourceDecodeRequest(sourceCache, fullEdge)
+                val proxyLease = sourceCache.acquire(
+                    proxyRequest.ticket,
+                ) ?: return@LaunchedEffect                      // proxy not cached yet — settle owns the decode
+                var renderId = 0L
+                val draftResult = proxyLease.use { lease ->
+                    runCatching {
+                        withContext(Dispatchers.Default) {
+                            runCancellableNative(
+                                onLateResult = { late ->
+                                    late.reportOutcome(AppRenderOutcome.SUPERSEDED)
+                                    late.close()
+                                },
+                            ) { cancellation ->
+                                e.simulatePreview(
+                                    lease.image,
+                                    state.toParams(previewMaxSizeOverride = draftEdge, skipGrainHalation = true),
+                                    cancellation = cancellation,
+                                )
+                            }.use { res ->
+                                renderId = res.renderId
+                                simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
+                            }
+                        }
                     }
-                }.onSuccess { bmp -> withContext(Dispatchers.Main) { preview = bmp } }
-                    .onFailure { Diag.w("render mode=draft failed: ${it.message}") }
-            }
+                }
+                if (!isActive || !publicationGate.tryClaim(publicationTicket)) {
+                    SimResult.reportOutcome(renderId, AppRenderOutcome.SUPERSEDED)
+                    draftResult.getOrNull()?.let { if (!it.isRecycled) it.recycle() }
+                    return@LaunchedEffect
+                }
+                draftResult.onSuccess { bmp ->
+                    try {
+                        withContext(Dispatchers.Main) { preview = bmp }
+                        SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
+                    } catch (cancelled: CancellationException) {
+                        SimResult.reportOutcome(renderId, AppRenderOutcome.SUPERSEDED)
+                        if (!bmp.isRecycled) bmp.recycle()
+                        throw cancelled
+                    }
+                }.onFailure {
+                    SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
+                    Diag.w("render mode=draft failed: ${it.message}")
+                }
         }
 
         // Crisp FINAL preview render on settle: re-runs whenever params, source or rotation
@@ -1100,6 +1717,10 @@ class MainActivity : ComponentActivity() {
             // then get cancelled mid-flight on the next edit ("coroutine scope left the
             // composition" in the logcat) — wasted all-core CPU that drains battery.
             delay(500)
+            val publicationTicket = publicationGate.begin(
+                previewRevision,
+                RenderPublicationPriority.SETTLE,
+            )
             previewBusy = true
             renderErr = null
             status = "rendering preview…"
@@ -1110,16 +1731,21 @@ class MainActivity : ComponentActivity() {
             val cacheKey = gradeCacheKey(fullEdge)
             val cached = gradeCache.lookup(cacheKey)
             val prevBefore = beforePreview
+            var renderId = 0L
             val result = runCatching {
                 withContext(Dispatchers.Default) {
                     if (cached != null && prevBefore != null) {
                         // Grade-only edit (identical engine inputs): re-grade the retained
                         // pristine engine result — ZERO native work. The ungraded `before`
                         // is unchanged by construction.
-                        prevBefore to gradeBufferToBitmap(cached.scratchCopy(), cached.width,
-                            cached.height, cached.colorSpace, state.savingCctfEncoding,
-                            state.saturation, state.vibrance, state.gamutCompress,
-                            state.localAdjustments)
+                        Triple(
+                            prevBefore,
+                            gradeBufferToBitmap(cached.scratchCopy(), cached.width,
+                                cached.height, cached.colorSpace, state.savingCctfEncoding,
+                                state.saturation, state.vibrance, state.gamutCompress,
+                                state.localAdjustments),
+                            false,
+                        )
                     } else {
                         decoding = true
                         // The live DRAFT effect above already paints a fast low-res proxy during the
@@ -1127,32 +1753,70 @@ class MainActivity : ComponentActivity() {
                         // coarse pass / extra fresh decode). Cached proxy source — re-decodes only when
                         // a decode-affecting key (URI/kind/WB/temp/tint/rotation/edge) changed;
                         // look-param edits reuse it.
-                        val image = loadSourceCachedForPreview(fullEdge)
-                        decoding = false
-                        val before = linearToDisplayBitmap(image)
-                        // Fit preview skips grain/halation (the user's "grain at 100%" choice): they
-                        // are rendered by the zoom ROI, the magnifier and export, never the fit settle.
-                        // Render with cacheKey.engineParams — the exact snapshot the key hashed.
-                        val after = e.simulatePreview(image, cacheKey.engineParams).use { res ->
-                            // Retain the PRISTINE engine output BEFORE the grade mutates res.data.
-                            gradeCache.store(cacheKey, res.data, res.width, res.height, res.colorSpace)
-                            simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
+                        loadSourceCachedForPreview(fullEdge).use { lease ->
+                            decoding = false
+                            val before = linearToDisplayBitmap(lease.image)
+                            // Fit preview skips grain/halation (the user's "grain at 100%" choice): they
+                            // are rendered by the zoom ROI, the magnifier and export, never the fit settle.
+                            // Render with cacheKey.engineParams — the exact snapshot the key hashed.
+                            val after = runCancellableNative(
+                                onLateResult = { late ->
+                                    late.reportOutcome(AppRenderOutcome.SUPERSEDED)
+                                    late.close()
+                                },
+                            ) { cancellation ->
+                                e.simulatePreview(
+                                    lease.image,
+                                    cacheKey.engineParams,
+                                    cancellation = cancellation,
+                                )
+                            }.use { res ->
+                                renderId = res.renderId
+                                // Retain the PRISTINE engine output BEFORE the grade mutates it.
+                                res.acquireDataLease().use { lease ->
+                                    val data = lease.data
+                                    gradeCache.store(
+                                        cacheKey,
+                                        data,
+                                        res.width,
+                                        res.height,
+                                        res.colorSpace,
+                                    )
+                                }
+                                simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
+                            }
+                            Triple(before, after, true)
                         }
-                        before to after
                     }
                 }
             }
             decoding = false
-            result.onSuccess { (before, after) ->
+            if (!isActive || !publicationGate.tryClaim(publicationTicket)) {
+                SimResult.reportOutcome(renderId, AppRenderOutcome.SUPERSEDED)
+                result.getOrNull()?.let { (before, after, ownsBefore) ->
+                    if (!after.isRecycled) after.recycle()
+                    if (ownsBefore && !before.isRecycled) before.recycle()
+                }
+                return@LaunchedEffect
+            }
+            result.onSuccess { (before, after, _) ->
                 beforePreview = before; preview = after
+                SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
                 lastRenderMs = System.currentTimeMillis() - renderStart
                 Diag.i("render mode=preview ${after.width}x${after.height} ${after.width * after.height}px ${lastRenderMs}ms")
                 renderErr = null
                 status = "preview ready"
             }.onFailure {
+                SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
                 Diag.w("render mode=preview failed after ${System.currentTimeMillis() - renderStart}ms: ${it.message}")
-                renderErr = it.message?.take(60)
-                status = "preview error: ${it.message}"
+                if (sourceKind != SourceKind.DEMO && it.isSourceAuthorizationFailure()) {
+                    sourceAuthorizationRequired = true
+                    renderErr = "source authorization required"
+                    status = "source access expired or file moved · choose it again"
+                } else {
+                    renderErr = it.message?.take(60)
+                    status = "preview error: ${it.message}"
+                }
             }
             previewBusy = false
         }
@@ -1162,37 +1826,83 @@ class MainActivity : ComponentActivity() {
         // path. The proxy decode is a cache hit (the main effect already loaded it), so this
         // adds only the LUT bake. Cancelled/replaced cleanly when previewTick advances.
         LaunchedEffect(previewTick, gpuEnabled) {
-            if (!gpuEnabled) { gpuLut = null; gpuProxy = null; gpuGain = 1f; return@LaunchedEffect }
+            if (!gpuEnabled) {
+                gpuLut = null
+                gpuProxyLease?.close()
+                gpuProxyLease = null
+                gpuGain = 1f
+                return@LaunchedEffect
+            }
             val e = engine ?: return@LaunchedEffect
             delay(380)
-            runCatching {
-                withContext(Dispatchers.Default) {
-                    val img = loadSourceCachedForPreview(state.previewMaxSize.coerceAtLeast(256))
-                    val params = state.toParams()
-                    // SHAPER_SRGB is REQUIRED here, not optional: LutGpuPreview's shader
-                    // always indexes through the sRGB transfer, so a LUT baked on the linear
-                    // lattice would be sampled at the wrong cell entirely — mid-grey 0.18
-                    // looking up at 0.46, i.e. overexposed and flat. The only unshaped bake
-                    // is the user-facing .cube export, which no shader consumes.
-                    val lut = CubeLut.parse(
-                        e.bakeCubeLut(params, 33, SpektraEngine.SHAPER_SRGB)
-                    )
-                    // The bake emits the pointwise transform at UNITY gain (a 3D LUT
-                    // cannot carry auto-exposure), so meter the SAME proxy through the
-                    // engine's own metering and hand the gain to the shader. Without it
-                    // the GPU preview renders dark with lifted shadows — the scene lands
-                    // in the film curve's toe. Metering is cheap next to the bake.
-                    val gain = e.exposureGain(img, params)
-                    Triple(img, lut, gain)
+            val gpuMaxEdge = state.previewMaxSize.coerceAtLeast(256)
+            val gpuParams = state.toParams()
+            var lutRenderId = 0L
+            val bakeResult = runCatching {
+                withOwnedContext(
+                    context = Dispatchers.Default,
+                    dispose = { submission: Triple<DecodedSourceCache.Lease, CubeLut?, Float> ->
+                        submission.first.close()
+                    },
+                ) {
+                    val lease = loadSourceCachedForPreview(gpuMaxEdge)
+                    try {
+                        // SHAPER_SRGB is REQUIRED here, not optional: LutGpuPreview's shader
+                        // always indexes through the sRGB transfer, so a LUT baked on the linear
+                        // lattice would be sampled at the wrong cell entirely — mid-grey 0.18
+                        // looking up at 0.46, i.e. overexposed and flat. The only unshaped bake
+                        // is the user-facing .cube export, which no shader consumes.
+                        val bake = runCancellableNative(
+                            onLateResult = { late ->
+                                late.reportOutcome(AppRenderOutcome.SUPERSEDED)
+                            },
+                        ) { cancellation ->
+                            e.bakeCubeLut(
+                                gpuParams,
+                                33,
+                                SpektraEngine.SHAPER_SRGB,
+                                cancellation,
+                            )
+                        }
+                        lutRenderId = bake.renderId
+                        val lut = CubeLut.parse(bake.text)
+                        // The bake emits the pointwise transform at UNITY gain (a 3D LUT
+                        // cannot carry auto-exposure), so meter the SAME proxy through the
+                        // engine's own metering and hand the gain to the shader. Without it
+                        // the GPU preview renders dark with lifted shadows — the scene lands
+                        // in the film curve's toe. Metering is cheap next to the bake.
+                        val gain = runCancellableNative { cancellation ->
+                            e.exposureGain(lease.image, gpuParams, cancellation)
+                        }
+                        Triple(lease, lut, gain)
+                    } catch (failure: Throwable) {
+                        lease.close()
+                        throw failure
+                    }
                 }
-            }.onSuccess { (img, lut, gain) ->
+            }
+            if (!isActive) {
+                SimResult.reportOutcome(lutRenderId, AppRenderOutcome.SUPERSEDED)
+                bakeResult.getOrNull()?.first?.close()
+                return@LaunchedEffect
+            }
+            bakeResult.onSuccess { (lease, lut, gain) ->
                 if (lut != null) {
-                    gpuProxy = img; gpuLut = lut; gpuGain = gain
+                    val previous = gpuProxyLease
+                    gpuProxyLease = lease
+                    previous?.close()
+                    gpuLut = lut; gpuGain = gain
+                    SimResult.reportOutcome(lutRenderId, AppRenderOutcome.CONSUMED)
                     Diag.i("gpu lut baked ${lut.size}^3 gain=%.3f — fit preview runs on GPU".format(gain))
                 } else {
+                    lease.close()
+                    SimResult.reportOutcome(lutRenderId, AppRenderOutcome.FAILED)
                     Diag.w("gpu lut parse failed -> CPU preview")
                 }
-            }.onFailure { Diag.w("gpu lut bake failed: ${it.message} -> CPU preview") }
+            }.onFailure {
+                SimResult.reportOutcome(lutRenderId, AppRenderOutcome.FAILED)
+                Diag.w("gpu lut bake failed: ${it.message} -> CPU preview")
+            }
         }
 
         // MEMORY (#2): `preview` and `beforePreview` are intentionally LEFT TO GC, not recycled
@@ -1252,32 +1962,63 @@ class MainActivity : ComponentActivity() {
         // right — but a grade-only edit never fired this effect, so it was not
         // persisted until some other change happened to save it along the way.
         LaunchedEffect(snapshot, recipeKey, recipeReady, defaultsJson, rotation,
+            recipeWriteBlockedKey, recipeWritableKey,
             state.rawWhiteBalance, state.rawTemperature, state.rawTint,
             state.creativeWbTemp, state.creativeWbTint, state.balanceToFilmStock,
             state.localAdjustments,
             state.saturation, state.vibrance, state.gamutCompress) {
             if (!recipeReady || recipeKey == null) return@LaunchedEffect
+            if (recipeWritableKey != recipeKey) return@LaunchedEffect
+            if (recipeWriteBlockedKey == recipeKey) return@LaunchedEffect
+            val autosaveEpoch = recipeEditEpoch.snapshot()
             delay(700)
+            if (!recipeEditEpoch.isCurrent(autosaveEpoch)) return@LaunchedEffect
+            if (recipeWritableKey != recipeKey) return@LaunchedEffect
+            if (recipeWriteBlockedKey == recipeKey) return@LaunchedEffect
             val current = runCatching { Presets.toJsonString(state) }.getOrNull()
             // A non-NONE manual rotation is itself an edit worth persisting, even when the
             // params are otherwise default — so only treat as "pristine" if rotation is NONE.
             if (current != null && current == defaultsJson && rotation == SourceRotation.NONE) {
-                // exists() is a file stat — keep it off main with the delete.
-                withContext(Dispatchers.IO) {
-                    if (Recipes.exists(ctx, recipeKey)) Recipes.delete(ctx, recipeKey)
+                val pendingDelete = RecipeWorkRuntime.submit {
+                    Recipes.delete(ctx, recipeKey)
+                }
+                try {
+                    pendingDelete.await()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    Diag.w("pristine recipe delete failed: ${failure.message}")
+                    status = "could not clear saved recipe"
+                    return@LaunchedEffect
                 }
                 hasRecipe = false
                 return@LaunchedEffect
             }
-            runCatching {
+            val saved = try {
                 // Reuse the main-thread serialization from above (torn-snapshot safety);
                 // only the envelope build + file write cross to IO.
                 val paramsJson = current ?: Presets.toJsonString(state)
-                withContext(Dispatchers.IO) {
-                    Recipes.saveJson(ctx, recipeKey, paramsJson, sourceName, rotation.degrees)
+                val savedSourceName = sourceName
+                val savedRotationDegrees = rotation.degrees
+                val pendingSave = RecipeWorkRuntime.submit {
+                    val expectedGeneration = Recipes.generation(recipeKey)
+                    Recipes.saveJson(
+                        ctx,
+                        recipeKey,
+                        paramsJson,
+                        savedSourceName,
+                        savedRotationDegrees,
+                        expectedGeneration,
+                    )
                 }
-            }.onSuccess { hasRecipe = true }
-                .onFailure { Diag.w("recipe auto-save failed: ${it.message}") }
+                pendingSave.await()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                Diag.w("recipe auto-save failed: ${failure.message}")
+                return@LaunchedEffect
+            }
+            if (saved) hasRecipe = true
         }
 
         // --- Undo/redo capture (debounced coalescing) ---
@@ -1586,29 +2327,44 @@ class MainActivity : ComponentActivity() {
                                     val e = engine ?: return@PresetPanel
                                     bakingLut = true; status = "baking ${if (clf) "CLF" else ".cube"} LUT…"
                                     scope.launch {
+                                        var lutRenderId = 0L
                                         val r = runCatching {
                                             withContext(Dispatchers.Default) {
                                                 // UNSHAPED, deliberately: this file goes to
                                                 // other software, and a .cube carries no
                                                 // shaper metadata — it must stay in the
                                                 // linear domain it advertises.
-                                                val cube = e.bakeCubeLut(
-                                                    state.toParams(), size,
-                                                    SpektraEngine.SHAPER_NONE,
-                                                )
+                                                val bake = runCancellableNative(
+                                                    onLateResult = { late ->
+                                                        late.reportOutcome(AppRenderOutcome.CANCELLED)
+                                                    },
+                                                ) { cancellation ->
+                                                    e.bakeCubeLut(
+                                                        state.toParams(),
+                                                        size,
+                                                        SpektraEngine.SHAPER_NONE,
+                                                        cancellation,
+                                                    )
+                                                }
+                                                lutRenderId = bake.renderId
                                                 if (clf) {
-                                                    val lut = CubeLut.parse(cube) ?: error("baked LUT could not be parsed")
+                                                    val lut = CubeLut.parse(bake.text) ?: error("baked LUT could not be parsed")
                                                     val film = StockCatalog.displayName(ctx, state.filmProfile)
                                                     val print = StockCatalog.displayName(ctx, state.printProfile)
                                                     ClfWriter.write(lut, title = "$film / $print")
                                                 } else {
-                                                    cube
+                                                    bake.text
                                                 }
                                             }
                                         }
                                         bakingLut = false
+                                        if (!isActive) {
+                                            SimResult.reportOutcome(lutRenderId, AppRenderOutcome.CANCELLED)
+                                            return@launch
+                                        }
                                         r.onSuccess { text ->
                                             pendingLutText = text
+                                            SimResult.reportOutcome(lutRenderId, AppRenderOutcome.CONSUMED)
                                             val fileName = lutFileName(
                                                 StockCatalog.displayName(ctx, state.filmProfile),
                                                 StockCatalog.displayName(ctx, state.printProfile),
@@ -1617,6 +2373,7 @@ class MainActivity : ComponentActivity() {
                                             runCatching { lutExporter.launch(fileName) }
                                                 .onFailure { status = "could not open save dialog: ${it.message}" }
                                         }.onFailure {
+                                            SimResult.reportOutcome(lutRenderId, AppRenderOutcome.FAILED)
                                             status = "LUT bake failed: ${it.message}"
                                             Toast.makeText(ctx, "LUT bake failed: ${it.message}", Toast.LENGTH_LONG).show()
                                         }
@@ -1630,6 +2387,18 @@ class MainActivity : ComponentActivity() {
                                 showHistogram = showHistogram,
                                 onToggleHistogram = { showHistogram = !showHistogram },
                                 hasRecipe = hasRecipe,
+                                needsAuthorization = sourceAuthorizationRequired,
+                                onReauthorize = {
+                                    if (sourceKind == SourceKind.RAW) {
+                                        rawPicker.launch(arrayOf("*/*"))
+                                    } else {
+                                        photoPicker.launch(
+                                            PickVisualMediaRequest(
+                                                ActivityResultContracts.PickVisualMedia.ImageOnly,
+                                            ),
+                                        )
+                                    }
+                                },
                                 onPickPhoto = {
                                     photoPicker.launch(
                                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
@@ -1637,15 +2406,63 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onOpenRaw = { rawPicker.launch(arrayOf("*/*")) },
                                 onUseDemo = {
+                                    val selectionGeneration = sourceMutationGate.begin()
                                     sourceUri = null; sourceKind = SourceKind.DEMO
                                     sourceName = "synthetic demo image"; rotation = SourceRotation.NONE
+                                    sourceAuthorizationRequired = false
+                                    // Deliberately do not attach durable clearing to lifecycleScope:
+                                    // a rotation after this tap must not let the old source reappear.
+                                    val pendingClear = sourceRuntime.submitReconciled(selectionGeneration) {
+                                        sourceAccess.clear()
+                                    }
+                                    scope.launch {
+                                        val outcome = pendingClear.await() ?: return@launch
+                                        if (!sourceMutationGate.isCurrent(selectionGeneration)) {
+                                            return@launch
+                                        }
+                                        when (outcome) {
+                                            is ReconciledSourceMutation.Applied -> {
+                                                status = "demo image"
+                                            }
+                                            is ReconciledSourceMutation.Rejected -> {
+                                                Diag.w("source clear failed: ${outcome.failure.message}")
+                                                reconcileVisibleSourceAfterFailure(outcome.durableState)
+                                                snackbarHost.currentSnackbarData?.dismiss()
+                                                snackbarHost.showSnackbar(
+                                                    "Could not clear the previous source; its state was restored.",
+                                                    withDismissAction = true,
+                                                )
+                                            }
+                                        }
+                                    }
                                     previewTick++
                                 },
                                 onResetEdits = {
+                                    // Invalidate every pre-reset debounce synchronously. A save that
+                                    // was already submitted is FIFO-before delete; one not submitted
+                                    // yet sees this epoch change and cannot queue behind delete.
+                                    recipeEditEpoch.invalidate()
+                                    // Submit before attaching a UI waiter: recreation can cancel the
+                                    // waiter, never the durable delete or its position before restore.
+                                    val pendingDelete = RecipeWorkRuntime.submit {
+                                        Recipes.delete(ctx, recipeKey)
+                                    }
                                     scope.launch {
-                                        // Recipe file delete off-main; the state resets that
-                                        // follow run back on the main thread.
-                                        withContext(Dispatchers.IO) { Recipes.delete(ctx, recipeKey) }
+                                        try {
+                                            pendingDelete.await()
+                                        } catch (cancelled: CancellationException) {
+                                            throw cancelled
+                                        } catch (failure: Throwable) {
+                                            Diag.w("explicit recipe reset delete failed: ${failure.message}")
+                                            status = "could not clear saved recipe"
+                                            snackbarHost.currentSnackbarData?.dismiss()
+                                            snackbarHost.showSnackbar(
+                                                "Saved recipe could not be cleared; edits were not reset",
+                                            )
+                                            return@launch
+                                        }
+                                        recipeWriteBlockedKey = null
+                                        recipeWritableKey = recipeKey
                                         Recipes.resetToDefaults(state, settings, profiles)
                                         presetBaseJson = null; presetFullJson = null; presetAmount = 1f
                                         hasRecipe = false; rotation = SourceRotation.NONE
@@ -1772,10 +2589,11 @@ class MainActivity : ComponentActivity() {
                             // and solve the WB that neutralizes it. Off the main thread (decode + crop).
                             scope.launch {
                                 runCatching {
-                                    val full = loadSourceCachedForZoom(MAX_EDGE_PX)
-                                    val avg = withContext(Dispatchers.Default) {
-                                        val crop = cropLinearImageRect(full, nx, ny, 5, 5)
-                                        try { avgRgb(crop) } finally { crop.close() }
+                                    val avg = loadSourceCachedForZoom(MAX_EDGE_PX).use { fullLease ->
+                                        withContext(Dispatchers.Default) {
+                                            val crop = cropLinearImageRect(fullLease.image, nx, ny, 5, 5)
+                                            try { avgRgb(crop) } finally { crop.close() }
+                                        }
                                     }
                                     CreativeWhiteBalance.solveNeutral(
                                         avg.first, avg.second, avg.third,
@@ -1812,6 +2630,12 @@ class MainActivity : ComponentActivity() {
                 ExportMask(
                     done = exportDone,
                     onDismiss = { exporting = false; exportDone = false },
+                    onCancel = {
+                        val running = exportRuntimeState as? ExportRuntimeState.Running
+                        if (running != null && ExportWorkRuntime.cancel(running.runId)) {
+                            status = "cancelling export"
+                        }
+                    },
                 )
             }
 
@@ -1830,6 +2654,17 @@ class MainActivity : ComponentActivity() {
                 ) {
                     runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
                 }
+                if (showExportSheet &&
+                    Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                    ContextCompat.checkSelfPermission(
+                        ctx,
+                        android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    runCatching {
+                        legacyStoragePermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    }
+                }
             }
 
             // --- Lightroom-style export options sheet ---
@@ -1844,7 +2679,21 @@ class MainActivity : ComponentActivity() {
                     keepGps = exportKeepGps,
                     onKeepGpsChange = { exportKeepGps = it },
                     onDismiss = { showExportSheet = false },
-                    onExport = {
+                    onExport = export@{
+                        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                            ContextCompat.checkSelfPermission(
+                                ctx,
+                                android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            runCatching {
+                                legacyStoragePermission.launch(
+                                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                                )
+                            }
+                            status = "grant storage access, then tap Export again"
+                            return@export
+                        }
                         val e = engine
                         showExportSheet = false
                         if (e != null) {
@@ -1867,27 +2716,32 @@ class MainActivity : ComponentActivity() {
                             val exportStartMs = System.currentTimeMillis()
                             Diag.i("export start format=${exportFmt.name}")
                             exporting = true; exportDone = false; status = "rendering full resolution…"
-                            // Keep the process alive across the whole render: a long
-                            // backgrounded export is a kill candidate for Samsung's
-                            // device-health manager, and the service takes oom_score_adj
-                            // from 700 to 50. It does NOT recover the ~4x background
-                            // slowdown — no service-tier cpuset on the measured device
-                            // contains the prime cores. See ExportForegroundService.
-                            ExportForegroundService.start(ctx)
-                            // Phase accumulators live out here so the reconciliation can be
-                            // printed next to `ok in`, using the SAME total. Everything from
-                            // exportStartMs to the final log is in exactly one bucket, and the
-                            // leftover is printed as `residual` rather than left for a reader
-                            // to compute — the earlier version closed its last phase before
-                            // res.close() and the coroutine unwind, so it undershot by design.
-                            var phSetup = 0L
-                            var phDecode = 0L
-                            var phExif = 0L
-                            var phSim = 0L
-                            var phGrade = 0L
-                            var phEnc = 0L
-                            scope.launch {
-                                val result = runCatching {
+                            val exportContext = ctx.applicationContext
+                            val exportParams = state.toParams()
+                            val exportCctf = state.savingCctfEncoding
+                            val exportSaturation = state.saturation
+                            val exportVibrance = state.vibrance
+                            val exportGamutCompress = state.gamutCompress
+                            val exportAdjustments = state.localAdjustments.toList()
+                            val exportJpegQuality = exportOptions.jpegQuality
+                            val exportSourceUri = sourceUri
+                            val exportDecodeRequest = currentSourceDecodeRequest()
+                            val launched = ExportWorkRuntime.launch(
+                                context = exportContext,
+                                format = exportFmt,
+                                startedAtMillis = exportStartMs,
+                            ) {
+                                var phSetup = 0L
+                                var phDecode = 0L
+                                var phExif = 0L
+                                var phSim = 0L
+                                var phGrade = 0L
+                                var phEnc = 0L
+                                var renderId = 0L
+                                val destinationCommit = ExportCommitLinearization()
+                                var previewCandidate: Bitmap? = null
+                                try {
+                                    val bitmap =
                                     withContext(Dispatchers.Default) {
                                         // Full-res off-heap buffers (the OOM fix) — close input/result promptly.
                                         // Phase breadcrumbs: the engine's own `stage timings` line
@@ -1900,14 +2754,24 @@ class MainActivity : ComponentActivity() {
                                         // IPC round trip and the coroutine dispatch hops.
                                         val tDecode0 = System.currentTimeMillis()
                                         phSetup = tDecode0 - exportStartMs
-                                        val image = loadSource(EXPORT_MAX_EDGE_PX)
+                                        val image = decodeSourceRequest(
+                                            exportDecodeRequest,
+                                            EXPORT_MAX_EDGE_PX,
+                                        ).image
                                         phDecode = System.currentTimeMillis() - tDecode0
                                         if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
                                             // Export the decoded scene-linear INPUT (before the film
                                             // engine) as a 32-bit float TIFF; the engine is skipped.
                                             val tEnc0 = System.currentTimeMillis()
                                             try {
-                                                withContext(Dispatchers.IO) { saveLinearInputAsTiff32f(ctx, image, baseName) }
+                                                withContext(Dispatchers.IO) {
+                                                    saveLinearInputAsTiff32f(
+                                                        exportContext,
+                                                        image,
+                                                        baseName,
+                                                        onCommitted = destinationCommit::markPublished,
+                                                    )
+                                                }
                                             } finally {
                                                 image.close()
                                             }
@@ -1918,37 +2782,90 @@ class MainActivity : ComponentActivity() {
                                             // A full EXIF read of a ~25 MB RAW plus two thread-pool
                                             // hops — its own phase, not silently between two others.
                                             val tExif0 = System.currentTimeMillis()
-                                            val srcExif = withContext(Dispatchers.IO) { readSourceExif(ctx, sourceUri, keepGps = keepGps) }
+                                            val srcExif = withContext(Dispatchers.IO) {
+                                                readSourceExif(exportContext, exportSourceUri, keepGps = keepGps)
+                                            }
                                             phExif = System.currentTimeMillis() - tExif0
-                                            // `simulate` is the engine PLUS its JNI marshalling: the
-                                            // input close below, and the ~140 MB result malloc +
-                                            // NewDirectByteBuffer that spektra_jni.cpp performs AFTER
-                                            // it prints `stage timings`. So this always exceeds the
-                                            // sum of that line, and a gap of a few hundred ms is the
-                                            // expected null result, not a boundary problem.
+                                            // `simulate` is the engine plus JNI marshalling and the
+                                            // ~140 MB result allocation/wrap. #163's outer native
+                                            // timing now covers that whole boundary; this Kotlin phase
+                                            // additionally includes the input close below and dispatch
+                                            // bookkeeping, so a small positive gap remains expected.
                                             val tSim0 = System.currentTimeMillis()
                                             val res = try {
-                                                e.simulate(image, state.toParams())
+                                                runCancellableNative(
+                                                    onLateResult = { late ->
+                                                        late.reportOutcome(AppRenderOutcome.CANCELLED)
+                                                        late.close()
+                                                    },
+                                                ) { cancellation ->
+                                                    e.simulate(
+                                                        image,
+                                                        exportParams,
+                                                        RenderKind.EXPORT,
+                                                        cancellation,
+                                                    )
+                                                }.also { renderId = it.renderId }
                                             } finally {
                                                 image.close()
                                             }
                                             phSim = System.currentTimeMillis() - tSim0
                                             try {
                                                 val tGrade0 = System.currentTimeMillis()
-                                                val bmp0 = simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
-                                                // Post-render downscale for the bitmap formats (high-bit-depth
-                                                // is always full-res → longEdge null). Free the full-res bitmap.
-                                                val bmp = longEdge?.let { edge ->
-                                                    scaleBitmapToLongEdge(bmp0, edge).also { if (it !== bmp0) bmp0.recycle() }
-                                                } ?: bmp0
+                                                 val bmp0 = simResultToBitmapGraded(
+                                                    res,
+                                                    exportCctf,
+                                                    exportSaturation,
+                                                    exportVibrance,
+                                                    exportGamutCompress,
+                                                     exportAdjustments,
+                                                 )
+                                                 // Take ownership immediately. If downscaling or any
+                                                 // pre-commit step throws, the outer failure path recycles it.
+                                                 previewCandidate = bmp0
+                                                 // Post-render downscale for the bitmap formats (high-bit-depth
+                                                 // is always full-res → longEdge null). Free the full-res bitmap.
+                                                 val bmp = longEdge?.let { edge ->
+                                                     scaleBitmapToLongEdge(bmp0, edge).also { scaled ->
+                                                         if (scaled !== bmp0) {
+                                                             previewCandidate = scaled
+                                                             runCatching { bmp0.recycle() }
+                                                         }
+                                                     }
+                                                 } ?: bmp0
+                                                 previewCandidate = bmp
                                                 phGrade = System.currentTimeMillis() - tGrade0
                                                 val tEnc0 = System.currentTimeMillis()
                                                 withContext(Dispatchers.IO) {
                                                     when (exportFmt) {
-                                                        ExportFormat.TIFF -> saveSimResultAsTiff(ctx, res, displayName = baseName)
-                                                        ExportFormat.TIFF32F -> saveSimResultAsTiff(ctx, res, displayName = baseName, float32 = true)
-                                                        ExportFormat.PNG16 -> saveSimResultAsPng16(ctx, res, displayName = baseName)
-                                                        else -> saveToGallery(ctx, bmp, exportFmt, exportOptions.jpegQuality, srcExif, displayName = baseName)
+                                                        ExportFormat.TIFF -> saveSimResultAsTiff(
+                                                            exportContext,
+                                                            res,
+                                                            displayName = baseName,
+                                                            onCommitted = destinationCommit::markPublished,
+                                                        )
+                                                        ExportFormat.TIFF32F -> saveSimResultAsTiff(
+                                                            exportContext,
+                                                            res,
+                                                            displayName = baseName,
+                                                            float32 = true,
+                                                            onCommitted = destinationCommit::markPublished,
+                                                        )
+                                                        ExportFormat.PNG16 -> saveSimResultAsPng16(
+                                                            exportContext,
+                                                            res,
+                                                            displayName = baseName,
+                                                            onCommitted = destinationCommit::markPublished,
+                                                        )
+                                                        else -> saveToGallery(
+                                                            exportContext,
+                                                            bmp,
+                                                            exportFmt,
+                                                            exportJpegQuality,
+                                                            srcExif,
+                                                            displayName = baseName,
+                                                            onCommitted = destinationCommit::markPublished,
+                                                        )
                                                     }
                                                 }
                                                 phEnc = System.currentTimeMillis() - tEnc0
@@ -1958,30 +2875,80 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
                                     }
-                                }
-                                result.onSuccess { bmp ->
-                                    bmp?.let { preview = it }
+                                    val retainedBitmap = runCatching {
+                                        bitmap?.let { full ->
+                                            scaleBitmapToLongEdge(full, 2_048).also { proxy ->
+                                                if (proxy !== full) full.recycle()
+                                            }
+                                        }
+                                    }.getOrElse {
+                                        runCatching { bitmap?.recycle() }
+                                        null
+                                    }
+                                    runCatching {
+                                        SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
+                                    }
                                     val totalMs = System.currentTimeMillis() - exportStartMs
-                                    val accounted = phSetup + phDecode + phExif + phSim + phGrade + phEnc
-                                    Diag.i(
-                                        "export phases ms: setup=$phSetup decode=$phDecode exif=$phExif " +
-                                            "simulate=$phSim grade=$phGrade encode=$phEnc " +
-                                            "residual=${totalMs - accounted} total=$totalMs"
+                                    ExportTerminalOutcome.Success(
+                                        format = exportFmt,
+                                        renderId = renderId,
+                                        bitmap = retainedBitmap,
+                                        totalMs = totalMs,
+                                        phases = ExportPhaseSnapshot(
+                                            setupMs = phSetup,
+                                            decodeMs = phDecode,
+                                            exifMs = phExif,
+                                            simulateMs = phSim,
+                                            gradeMs = phGrade,
+                                            encodeMs = phEnc,
+                                        ),
                                     )
-                                    Diag.i("export format=${exportFmt.name} ok in ${totalMs}ms")
-                                    exportDone = true
-                                    status = "saved to Pictures/Spektrafilm"
-                                }.onFailure {
-                                    Diag.w("export format=${exportFmt.name} failed after ${System.currentTimeMillis() - exportStartMs}ms: ${it.message}")
-                                    exporting = false
-                                    status = "export failed: ${it.message}"
-                                    Toast.makeText(ctx, "Export failed: ${it.message}", Toast.LENGTH_LONG).show()
+                                } catch (failure: Throwable) {
+                                    if (destinationCommit.isPublished) {
+                                        // Publication is the transaction's linearization point.
+                                        // Preview scaling, native telemetry, close/unwind, or outcome
+                                        // construction failures after it can never turn success into a
+                                        // retryable failure/duplicate export.
+                                        runCatching { previewCandidate?.recycle() }
+                                        runCatching {
+                                            SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
+                                        }
+                                        ExportTerminalOutcome.Success(
+                                            format = exportFmt,
+                                            renderId = renderId,
+                                            bitmap = null,
+                                            totalMs = System.currentTimeMillis() - exportStartMs,
+                                            phases = ExportPhaseSnapshot(
+                                                setupMs = phSetup,
+                                                decodeMs = phDecode,
+                                                exifMs = phExif,
+                                                simulateMs = phSim,
+                                                gradeMs = phGrade,
+                                                encodeMs = phEnc,
+                                            ),
+                                        )
+                                     } else {
+                                        runCatching { previewCandidate?.recycle() }
+                                        if (failure is CancellationException) {
+                                            SimResult.reportOutcome(renderId, AppRenderOutcome.CANCELLED)
+                                            ExportTerminalOutcome.Cancelled(
+                                                format = exportFmt,
+                                                renderId = renderId,
+                                                elapsedMs = System.currentTimeMillis() - exportStartMs,
+                                            )
+                                        } else {
+                                            SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
+                                            ExportTerminalOutcome.Failure(
+                                                format = exportFmt,
+                                                renderId = renderId,
+                                                elapsedMs = System.currentTimeMillis() - exportStartMs,
+                                                cause = failure,
+                                            )
+                                        }
+                                     }
                                 }
-                            }.invokeOnCompletion {
-                                // Covers success, failure AND cancellation: if the activity goes
-                                // away mid-export the ongoing notification must go with it.
-                                ExportForegroundService.stop(ctx)
                             }
+                            if (launched == null) status = "an export is already running"
                         }
                     },
                 )
@@ -2748,6 +3715,8 @@ class MainActivity : ComponentActivity() {
         showHistogram: Boolean,
         onToggleHistogram: () -> Unit,
         hasRecipe: Boolean,
+        needsAuthorization: Boolean,
+        onReauthorize: () -> Unit,
         onPickPhoto: () -> Unit,
         onOpenRaw: () -> Unit,
         onUseDemo: () -> Unit,
@@ -2756,6 +3725,16 @@ class MainActivity : ComponentActivity() {
         Text("Source: $sourceName", style = MaterialTheme.typography.bodySmall)
         Text(status, style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (needsAuthorization) {
+            Button(onClick = onReauthorize, modifier = Modifier.fillMaxWidth()) {
+                Text("Choose source again")
+            }
+            Text(
+                "The previous permission expired, was revoked, or the file moved. Your recipe is kept.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = onPickPhoto, modifier = Modifier.weight(1f)) { Text("Pick photo") }
             Button(onClick = onOpenRaw, modifier = Modifier.weight(1f)) { Text("Open RAW/DNG") }
@@ -2798,7 +3777,11 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ExportMask(done: Boolean, onDismiss: () -> Unit) {
+    private fun ExportMask(
+        done: Boolean,
+        onDismiss: () -> Unit,
+        onCancel: () -> Unit,
+    ) {
         Box(
             Modifier
                 .fillMaxSize()
@@ -2814,6 +3797,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 if (!done) {
                     CircularProgressIndicator(color = Color.White)
+                    Button(onClick = onCancel) { Text("Cancel export") }
                     Text(
                         "Rendering at full resolution…",
                         color = Color.White,
@@ -2887,7 +3871,7 @@ class MainActivity : ComponentActivity() {
                 "Apply the hanatos2025 bandpass adaptation window when reconstructing spectra.")
             SwitchRow("hanatos2025 adaptation surface", s.adaptationSurface, { s.adaptationSurface = it },
                 "Apply the hanatos2025 surface adaptation polynomial when reconstructing spectra.")
-            EnhancedSlider("Spectral gaussian blur", s.spectralGaussianBlur, 0f..20f,
+            EnhancedSlider("Spectral gaussian blur", s.spectralGaussianBlur, OperationalParamLimits.SPECTRAL_GAUSSIAN_BLUR,
                 { s.spectralGaussianBlur = it }, step = 0.1f, decimals = 1,
                 tooltip = "Gaussian blur sigma applied to the reconstructed spectra (spectral-axis " +
                     "samples; each sample is 5 nm). 0 = off.", default = PARAM_DEFAULTS.spectralGaussianBlur)
@@ -2897,7 +3881,7 @@ class MainActivity : ComponentActivity() {
             TripleSlider("IR filter", s.filterIr, 0f..800f, { s.filterIr = it }, step = 1f, decimals = 0,
                 tooltip = "Filter IR light (amplitude, wavelength cutoff nm, sigma nm).",
                 componentLabels = Triple("amp", "λ", "σ"), default = PARAM_DEFAULTS.filterIr)
-            EnhancedSlider("Upscale factor", s.upscaleFactor, 0f..4f, { s.upscaleFactor = it },
+            EnhancedSlider("Upscale factor", s.upscaleFactor, OperationalParamLimits.UPSCALE_FACTOR, { s.upscaleFactor = it },
                 step = 0.5f, decimals = 1, tooltip = "Scale image size up to increase resolution", default = PARAM_DEFAULTS.upscaleFactor)
             // Crop is now an interactive overlay (see the crop button under the
             // preview). Upscale stays a slider: it is a resolution multiplier, not
@@ -3091,7 +4075,7 @@ class MainActivity : ComponentActivity() {
                         onAutoExposureChange = { s.autoExposure = it },
                         onMethodChange = { s.autoExposureMethod = it },
                     )
-                    EnhancedSlider("Film format mm", s.filmFormatMm, 8f..120f, { s.filmFormatMm = it },
+                    EnhancedSlider("Film format mm", s.filmFormatMm, OperationalParamLimits.FILM_FORMAT_MM, { s.filmFormatMm = it },
                         step = 1f, decimals = 0,
                         tooltip = "Long edge of the film format in mm (8, 16, 35, 60, 120)", default = PARAM_DEFAULTS.filmFormatMm)
                     EnhancedSlider("Camera lens blur um", s.cameraLensBlurUm, 0f..20f, { s.cameraLensBlurUm = it },
@@ -3270,21 +4254,21 @@ class MainActivity : ComponentActivity() {
             onEnabledChange = { s.grainActive = it }, help = ParamHelpText.forKey(ParamHelpText.GRAIN)) {
             var advanced by remember { mutableStateOf(false) }
             // Basic: the two knobs most users reach for — grain size (ISO) and softness.
-            EnhancedSlider("Particle area um2", s.grainParticleAreaUm2, 0f..2f, { s.grainParticleAreaUm2 = it },
+            EnhancedSlider("Particle area um2", s.grainParticleAreaUm2, OperationalParamLimits.GRAIN_PARTICLE_AREA_UM2, { s.grainParticleAreaUm2 = it },
                 step = 0.2f, decimals = 2, tooltip = "Area of particles in um2, relates to ISO.", default = PARAM_DEFAULTS.grainParticleAreaUm2)
             EnhancedSlider("Blur", s.grainBlur, 0f..3f, { s.grainBlur = it }, step = 0.05f, decimals = 2,
                 tooltip = "Sigma of gaussian blur in pixels for the grain.", default = PARAM_DEFAULTS.grainBlur)
             AdvancedToggle(advanced) { advanced = it }
             if (advanced) {
                 SwitchRow("Sublayers active", s.grainSublayersActive, { s.grainSublayersActive = it })
-                TripleSlider("Particle scale", s.grainParticleScale, 0f..5f, { s.grainParticleScale = it },
+                TripleSlider("Particle scale", s.grainParticleScale, OperationalParamLimits.GRAIN_PARTICLE_SCALE, { s.grainParticleScale = it },
                     step = 0.1f, decimals = 2, tooltip = "Scale of particle area for the RGB layers.",
                     default = PARAM_DEFAULTS.grainParticleScale)
-                TripleSlider("Particle scale layers", s.grainParticleScaleLayers, 0f..5f,
+                TripleSlider("Particle scale layers", s.grainParticleScaleLayers, OperationalParamLimits.GRAIN_PARTICLE_SCALE_LAYERS,
                     { s.grainParticleScaleLayers = it }, step = 0.25f, decimals = 2,
                     tooltip = "Scale of particle area for the sublayers in each color layer.",
                     default = PARAM_DEFAULTS.grainParticleScaleLayers)
-                TripleSlider("Density min", s.grainDensityMin, 0f..0.5f, { s.grainDensityMin = it },
+                TripleSlider("Density min", s.grainDensityMin, OperationalParamLimits.GRAIN_DENSITY_MIN, { s.grainDensityMin = it },
                     step = 0.01f, decimals = 3, tooltip = "Minimum density of the grain (0.03-0.06).",
                     default = PARAM_DEFAULTS.grainDensityMin)
                 TripleSlider("Uniformity", s.grainUniformity, 0.5f..1f, { s.grainUniformity = it },
@@ -3295,7 +4279,7 @@ class MainActivity : ComponentActivity() {
                 PairSlider("Micro structure", s.grainMicroStructure, 0f..100f, { s.grainMicroStructure = it },
                     step = 0.1f, decimals = 2, tooltip = "[sigma blur um, molecular clump size nm]",
                     componentLabels = "σ" to "nm", default = PARAM_DEFAULTS.grainMicroStructure)
-                IntSlider("Sublayers", s.grainNSubLayers, 1..5, { s.grainNSubLayers = it },
+                IntSlider("Sublayers", s.grainNSubLayers, OperationalParamLimits.GRAIN_SUBLAYERS, { s.grainNSubLayers = it },
                     default = PARAM_DEFAULTS.grainNSubLayers)
             }
             Divider()
@@ -3375,7 +4359,7 @@ class MainActivity : ComponentActivity() {
                 TripleSlider("First sigma um", s.halFirstSigmaUm, 0f..200f, { s.halFirstSigmaUm = it },
                     step = 1f, decimals = 1, tooltip = "Sigma of the first halation bounce per channel, in um.",
                     default = PARAM_DEFAULTS.halFirstSigmaUm)
-                IntSlider("N bounces", s.halNBounces, 1..5, { s.halNBounces = it },
+                IntSlider("N bounces", s.halNBounces, OperationalParamLimits.HALATION_BOUNCES, { s.halNBounces = it },
                     tooltip = "Number of multi-bounce Gaussians summed (typical 2-3).",
                     default = PARAM_DEFAULTS.halNBounces)
                 EnhancedSlider("Bounce decay", s.halBounceDecay, 0f..1f, { s.halBounceDecay = it },
@@ -3505,12 +4489,18 @@ class MainActivity : ComponentActivity() {
 
 /** Average RGB (0..1) of a small LinearImage crop — the WB eyedropper's sampled neutral. */
 private fun avgRgb(img: com.spectrafilm.engine.LinearImage): Triple<Float, Float, Float> {
-    val f = img.data.duplicate().order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
-    val n = (img.width * img.height).coerceAtLeast(1)
-    var r = 0f; var g = 0f; var b = 0f
-    for (i in 0 until n) { val k = i * 3; r += f.get(k); g += f.get(k + 1); b += f.get(k + 2) }
-    val inv = 1f / n
-    return Triple(r * inv, g * inv, b * inv)
+    return img.acquireDataLease().use { lease ->
+        val data = lease.data
+        val f = data.asFloatBuffer()
+        val n = (img.width * img.height).coerceAtLeast(1)
+        var r = 0f; var g = 0f; var b = 0f
+        for (i in 0 until n) {
+            val k = i * 3
+            r += f.get(k); g += f.get(k + 1); b += f.get(k + 2)
+        }
+        val inv = 1f / n
+        Triple(r * inv, g * inv, b * inv)
+    }
 }
 
 @Composable

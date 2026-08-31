@@ -15,15 +15,18 @@ import android.net.Uri
 
 /** Project + author links used by Settings / About / onboarding. */
 object Links {
-    const val SOURCE = "https://github.com/thetechgeekko/Spectrafilmandroid/"
-    const val ISSUES = "https://github.com/thetechgeekko/Spectrafilmandroid/issues"
-    const val NEW_ISSUE = "https://github.com/thetechgeekko/Spectrafilmandroid/issues/new"
+    const val SOURCE = "https://github.com/thetechgeekko/Spektrafilm-android/"
+    const val RELEASES = "https://github.com/thetechgeekko/Spektrafilm-android/releases"
+    const val ISSUES = "https://github.com/thetechgeekko/Spektrafilm-android/issues"
+    const val NEW_ISSUE = "https://github.com/thetechgeekko/Spektrafilm-android/issues/new"
     const val AUTHOR_INSTAGRAM = "https://www.instagram.com/akshay.pool/"
     const val AUTHOR_YOUTUBE = "https://www.youtube.com/@Akshayishere/videos"
     const val SPEKTRAFILM = "https://github.com/Spektrafilm"
     const val IMAGE_TOOLBOX = "https://github.com/T8RIN/ImageToolbox"
     const val COLOUR_SCIENCE = "https://www.colour-science.org/"
     const val LIBRAW = "https://www.libraw.org/"
+    const val LIBRAW_SOURCE = "https://github.com/LibRaw/LibRaw"
+    const val LIBRAW_0222_ARCHIVE = "https://www.libraw.org/data/LibRaw-0.22.2.tar.gz"
     const val PIXLS = "https://pixls.us/"
     const val GPLV3 = "https://www.gnu.org/licenses/gpl-3.0.html"
 

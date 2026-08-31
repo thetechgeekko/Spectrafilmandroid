@@ -16,6 +16,7 @@ package com.spectrafilm.app
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CancellationException
 import kotlin.math.abs
 
 object CreativeWhiteBalance {
@@ -123,22 +124,40 @@ object CreativeWhiteBalance {
      * pixels (native byte order, matching the engine's JNI view). No clamping — the spectral
      * upsampler handles the small out-of-[0,1] excursions, as the RAW-WB path does.
      */
-    fun applyInPlace(data: ByteBuffer, pixelCount: Int, m: FloatArray) {
-        val dup = data.duplicate()
-        dup.clear()
-        dup.order(ByteOrder.nativeOrder())
-        val f = dup.asFloatBuffer()
+    fun applyInPlace(
+        data: ByteBuffer,
+        pixelCount: Int,
+        m: FloatArray,
+        isCancelled: () -> Boolean = { false },
+    ) {
+        require(data.isDirect) { "creative white balance requires a direct buffer" }
+        require(pixelCount >= 0) { "pixelCount must be non-negative" }
+        require(m.size >= 9) { "creative white-balance matrix requires 9 values" }
+        val requiredBytes = pixelCount.toLong() * 3L * Float.SIZE_BYTES
+        require(requiredBytes <= Int.MAX_VALUE) {
+            "creative white-balance buffer is too large: $requiredBytes bytes"
+        }
+        val logical = data.duplicate().order(ByteOrder.nativeOrder())
+        require(logical.remaining().toLong() >= requiredBytes) {
+            "creative white-balance buffer is truncated: ${logical.remaining()} < $requiredBytes"
+        }
+        logical.limit(logical.position() + requiredBytes.toInt())
+        val f = logical.slice().order(ByteOrder.nativeOrder()).asFloatBuffer()
         val m0 = m[0]; val m1 = m[1]; val m2 = m[2]
         val m3 = m[3]; val m4 = m[4]; val m5 = m[5]
         val m6 = m[6]; val m7 = m[7]; val m8 = m[8]
         var i = 0
-        repeat(pixelCount) {
+        repeat(pixelCount) { pixel ->
+            if ((pixel and 1023) == 0 && isCancelled()) {
+                throw CancellationException("creative white balance cancelled")
+            }
             val r = f.get(i); val gv = f.get(i + 1); val b = f.get(i + 2)
             f.put(i, m0 * r + m1 * gv + m2 * b)
             f.put(i + 1, m3 * r + m4 * gv + m5 * b)
             f.put(i + 2, m6 * r + m7 * gv + m8 * b)
             i += 3
         }
+        if (isCancelled()) throw CancellationException("creative white balance cancelled")
     }
 
     /**

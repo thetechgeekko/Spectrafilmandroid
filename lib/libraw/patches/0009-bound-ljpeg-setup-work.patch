@@ -1,0 +1,92 @@
+diff --git a/libraw/libraw_internal.h b/libraw/libraw_internal.h
+--- a/libraw/libraw_internal.h
++++ b/libraw/libraw_internal.h
+@@ -253,6 +253,7 @@ struct tiff_ifd_t
+ struct jhead
+ {
+   int algo, bits, high, wide, clrs, sraw, psv, restart, vpred[6];
++  unsigned setup_work_units;
+   ushort quant[64], idct[64], *huff[20], *free[20], *row;
+ };
+ 
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -314,6 +314,7 @@ int LibRaw::ljpeg_start(struct jhead *jh, int info_only)
+     if (segment_length < 2)
+       return reject_segment();
+     len = segment_length - 2;
++    jh->setup_work_units += segment_length + 2U;
+     if (tag <= 0xff00)
+       return reject_segment();
+     if (fread(data, 1, len, ifp) != len)
+@@ -354,9 +355,12 @@ int LibRaw::ljpeg_start(struct jhead *jh, int info_only)
+           seen_table[c] = true;
+           size_t leaves = 0;
+           int available_codes = 1;
++          int max_code_length = 0;
+           for (int code_length = 0; code_length < 16; ++code_length)
+           {
+             leaves += probe[code_length];
++            if (probe[code_length])
++              max_code_length = code_length + 1;
+             available_codes = available_codes * 2 - probe[code_length];
+             if (available_codes < 0)
+               return reject_segment();
+@@ -365,6 +369,7 @@ int LibRaw::ljpeg_start(struct jhead *jh, int info_only)
+           if (!leaves || leaves > 256 ||
+               leaves > static_cast<size_t>(dht_end - probe))
+             return reject_segment();
++          jh->setup_work_units += 2U << max_code_length;
+           probe += leaves;
+         }
+         for (dp = data; dp < dht_end;)
+diff --git a/src/decoders/dng.cpp b/src/decoders/dng.cpp
+--- a/src/decoders/dng.cpp
++++ b/src/decoders/dng.cpp
+@@ -103,6 +103,7 @@ void LibRaw::lossless_dng_load_raw()
+       INT64(sizeof(ushort));
+   remaining_ljpeg_samples = MAX(remaining_ljpeg_samples, minimum_ljpeg_samples);
+   remaining_ljpeg_samples = MIN(remaining_ljpeg_samples, memory_ljpeg_samples);
++  INT64 remaining_ljpeg_setup_units = remaining_ljpeg_samples * 2;
+ 
+   while (trow < raw_height)
+   {
+@@ -121,6 +122,13 @@ void LibRaw::lossless_dng_load_raw()
+       fseek(ifp, get4(), SEEK_SET);
+     if (!ljpeg_start(&jh, 0))
+       break;
++    if (jh.setup_work_units > remaining_ljpeg_setup_units)
++    {
++      ljpeg_end(&jh);
++      shot_select = ss;
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    }
++    remaining_ljpeg_setup_units -= jh.setup_work_units;
+     const INT64 jpeg_samples =
+         INT64(jh.wide) * INT64(jh.high) * INT64(jh.clrs);
+     if (jpeg_samples < 1 || jpeg_samples > remaining_ljpeg_samples)
+diff --git a/src/decoders/decoders_libraw_dcrdefs.cpp b/src/decoders/decoders_libraw_dcrdefs.cpp
+--- a/src/decoders/decoders_libraw_dcrdefs.cpp
++++ b/src/decoders/decoders_libraw_dcrdefs.cpp
+@@ -149,6 +149,7 @@ void LibRaw::sony_ljpeg_load_raw()
+       INT64(sizeof(ushort));
+   remaining_ljpeg_samples = MAX(remaining_ljpeg_samples, minimum_ljpeg_samples);
+   remaining_ljpeg_samples = MIN(remaining_ljpeg_samples, memory_ljpeg_samples);
++  INT64 remaining_ljpeg_setup_units = remaining_ljpeg_samples * 2;
+ 
+   while (trow < raw_height)
+   {
+@@ -164,6 +165,12 @@ void LibRaw::sony_ljpeg_load_raw()
+       fseek(ifp, get4(), SEEK_SET);
+     if (!ljpeg_start(&jh, 0))
+       break;
++    if (jh.setup_work_units > remaining_ljpeg_setup_units)
++    {
++      ljpeg_end(&jh);
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    }
++    remaining_ljpeg_setup_units -= jh.setup_work_units;
+     if (jh.clrs != 4)
+     {
+       ljpeg_end(&jh);

@@ -1,0 +1,192 @@
+diff --git a/internal/var_defines.h b/internal/var_defines.h
+--- a/internal/var_defines.h
++++ b/internal/var_defines.h
+@@ -1,6 +1,8 @@
+ /* -*- C++ -*-
+  * File: var_defines.h
+  * Copyright 2008-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  * Created: Sat Mar  8, 2008
+  *
+  * LibRaw redefinitions of dcraw internal variables
+diff --git a/libraw/libraw_const.h b/libraw/libraw_const.h
+--- a/libraw/libraw_const.h
++++ b/libraw/libraw_const.h
+@@ -1,6 +1,8 @@
+ /* -*- C++ -*-
+  * File: libraw_const.h
+  * Copyright 2008-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  * Created: Sat Mar  8 , 2008
+  * LibRaw error codes
+ LibRaw is free software; you can redistribute it and/or modify
+diff --git a/libraw/libraw_internal.h b/libraw/libraw_internal.h
+--- a/libraw/libraw_internal.h
++++ b/libraw/libraw_internal.h
+@@ -1,6 +1,8 @@
+ /* -*- C++ -*-
+  * File: libraw_internal.h
+  * Copyright 2008-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  * Created: Sat Mar  8 , 2008
+  *
+  * LibRaw internal data structures (not visible outside)
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/decoders/decoders_libraw_dcrdefs.cpp b/src/decoders/decoders_libraw_dcrdefs.cpp
+--- a/src/decoders/decoders_libraw_dcrdefs.cpp
++++ b/src/decoders/decoders_libraw_dcrdefs.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw is free software; you can redistribute it and/or modify
+  it under the terms of the one of two licenses as you choose:
+diff --git a/src/decoders/dng.cpp b/src/decoders/dng.cpp
+--- a/src/decoders/dng.cpp
++++ b/src/decoders/dng.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/decoders/fp_dng.cpp b/src/decoders/fp_dng.cpp
+--- a/src/decoders/fp_dng.cpp
++++ b/src/decoders/fp_dng.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw is free software; you can redistribute it and/or modify
+  it under the terms of the one of two licenses as you choose:
+diff --git a/src/decoders/load_mfbacks.cpp b/src/decoders/load_mfbacks.cpp
+--- a/src/decoders/load_mfbacks.cpp
++++ b/src/decoders/load_mfbacks.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/decoders/olympus14.cpp b/src/decoders/olympus14.cpp
+--- a/src/decoders/olympus14.cpp
++++ b/src/decoders/olympus14.cpp
+@@ -1,6 +1,8 @@
+ /* -*- C++ -*-
+  * File: pana8.cpp
+  * Copyright (C) 2024-2025 Alex Tutubalin, LibRaw LLC
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+    Olympus/OM System 12/14-bit file decoder
+ 
+diff --git a/src/decoders/pana8.cpp b/src/decoders/pana8.cpp
+--- a/src/decoders/pana8.cpp
++++ b/src/decoders/pana8.cpp
+@@ -1,6 +1,8 @@
+ /* -*- C++ -*-
+  * File: pana8.cpp
+  * Copyright (C) 2022 Alex Tutubalin, LibRaw LLC
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+    Panasonic RawFormat=8 file decoder
+ 
+diff --git a/src/metadata/canon.cpp b/src/metadata/canon.cpp
+--- a/src/metadata/canon.cpp
++++ b/src/metadata/canon.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+ 
+  LibRaw is free software; you can redistribute it and/or modify
+diff --git a/src/metadata/identify.cpp b/src/metadata/identify.cpp
+--- a/src/metadata/identify.cpp
++++ b/src/metadata/identify.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/metadata/makernotes.cpp b/src/metadata/makernotes.cpp
+--- a/src/metadata/makernotes.cpp
++++ b/src/metadata/makernotes.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/metadata/tiff.cpp b/src/metadata/tiff.cpp
+--- a/src/metadata/tiff.cpp
++++ b/src/metadata/tiff.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/postprocessing/postprocessing_aux.cpp b/src/postprocessing/postprocessing_aux.cpp
+--- a/src/postprocessing/postprocessing_aux.cpp
++++ b/src/postprocessing/postprocessing_aux.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+diff --git a/src/utils/utils_libraw.cpp b/src/utils/utils_libraw.cpp
+--- a/src/utils/utils_libraw.cpp
++++ b/src/utils/utils_libraw.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+ 
+  LibRaw is free software; you can redistribute it and/or modify
+diff --git a/src/x3f/x3f_parse_process.cpp b/src/x3f/x3f_parse_process.cpp
+--- a/src/x3f/x3f_parse_process.cpp
++++ b/src/x3f/x3f_parse_process.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-08-30; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+ 
+  LibRaw is free software; you can redistribute it and/or modify

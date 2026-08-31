@@ -12,7 +12,7 @@
  * buffer with ZERO native work.
  *
  * ⚠ The pristine copy MUST be taken before simResultToBitmapGraded runs —
- * ColorGrade/MaskCompositor mutate `res.data` in place. The master buffer here
+ * ColorGrade/MaskCompositor mutate the leased result buffer in place. The master buffer here
  * is never mutated after store(); every reader grades a fresh [Pristine.scratchCopy].
  *
  * Threading: the settle coroutine is the sole writer (store/replace); readers on

@@ -1,0 +1,19 @@
+diff --git a/src/metadata/canon.cpp b/src/metadata/canon.cpp
+--- a/src/metadata/canon.cpp
++++ b/src/metadata/canon.cpp
+@@ -786,7 +786,14 @@ void LibRaw::parseCanonMakernotes(unsigned tag, unsigned type, unsigned len, uns
+     }                                                        \
+   }                                                          \
+   sraw_mul_max /= 1024.f;                                    \
+-  FORC4 sraw_mul[c] = (ushort)((float)sraw_mul[c] * sraw_mul_max);
++  FORC4 {                                                    \
++    const float scaled_sraw_mul =                            \
++        (float)sraw_mul[c] * sraw_mul_max;                   \
++    if (!(scaled_sraw_mul >= 0.f &&                          \
++          scaled_sraw_mul <= (float)USHRT_MAX))              \
++      throw LIBRAW_EXCEPTION_IO_CORRUPT;                     \
++    sraw_mul[c] = (ushort)scaled_sraw_mul;                   \
++  }
+ 
+ #define CR3_ColorData(offset)                                \
+   fseek(ifp, save1 + ((offset+0x0041) << 1), SEEK_SET);      \

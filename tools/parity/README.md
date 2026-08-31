@@ -40,6 +40,8 @@ simulate(image, params)   ── DebugParams ──►      ▼
 | `spkvec.py`          | NumPy reader/writer for `.spkvec`. Used by `gen_goldens.py`; CLI `python spkvec.py info FILE`. |
 | `spkvec_io.h`        | Header-only C++ reader/writer for `.spkvec`, byte-compatible with `spkvec.py`. |
 | `gen_goldens.py`     | Runs `spektrafilm` with each DebugParams tap on a fixed synthetic image; writes `goldens/<case>/<tap>.spkvec` + `manifest.json`. **Requires a spektrafilm env.** |
+| `gen_viewing_illuminant_visuals.py` | Re-scans the two committed cinema-print density taps under K75P (plus a deliberately wrong D50 counterfactual), writes six output-space references, two review PNGs, hashes, and numeric deltas. **Requires the pinned oracle + colour 0.4.7.** |
+| `raw_wb_cat_research.py` | Dependency-free lock for the RAW-WB CAT02 decision; compares current XYZ scaling, Bradford, no adaptation, cast order, and oracle tolerance skips against pinned float32 bits in `fixtures/raw_wb_cat_vectors.json`. |
 | `compare_main.cpp`   | Standalone comparator: reads a golden `.spkvec` and an engine `.spkvec`, reports max-abs / RMS vs tolerance. Seed of the CI parity test. |
 | `CMakeLists.txt`     | Host build for `spkvec_compare` (independent of the Android/NDK engine module). |
 | `cases.md`           | The parity case matrix (profile pairs, scan_film on/off, taps) gating M3/M4. |
@@ -62,6 +64,11 @@ runs `simulate` with the matching `DebugParams` flag set:
 Each captured buffer is written to `goldens/<case>/<tap>.spkvec` and the case
 (profiles, toggles, image spec, per-tap stats, tolerances) is recorded in
 `goldens/<case>/manifest.json`.
+
+The Kodak 2383/2393 K75P cases additionally run the pinned oracle with
+`settings.use_scanner_lut=True` and `lut_resolution=17`, writing
+`final_rgb_scanner_lut_17.spkvec`. This gates accelerated mode against the same
+upstream mode; it is not a widened comparison with direct spectral integration.
 
 ### Requirements (spektrafilm env)
 
@@ -99,8 +106,12 @@ semantics — at it and every later commit up to HEAD, `film_log_raw` diverges
 (`max_abs ≈ 4.44` vs the committed golden). That is why the oracle SHA must be
 pinned: a fresh clone defaults to HEAD and silently produces non-matching goldens.
 
-`tools/parity/setup_env.sh` exports `SPEKTRAFILM_ORACLE_SHA` and warns if your
-`SPEKTRAFILM_SRC` checkout is not on it. To reproduce the goldens:
+`tools/parity/setup_env.sh` exports `SPEKTRAFILM_ORACLE_SHA` and gives an early
+warning if your `SPEKTRAFILM_SRC` checkout is not on it. Both golden generators
+also enforce provenance themselves: they resolve the checkout actually imported,
+require the exact SHA and a Git-clean tracked/staged/non-ignored-untracked state
+before and after oracle execution, and refuse to write a misleading manifest.
+To reproduce the goldens:
 
 ```bash
 git clone https://github.com/andreavolpato/spektrafilm /tmp/spektrafilm
@@ -118,7 +129,19 @@ python gen_goldens.py --list     # list cases (no spektrafilm needed)
 python gen_goldens.py --case print_portra   # one case
 python gen_goldens.py --size 64  # test-image edge length (px)
 
+# K75P output-space refs + visual evidence (checkout must be pinned and clean).
+python gen_viewing_illuminant_visuals.py --spektrafilm-src /tmp/spektrafilm
+
+# Offline provenance-gate tests (clean/wrong-HEAD/tracked-dirty/untracked-dirty).
+python -m unittest tools.parity.tests.test_oracle_provenance -v
+
 python spkvec.py info goldens/print_portra/film_density_cmy.spkvec   # inspect a golden
+
+# Reproduce the research-only RAW-WB CAT decision without external packages.
+python raw_wb_cat_research.py --check
+
+# Independently execute the exact pinned colour-science environment, if installed.
+python raw_wb_cat_research.py --check --verify-colour
 ```
 
 Determinism: the synthetic image is seeded (`SEED=20260529`); cases disable

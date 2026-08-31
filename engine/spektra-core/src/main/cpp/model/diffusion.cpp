@@ -27,6 +27,7 @@
 #include "kernels/exponential_filter.h"
 #include "kernels/fft_convolve.h"
 #include "kernels/parallel.h"
+#include "runtime/stage_timer.h"
 
 // M_PI is not in standard C++ <cmath>; some toolchains gate it behind
 // _USE_MATH_DEFINES / _GNU_SOURCE. Provide the IEEE-754 double value (identical
@@ -361,7 +362,7 @@ double bloom_max_lambda_um(const FamilyCfg& cfg) {
 // especially anyone raising SPK_DIFFUSION_FFT_MAX -- must read this afterwards,
 // because a "the bigger transform didn't help" result and a "the bigger transform
 // never ran" result look identical in a timing alone.
-std::atomic<unsigned long long> g_fft_fallbacks{0};
+thread_local std::atomic<unsigned long long> g_fft_fallbacks{0};
 
 // Transform-size cap, overridable so the trade can be MEASURED rather than assumed.
 // Scratch is 2*N*(N/2+1)*2*8 + N*N*8 bytes: 100.7 MB at N = 2048, 402.8 MB at
@@ -601,6 +602,7 @@ void apply_diffusion_filter_um(double* raw, int w, int h,
             // the direct loop is CORRECT but potentially ~100x slower, so record it
             // rather than letting the render just be mysteriously slow.
             g_fft_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            stage_timing_note_fft_fallback();
         }
         // Each output row is an independent O(w*ks^2) accumulation over the
         // read-only padded plane.

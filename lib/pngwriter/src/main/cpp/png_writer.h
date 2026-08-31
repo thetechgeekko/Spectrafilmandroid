@@ -45,8 +45,16 @@ struct PngMetadata {
 
 struct PngWriteResult {
     bool ok = false;
+    bool cancelled = false;
     std::string error;        // populated when ok == false
     size_t bytesWritten = 0;  // size of the produced file / buffer
+};
+
+// Optional cooperative cancellation. The callback runs synchronously on the
+// writer thread and must not throw. A null callback means "not cancellable".
+struct PngCancellation {
+    void* context = nullptr;
+    bool (*isCancelled)(void* context) noexcept = nullptr;
 };
 
 // --- Core writer: 16-bit/sample interleaved RGB ------------------------------
@@ -58,12 +66,14 @@ struct PngWriteResult {
 // Encode to an in-memory byte vector (host-test + unit-test friendly).
 PngWriteResult writePng16ToMemory(const uint16_t* rgb16, int width, int height,
                                   const PngMetadata& meta,
-                                  std::vector<uint8_t>& outBytes);
+                                  std::vector<uint8_t>& outBytes,
+                                  const PngCancellation* cancellation = nullptr);
 
 // Encode and write to a filesystem path.
 PngWriteResult writePng16ToFile(const uint16_t* rgb16, int width, int height,
                                 const PngMetadata& meta,
-                                const std::string& path);
+                                const std::string& path,
+                                const PngCancellation* cancellation = nullptr);
 
 // --- Convenience: quantise a float RGB buffer [0,1] -> uint16 ---------------
 //
@@ -73,7 +83,8 @@ PngWriteResult writePng16ToFile(const uint16_t* rgb16, int width, int height,
 // both formats.
 PngWriteResult writePngFloatToFile(const float* rgbFloat, int width, int height,
                                    const PngMetadata& meta,
-                                   const std::string& path);
+                                   const std::string& path,
+                                   const PngCancellation* cancellation = nullptr);
 
 }  // namespace spectrafilm
 

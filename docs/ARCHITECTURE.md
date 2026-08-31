@@ -8,6 +8,23 @@
 > `liblibraw.so`), and `targetSdk`/`compileSdk` is **34**. The native-engine rationale below is
 > still accurate. For the real layout see `CLAUDE.md` and `engine/spektra-core/README.md`.
 
+## Shipped storage boundary
+
+The standalone app's current persistence/export contract is documented in
+[TRANSACTIONAL_STORAGE.md](TRANSACTIONAL_STORAGE.md). In short, Android 10+
+exports use recoverable app-tagged `MediaStore` pending rows and a verified
+staged payload; Android 7-9 uses a same-directory fsynced temporary file and an
+atomic no-overwrite rename after the legacy runtime permission is granted.
+Process-owned export work survives Activity recreation. Source documents retain
+persistable SAF access when the provider supports it; acquire/clear/restore run
+through one process FIFO and otherwise enter an explicit reauthorization state.
+Recipe/preset/sidecar JSON uses bounded parsing plus atomic replacement, while
+mask interchange is defined by [MASK_JSON_SCHEMA.md](MASK_JSON_SCHEMA.md).
+
+These guarantees are process-recoverable rather than a cross-provider database
+transaction: a provider can report an indeterminate publish result, in which
+case the app blocks another export until reconciliation resolves the row.
+
 ## Module map
 
 ```
@@ -69,11 +86,31 @@ spektra-core.simulate(linearRgb, params):
                               grain (Poisson-binomial), halation/scatter
    4. Printing stage          film CMY → spectral transmittance → enlarger illuminant + dichroic
                               Y/M filters → print paper exposure → print density curves
-   5. Scanning stage          density → spectral radiance → CIE XYZ (2° observer) → output RGB
-                              (sRGB/AdobeRGB/ProPhoto/Rec2020/ACES) + glare, unsharp, CCTF
+   5. Scanning stage          density → profile viewing illuminant → CIE XYZ (2° observer)
+                              → output RGB (sRGB/AdobeRGB/ProPhoto/Rec2020/ACES)
+                              + glare, unsharp, CCTF
    ▼
 Bitmap (display-referred) ─► host preview / export with EXIF+ICC
 ```
+
+### Profile-driven scan illuminants
+
+The shipped native scanner resolves `info.viewing_illuminant` while loading a
+profile. Its exact, fail-closed registry currently contains D50 and K75P
+(Kinoton 75P, selected by Kodak 2383 and 2393). One immutable resolved record
+owns the spectral distribution, XYZ normalization, and output-space adaptation
+matrices. Unknown identifiers fail profile loading with the rejected metadata
+value in the diagnostic; there is no D50 fallback.
+
+That record flows unchanged through the direct CPU spectral integral, scanner
+3D-LUT construction/cache key, Vulkan linear and fused preview/export tables,
+viewing glare, and black/white reference measurement. The two K75P full-route
+goldens lock direct mode and LUT17 mode independently against matching pinned
+oracle outputs; the LUT-vs-direct delta is diagnostic because upstream's coarse
+17³ PCHIP is intentionally approximate. Strict exact export therefore keeps the
+scanner LUT off. The GPU test separately compares both K75P routes with CPU export
+and runs K75P first so the process-global self-check cannot be armed by D50 alone.
+A scan route therefore cannot substitute its own illuminant policy unnoticed.
 
 ## Why the engine is native (C++/NDK), not Kotlin
 

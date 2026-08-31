@@ -1,0 +1,113 @@
+{
+  "case_id": "print_kodak_2383_k75p",
+  "film_profile": "kodak_portra_400",
+  "generator": "gen_goldens.py",
+  "image": {
+    "input_color_space": "ProPhoto RGB (linear)",
+    "kind": "synthetic_ramp_macbeth",
+    "seed": 20260529,
+    "shape": [
+      64,
+      64,
+      3
+    ],
+    "size": 64
+  },
+  "notes": "Kodak 2383 print scanned under its declared Kinoton 75P viewing illuminant. Locks the profile-driven K75P spectral integral and K75P-to-output-white CAT without stochastic/spatial effects.",
+  "oracle": {
+    "colour_version": "0.4.7",
+    "commit": "c1d0e44b962d80a51ea096d33faea346e4f3836c",
+    "repository": "https://github.com/andreavolpato/spektrafilm",
+    "worktree": "clean"
+  },
+  "print_profile": "kodak_2383",
+  "scan_film": false,
+  "spkvec_version": 1,
+  "taps": {
+    "film_density_cmy": {
+      "file": "film_density_cmy.spkvec",
+      "max": 1.5096431970596313,
+      "mean": 0.9086718559265137,
+      "min": 0.0,
+      "shape": [
+        64,
+        64,
+        3
+      ]
+    },
+    "film_log_raw": {
+      "file": "film_log_raw.spkvec",
+      "max": 1.0561563968658447,
+      "mean": 0.2743043601512909,
+      "min": -3.5808303356170654,
+      "shape": [
+        64,
+        64,
+        3
+      ]
+    },
+    "final_rgb": {
+      "file": "final_rgb.spkvec",
+      "max": 0.9116693139076233,
+      "mean": 0.5433076024055481,
+      "min": 0.0,
+      "shape": [
+        64,
+        64,
+        3
+      ]
+    },
+    "final_rgb_scanner_lut_17": {
+      "file": "final_rgb_scanner_lut_17.spkvec",
+      "lut_resolution": 17,
+      "max": 0.9116297364234924,
+      "mean": 0.5433477163314819,
+      "min": 0.0,
+      "shape": [
+        64,
+        64,
+        3
+      ]
+    },
+    "print_density_cmy": {
+      "file": "print_density_cmy.spkvec",
+      "max": 3.1024177074432373,
+      "mean": 0.536064863204956,
+      "min": 0.020493989810347557,
+      "shape": [
+        64,
+        64,
+        3
+      ]
+    }
+  },
+  "toggles": {
+    "auto_exposure": false,
+    "auto_exposure_method": "center_weighted",
+    "deactivate_spatial_effects": true,
+    "deactivate_stochastic_effects": true,
+    "diffusion_active": false,
+    "diffusion_family": "black_pro_mist",
+    "diffusion_halo_warmth": 0.0,
+    "diffusion_spatial_scale": 1.0,
+    "diffusion_strength": 0.5,
+    "exposure_compensation_ev": 0.0,
+    "grain_active": false,
+    "halation_off": false,
+    "lens_blur_um": 0.0,
+    "normalize_print_exposure": true,
+    "print_exposure_compensation": true,
+    "scanner_black_correction": false,
+    "scanner_black_level": 0.01,
+    "scanner_lut_resolutions": [
+      17
+    ],
+    "scanner_white_correction": false,
+    "scanner_white_level": 0.98,
+    "spectral_gaussian_blur": 0.0
+  },
+  "tolerance": {
+    "max_abs": 0.0001,
+    "rms": 1e-05
+  }
+}

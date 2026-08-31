@@ -4,8 +4,9 @@
  * Port of spektrafilm (GPLv3) by Andrea Volpato — film modeling powered by spektrafilm.
  *
  * Proves the WIRED scanner-LUT path is correct end-to-end (not just the isolated
- * kernel that tests/test_lut_accel.cpp gates). It runs the WHOLE scan_film
- * pipeline through spk_simulate() twice on the same deterministic fixture:
+ * kernel that tests/test_lut_accel.cpp gates). It runs both the scan_film route
+ * and the Kodak 2383/2393 print routes through spk_simulate() on the same
+ * deterministic fixture:
  *   (A) use_scanner_lut = 0  -> the DEFAULT direct spectral path (bit-exact, the
  *       parity-gate path).
  *   (B) use_scanner_lut = 1  -> the LUT-accelerated path (scan() builds a per-
@@ -14,19 +15,24 @@
  *       integral).
  *
  * Assertions:
- *  1. The direct (A) output is BYTE-IDENTICAL to the committed scan_portra
- *     final_rgb golden's tolerance band (max_abs <= 1e-4), confirming wiring the
- *     opt-in branch did not perturb the default path.
- *  2. The LUT (B) output is within the documented ACCELERATION tolerance of the
- *     direct (A) output: ~5e-5 at lut_resolution=17 (the engine default), and an
- *     order of magnitude tighter at lut_resolution=64. This is NOT bit-exact by
- *     design (interpolation), so it is held to a band, not the 1e-4 parity gate.
+ *  1. The direct (A) output matches each committed oracle final_rgb golden
+ *     (max_abs <= 1e-4, rms <= 1e-5). The cinema-print cases therefore lock the
+ *     K75P spectral integral + output-white adaptation on the CPU direct route.
+ *  2. The K75P LUT (B) output matches a committed, pinned-spektrafilm fixture
+ *     generated with the same lut_resolution=17 (max_abs <= 1e-4, rms <= 1e-5).
+ *     This is a like-for-like oracle-parity gate: coarse LUT output is
+ *     intentionally not conflated with direct spectral integration.
+ *  3. The legacy D50 route retains its LUT-vs-direct convergence gates at
+ *     resolutions 17 and 64.
  *
  * Build (host) — full source set, from the cpp root:
  *   g++ -std=c++17 -O2 -I <cpp_root> -I <tools/parity> \
  *     tests/test_scanner_lut_e2e.cpp <full SRC set> -o /tmp/test_scanner_lut_e2e
  * Run:
  *   /tmp/test_scanner_lut_e2e <asset_dir> <scan_portra_golden_dir> <input.f64>
+ *
+ * The Kodak K75P golden directories are resolved as siblings of scan_portra;
+ * no oracle generation is performed by this test.
  */
 #include <cmath>
 #include <cstdio>
@@ -60,11 +66,12 @@ Metrics compare(const float* a, const float* b, size_t n) {
 }
 
 // Run the full scan_film pipeline once with the given LUT settings.
-bool run(spk_engine* eng, const spk_image& in, int use_lut, int lut_res,
+bool run(spk_engine* eng, const spk_image& in, const char* print_profile,
+         int scan_film, int use_lut, int lut_res,
          std::vector<float>* out_rgb, int* w, int* h) {
     spk_params p{};
     p.film_profile = "kodak_portra_400";
-    p.print_profile = "kodak_portra_endura";
+    p.print_profile = print_profile;
     spk_default_params(&p);
     p.exposure_compensation_ev = 0.0f;
     p.auto_exposure = 0;
@@ -78,7 +85,7 @@ bool run(spk_engine* eng, const spk_image& in, int use_lut, int lut_res,
     p.scanner_unsharp[1] = 0.0f;
     p.dir_couplers_active = 1;
     p.glare_active = 0;
-    p.scan_film = 1;
+    p.scan_film = scan_film;
     p.output_color_space = SPK_CS_SRGB;
     p.output_cctf_encoding = 1;
     p.rgb_to_raw_method = SPK_RGB2RAW_HANATOS2025;
@@ -99,6 +106,11 @@ bool run(spk_engine* eng, const spk_image& in, int use_lut, int lut_res,
     return true;
 }
 
+std::string parent_dir(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -112,9 +124,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    spkvec::Array gold = spkvec::read(golden_dir + "/final_rgb.spkvec");
-    const int height = static_cast<int>(gold.shape[0]);
-    const int width = static_cast<int>(gold.shape[1]);
+    spkvec::Array scan_gold =
+        spkvec::read(golden_dir + "/final_rgb.spkvec");
+    const int height = static_cast<int>(scan_gold.shape[0]);
+    const int width = static_cast<int>(scan_gold.shape[1]);
     const int npix = width * height;
     const size_t n = static_cast<size_t>(npix) * 3;
 
@@ -133,35 +146,97 @@ int main(int argc, char** argv) {
 
     std::printf("Image: %dx%dx3\n", width, height);
 
-    // (A) Direct path (use_scanner_lut = 0): the default, bit-exact path.
-    std::vector<float> direct; int dw = 0, dh = 0;
-    if (!run(eng, in_img, /*use_lut=*/0, /*res=*/17, &direct, &dw, &dh)) return 2;
+    const std::string goldens_root = parent_dir(golden_dir);
+    auto check_route = [&](const char* label, const char* print_profile,
+                           int scan_film, const std::string& route_golden_dir,
+                           bool has_lut_oracle) {
+        spkvec::Array gold =
+            spkvec::read(route_golden_dir + "/final_rgb.spkvec");
+        if (gold.data.size() != n || static_cast<int>(gold.shape[0]) != height ||
+            static_cast<int>(gold.shape[1]) != width) {
+            std::fprintf(stderr, "%s golden shape mismatch\n", label);
+            return false;
+        }
 
-    Metrics m_gold = compare(direct.data(), gold.data.data(), n);
-    const double tol_max_abs = 1e-4, tol_rms = 1e-5;
-    bool pass_direct = (m_gold.max_abs <= tol_max_abs) && (m_gold.rms <= tol_rms);
-    std::printf("[scanner_lut_e2e direct vs golden] max_abs=%.6e (tol %.0e) "
-                "rms=%.6e (tol %.0e) -> %s\n",
-                m_gold.max_abs, tol_max_abs, m_gold.rms, tol_rms,
-                pass_direct ? "PASS" : "FAIL");
+        // (A) Direct path (use_scanner_lut = 0): the default oracle path.
+        std::vector<float> direct;
+        int dw = 0, dh = 0;
+        if (!run(eng, in_img, print_profile, scan_film, /*use_lut=*/0,
+                 /*res=*/17, &direct, &dw, &dh)) {
+            return false;
+        }
+        if (dw != width || dh != height || direct.size() != n) {
+            std::fprintf(stderr, "%s direct output shape mismatch\n", label);
+            return false;
+        }
 
-    // (B) LUT path at the engine default resolution (17) and a finer one (64).
-    bool pass_lut = true;
-    const struct { int res; double band; } cfgs[] = {{17, 5e-5}, {64, 5e-6}};
-    for (const auto& cfg : cfgs) {
-        std::vector<float> lut; int lw = 0, lh = 0;
-        if (!run(eng, in_img, /*use_lut=*/1, cfg.res, &lut, &lw, &lh)) return 2;
-        Metrics m = compare(lut.data(), direct.data(), n);
-        bool within = m.max_abs <= cfg.band;
-        std::printf("[scanner_lut_e2e LUT(res=%d) vs direct] max_abs=%.6e "
-                    "(accel band %.0e, NOT bit-exact by design) rms=%.6e -> %s\n",
-                    cfg.res, m.max_abs, cfg.band, m.rms,
-                    within ? "WITHIN BAND" : "OUT OF BAND");
-        pass_lut = pass_lut && within;
-    }
+        Metrics m_gold = compare(direct.data(), gold.data.data(), n);
+        const double tol_max_abs = 1e-4, tol_rms = 1e-5;
+        bool pass_direct =
+            (m_gold.max_abs <= tol_max_abs) && (m_gold.rms <= tol_rms);
+        std::printf("[%s direct vs golden] max_abs=%.6e (tol %.0e) "
+                    "rms=%.6e (tol %.0e) -> %s\n",
+                    label, m_gold.max_abs, tol_max_abs, m_gold.rms, tol_rms,
+                    pass_direct ? "PASS" : "FAIL");
+
+        // (B) Default preview grid for every route. K75P compares like-for-like
+        // with the pinned oracle's LUT output. The legacy D50 fixture predates a
+        // route-level LUT oracle and retains its tight direct-convergence gate.
+        bool pass_lut = true;
+        const struct { int res; double direct_band; } cfgs[] = {
+            {17, 5e-5}, {64, 5e-6}};
+        const int cfg_count = has_lut_oracle ? 1 : 2;
+        for (int i = 0; i < cfg_count; ++i) {
+            const auto& cfg = cfgs[i];
+            std::vector<float> lut;
+            int lw = 0, lh = 0;
+            if (!run(eng, in_img, print_profile, scan_film, /*use_lut=*/1,
+                     cfg.res, &lut, &lw, &lh)) {
+                return false;
+            }
+            if (lw != width || lh != height || lut.size() != n) return false;
+            Metrics versus_direct = compare(lut.data(), direct.data(), n);
+            if (has_lut_oracle) {
+                spkvec::Array lut_gold = spkvec::read(
+                    route_golden_dir + "/final_rgb_scanner_lut_17.spkvec");
+                if (lut_gold.data.size() != n || lut_gold.shape != gold.shape) {
+                    std::fprintf(stderr, "%s LUT oracle shape mismatch\n", label);
+                    return false;
+                }
+                Metrics oracle = compare(lut.data(), lut_gold.data.data(), n);
+                const bool within = oracle.max_abs <= 1e-4 && oracle.rms <= 1e-5;
+                std::printf("[%s LUT(res=17) vs pinned LUT oracle] "
+                            "max_abs=%.6e (tol 1e-4) rms=%.6e (tol 1e-5); "
+                            "vs-direct max_abs=%.6e (diagnostic) -> %s\n",
+                            label, oracle.max_abs, oracle.rms,
+                            versus_direct.max_abs, within ? "PASS" : "FAIL");
+                pass_lut = pass_lut && within;
+            } else {
+                const bool within =
+                    versus_direct.max_abs <= cfg.direct_band;
+                std::printf("[%s LUT(res=%d) vs direct] max_abs=%.6e "
+                            "(accel band %.0e, NOT bit-exact by design) "
+                            "rms=%.6e -> %s\n",
+                            label, cfg.res, versus_direct.max_abs,
+                            cfg.direct_band, versus_direct.rms,
+                            within ? "WITHIN BAND" : "OUT OF BAND");
+                pass_lut = pass_lut && within;
+            }
+        }
+        return pass_direct && pass_lut;
+    };
+
+    // Exercise both affected K75P profiles, then retain the legacy D50 route.
+    // Viewing-only LUT-cache isolation is gated separately by test_lut_cache_e2e.
+    bool all = true;
+    all &= check_route("kodak_2383/K75P", "kodak_2383", /*scan_film=*/0,
+                       goldens_root + "/print_kodak_2383_k75p", true);
+    all &= check_route("kodak_2393/K75P", "kodak_2393", /*scan_film=*/0,
+                       goldens_root + "/print_kodak_2393_k75p", true);
+    all &= check_route("scan_portra/D50", "kodak_portra_endura",
+                       /*scan_film=*/1, golden_dir, false);
 
     spk_engine_destroy(eng);
-    bool all = pass_direct && pass_lut;
     std::printf("%s\n", all ? "ALL PASS" : "FAIL");
     return all ? 0 : 1;
 }

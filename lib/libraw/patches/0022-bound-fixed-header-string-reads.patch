@@ -1,0 +1,85 @@
+--- a/src/metadata/identify.cpp
++++ b/src/metadata/identify.cpp
+@@ -581,18 +581,18 @@
+     strcpy(model, "N Digital");
+     parse_kyocera();
+   }
+-  else if (!strcmp(head, "PXN"))
++  else if (!memcmp(head, "PXN", sizeof("PXN")))
+   {
+     strcpy(make, "Logitech");
+     strcpy(model, "Fotoman Pixtura");
+   }
+-  else if (!strcmp(head, "qktk"))
++  else if (!memcmp(head, "qktk", sizeof("qktk")))
+   {
+     strcpy(make, "Apple");
+     strcpy(model, "QuickTake 100");
+     load_raw = &LibRaw::quicktake_100_load_raw;
+   }
+-  else if (!strcmp(head, "qktn"))
++  else if (!memcmp(head, "qktn", sizeof("qktn")))
+   {
+     strcpy(make, "Apple");
+     strcpy(model, "QuickTake 150");
+--- a/src/metadata/makernotes.cpp
++++ b/src/metadata/makernotes.cpp
+@@ -369,7 +369,7 @@
+   if (!strncmp(make, "Nokia", 5))
+     return;
+ 
+-  char buf[10];
++  char buf[11];
+   char another_buf[128];
+ 
+   memset(another_buf,0,sizeof(another_buf));
+--- a/src/x3f/x3f_parse_process.cpp
++++ b/src/x3f/x3f_parse_process.cpp
+@@ -244,13 +244,19 @@
+       // Try to find model number in first 2048 bytes;
+       INT64 pos = libraw_internal_data.internal_data.input->tell();
+       libraw_internal_data.internal_data.input->seek(0, SEEK_SET);
+-      unsigned char buf[2048];
+-      libraw_internal_data.internal_data.input->read(buf, 2048, 1);
++      unsigned char buf[2048] = {};
++      const int read_count = libraw_internal_data.internal_data.input->read(
++          buf, 1, sizeof(buf));
+       libraw_internal_data.internal_data.input->seek(pos, SEEK_SET);
+-      unsigned char *fnd = (unsigned char *)lr_memmem(buf, 2048, "SIGMA dp", 8);
++      const size_t bytes_read = read_count > 0
++          ? MIN(size_t(read_count), sizeof(buf))
++          : 0;
++      unsigned char *buffer_end = buf + bytes_read;
++      unsigned char *fnd =
++          (unsigned char *)lr_memmem(buf, bytes_read, "SIGMA dp", 8);
+       unsigned char *fndsd =
+-          (unsigned char *)lr_memmem(buf, 2048, "sd Quatt", 8);
+-      if (fnd)
++          (unsigned char *)lr_memmem(buf, bytes_read, "sd Quatt", 8);
++      if (fnd && fnd + 8 < buffer_end)
+       {
+         unsigned char *nm = fnd + 8;
+         snprintf(imgdata.idata.model, 64, "dp%c Quattro",
+@@ -258,12 +264,16 @@
+       }
+       else if (fndsd)
+       {
+-        unsigned char *fndsdQH = (unsigned char *)lr_memmem(fndsd, 20, "sd Quattro H", 12);
+-        if (fndsdQH)
+-            snprintf(imgdata.idata.model, 64, "%s", fndsdQH);
+-        else
+-            snprintf(imgdata.idata.model, 64, "%s", fndsd);
+-    }
++        const size_t remaining = size_t(buffer_end - fndsd);
++        unsigned char *fndsdQH = (unsigned char *)lr_memmem(
++            fndsd, MIN(size_t(20), remaining), "sd Quattro H", 12);
++        const unsigned char *model_start = fndsdQH ? fndsdQH : fndsd;
++        const size_t model_length =
++            MIN(sizeof(imgdata.idata.model) - 1,
++                size_t(buffer_end - model_start));
++        snprintf(imgdata.idata.model, sizeof(imgdata.idata.model), "%.*s",
++                 int(model_length), (const char *)model_start);
++      }
+       else
+ #endif
+         if ((imgdata.sizes.raw_width == 6656) ||

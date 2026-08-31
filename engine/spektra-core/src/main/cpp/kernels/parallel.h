@@ -30,6 +30,10 @@
 #define SPK_KERNELS_PARALLEL_H
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -111,6 +115,48 @@ constexpr int kParallelMinChunk = 8192;
 // on the existing fixture, so 1-vs-N really compares split work against serial work.
 int parallel_min_chunk();
 
+// Cooperative cancellation for long native maps. The callback is deliberately
+// owned and invoked by the thread that constructs the scope. Android's JNI
+// adapter holds that caller thread's JNIEnv, so render-pool workers may observe
+// only the local atomic stop flag and must never invoke the callback themselves.
+using ParallelCancelCheck = int (*)(void*);
+
+class ParallelCancellationScope {
+public:
+    ParallelCancellationScope(ParallelCancelCheck check, void* context) noexcept;
+    ~ParallelCancellationScope();
+
+    ParallelCancellationScope(const ParallelCancellationScope&) = delete;
+    ParallelCancellationScope& operator=(const ParallelCancellationScope&) = delete;
+
+private:
+    ParallelCancelCheck check_;
+    void* context_;
+    bool cancelled_ = false;
+    ParallelCancellationScope* previous_ = nullptr;
+
+    friend bool parallel_cancellation_active() noexcept;
+    friend bool parallel_cancellation_latched() noexcept;
+    friend bool parallel_cancellation_requested() noexcept;
+    friend bool parallel_cancellation_poll(ParallelCancelCheck, void*) noexcept;
+};
+
+// Marker thrown only on the scope-owning thread after every worker has joined.
+// The run_* orchestration boundary catches it and maps it to SPK_ERR_CANCELLED,
+// so partially-filled stage buffers can never flow into dependent arithmetic.
+struct ParallelCancelled final {};
+
+bool parallel_cancellation_active() noexcept;
+bool parallel_cancellation_latched() noexcept;
+bool parallel_cancellation_requested() noexcept;
+bool parallel_cancellation_poll(ParallelCancelCheck check,
+                                void* context) noexcept;
+
+// At most this many declared pixel-equivalents are completed by the caller
+// between callback polls. Weighted maps clamp to one row/column when a single
+// unit itself exceeds this value.
+constexpr int kCancellationPollWork = 1024;
+
 namespace detail {
 
 // Dispatch [begin, end) as ceil-divided chunks across nthreads workers (the
@@ -158,6 +204,84 @@ void parallel_dispatch(int begin, int end, int nthreads, const Body& body) {
 #endif  // SPK_USE_TBB
 }
 
+// Cancellation-aware dispatch. The null-callback route never enters here and
+// therefore retains parallel_dispatch above byte-for-byte. With a callback,
+// every fixed worker range is subdivided into bounded deterministic blocks.
+// Workers only read `stop`; callback polling remains on the invoking thread.
+template <typename Body>
+void parallel_dispatch_cancellable(int begin, int end, int nthreads,
+                                   int block_items, const Body& body) {
+    if (block_items < 1) block_items = 1;
+    if (parallel_cancellation_requested()) throw ParallelCancelled{};
+
+    const auto run_blocks = [&](int cb, int ce, std::atomic<bool>* stop,
+                                bool poll) {
+        for (int b = cb; b < ce; b += block_items) {
+            if (stop && stop->load(std::memory_order_relaxed)) return;
+            if (poll && parallel_cancellation_requested()) {
+                if (stop) stop->store(true, std::memory_order_relaxed);
+                return;
+            }
+            const int be = std::min(b + block_items, ce);
+            body(b, be);
+        }
+    };
+
+    if (nthreads <= 1) {
+        run_blocks(begin, end, nullptr, true);
+        if (parallel_cancellation_latched()) throw ParallelCancelled{};
+        return;
+    }
+
+    const int count = end - begin;
+    const int chunk = (count + nthreads - 1) / nthreads;
+    std::atomic<bool> stop{false};
+    std::atomic<int> workers_left{0};
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(nthreads - 1));
+    for (int t = 1; t < nthreads; ++t) {
+        const int cb = begin + t * chunk;
+        if (cb >= end) break;
+        const int ce = std::min(cb + chunk, end);
+        workers_left.fetch_add(1, std::memory_order_relaxed);
+        workers.emplace_back([&, cb, ce]() {
+            run_blocks(cb, ce, &stop, false);
+            workers_left.fetch_sub(1, std::memory_order_release);
+            wait_cv.notify_one();
+        });
+    }
+
+    bool cancelled = false;
+    try {
+        run_blocks(begin, std::min(begin + chunk, end), &stop, true);
+    } catch (const ParallelCancelled&) {
+        // A nested owner-thread map may surface the same marker. Stop this
+        // dispatch too, join its workers, then rethrow below.
+        cancelled = true;
+        stop.store(true, std::memory_order_relaxed);
+    }
+
+    // Normally equal-sized chunks finish together. If a worker has a heavier
+    // row/column, keep sampling from the owner thread while it drains instead
+    // of blocking in join with a stale JNI cancellation signal.
+    while (!stop.load(std::memory_order_relaxed) &&
+           workers_left.load(std::memory_order_acquire) > 0) {
+        if (parallel_cancellation_requested()) {
+            cancelled = true;
+            stop.store(true, std::memory_order_relaxed);
+            break;
+        }
+        std::unique_lock<std::mutex> lock(wait_mutex);
+        wait_cv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
+            return workers_left.load(std::memory_order_acquire) == 0;
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    if (cancelled || parallel_cancellation_latched()) throw ParallelCancelled{};
+}
+
 }  // namespace detail
 
 // Split [begin, end) into up to parallel_num_threads() contiguous, disjoint
@@ -177,6 +301,11 @@ void parallel_for(int begin, int end, const Body& body) {
         const int min_chunk = parallel_min_chunk();
         const int max_by_work = (count + min_chunk - 1) / min_chunk;
         nthreads = std::min(nthreads, max_by_work < 1 ? 1 : max_by_work);
+    }
+    if (parallel_cancellation_active()) {
+        detail::parallel_dispatch_cancellable(
+            begin, end, nthreads, kCancellationPollWork, body);
+        return;
     }
     if (nthreads <= 1) {
         body(begin, end);
@@ -209,6 +338,14 @@ void parallel_for_weighted(int begin, int end, long long unit_work,
         if (max_by_work < static_cast<long long>(nthreads)) {
             nthreads = static_cast<int>(max_by_work < 1 ? 1 : max_by_work);
         }
+    }
+    if (parallel_cancellation_active()) {
+        const long long uw = unit_work < 1 ? 1 : unit_work;
+        const long long block = kCancellationPollWork / uw;
+        detail::parallel_dispatch_cancellable(
+            begin, end, nthreads,
+            static_cast<int>(block < 1 ? 1 : block), body);
+        return;
     }
     if (nthreads <= 1) {
         body(begin, end);

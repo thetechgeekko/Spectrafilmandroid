@@ -1,5 +1,11 @@
 # Export fast path — maximum quality, minimum time
 
+> **Current plan (2026-08-29):** [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md)
+> supersedes this file for the 1–2 second SLO, current measurements and library choices. This file
+> remains the engineering history of landed/rejected fast-path ideas. “Bit-identical” must now be
+> qualified as engine samples, decoded samples/metadata, or complete container bytes; Fast GPU is a
+> separate oracle-equivalent route, not the strict exact route.
+
 Mandate: make export as fast as possible **without ever trading quality**. Speed comes from
 better engineering, not from computing less. Every item below is either provably bit-exact,
 explicitly flagged as not, or rejected.
@@ -32,7 +38,8 @@ to protect them.
 splits for real. **[measured]** after the fix: 8 threads → **8 chunks**, results still correct.
 Unset in production, so the shipping path and every golden are byte-identical to before.
 
-> **Run the 36-test `engine-parity` suite before merging.** The toolchain and assets to run it
+> **Run the current 39-case `engine-parity` suite before merging.** The workflow is the authority;
+> do not trust a prose count if its `build_run` table changes. The toolchain and assets to run it
 > were not available where this change was written; the default-inert argument is sound but the
 > suite is the authority.
 
@@ -127,7 +134,7 @@ what makes a 12 MP export survive on a 4 GB device at all (measured peak-RSS slo
 
 Every change must pass before it lands:
 
-1. The full 36-test `engine-parity` suite green.
+1. The full current 39-case `engine-parity` suite green at both flag legs.
 2. `test_parallel` green **with real multi-chunk execution** (Phase 0).
 3. An **export-digest** check: SHA-256 of the exported container payload over a fixed matrix of
    scene × format × params, so "quality unchanged" is a property of the shipped file rather than

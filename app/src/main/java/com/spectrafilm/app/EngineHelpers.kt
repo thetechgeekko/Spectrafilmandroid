@@ -12,17 +12,25 @@ import com.spectrafilm.app.masks.MaskCompositor
 import com.spectrafilm.engine.ColorSpace
 import com.spectrafilm.engine.LinearImage
 import com.spectrafilm.engine.SimResult
+import com.spectrafilm.libraw.LinearResult
+import com.spectrafilm.libraw.DecodeStatus
+import com.spectrafilm.libraw.RawDecodeCancellation
 import com.spectrafilm.libraw.RawDecodeException
 import com.spectrafilm.libraw.RawDecoder
+import com.spectrafilm.libraw.RawInputLimits
 import com.spectrafilm.libraw.WhiteBalance
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.CoroutineContext
 import kotlin.math.max
 import kotlin.math.min
 
@@ -46,7 +54,9 @@ fun extractAssets(ctx: Context): File {
 
 /** A deterministic scene-linear ProPhoto-ish test image: horizontal exposure ramp + RGB bands. */
 fun syntheticLinearImage(size: Int): LinearImage {
-    val buf = ByteBuffer.allocateDirect(size * size * 3 * 4).order(ByteOrder.nativeOrder())
+    require(size >= 2) { "synthetic image size must be at least 2" }
+    val buf = ByteBuffer.allocateDirect(checkedRgbFloatBytes(size, size))
+        .order(ByteOrder.nativeOrder())
     val f = buf.asFloatBuffer()
     for (y in 0 until size) {
         val band = (y * 4 / size) // 0..3
@@ -88,6 +98,7 @@ fun decodeRawToLinear(
     temperatureK: Double,
     tint: Double,
     maxEdge: Int = MAX_EDGE_PX,
+    cancellation: RawDecodeCancellation? = null,
 ): LinearImage {
     // Issue #7 mitigation: even with the fd decode (no full-file Java byte[]), LibRaw
     // still expands the RAW to a float32 buffer (12 bytes/px) natively. For preview-scale
@@ -99,7 +110,16 @@ fun decodeRawToLinear(
     var halfSize = maxEdge <= HALF_DECODE_EDGE_THRESHOLD
     while (true) {
         try {
-            return decodeRawAtEdge(ctx, uri, wb, temperatureK, tint, attemptEdge, halfSize)
+            return decodeRawAtEdge(
+                ctx,
+                uri,
+                wb,
+                temperatureK,
+                tint,
+                attemptEdge,
+                halfSize,
+                cancellation,
+            )
         } catch (oom: OutOfMemoryError) {
             // Encourage the collector to reclaim the failed transient before retrying.
             System.gc()
@@ -126,24 +146,42 @@ fun decodeRawToLinear(
  * allocation is the small reusable chunk — never `readBytes()`'s file-sized (and transiently
  * up to 2x) Java byte[]. Used as the OOM-safer input for LibRaw's buffer decode path when the
  * fd decode isn't usable; LibRaw's in-memory open also tends to succeed where its fd open
- * failed. Returns null if the stream can't be opened or the file exceeds the 2 GiB direct-
- * buffer limit (the caller then propagates to loadSource's bounded platform decoder).
+ * failed. Returns null if the stream can't be opened; encoded inputs above the canonical
+ * 64 MiB LibRaw ceiling fail typed before any provider-sized allocation or read.
  *
  * NOTE: on Android `ByteBuffer.allocateDirect` is still a non-movable byte[] on the ART heap,
  * so this is NOT off-heap — for a pathologically large file the allocateDirect itself can OOM;
  * that case rethrows and loadSource falls back to the sample-size-bounded ImageDecoder.
  */
-private fun readUriToDirectBuffer(ctx: Context, uri: Uri): ByteBuffer? {
+private fun readUriToDirectBuffer(
+    ctx: Context,
+    uri: Uri,
+    cancellation: RawDecodeCancellation?,
+): ByteBuffer? {
     val pfd = ctx.contentResolver.openFileDescriptor(uri, "r") ?: return null
     return pfd.use {
         val size = it.statSize
-        if (size <= 0L || size > Int.MAX_VALUE) return@use null
-        val buf = ByteBuffer.allocateDirect(size.toInt()).order(ByteOrder.nativeOrder())
+        val capacity = checkedRawUriInputCapacity(size) ?: return@use null
+        val buf = ByteBuffer.allocateDirect(capacity).order(ByteOrder.nativeOrder())
         java.io.FileInputStream(it.fileDescriptor).use { input ->
             val chunk = ByteArray(1 shl 20)
             while (true) {
+                if (cancellation?.isCancellationRequested == true) {
+                    throw RawDecodeException(
+                        "RAW decode cancelled",
+                        DecodeStatus.CANCELLED.code,
+                        0,
+                    )
+                }
                 val n = input.read(chunk)
                 if (n < 0) break
+                if (n > buf.remaining()) {
+                    throw RawDecodeException(
+                        "RAW provider returned more bytes than its declared size",
+                        DecodeStatus.INPUT.code,
+                        0,
+                    )
+                }
                 buf.put(chunk, 0, n)
             }
         }
@@ -171,6 +209,7 @@ private fun decodeRawAtEdge(
     tint: Double,
     maxEdge: Int,
     halfSize: Boolean,
+    cancellation: RawDecodeCancellation?,
 ): LinearImage {
     val settings = RawDecoder.Settings(
         whiteBalance = wb, temperatureK = temperatureK, tint = tint, halfSize = halfSize,
@@ -189,9 +228,7 @@ private fun decodeRawAtEdge(
     // Fall back to the byte[] path only if the provider's fd can't be decoded (e.g. a
     // non-seekable/in-memory document provider that LibRaw can't seek).
     val result = try {
-        ctx.contentResolver.openFileDescriptor(uri, "r")?.use {
-            RawDecoder.decodeToLinear(it.fd, settings)
-        } ?: error("Could not open RAW file")
+        decodeRawFromFd(ctx, uri, settings, cancellation)
     } catch (e: RawDecodeException) {
         // A real LibRaw decode verdict (lossy-JPEG / JPEG-XL Expert-RAW DNG it can't decode):
         // let it propagate so loadSource routes to the bounded platform decoder, instead of
@@ -202,17 +239,13 @@ private fun decodeRawAtEdge(
         // open). Retry from the file bytes via a direct ByteBuffer (avoids readBytes()'s
         // file-sized + 2x-regrowth managed array; LibRaw's buffer open often succeeds here).
         // If even that allocation fails, propagate -> loadSource's platform decoder.
-        val direct = readUriToDirectBuffer(ctx, uri) ?: throw e
-        RawDecoder.decodeToLinear(direct, settings)
+        val direct = readUriToDirectBuffer(ctx, uri, cancellation) ?: throw e
+        RawDecoder.decodeToLinear(direct, settings, cancellation)
     }
-    val w = result.width
-    val h = result.height
+    return rawResultToLinearImage(result, maxEdge)
 
-    val longest = max(w, h)
-    var step = 1
-    while (longest / step > maxEdge) step++
-
-    // result.data is now a NATIVE, off-heap buffer (malloc + NewDirectByteBuffer; see
+    // The result is now backed by a NATIVE, off-heap buffer (malloc +
+    // NewDirectByteBuffer; see
     // raw_decoder_jni.cpp) rather than a JVM-managed ByteBuffer.allocateDirect (which on
     // Android is a non-movable byte[] on the ~256 MB ART heap). For EXPORT-scale targets
     // we hand that off-heap buffer straight to the engine — keeping the full-res ~140 MB
@@ -221,40 +254,111 @@ private fun decodeRawAtEdge(
     // copy into a small managed buffer and free the native original right away, so the
     // proxy decode + preview cache lifecycle (which reuses the buffer across renders and
     // relies on GC) is unchanged.
-    val exportScale = maxEdge > HALF_DECODE_EDGE_THRESHOLD
-
-    if (step <= 1) {
-        if (exportScale) {
-            return LinearImage(
-                result.data, w, h, colorSpace = result.colorSpace,
-                onClose = { RawDecoder.freeOffHeap(it) },
-            )
-        }
-        val managed = ByteBuffer.allocateDirect(w * h * 3 * 4).order(ByteOrder.nativeOrder())
-        managed.asFloatBuffer().put(result.data.order(ByteOrder.nativeOrder()).asFloatBuffer())
-        RawDecoder.freeOffHeap(result.data)
-        return LinearImage(managed, w, h, colorSpace = result.colorSpace)
-    }
-
     // Native ignored the maxLongEdge cap (some DNGs do): box-downsample into a managed
     // proxy, then free the off-heap native original.
-    val src = result.data.order(ByteOrder.nativeOrder()).asFloatBuffer()
-    val outW = (w + step - 1) / step
-    val outH = (h + step - 1) / step
-    val out = ByteBuffer.allocateDirect(outW * outH * 3 * 4).order(ByteOrder.nativeOrder())
-    val of = out.asFloatBuffer()
-    var oi = 0
-    for (oy in 0 until outH) {
-        val sy = oy * step
-        val rowBase = sy * w
-        for (ox in 0 until outW) {
-            val si = (rowBase + ox * step) * 3
-            of.put(oi, src.get(si)); of.put(oi + 1, src.get(si + 1)); of.put(oi + 2, src.get(si + 2))
-            oi += 3
+}
+
+/** Validate a provider's declared length before any provider-sized allocation or read. */
+internal fun checkedRawUriInputCapacity(statSize: Long): Int? =
+    if (statSize <= 0L) null else RawInputLimits.checkedCapacity(statSize)
+
+/**
+ * Converts a decoded RAW result while making the native allocation ownership explicit.
+ * This consumes [result]. Export transfers its active data lease into [LinearImage];
+ * proxy paths copy and close immediately. A concurrent `result.close()` cannot free
+ * the native allocation while conversion or the transferred image still holds the lease.
+ */
+internal fun rawResultToLinearImage(result: LinearResult, maxEdge: Int): LinearImage {
+    val lease = result.acquireDataLease()
+    var leaseTransferred = false
+    try {
+        require(maxEdge > 0) { "maxEdge must be positive" }
+        val width = result.width
+        val height = result.height
+        val requiredBytes = checkedRgbFloatBytes(width, height)
+        val logical = lease.data.duplicate().order(ByteOrder.nativeOrder())
+        require(logical.remaining() >= requiredBytes) {
+            "RAW result buffer is truncated: ${logical.remaining()} < $requiredBytes"
         }
+        logical.limit(logical.position() + requiredBytes)
+        val packed = logical.slice().order(ByteOrder.nativeOrder())
+
+        val longest = max(width, height)
+        var step = 1
+        while (longest / step > maxEdge) step++
+        val exportScale = maxEdge > HALF_DECODE_EDGE_THRESHOLD
+
+        return if (step <= 1 && exportScale) {
+            val image = LinearImage.fromDataLease(
+                packed,
+                width,
+                height,
+                colorSpace = result.colorSpace,
+                lease = lease,
+            )
+            leaseTransferred = true
+            image
+        } else if (step <= 1) {
+            val managed = ByteBuffer.allocateDirect(requiredBytes)
+                .order(ByteOrder.nativeOrder())
+            managed.put(packed.duplicate())
+            managed.flip()
+            LinearImage(managed, width, height, colorSpace = result.colorSpace)
+        } else {
+            val src = packed.asFloatBuffer()
+            val outWidth = ((width.toLong() + step - 1L) / step).toInt()
+            val outHeight = ((height.toLong() + step - 1L) / step).toInt()
+            val out = ByteBuffer.allocateDirect(checkedRgbFloatBytes(outWidth, outHeight))
+                .order(ByteOrder.nativeOrder())
+            val output = out.asFloatBuffer()
+            var outputIndex = 0
+            for (outputY in 0 until outHeight) {
+                val sourceY = outputY * step
+                val sourceRow = sourceY * width
+                for (outputX in 0 until outWidth) {
+                    val sourceIndex = (sourceRow + outputX * step) * 3
+                    output.put(outputIndex, src.get(sourceIndex))
+                    output.put(outputIndex + 1, src.get(sourceIndex + 1))
+                    output.put(outputIndex + 2, src.get(sourceIndex + 2))
+                    outputIndex += 3
+                }
+            }
+            LinearImage(out, outWidth, outHeight, colorSpace = result.colorSpace)
+        }
+    } finally {
+        // Linearize ownership consumption before dropping a local lease. For the
+        // export path the transferred lease remains active until LinearImage.close().
+        result.close()
+        if (!leaseTransferred) lease.close()
     }
-    RawDecoder.freeOffHeap(result.data)
-    return LinearImage(out, outW, outH, colorSpace = result.colorSpace)
+}
+
+internal fun checkedRgbFloatBytes(width: Int, height: Int): Int {
+    require(width > 0 && height > 0) { "invalid RAW dimensions ${width}x$height" }
+    val bytes = width.toLong() * height.toLong() * 3L * Float.SIZE_BYTES
+    require(bytes <= Int.MAX_VALUE) { "RAW image is too large: ${width}x$height" }
+    return bytes.toInt()
+}
+
+/** Close the decoded result if descriptor cleanup itself fails after native success. */
+private fun decodeRawFromFd(
+    ctx: Context,
+    uri: Uri,
+    settings: RawDecoder.Settings,
+    cancellation: RawDecodeCancellation?,
+): LinearResult {
+    val descriptor = ctx.contentResolver.openFileDescriptor(uri, "r")
+        ?: error("Could not open RAW file")
+    var decoded: LinearResult? = null
+    try {
+        decoded = RawDecoder.decodeToLinear(descriptor.fd, settings, cancellation)
+        descriptor.close()
+        return decoded
+    } catch (failure: Throwable) {
+        decoded?.close()
+        runCatching { descriptor.close() }
+        throw failure
+    }
 }
 
 /**
@@ -276,7 +380,8 @@ fun cropLinearImage(src: LinearImage, nx: Float, ny: Float, cropEdge: Int): Line
  */
 fun cropLinearImageRect(
     src: LinearImage, nx: Float, ny: Float, cropW: Int, cropH: Int,
-): LinearImage {
+): LinearImage = src.acquireDataLease().use { sourceLease ->
+    val sourceData = sourceLease.data
     val w = src.width
     val h = src.height
     val cw = cropW.coerceIn(1, w)
@@ -286,8 +391,15 @@ fun cropLinearImageRect(
     val x0 = (cxPx - cw / 2).coerceIn(0, w - cw)
     val y0 = (cyPx - ch / 2).coerceIn(0, h - ch)
 
-    val sf = src.data.order(ByteOrder.nativeOrder()).asFloatBuffer()
-    val out = ByteBuffer.allocateDirect(cw * ch * 3 * 4).order(ByteOrder.nativeOrder())
+    val requiredSourceBytes = checkedRgbFloatBytes(w, h)
+    val logicalSource = sourceData.duplicate().order(ByteOrder.nativeOrder())
+    require(logicalSource.remaining() >= requiredSourceBytes) {
+        "crop source buffer is truncated: ${logicalSource.remaining()} < $requiredSourceBytes"
+    }
+    logicalSource.limit(logicalSource.position() + requiredSourceBytes)
+    val sf = logicalSource.slice().order(ByteOrder.nativeOrder()).asFloatBuffer()
+    val out = ByteBuffer.allocateDirect(checkedRgbFloatBytes(cw, ch))
+        .order(ByteOrder.nativeOrder())
     val of = out.asFloatBuffer()
     var oi = 0
     for (oy in 0 until ch) {
@@ -298,7 +410,7 @@ fun cropLinearImageRect(
             oi += 3
         }
     }
-    return LinearImage(out, cw, ch, colorSpace = src.colorSpace)
+    LinearImage(out, cw, ch, colorSpace = src.colorSpace)
 }
 
 /** Native pixel edge of the full-resolution magnifier crop. */
@@ -320,6 +432,38 @@ const val ROI_DRAFT_MAX_PX = 640
 const val DRAFT_RENDER_MAX_PX = 384
 
 /**
+ * Run a resource-producing block on [context] without leaking its result in
+ * [withContext]'s prompt-cancellation return window.
+ *
+ * A dispatcher switch can finish [block], then observe caller cancellation before the value is
+ * delivered. Ordinary `withContext` discards that value. This helper keeps the produced value in
+ * an atomic handoff slot until delivery succeeds; any exceptional/cancelled exit consumes the slot
+ * through [dispose]. After a normal return, ownership belongs exclusively to the caller.
+ */
+internal suspend fun <T : Any> withOwnedContext(
+    context: CoroutineContext,
+    dispose: (T) -> Unit,
+    block: suspend () -> T,
+): T {
+    val pending = AtomicReference<T?>()
+    try {
+        val result = withContext(context) {
+            block().also { produced ->
+                check(pending.compareAndSet(null, produced)) {
+                    "owned context produced more than one resource"
+                }
+            }
+        }
+        check(pending.compareAndSet(result, null)) {
+            "owned context resource handoff was already consumed"
+        }
+        return result
+    } finally {
+        pending.getAndSet(null)?.let(dispose)
+    }
+}
+
+/**
  * Coalesces concurrent or rapidly-cancelled decodes of the SAME source key into ONE in-flight
  * decode, run in a caller-supplied STABLE [CoroutineScope]. The zoom ROI render + 100% magnifier
  * re-fire on every gesture settle and are cancelled+restarted, but a native LibRaw decode does NOT
@@ -331,10 +475,10 @@ const val DRAFT_RENDER_MAX_PX = 384
  */
 class SingleFlight<T> {
     private val mutex = Mutex()
-    private var key: String? = null
+    private var key: Any? = null
     private var inflight: Deferred<T>? = null
 
-    suspend fun run(key: String, scope: CoroutineScope, block: suspend () -> T): T {
+    suspend fun run(key: Any, scope: CoroutineScope, block: suspend () -> T): T {
         val deferred = mutex.withLock {
             val cur = inflight
             if (this.key == key && cur != null && cur.isActive) {
@@ -352,7 +496,7 @@ class SingleFlight<T> {
  * slider/param edits don't re-decode the RAW/photo (LibRaw decode or bitmap decode + sRGB→
  * ProPhoto linearization + EXIF/rotation) on every render. Only the look/film params change
  * between most renders, and the decoded source does NOT depend on any of them — it depends
- * only on the DECODE-affecting inputs captured in [Key].
+ * only on the DECODE-affecting inputs captured in [Request].
  *
  * READ-ONLY / DEFENSIVE-COPY DECISION: verified against the engine + JNI that the input image
  * buffer is treated as strictly const, so the SAME cached [LinearImage] can be re-fed to
@@ -365,21 +509,21 @@ class SingleFlight<T> {
  *     (read-only read; spektra.cpp ~L901) before simulating.
  *   - The JNI obtains `in_data` via `GetDirectBufferAddress` and only reads it (spektra_jni.cpp).
  * Therefore re-using the cached buffer cannot corrupt it. (If the engine ever started writing
- * into the input, this class would have to hand out a copy instead — see [get].)
+ * into the input, this class would have to hand out a copy instead — see [acquire].)
  *
- * Scope: exactly ONE cached entry (the current source at the current proxy resolution). Storing
- * a new entry drops the previous [LinearImage] reference, so its direct ByteBuffer becomes
- * eligible for GC — we never hold two large source buffers at once.
+ * Scope: exactly ONE cached entry (the current source at the current proxy resolution). Publishing
+ * a new entry retires the previous [LinearImage], closing it now or after its last active lease.
  *
  * Thread-safety: all access happens from the preview render coroutine (Dispatchers.Default /
  * .IO sequentially per render); methods are `@Synchronized` as cheap insurance since
  * [invalidate] may be called from a different scope.
  */
-class DecodedSourceCache {
+internal class DecodedSourceCache {
     /** Everything that affects the DECODE of the proxy source — and nothing that doesn't. */
-    private data class Key(
+    data class Request(
         val uri: String?,
         val kind: String,
+        val authorizationRequired: Boolean,
         val whiteBalance: WhiteBalance,
         val temperature: Float,
         val tint: Float,
@@ -396,44 +540,126 @@ class DecodedSourceCache {
         val maxEdge: Int,
     )
 
-    private var key: Key? = null
-    private var image: LinearImage? = null
+    /** Publication authority for one immutable logical decode request. */
+    data class Ticket(
+        internal val request: Request,
+        internal val generation: Long,
+    )
+
+    private class Entry(
+        val request: Request,
+        val image: LinearImage,
+    ) {
+        private var leases = 0
+        private var retired = false
+
+        @Synchronized
+        fun acquire(): Lease? {
+            if (retired) return null
+            leases++
+            return Lease(image, ::release)
+        }
+
+        @Synchronized
+        fun retire() {
+            if (retired) return
+            retired = true
+            if (leases == 0) image.close()
+        }
+
+        @Synchronized
+        private fun release() {
+            check(leases > 0) { "decoded-source lease underflow" }
+            leases--
+            if (retired && leases == 0) image.close()
+        }
+    }
+
+    /** Pins one cached frame until [close], deferring eviction/invalidation cleanup. */
+    class Lease internal constructor(
+        val image: LinearImage,
+        private val release: () -> Unit,
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean(false)
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) release()
+        }
+    }
+
+    private var entry: Entry? = null
+    private var requested: Request? = null
+    private var generation = 0L
+
+    /**
+     * Begin or join the newest decode generation. A different immutable request invalidates old
+     * publication authority before its detached decode can complete.
+     */
+    @Synchronized
+    fun beginRequest(request: Request): Ticket {
+        if (requested != request) {
+            requested = request
+            generation++
+        }
+        return Ticket(request, generation)
+    }
 
     /**
      * Return the cached decoded source if its key matches the supplied decode inputs, else
-     * null. A null result means the caller must decode (via loadSource) and then [put] it.
+     * null. A null result means the caller must decode the immutable request and then [publish] it.
      */
-    @Synchronized
-    fun get(
-        uri: String?, kind: String, whiteBalance: WhiteBalance,
-        temperature: Float, tint: Float, creativeTemp: Float, creativeTint: Float,
-        filmBalance: String, rotationDegrees: Int, maxEdge: Int,
-    ): LinearImage? {
-        val k = Key(uri, kind, whiteBalance, temperature, tint, creativeTemp, creativeTint, filmBalance, rotationDegrees, maxEdge)
-        return if (k == key) image else null
+    fun acquire(ticket: Ticket): Lease? {
+        val candidate = synchronized(this) {
+            entry?.takeIf {
+                ticket.generation == generation &&
+                    ticket.request == requested &&
+                    it.request == ticket.request
+            }
+        }
+        return candidate?.acquire()
     }
 
-    /** Store [img] as the single cached entry, releasing any previous one. */
-    @Synchronized
-    fun put(
-        uri: String?, kind: String, whiteBalance: WhiteBalance,
-        temperature: Float, tint: Float, creativeTemp: Float, creativeTint: Float,
-        filmBalance: String, rotationDegrees: Int, maxEdge: Int,
-        img: LinearImage,
-    ) {
-        // Release the previous entry. This cache only holds proxy-scale (previewMaxSize
-        // <= 1024, well below HALF_DECODE_EDGE_THRESHOLD) MANAGED buffers, so close() is
-        // a no-op the GC then reclaims; closing also correctly frees the native buffer
-        // were an off-heap image ever cached, instead of leaking it (native memory is
-        // not GC-tracked). Guarded against re-putting the same instance.
-        image?.takeIf { it !== img }?.close()
-        key = Key(uri, kind, whiteBalance, temperature, tint, creativeTemp, creativeTint, filmBalance, rotationDegrees, maxEdge)
-        image = img
+    fun isCurrent(ticket: Ticket): Boolean = synchronized(this) {
+        ticket.generation == generation && ticket.request == requested
+    }
+
+    /**
+     * Consume [img], publishing it only while [ticket] remains current. Stale detached results are
+     * closed here and can never evict a newer cache entry.
+     */
+    fun publish(ticket: Ticket, img: LinearImage): Boolean {
+        var accepted = false
+        val previous = synchronized(this) {
+            if (ticket.generation != generation || ticket.request != requested) {
+                null
+            } else {
+                accepted = true
+                val current = entry
+                if (current?.image !== img) {
+                    entry = Entry(ticket.request, img)
+                    current
+                } else {
+                    null
+                }
+            }
+        }
+        if (accepted) {
+            previous?.retire()
+        } else {
+            img.close()
+        }
+        return accepted
     }
 
     /** Drop the cached entry (e.g. on teardown), releasing its buffer. */
-    @Synchronized
-    fun invalidate() { image?.close(); key = null; image = null }
+    fun invalidate() {
+        val previous = synchronized(this) {
+            generation++
+            requested = null
+            entry.also { entry = null }
+        }
+        previous?.retire()
+    }
 }
 
 /**
@@ -526,7 +752,7 @@ private fun createTaggedBitmap(w: Int, h: Int, cs: ColorSpace): Bitmap {
 
 /**
  * Apply the creative output grade (gamut compression + Saturation/Vibrance) AND the local-adjustment
- * masks in place to [res]'s output buffer, then convert to a bitmap. Mutating `res.data` in place means
+ * masks in place to [res]'s leased output buffer, then convert to a bitmap. Mutating that buffer means
  * a subsequent 16-bit export ([saveSimResultAsTiff] / [saveSimResultAsPng16]) that reads the SAME [res]
  * inherits both — so preview and every export format stay WYSIWYG. Masks run AFTER the global grade
  * (local adjustments are on the final graded image). All-no-op → zero per-pixel cost.
@@ -538,8 +764,20 @@ fun simResultToBitmapGraded(
     vibrance: Float,
     gamutCompress: Float,
     localAdjustments: List<LocalAdjustment> = emptyList(),
-): Bitmap = gradeBufferToBitmap(res.data, res.width, res.height, res.colorSpace,
-    cctfEncoded, saturation, vibrance, gamutCompress, localAdjustments)
+): Bitmap = res.acquireDataLease().use { lease ->
+    val data = lease.data
+    gradeBufferToBitmap(
+        data,
+        res.width,
+        res.height,
+        res.colorSpace,
+        cctfEncoded,
+        saturation,
+        vibrance,
+        gamutCompress,
+        localAdjustments,
+    )
+}
 
 /**
  * The buffer-level core of [simResultToBitmapGraded]: grade [data] IN PLACE and

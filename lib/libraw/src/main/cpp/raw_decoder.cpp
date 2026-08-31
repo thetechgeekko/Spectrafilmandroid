@@ -1,9 +1,11 @@
 /*
  * Spektrafilm for Android — lib:libraw native decoder (implementation).
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
- * Uses LibRaw (LGPL-2.1).
+ * Uses statically included, dual-offered LibRaw; distribution is governed by the
+ * bundled decision record and fail-closed release audit.
  *
- * Reproduces spektrafilm/utils/raw_file_processor.py on-device with LibRaw:
+ * Implements the same processing-option contract as
+ * spektrafilm/utils/raw_file_processor.py on-device with LibRaw:
  *   raw.postprocess(output_color=ACES, output_bps=16, no_auto_bright=True,
  *                   gamma=(1,1), use_camera_wb=<as_shot>)
  * then the colour-science white-balance path (Von-Kries adaptation + tint) for
@@ -12,20 +14,24 @@
  * output_colorspace="ProPhoto RGB". The decoded result is therefore linear
  * ProPhoto RGB, NOT ACES2065-1 (ACES is only the intermediate working space).
  *
- * The LibRaw include is guarded with __has_include so this translation unit still
- * compiles and links even if LibRaw is unavailable (e.g. a host build without the
- * source). In the normal build, CMake fetches LibRaw and adds its root to this
- * target's include path, so <libraw/libraw.h> resolves and the real decode path
- * (SFRAW_HAVE_LIBRAW) is compiled in.
+ * The LibRaw include is guarded so the first-party sniffer tests can compile the
+ * diagnostic-only no-LibRaw branch. Shipping CMake fails closed unless the
+ * verified dependency is present; normal builds fetch it, add its headers, and
+ * compile the real SFRAW_HAVE_LIBRAW decode path.
  */
 #include "raw_decoder.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <new>
 #include <unistd.h>
 #include <vector>
 
@@ -33,7 +39,7 @@
 #include <android/log.h>
 #endif
 
-#if defined(__has_include)
+#if !defined(SFRAW_FORCE_NO_LIBRAW) && defined(__has_include)
 #  if __has_include(<libraw/libraw.h>)
 #    include <libraw/libraw.h>
 #    define SFRAW_HAVE_LIBRAW 1
@@ -42,6 +48,35 @@
 
 #ifndef SFRAW_HAVE_LIBRAW
 #  define SFRAW_HAVE_LIBRAW 0
+#endif
+
+#if defined(SFRAW_TESTING)
+namespace sfraw::test {
+namespace {
+using LibRawProgressObserver = void (*)(void*);
+std::atomic<LibRawProgressObserver> g_libraw_progress_observer{nullptr};
+std::atomic<void*> g_libraw_progress_context{nullptr};
+}  // namespace
+
+void setLibRawProgressObserverForTest(LibRawProgressObserver observer,
+                                      void* context) noexcept {
+    g_libraw_progress_context.store(context, std::memory_order_relaxed);
+    g_libraw_progress_observer.store(observer, std::memory_order_release);
+}
+
+void notifyLibRawProgressForTest() noexcept {
+    const auto observer =
+        g_libraw_progress_observer.load(std::memory_order_acquire);
+    if (observer != nullptr) {
+        observer(g_libraw_progress_context.load(std::memory_order_relaxed));
+    }
+}
+}  // namespace sfraw::test
+#endif
+
+#if SFRAW_HAVE_LIBRAW
+static_assert(LIBRAW_VERSION == LIBRAW_MAKE_VERSION(0, 22, 2),
+              "sfraw must compile against the audited LibRaw 0.22.2 source");
 #endif
 
 namespace spectrafilm {
@@ -58,11 +93,11 @@ namespace spectrafilm {
 //      generic corrupt-file error.
 //   2. For diagnostics: naming the compression in error messages.
 //
-// CRITICAL: lossless-JPEG/LJ92 (Compression 7) and uncompressed (1) and deflate
-// (8) all decode NATIVELY (see DecodeStatus doc in raw_decoder.h). LibRaw's
-// internal lossless_jpeg_load_raw handles tag 7 with no libjpeg. So tag 7 must
-// NOT be classified as a fallback case — only genuinely-unsupported lossy JPEG
-// (6 / 0x884C) and JPEG-XL (0xCD42) are.
+// CRITICAL: lossless-JPEG/LJ92 (Compression 7), uncompressed (1), and the
+// SampleFormat=3 floating-point deflate subset (Compression 8) decode natively.
+// Integer/linear deflate is a typed fallback in pinned LibRaw 0.22.2. LibRaw's
+// internal lossless_jpeg_load_raw handles tag 7 with no libjpeg, so tag 7 must
+// never be classified as an unsupported-codec fallback.
 //
 // Many mobile/Pixel DNGs put a large JPEG *preview* in IFD0 and the real raw
 // plane in a SubIFD; the IFD walk below (SubIFDs + next-IFD chain, picking the
@@ -76,7 +111,7 @@ enum Compression {
     kNone = 1,            // uncompressed -> decodes natively
     kLossyJpegOld = 6,    // old-style JPEG (lossy) -> needs libjpeg (fallback)
     kLosslessJpeg = 7,    // lossless JPEG / LJ92 -> decodes natively (internal)
-    kDeflate = 8,         // ZIP/DEFLATE (Adobe) -> decodes natively (USE_ZLIB)
+    kDeflate = 8,         // float ZIP/DEFLATE -> native with USE_ZLIB
     kDeflateAdobe = 0x80B2,
     kLossyJpeg = 0x884C,  // DNG 1.4 lossy baseline JPEG -> needs libjpeg
     kJpegXL = 0xCD42,     // DNG 1.7 JPEG-XL (52546) -> needs libjxl/dngsdk
@@ -86,7 +121,9 @@ struct Reader {
     const uint8_t* p = nullptr;
     size_t n = 0;
     bool be = false;
-    bool in(size_t off, size_t len) const { return off + len <= n && off <= n; }
+    bool in(size_t off, size_t len) const {
+        return off <= n && len <= n - off;
+    }
     uint16_t u16(size_t o) const {
         if (!in(o, 2)) return 0;
         return be ? (uint16_t)((p[o] << 8) | p[o + 1])
@@ -102,12 +139,17 @@ struct Reader {
 };
 
 inline void scanIfd(const Reader& r, uint32_t ifdOff, bool& isDng,
-                    int& bestComp, uint64_t& bestPx, int depth) {
-    if (ifdOff == 0 || depth > 4 || !r.in(ifdOff, 2)) return;
+                    int& bestComp, int& bestSampleFormat,
+                    uint64_t& bestPx, int depth,
+                    unsigned& remainingIfds) {
+    if (ifdOff == 0 || depth > 4 || remainingIfds == 0 ||
+        !r.in(ifdOff, 2)) return;
+    --remainingIfds;
     uint16_t entries = r.u16(ifdOff);
     if (entries == 0 || entries > 512) return;
 
     int comp = kUnknown;
+    int sampleFormat = 1;  // TIFF default: unsigned integer.
     uint32_t width = 0, height = 0, newSubfileType = 0;
     uint32_t subifds[16];
     int subCount = 0;
@@ -127,6 +169,7 @@ inline void scanIfd(const Reader& r, uint32_t ifdOff, bool& isDng,
             case 0x0100: width = scalar(); break;           // ImageWidth
             case 0x0101: height = scalar(); break;          // ImageLength
             case 0x0103: comp = (int)scalar(); break;       // Compression
+            case 0x0153: sampleFormat = (int)scalar(); break; // SampleFormat
             case 0xC612: isDng = true; break;               // DNGVersion
             case 0x014A:                                    // SubIFDs
                 if ((type == 4 || type == 3) && count <= 16) {
@@ -148,66 +191,96 @@ inline void scanIfd(const Reader& r, uint32_t ifdOff, bool& isDng,
     if (!reduced && comp != kUnknown && px >= bestPx) {
         bestPx = px;
         bestComp = comp;
+        bestSampleFormat = sampleFormat;
     }
     for (int s = 0; s < subCount; ++s)
-        scanIfd(r, subifds[s], isDng, bestComp, bestPx, depth + 1);
+        scanIfd(r, subifds[s], isDng, bestComp, bestSampleFormat, bestPx,
+                depth + 1,
+                remainingIfds);
 
     uint32_t next = r.u32((size_t)ifdOff + 2 + (size_t)entries * 12);
-    if (next > ifdOff) scanIfd(r, next, isDng, bestComp, bestPx, depth);
+    if (next > ifdOff)
+        scanIfd(r, next, isDng, bestComp, bestSampleFormat, bestPx, depth,
+                remainingIfds);
 }
 
-// Returns the primary-image compression; sets *isDng if a DNGVersion tag seen.
-inline int compressionOf(const uint8_t* data, size_t len, bool* isDng) {
-    *isDng = false;
-    if (data == nullptr || len < 8) return kUnknown;
+struct PrimaryImageInfo {
+    int compression = kUnknown;
+    int sampleFormat = 1;
+    bool isDng = false;
+};
+
+inline PrimaryImageInfo primaryImageInfoOf(const uint8_t* data, size_t len) {
+    PrimaryImageInfo info;
+    if (data == nullptr || len < 8) return info;
     Reader r;
     r.p = data;
     r.n = len;
     if (data[0] == 'I' && data[1] == 'I') r.be = false;
     else if (data[0] == 'M' && data[1] == 'M') r.be = true;
-    else return kUnknown;
-    int best = kUnknown;
+    else return info;
     uint64_t bestPx = 0;
-    bool dng = false;
-    scanIfd(r, r.u32(4), dng, best, bestPx, 0);
-    *isDng = dng;
-    return best;
+    // Bound both recursive SubIFDs and the otherwise attacker-controlled
+    // next-IFD chain. This parser is only a fallback diagnostic; 32 IFDs is
+    // ample for real DNG metadata and prevents stack/CPU amplification.
+    unsigned remainingIfds = 32;
+    scanIfd(r, r.u32(4), info.isDng, info.compression,
+            info.sampleFormat, bestPx, 0, remainingIfds);
+    return info;
+}
+
+// Returns the primary-image compression; sets *isDng if a DNGVersion tag seen.
+inline int compressionOf(const uint8_t* data, size_t len, bool* isDng) {
+    const PrimaryImageInfo info = primaryImageInfoOf(data, len);
+    *isDng = info.isDng;
+    return info.compression;
 }
 
 inline bool isDeflate(int c) { return c == kDeflate || c == kDeflateAdobe; }
 inline bool isLossyJpeg(int c) { return c == kLossyJpeg || c == kLossyJpegOld; }
 inline bool isJpegXL(int c) { return c == kJpegXL; }
-// Compressions LibRaw decodes natively in this build (no external image libs).
-inline bool isNativelySupported(int c) {
-    return c == kNone || c == kLosslessJpeg || isDeflate(c);
+
+inline int classifyKnownCodecFallback(const PrimaryImageInfo& info) {
+    if (!info.isDng) return SFRAW_ERR_UNPACK;
+    const int comp = info.compression;
+    if (isJpegXL(comp)) return SFRAW_ERR_JPEGXL_DNG;
+    if (isLossyJpeg(comp)) {
+#ifndef USE_JPEG
+        return SFRAW_ERR_LOSSY_JPEG_DNG;
+#endif
+    }
+    if (isDeflate(comp)) {
+#ifndef USE_ZLIB
+        return SFRAW_ERR_DEFLATE_DNG;
+#else
+        if (comp != kDeflate || info.sampleFormat != 3)
+            return SFRAW_ERR_DEFLATE_DNG;
+#endif
+    }
+    return SFRAW_ERR_UNPACK;
+}
+
+// Some unsupported compression tags are rejected by LibRaw during
+// open_buffer(), before unpack classification is reachable. Keep those typed.
+inline int classifyOpenFailure(const uint8_t* data, size_t len) {
+    return classifyKnownCodecFallback(primaryImageInfoOf(data, len));
 }
 
 // Classify an unpack() failure for a compressed DNG into a stable status.
 // Returns SFRAW_ERR_UNPACK if it isn't a recognizable must-fallback case.
 //
 // Note: this only runs AFTER unpack() has already failed. Uncompressed (1),
-// lossless-JPEG/LJ92 (7) and deflate (8) decode natively, so reaching here with
-// one of those means a genuine data error, not an unsupported codec -> we leave
-// them as SFRAW_ERR_UNPACK rather than mislabeling them as a fallback case.
+// lossless-JPEG/LJ92 (7), and SampleFormat=3 float deflate decode natively;
+// integer/linear deflate is intentionally classified as a typed fallback.
 inline int classifyUnpackFailure(const uint8_t* data, size_t len) {
-    bool isDng = false;
-    int comp = compressionOf(data, len, &isDng);
-    if (isDng) {
-        if (isJpegXL(comp)) return SFRAW_ERR_JPEGXL_DNG;  // needs libjxl/dngsdk
-        if (isLossyJpeg(comp)) {
-#ifndef USE_JPEG
-            return SFRAW_ERR_LOSSY_JPEG_DNG;  // needs libjpeg
-#endif
-        }
-        if (isDeflate(comp)) {
-#ifndef USE_ZLIB
-            return SFRAW_ERR_DEFLATE_DNG;  // misbuild: rebuild with USE_ZLIB
-#endif
-        }
+    const PrimaryImageInfo info = primaryImageInfoOf(data, len);
+    const int knownFallback = classifyKnownCodecFallback(info);
+    if (knownFallback != SFRAW_ERR_UNPACK) return knownFallback;
+    if (info.isDng) {
         // A DNG of unknown/unreadable compression that still failed unpack: the
         // dominant real-world cause among DNGs LibRaw can't open is an
         // unsupported lossy codec, so hint the platform fallback.
-        if (comp == kUnknown) return SFRAW_ERR_LOSSY_JPEG_DNG;
+        if (info.compression == kUnknown) return SFRAW_ERR_LOSSY_JPEG_DNG;
     }
     return SFRAW_ERR_UNPACK;
 }
@@ -230,6 +303,130 @@ const char* dngCompressionName(int v) {
 }
 
 namespace {
+
+// LibRaw defaults its unpack/raw-store allocation budget to 2048 MiB, which is
+// unsuitable for an Android process. Patch 0004 separately bounds identify-time
+// metadata at compile time. Ticket #173 owns a future device-class/tiled policy.
+constexpr unsigned kMaxRawMemoryMb = 128;
+// Immediate safety ceiling for the current in-memory decoder. Ticket #173
+// replaces the fd slurp with a seekable/tiled datastream before larger future
+// RAWs can be admitted without making encoded bytes an unbounded allocation.
+constexpr size_t kMaxEncodedInputBytes = 64U * 1024U * 1024U;
+// LibRaw's raw-store budget does not include every later dcraw_process(),
+// dcraw_make_mem_image(), and float-result allocation. Bound metadata-declared
+// pixels before unpack() as an immediate mobile-safe policy. Do not relax this
+// for half_size: non-Bayer/linear DNG layouts may ignore that request and still
+// allocate at full resolution. Ticket #173 replaces the fixed limit with tiled
+// decode and device-class budgeting.
+constexpr uint64_t kMaxFullDecodePixels =
+    sizeof(void*) >= 8 ? 12ULL * 1024ULL * 1024ULL
+                       : 8ULL * 1024ULL * 1024ULL;
+
+#if SFRAW_HAVE_LIBRAW
+void applyInputLimits(LibRaw& raw) {
+    raw.imgdata.rawparams.max_raw_memory_mb = kMaxRawMemoryMb;
+}
+
+bool isMemoryLimitFailure(int code) {
+    return code == LIBRAW_UNSUFFICIENT_MEMORY || code == LIBRAW_TOO_BIG ||
+           code == ENOMEM;
+}
+
+bool cancellationRequested(const DecodeOptions& options) {
+    return options.cancelFlag != nullptr &&
+           options.cancelFlag->load(std::memory_order_acquire);
+}
+
+int cancelLibRawProgress(void* context, LibRaw_progress, int, int) {
+#if defined(SFRAW_TESTING)
+    sfraw::test::notifyLibRawProgressForTest();
+#endif
+    const auto* flag = static_cast<const std::atomic<bool>*>(context);
+    return flag != nullptr && flag->load(std::memory_order_acquire) ? 1 : 0;
+}
+
+void applyCancellationHandler(LibRaw& raw, const DecodeOptions& options) {
+    if (options.cancelFlag != nullptr) {
+        // LibRaw owns neither the callback context nor the flag. The DecodeOptions
+        // cancellation lease outlives this synchronous decode, and the callback
+        // only reads the atomic even though LibRaw's API accepts an untyped void*.
+        raw.set_progress_handler(cancelLibRawProgress,
+                                 const_cast<std::atomic<bool>*>(options.cancelFlag));
+    }
+}
+
+DecodeResult cancellationFailure(int librawCode = 0) {
+    DecodeResult result;
+    result.librawCode = librawCode;
+    result.status = SFRAW_ERR_CANCELLED;
+    result.error = "RAW decode cancelled";
+    return result;
+}
+
+bool pixelProductExceeds(uint64_t width, uint64_t height, uint64_t limit) {
+    return width != 0U && (height > limit / width);
+}
+
+bool stretchedDimensionsExceedLimit(const libraw_image_sizes_t& sizes,
+                                    uint64_t limit) {
+    const double aspect = sizes.pixel_aspect;
+    if (!std::isfinite(aspect) || aspect <= 0.0) return true;
+
+    const uint64_t width = sizes.width;
+    const uint64_t height = sizes.height;
+    if (width == 0U || height == 0U) return false;
+
+    double projectedWidth = static_cast<double>(width);
+    double projectedHeight = static_cast<double>(height);
+    // TIFF identify() normalizes only values strictly inside (0.995, 1.005).
+    // Mirror stretch() for every surviving value on either side of 1.0,
+    // including the exact 0.995/1.005 boundary values.
+    if (aspect < 1.0) {
+        projectedHeight = projectedHeight / aspect + 0.5;
+    } else if (aspect > 1.0) {
+        projectedWidth = projectedWidth * aspect + 0.5;
+    }
+    const double maxUshort =
+        static_cast<double>(std::numeric_limits<uint16_t>::max());
+    if (!std::isfinite(projectedWidth) || !std::isfinite(projectedHeight) ||
+        projectedWidth > maxUshort || projectedHeight > maxUshort) {
+        return true;
+    }
+    return pixelProductExceeds(static_cast<uint64_t>(projectedWidth),
+                               static_cast<uint64_t>(projectedHeight), limit);
+}
+
+bool declaredDecodeDimensionsExceedLimit(const LibRaw& raw,
+                                         const DecodeOptions&) {
+    const auto& sizes = raw.imgdata.sizes;
+    // LibRaw::unpack() may expand its raw-store dimensions to include active
+    // area margins even when raw_width*raw_height and width*height are each
+    // individually below the limit. Mirror that allocation geometry with
+    // widened arithmetic so hostile ActiveArea values cannot amplify memory.
+    const uint64_t allocationWidth = std::max<uint64_t>(
+        sizes.raw_width,
+        static_cast<uint64_t>(sizes.width) + sizes.left_margin);
+    const uint64_t allocationHeight = std::max<uint64_t>(
+        sizes.raw_height,
+        static_cast<uint64_t>(sizes.height) + sizes.top_margin);
+    return pixelProductExceeds(sizes.raw_width, sizes.raw_height,
+                               kMaxFullDecodePixels) ||
+           pixelProductExceeds(sizes.width, sizes.height,
+                               kMaxFullDecodePixels) ||
+           pixelProductExceeds(allocationWidth, allocationHeight,
+                               kMaxFullDecodePixels) ||
+           stretchedDimensionsExceedLimit(sizes, kMaxFullDecodePixels);
+}
+
+DecodeResult dimensionLimitFailure(const DecodeOptions&) {
+    DecodeResult result;
+    result.status = SFRAW_ERR_NO_MEMORY;
+    result.error = sizeof(void*) >= 8
+        ? "RAW geometry exceeds 12 MiPixel in-memory safety limit"
+        : "RAW geometry exceeds 8 MiPixel in-memory safety limit";
+    return result;
+}
+#endif
 
 // Reference (target) white for the daylight-base modes. raw_file_processor.py:
 //   _DAYLIGHT_REFERENCE_TEMPERATURE = 6504.0
@@ -273,6 +470,29 @@ constexpr double kAcesToProPhoto[9] = {
      0.0036113618663812341, 1.0896136492217019,   -0.093265792081978632,
     -0.00205967931567552,  -0.0022515883414713734, 1.0045855773288515,
 };
+
+void mat3MulVec(const double m[9], const double v[3], double out[3]);
+
+bool aces2065ToProPhotoRGBImpl(float* rgb, size_t pixelCount,
+                               const std::atomic<bool>* cancelFlag) {
+    // Pure matrix (kAcesToProPhoto), no transfer function. Accumulate in double
+    // for parity with the float64 numpy/colour path, then store float32.
+    // Deliberately do not clamp: gamut handling is a separate pipeline stage.
+    for (size_t i = 0; i < pixelCount; ++i) {
+        if ((i & 4095U) == 0U && cancelFlag != nullptr &&
+            cancelFlag->load(std::memory_order_acquire)) {
+            return false;
+        }
+        const double in[3] = {rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2]};
+        double out[3];
+        mat3MulVec(kAcesToProPhoto, in, out);
+        rgb[i * 3 + 0] = static_cast<float>(out[0]);
+        rgb[i * 3 + 1] = static_cast<float>(out[1]);
+        rgb[i * 3 + 2] = static_cast<float>(out[2]);
+    }
+    return cancelFlag == nullptr ||
+           !cancelFlag->load(std::memory_order_acquire);
+}
 
 void mat3MulVec(const double m[9], const double v[3], double out[3]) {
     out[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
@@ -383,21 +603,15 @@ void aces2065ToProPhotoRGB(float* rgb, size_t pixelCount) {
     // Deliberately does NOT clamp: ACES2065-1 (AP0) is wider than ProPhoto, so
     // saturated colours can map slightly out of gamut (negative / >1), exactly as
     // the oracle leaves them — gamut handling is a separate, opt-in pipeline stage.
-    for (size_t i = 0; i < pixelCount; ++i) {
-        const double in[3] = {rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2]};
-        double out[3];
-        mat3MulVec(kAcesToProPhoto, in, out);
-        rgb[i * 3 + 0] = static_cast<float>(out[0]);
-        rgb[i * 3 + 1] = static_cast<float>(out[1]);
-        rgb[i * 3 + 2] = static_cast<float>(out[2]);
-    }
+    (void)aces2065ToProPhotoRGBImpl(rgb, pixelCount, nullptr);
 }
 
 #if SFRAW_HAVE_LIBRAW
 
 namespace {
 
-// Apply the rawpy-parity postprocess params (RAW_DNG.md):
+// Apply the desktop-compatible postprocess option contract (RAW_DNG.md).
+// Exact output parity also requires the same qualified LibRaw version (#189).
 //   output_color=6 (ACES), output_bps=16, no_auto_bright=1, gamm[0]=gamm[1]=1.0,
 //   use_camera_wb for as-shot.
 // When options.halfSize is true, also sets half_size=1 so LibRaw averages each
@@ -414,6 +628,9 @@ void applyParityParams(LibRaw& raw, const DecodeOptions& options) {
     p.no_auto_bright = 1;
     p.gamm[0]        = 1.0;   // gamma (1,1) -> linear
     p.gamm[1]        = 1.0;
+    // Built-in wavelet denoise is outside Spektrafilm's parity contract. Pinning
+    // zero makes the default explicit and keeps that postprocess path unreachable.
+    p.threshold      = 0.0f;
 
     // Half-size proxy decode: set to 1 for fast low-memory decode, 0 for full-res.
     // Explicitly writing 0 in the full-res path is defensive — LibRaw default-
@@ -436,10 +653,11 @@ void applyParityParams(LibRaw& raw, const DecodeOptions& options) {
 
 // Full per-pixel Von-Kries adaptation in ACES RGB (the non-neutral-accurate path),
 // mirroring _apply_white_balance_adaptation + _apply_tint_adjustment.
-void applyAcesAdaptation(float* rgb, size_t pixelCount, const DecodeOptions& options) {
+bool applyAcesAdaptation(float* rgb, size_t pixelCount,
+                         const DecodeOptions& options) {
     if (options.whiteBalance == WhiteBalanceMode::AsShot ||
         options.whiteBalance == WhiteBalanceMode::Daylight) {
-        return;
+        return !cancellationRequested(options);
     }
 
     double targetTemp = options.temperatureK;
@@ -457,6 +675,7 @@ void applyAcesAdaptation(float* rgb, size_t pixelCount, const DecodeOptions& opt
     const double sz = reference[2] / scene[2];
 
     for (size_t i = 0; i < pixelCount; ++i) {
+        if ((i & 4095U) == 0U && cancellationRequested(options)) return false;
         double in[3] = {rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2]};
         double xyz[3];
         mat3MulVec(kAcesRgbToXyz, in, xyz);
@@ -467,6 +686,7 @@ void applyAcesAdaptation(float* rgb, size_t pixelCount, const DecodeOptions& opt
         rgb[i * 3 + 1] = static_cast<float>(out[1] * tint);  // green tint
         rgb[i * 3 + 2] = static_cast<float>(out[2]);
     }
+    return !cancellationRequested(options);
 }
 
 // Run unpack + dcraw_process + dcraw_make_mem_image and copy the 16-bit linear RGB
@@ -479,6 +699,8 @@ void applyAcesAdaptation(float* rgb, size_t pixelCount, const DecodeOptions& opt
 DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
                           const uint8_t* srcData, size_t srcLen) {
     DecodeResult result;
+
+    if (cancellationRequested(options)) return cancellationFailure();
 
     // Intra-decode phase timers (#158). `phaseMs()` returns the delta since the last
     // call and re-stamps, so the phases are contiguous by construction and cannot
@@ -498,9 +720,13 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
 
     int rc = raw.unpack();
     mUnpack = phaseMs();
+    if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
+    if (cancellationRequested(options)) return cancellationFailure();
     if (rc != LIBRAW_SUCCESS) {
         result.librawCode = rc;
-        result.status = dngsniff::classifyUnpackFailure(srcData, srcLen);
+        result.status = isMemoryLimitFailure(rc)
+            ? SFRAW_ERR_NO_MEMORY
+            : dngsniff::classifyUnpackFailure(srcData, srcLen);
         // Name the specific compression in the message for diagnosability.
         bool isDng = false;
         int comp = dngsniff::compressionOf(srcData, srcLen, &isDng);
@@ -515,18 +741,30 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
             hint = " [JPEG-XL DNG; this build has no libjxl/dngsdk — fall back to "
                    "platform ImageDecoder]";
         else if (result.status == SFRAW_ERR_DEFLATE_DNG)
-            hint = " [deflate-compressed DNG; rebuild LibRaw with USE_ZLIB]";
+            hint = " [deflate DNG layout unsupported by pinned LibRaw (integer "
+                   "samples) or zlib is disabled; use the platform fallback]";
         result.error = std::string("LibRaw unpack() failed: ") +
                        libraw_strerror(rc) + where + hint;
         return result;
     }
+    // Some loaders finalize or replace image geometry during unpack(). Re-run
+    // the same overflow-safe raw/visible/margin/aspect guard before any
+    // dcraw_process() allocation instead of trusting identify-time dimensions.
+    if (declaredDecodeDimensionsExceedLimit(raw, options)) {
+        return dimensionLimitFailure(options);
+    }
     applyParityParams(raw, options);
+    if (cancellationRequested(options)) return cancellationFailure();
     phaseMs();  // param setup is not decode work — keep it out of `process`
     rc = raw.dcraw_process();
     mProcess = phaseMs();
+    if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
+    if (cancellationRequested(options)) return cancellationFailure();
     if (rc != LIBRAW_SUCCESS) {
         result.librawCode = rc;
-        result.status = SFRAW_ERR_PROCESS;
+        result.status = isMemoryLimitFailure(rc)
+            ? SFRAW_ERR_NO_MEMORY
+            : SFRAW_ERR_PROCESS;
         result.error =
             std::string("LibRaw dcraw_process() failed: ") + libraw_strerror(rc);
         return result;
@@ -535,38 +773,58 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     int status = LIBRAW_SUCCESS;
     libraw_processed_image_t* img = raw.dcraw_make_mem_image(&status);
     mMemImg = phaseMs();
+    if (status == LIBRAW_CANCELLED_BY_CALLBACK) {
+        if (img) LibRaw::dcraw_clear_mem(img);
+        return cancellationFailure(status);
+    }
     if (img == nullptr || status != LIBRAW_SUCCESS) {
         if (img) LibRaw::dcraw_clear_mem(img);
         result.librawCode = status;
-        result.status = SFRAW_ERR_PROCESS;
+        result.status = isMemoryLimitFailure(status)
+            ? SFRAW_ERR_NO_MEMORY
+            : SFRAW_ERR_PROCESS;
         result.error = std::string("LibRaw dcraw_make_mem_image() failed: ") +
                        libraw_strerror(status);
         return result;
     }
-    if (img->type != LIBRAW_IMAGE_BITMAP || img->colors != 3 || img->bits != 16) {
-        LibRaw::dcraw_clear_mem(img);
+    auto clearImage = [](libraw_processed_image_t* owned) {
+        if (owned != nullptr) LibRaw::dcraw_clear_mem(owned);
+    };
+    std::unique_ptr<libraw_processed_image_t, decltype(clearImage)> image(
+        img, clearImage);
+    if (cancellationRequested(options)) return cancellationFailure();
+    if (image->type != LIBRAW_IMAGE_BITMAP || image->colors != 3 ||
+        image->bits != 16) {
         result.status = SFRAW_ERR_FORMAT;
         result.error = "unexpected LibRaw image format (expected 16-bit 3-channel)";
         return result;
     }
 
-    const int fullW = img->width;
-    const int fullH = img->height;
-    const auto* src = reinterpret_cast<const uint16_t*>(img->data);
+    const int fullW = image->width;
+    const int fullH = image->height;
+    if (fullW <= 0 || fullH <= 0 ||
+        pixelProductExceeds(static_cast<uint64_t>(fullW),
+                            static_cast<uint64_t>(fullH),
+                            kMaxFullDecodePixels)) {
+        return dimensionLimitFailure(options);
+    }
+    const auto* src = reinterpret_cast<const uint16_t*>(image->data);
     constexpr float kInv16 = 1.0f / 65535.0f;
 
     // Cap the longest edge to options.maxLongEdge (proxy bound) DURING the uint16->float
     // copy: subsample img->data straight into the final-sized buffer so we never hold a
     // second full-resolution float image. LibRaw's half_size is honoured for most Bayer
     // DNGs, but some (e.g. certain Samsung Expert-RAW DNGs) decode full-resolution
-    // regardless; without this cap result.rgb stays full-res and the JVM-side direct
-    // ByteBuffer (a managed byte[] on Android) OOMs the ART heap. Peak native memory here
-    // is LibRaw's own image + the (small) capped buffer — not two full-res copies.
+    // regardless; without this cap result.rgb stays full-res and the returned direct
+    // buffer plus downstream copies can exhaust the process memory budget. Peak native
+    // memory here is LibRaw's own image + the capped buffer, not two full-res copies.
     int step = 1;
     {
         const int longest = fullW > fullH ? fullW : fullH;
         if (options.maxLongEdge > 0 && longest > options.maxLongEdge) {
-            while (longest / step > options.maxLongEdge) ++step;
+            step = static_cast<int>(
+                (static_cast<int64_t>(longest) + options.maxLongEdge - 1) /
+                options.maxLongEdge);
         }
     }
     const int ow = step > 1 ? (fullW + step - 1) / step : fullW;
@@ -575,6 +833,7 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     result.height = oh;
     result.rgb.resize(static_cast<size_t>(ow) * oh * 3);
     for (int oy = 0; oy < oh; ++oy) {
+        if (cancellationRequested(options)) return cancellationFailure();
         const size_t srow = static_cast<size_t>(oy) * step * fullW;
         for (int ox = 0; ox < ow; ++ox) {
             const size_t si = (srow + static_cast<size_t>(ox) * step) * 3;
@@ -585,9 +844,12 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
         }
     }
     mCopy = phaseMs();
-    LibRaw::dcraw_clear_mem(img);
+    image.reset();
 
-    applyAcesAdaptation(result.rgb.data(), static_cast<size_t>(ow) * oh, options);
+    if (!applyAcesAdaptation(result.rgb.data(), static_cast<size_t>(ow) * oh,
+                             options)) {
+        return cancellationFailure();
+    }
     mAdapt = phaseMs();
 
     // Final colourspace conversion: linear ACES2065-1 -> linear ProPhoto RGB, the
@@ -596,8 +858,13 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     // Without this the buffer was tagged ACES but read as ProPhoto downstream
     // (spektra_jni hardcodes the engine input to ProPhoto), so every native RAW
     // decode ran through the wrong primaries.
-    aces2065ToProPhotoRGB(result.rgb.data(), static_cast<size_t>(ow) * oh);
+    if (!aces2065ToProPhotoRGBImpl(result.rgb.data(),
+                                   static_cast<size_t>(ow) * oh,
+                                   options.cancelFlag)) {
+        return cancellationFailure();
+    }
     mColour = phaseMs();
+    if (cancellationRequested(options)) return cancellationFailure();
 
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "sfraw",
@@ -617,34 +884,64 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
 
 }  // namespace
 
-DecodeResult decodeFromBuffer(const uint8_t* data, size_t length, const DecodeOptions& options) {
+DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
+                              const DecodeOptions& options) try {
     DecodeResult result;
+    if (cancellationRequested(options)) return cancellationFailure();
     if (data == nullptr || length == 0) {
         result.status = SFRAW_ERR_INPUT;
         result.error = "empty input buffer";
         return result;
     }
+    if (length > kMaxEncodedInputBytes) {
+        result.status = SFRAW_ERR_INPUT;
+        result.error = "RAW input exceeds 64 MiB safety limit";
+        return result;
+    }
     LibRaw raw;
+    applyInputLimits(raw);
+    applyCancellationHandler(raw, options);
     int rc = raw.open_buffer(const_cast<uint8_t*>(data), length);
+    if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
+    if (cancellationRequested(options)) return cancellationFailure();
     if (rc != LIBRAW_SUCCESS) {
         result.librawCode = rc;
-        result.status = (rc == LIBRAW_FILE_UNSUPPORTED) ? SFRAW_ERR_FILE_UNSUPPORTED
-                                                        : SFRAW_ERR_OPEN;
+        const int codecFallback = dngsniff::classifyOpenFailure(data, length);
+        result.status = isMemoryLimitFailure(rc) ? SFRAW_ERR_NO_MEMORY
+            : (codecFallback != SFRAW_ERR_UNPACK ? codecFallback
+            : (rc == LIBRAW_FILE_UNSUPPORTED ? SFRAW_ERR_FILE_UNSUPPORTED
+                                              : SFRAW_ERR_OPEN));
         result.error = std::string("LibRaw open_buffer() failed: ") +
                        libraw_strerror(rc) + " (unsupported or corrupt RAW)";
         return result;
     }
+    if (declaredDecodeDimensionsExceedLimit(raw, options)) {
+        return dimensionLimitFailure(options);
+    }
     return finishDecode(raw, options, data, length);
+} catch (const std::bad_alloc&) {
+    DecodeResult result;
+    result.status = SFRAW_ERR_NO_MEMORY;
+    result.error = "out of memory";
+    return result;
+} catch (...) {
+    DecodeResult result;
+    result.status = SFRAW_ERR_UNKNOWN;
+    result.error = "decode failed";
+    return result;
 }
 
-DecodeResult decodeFromFd(int fd, const DecodeOptions& options) {
+DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
     DecodeResult result;
+    if (cancellationRequested(options)) return cancellationFailure();
     if (fd < 0) {
         result.status = SFRAW_ERR_INPUT;
         result.error = "invalid file descriptor";
         return result;
     }
     LibRaw raw;
+    applyInputLimits(raw);
+    applyCancellationHandler(raw, options);
     // LibRaw can read from a FILE*; we dup the fd so the caller keeps ownership.
     int dup_fd = ::dup(fd);
     if (dup_fd < 0) {
@@ -652,30 +949,43 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) {
         result.error = "dup(fd) failed";
         return result;
     }
-    FILE* fp = ::fdopen(dup_fd, "rb");
-    if (fp == nullptr) {
+    FILE* openedFile = ::fdopen(dup_fd, "rb");
+    if (openedFile == nullptr) {
         ::close(dup_fd);
         result.status = SFRAW_ERR_INPUT;
         result.error = "fdopen() failed";
         return result;
     }
-    // open_datastream owns the FILE* lifecycle once the buffer is attached; simplest
-    // robust path is to slurp into memory and reuse open_buffer.
-    // TODO(libraw): for very large RAWs, switch to a LibRaw_abstract_datastream
-    // backed by the fd to avoid the full read into RAM.
+    std::unique_ptr<FILE, decltype(&std::fclose)> fp(openedFile, &std::fclose);
+    // Keep the existing open_buffer parity path for this ticket, but read in
+    // bounded chunks. This supports descriptors without a trustworthy stat size
+    // and rejects over-limit files before growing the vector past the ceiling.
     std::vector<uint8_t> bytes;
     [[maybe_unused]] auto ioAt = std::chrono::steady_clock::now();
-    {
-        std::fseek(fp, 0, SEEK_END);
-        long size = std::ftell(fp);
-        std::fseek(fp, 0, SEEK_SET);
-        if (size > 0) {
-            bytes.resize(static_cast<size_t>(size));
-            size_t read = std::fread(bytes.data(), 1, bytes.size(), fp);
-            bytes.resize(read);
+    std::array<uint8_t, 64U * 1024U> chunk{};
+    for (;;) {
+        if (cancellationRequested(options)) return cancellationFailure();
+        const size_t read =
+            std::fread(chunk.data(), 1, chunk.size(), fp.get());
+        if (cancellationRequested(options)) return cancellationFailure();
+        if (read > 0) {
+            if (read > kMaxEncodedInputBytes - bytes.size()) {
+                result.status = SFRAW_ERR_INPUT;
+                result.error = "RAW input exceeds 64 MiB safety limit";
+                return result;
+            }
+            bytes.insert(bytes.end(), chunk.data(), chunk.data() + read);
+        }
+        if (read < chunk.size()) {
+            if (std::ferror(fp.get())) {
+                result.status = SFRAW_ERR_INPUT;
+                result.error = "failed to read RAW from fd";
+                return result;
+            }
+            break;
         }
     }
-    std::fclose(fp);  // closes dup_fd
+    fp.reset();  // closes only the duplicate; caller retains ownership
 #ifdef __ANDROID__
     // Separated from the phases above because it happens before LibRaw sees anything.
     // Only the fd path is timed: decodeFromBuffer has no file read, and exports take
@@ -691,35 +1001,53 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) {
         return result;
     }
     int rc = raw.open_buffer(bytes.data(), bytes.size());
+    if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
+    if (cancellationRequested(options)) return cancellationFailure();
     if (rc != LIBRAW_SUCCESS) {
         result.librawCode = rc;
-        result.status = (rc == LIBRAW_FILE_UNSUPPORTED) ? SFRAW_ERR_FILE_UNSUPPORTED
-                                                        : SFRAW_ERR_OPEN;
+        const int codecFallback =
+            dngsniff::classifyOpenFailure(bytes.data(), bytes.size());
+        result.status = isMemoryLimitFailure(rc) ? SFRAW_ERR_NO_MEMORY
+            : (codecFallback != SFRAW_ERR_UNPACK ? codecFallback
+            : (rc == LIBRAW_FILE_UNSUPPORTED ? SFRAW_ERR_FILE_UNSUPPORTED
+                                              : SFRAW_ERR_OPEN));
         result.error = std::string("LibRaw open_buffer() failed: ") +
                        libraw_strerror(rc) + " (unsupported or corrupt RAW)";
         return result;
     }
+    if (declaredDecodeDimensionsExceedLimit(raw, options)) {
+        return dimensionLimitFailure(options);
+    }
     return finishDecode(raw, options, bytes.data(), bytes.size());
+} catch (const std::bad_alloc&) {
+    DecodeResult result;
+    result.status = SFRAW_ERR_NO_MEMORY;
+    result.error = "out of memory";
+    return result;
+} catch (...) {
+    DecodeResult result;
+    result.status = SFRAW_ERR_UNKNOWN;
+    result.error = "decode failed";
+    return result;
 }
 
 #else  // !SFRAW_HAVE_LIBRAW
 
-// Fallback: LibRaw headers were not found at compile time (only happens if the
-// FetchContent step was skipped without -DSFRAW_LIBRAW_SOURCE_DIR). The module
-// still compiles and the .so links so the Kotlin facade can be wired; decode()
-// returns a clear error instead of crashing.
+// Headerless fallback retained only for lightweight source-level tests that
+// intentionally compile this file without the native dependency. Production
+// CMake fails during configure before a libsfraw.so can take this branch.
 
 DecodeResult decodeFromBuffer(const uint8_t*, size_t, const DecodeOptions&) {
     DecodeResult result;
     result.status = SFRAW_ERR_UNKNOWN;
-    result.error = "LibRaw unavailable: configure with network (FetchContent) or -DSFRAW_LIBRAW_SOURCE_DIR";
+    result.error = "LibRaw unavailable in this non-production test build";
     return result;
 }
 
 DecodeResult decodeFromFd(int, const DecodeOptions&) {
     DecodeResult result;
     result.status = SFRAW_ERR_UNKNOWN;
-    result.error = "LibRaw unavailable: configure with network (FetchContent) or -DSFRAW_LIBRAW_SOURCE_DIR";
+    result.error = "LibRaw unavailable in this non-production test build";
     return result;
 }
 

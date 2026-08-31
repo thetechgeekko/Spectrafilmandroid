@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "oracle": {
+    "repository": "https://github.com/andreavolpato/spektrafilm",
+    "sha": "c1d0e44b962d80a51ea096d33faea346e4f3836c",
+    "source_path": "src/spektrafilm/utils/raw_file_processor.py",
+    "source_blob": "97e34feb80fe47a6a3b36fcb93bef626d397135a",
+    "test_path": "tests/test_raw_file_processor.py",
+    "test_blob": "9103a1d05110fa973a9e696d9a7a02ee865ff81a",
+    "latest_checked_sha": "3bb2c2d2801ff68b92019cf1dbcbb133d60832bc",
+    "latest_checked_utc": "2026-08-30",
+    "environment": {
+      "python": "3.11.2",
+      "numpy": "1.26.4",
+      "colour_science": "0.4.7"
+    },
+    "call": "colour.chromatic_adaptation(XYZ, source_white, target_white, method='Von Kries')",
+    "resolved_transform": "CAT02"
+  },
+  "selected_model": "cat02",
+  "target_white": {
+    "temperature_k": 6504.0,
+    "cct_to_xy": "CIE Illuminant D Series at >=4000 K; Kang 2002 below 4000 K",
+    "normalization": "XYZ Y=1"
+  },
+  "scenarios": [
+    {
+      "id": "as_shot",
+      "mode": "as_shot",
+      "description": "Camera metadata WB is owned by LibRaw; no post-demosaic CAT or tint."
+    },
+    {
+      "id": "daylight",
+      "mode": "daylight",
+      "description": "LibRaw daylight base; the upstream oracle applies no extra CAT."
+    },
+    {
+      "id": "tungsten_2850",
+      "mode": "tungsten",
+      "description": "Tungsten preset, 2850 K scene white to 6504 K reference."
+    },
+    {
+      "id": "fluorescent_mixed_proxy",
+      "mode": "custom",
+      "temperature_k": 4100.0,
+      "tint": 0.85,
+      "description": "CCT+tint proxy for fluorescent/mixed light; the current API cannot encode a spectral SPD or Duv directly."
+    },
+    {
+      "id": "near_reference_tinted",
+      "mode": "custom",
+      "temperature_k": 6504.01,
+      "tint": 1.1,
+      "description": "Exercises the oracle's numpy.allclose CAT skip and its separate float32 tint step."
+    },
+    {
+      "id": "near_unity_tint_skip",
+      "mode": "custom",
+      "temperature_k": 4100.0,
+      "tint": 1.000001,
+      "description": "Exercises the oracle's numpy.isclose tint skip; current Android always multiplies tint."
+    },
+    {
+      "id": "extreme_warm_ui_min",
+      "mode": "custom",
+      "temperature_k": 1000.0,
+      "tint": 0.2,
+      "description": "Android/upstream GUI minimum; outside Kang 2002's documented 1667 K domain but deterministically computed by the pinned oracle."
+    },
+    {
+      "id": "extreme_cool_ui_max",
+      "mode": "custom",
+      "temperature_k": 12000.0,
+      "tint": 1.8,
+      "description": "Android GUI maximum with an extreme green multiplier."
+    }
+  ],
+  "patches": [
+    {
+      "id": "neutral_shadow",
+      "kind": "analytic-neutral",
+      "aces_rgb": [0.01, 0.01, 0.01]
+    },
+    {
+      "id": "neutral_mid",
+      "kind": "analytic-neutral",
+      "aces_rgb": [0.18, 0.18, 0.18]
+    },
+    {
+      "id": "neutral_hdr",
+      "kind": "analytic-neutral",
+      "aces_rgb": [2.0, 2.0, 2.0]
+    },
+    {
+      "id": "wide_gamut_hdr",
+      "kind": "analytic-colour",
+      "aces_rgb": [1.2, 0.2, 0.05]
+    },
+    {
+      "id": "samsung_native_dng_patch",
+      "kind": "camera-seed",
+      "camera_cohort": "Samsung SM-S948W native DNG",
+      "aces_rgb": [0.01326009, 0.009903105, 0.003036545],
+      "provenance": "5x5 median at normalized (x=.75,y=.25), rawpy 0.27.0/LibRaw 0.22.1 daylight half-size decode; source SHA-256 58093ddfb0bba8fa6be32ae038b1323584e30902b20fb7c338eab4d6e16e444a"
+    },
+    {
+      "id": "motioncam_dng_patch",
+      "kind": "camera-seed",
+      "camera_cohort": "MotionCam DNG on Android sensor",
+      "aces_rgb": [0.78362707, 0.564049744, 0.715114061],
+      "provenance": "5x5 median at normalized (x=.75,y=.25), rawpy 0.27.0/LibRaw 0.22.1 daylight half-size decode; source SHA-256 bb74d3285ccb32cb775aaac029471cf6ed23ce4ec66e9e370ada1b2b2010b314"
+    },
+    {
+      "id": "fujifilm_x100s_raf_patch",
+      "kind": "camera-seed",
+      "camera_cohort": "Fujifilm X100S RAF/X-Trans",
+      "aces_rgb": [0.308690013, 0.305363546, 0.458930343],
+      "provenance": "5x5 median at normalized (x=.75,y=.25), rawpy 0.27.0/LibRaw 0.22.1 daylight half-size decode; source SHA-256 5e2322bb1739c7cfc10b5d8d770aac4482916dbc1ad873dd1bb7cbed1f90a980"
+    }
+  ],
+  "colour_reference_vectors": [
+    {
+      "scenario": "daylight",
+      "patch": "neutral_mid",
+      "aces_bits": [1043878380, 1043878380, 1043878380],
+      "prophoto_bits": [1043880544, 1043877887, 1043881694]
+    },
+    {
+      "scenario": "tungsten_2850",
+      "patch": "neutral_mid",
+      "aces_bits": [1045456876, 1047440146, 1057627275],
+      "prophoto_bits": [1043437842, 1045514453, 1057652943]
+    },
+    {
+      "scenario": "fluorescent_mixed_proxy",
+      "patch": "fujifilm_x100s_raf_patch",
+      "aces_bits": [1051511604, 1050046974, 1061742265],
+      "prophoto_bits": [1050624658, 1048454997, 1061779878]
+    },
+    {
+      "scenario": "near_reference_tinted",
+      "patch": "motioncam_dng_patch",
+      "aces_bits": [1061723081, 1058985503, 1060573623],
+      "prophoto_bits": [1062260788, 1058846848, 1060578122]
+    },
+    {
+      "scenario": "near_unity_tint_skip",
+      "patch": "neutral_mid",
+      "aces_bits": [1044076829, 1045025430, 1050541910],
+      "prophoto_bits": [1043289196, 1044323614, 1050561857]
+    },
+    {
+      "scenario": "extreme_warm_ui_min",
+      "patch": "samsung_native_dng_patch",
+      "aces_bits": [1011439736, 995384338, 1023701710],
+      "prophoto_bits": [1011415812, 974298006, 1023732760]
+    },
+    {
+      "scenario": "extreme_cool_ui_max",
+      "patch": "wide_gamut_hdr",
+      "aces_bits": [1067891831, 1052611655, 1022633948],
+      "prophoto_bits": [1069979489, 1053789616, 1020819312]
+    }
+  ],
+  "expected_report_sha256": "fff1b77b0dfd776fcf6eefd24451166affb2f465695c5b89d0edc13453dc3d09"
+}

@@ -1,0 +1,46 @@
+diff --git a/src/decoders/load_mfbacks.cpp b/src/decoders/load_mfbacks.cpp
+--- a/src/decoders/load_mfbacks.cpp
++++ b/src/decoders/load_mfbacks.cpp
+@@ -722,6 +722,7 @@
+   struct jhead jh;
+   int shot, row, col, *back[5]={0,0,0,0,0},
+  	 len[2], diff[12], pred, sh, f, c;
++  INT64 next_pred;
+   unsigned s;
+   unsigned upix, urow, ucol;
+   ushort *ip;
+@@ -764,20 +765,31 @@
+         }
+         for (s = col; s < unsigned(col + 2); s++)
+         {
+-          pred = 0x8000 + load_flags;
++          next_pred = INT64(0x8000) + INT64(load_flags);
++          if (next_pred < INT_MIN || next_pred > INT_MAX)
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
++          pred = int(next_pred);
+           if (col)
+             pred = back[2][s - 2];
+           if (col && row > 1)
+             switch (jh.psv)
+             {
+             case 11:
+-              pred += back[0][s] / 2 - back[0][s - 2] / 2;
++              next_pred = INT64(pred) + INT64(back[0][s]) / 2 -
++                          INT64(back[0][s - 2]) / 2;
++              if (next_pred < INT_MIN || next_pred > INT_MAX)
++                throw LIBRAW_EXCEPTION_IO_CORRUPT;
++              pred = int(next_pred);
+               break;
+             }
+           f = (row & 1) * 3 ^ ((col + s) & 1);
+           FORC(int(tiff_samples))
+           {
+-            pred += diff[(s & 1) * tiff_samples + c];
++            next_pred = INT64(pred) +
++                        INT64(diff[(s & 1) * tiff_samples + c]);
++            if (next_pred < INT_MIN || next_pred > INT_MAX)
++              throw LIBRAW_EXCEPTION_IO_CORRUPT;
++            pred = int(next_pred);
+             upix = pred >> sh & 0xffff;
+             if (raw_image && c == shot)
+               RAW(row, s) = upix;

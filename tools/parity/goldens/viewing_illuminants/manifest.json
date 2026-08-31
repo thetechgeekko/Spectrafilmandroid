@@ -1,0 +1,61 @@
+{
+  "columns": {
+    "d50_vs_k75p_diff.png": [
+      "K75P",
+      "D50 counterfactual",
+      "abs diff heatmap"
+    ],
+    "k75p_2383_2393.png": [
+      "Kodak 2383 K75P",
+      "Kodak 2393 K75P"
+    ]
+  },
+  "heat_gain": 8.0,
+  "metrics": {
+    "kodak_2383": {
+      "d50_vs_k75p_max_abs": 0.17841127514839172,
+      "d50_vs_k75p_rms": 0.014902156798073484,
+      "k75p_fixture_max_abs": 1.2665987014770508e-07,
+      "k75p_fixture_rms": 1.3438021713241467e-08
+    },
+    "kodak_2393": {
+      "d50_vs_k75p_max_abs": 0.18768800795078278,
+      "d50_vs_k75p_rms": 0.015658422004368688,
+      "k75p_fixture_max_abs": 1.695007085800171e-07,
+      "k75p_fixture_rms": 1.318130071520441e-08
+    }
+  },
+  "oracle": {
+    "colour_version": "0.4.7",
+    "commit": "c1d0e44b962d80a51ea096d33faea346e4f3836c",
+    "pillow_version": "12.3.0",
+    "repository": "https://github.com/andreavolpato/spektrafilm",
+    "worktree": "clean"
+  },
+  "output_space_ref_sha256": {
+    "kodak_2383": {
+      "aces2065_1": "b0cab4f383e04c5dd7eebed1ac132ee6f4d238118ab38df64c45a91a8f68a667",
+      "adobe_rgb": "f5a010d4fc7287f4907de3cac5d79e6dd55accf4037e2d0ae57c7da6565ff6e9",
+      "linear_srgb": "8d43686f516cdca7ac25efc9fbe4b3d865a66602eaab035e00c2197a65111796",
+      "prophoto": "5b3e8debcfad86c5271e02d07fdf31ffe4412f806552d97f74cd2636b7334764",
+      "rec2020": "0eef5b58a6a58edda44937372cec4791c78578ffc288c3147696d681f8b94fe3",
+      "srgb": "343df1bd1e290f46ce59b7eb1cf86757fb8d9752602fc8168b9506d7f4861309"
+    },
+    "kodak_2393": {
+      "aces2065_1": "af1a219388fe7b35bc76c87d97b76ffcd92ed76924738814eea4453dd23b0f83",
+      "adobe_rgb": "8f1475d6c3de58c99437545284dce84838fc6850a4e25b63d3a3f6b8c63a1388",
+      "linear_srgb": "85a1f748602bde4ab026ed4db33a3f87898ac3e665107edfcfdfccc9077232a8",
+      "prophoto": "fd4782951453000d8d1892c6ad59d9edbaa7822ed40967a1f0e325bfa15c7fe4",
+      "rec2020": "ec859574b62befe57890087e31267887479f7677f597a2c0fb4346fafb8b4b56",
+      "srgb": "0cb309ef7e0313b4deb0dcd5c6b44a852d26e26acc1bb4ec169fedbd1763ba91"
+    }
+  },
+  "rows": [
+    "kodak_2383",
+    "kodak_2393"
+  ],
+  "sha256": {
+    "d50_vs_k75p_diff.png": "9bd908193cd7f7de40ca8a6c07189a593c49df3ae761bfea1ad948fccea7fa22",
+    "k75p_2383_2393.png": "3699641b7d264d2f78998e1ae3461be9162e76ba671735a7c2495080f5a44533"
+  }
+}

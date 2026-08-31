@@ -3,7 +3,7 @@
  * Film modeling powered by spektrafilm.
  *
  * The seam that makes masks DO something: it blends a [LocalAdjustment]'s Tier-A delta into the engine
- * OUTPUT buffer where the mask is opaque. Applied in place on the same `SimResult.data` the global
+ * OUTPUT buffer where the mask is opaque. Applied in place on the same leased `SimResult` buffer the global
  * grade uses (so preview + every export inherit it identically), it is a parity-safe Tier-2 op — no
  * engine/spektra-core/cpp is touched, and an empty/no-op stack is a strict no-op.
  *

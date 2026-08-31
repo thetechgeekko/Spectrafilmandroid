@@ -1,0 +1,89 @@
+diff --git a/libraw/libraw_internal.h b/libraw/libraw_internal.h
+--- a/libraw/libraw_internal.h
++++ b/libraw/libraw_internal.h
+@@ -176,6 +176,7 @@ typedef struct
+   INT64 meta_offset;
+   INT64 exif_offset, exif_subdir_offset, ifd0_offset;
+   INT64 data_size;
++  UINT64 ljpeg_setup_work_remaining;
+   unsigned meta_length;
+   unsigned cr3_exif_length, cr3_ifd0_length;
+   unsigned thumb_misc;
+diff --git a/internal/var_defines.h b/internal/var_defines.h
+--- a/internal/var_defines.h
++++ b/internal/var_defines.h
+@@ -171,6 +171,7 @@ it under the terms of the one of two licenses as you choose:
+ #define strip_offset      (libraw_internal_data.unpacker_data.strip_offset)
+ #define data_offset       (libraw_internal_data.unpacker_data.data_offset)
+ #define data_size         (libraw_internal_data.unpacker_data.data_size)
++#define ljpeg_setup_work_remaining (libraw_internal_data.unpacker_data.ljpeg_setup_work_remaining)
+ #define meta_offset       (libraw_internal_data.unpacker_data.meta_offset)
+ #define meta_length       (libraw_internal_data.unpacker_data.meta_length)
+ #define thumb_misc        (libraw_internal_data.unpacker_data.thumb_misc)
+diff --git a/src/metadata/identify.cpp b/src/metadata/identify.cpp
+--- a/src/metadata/identify.cpp
++++ b/src/metadata/identify.cpp
+@@ -460,6 +460,18 @@ void LibRaw::identify()
+   iso_speed = shutter = aperture = focal_len = 0;
+   unique_id = 0ULL;
+   tiff_nifds = 0;
++  const INT64 signedInputBytes = ifp->size();
++  const UINT64 inputBytes = signedInputBytes > 0 ? UINT64(signedInputBytes) : 0;
++  const UINT64 maxValue = ~UINT64(0);
++  const UINT64 inputWorkBudget = inputBytes > maxValue / 2
++      ? maxValue
++      : inputBytes * 2;
++  const UINT64 memoryBytes = UINT64(imgdata.rawparams.max_raw_memory_mb) *
++      UINT64(1024 * 1024);
++  const UINT64 memoryWorkBudget = memoryBytes > maxValue / 2
++      ? maxValue
++      : memoryBytes * 2;
++  ljpeg_setup_work_remaining = MIN(inputWorkBudget, memoryWorkBudget);
+   is_NikonTransfer = 0;
+   is_Olympus = 0;
+   OlympusDNG_SubDirOffsetValid = 0;
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -298,6 +298,23 @@ int LibRaw::ljpeg_start(struct jhead *jh, int info_only)
+       throw LIBRAW_EXCEPTION_IO_CORRUPT;
+     return 0;
+   };
++  auto account_setup_work = [&](unsigned units) {
++    if (jh->setup_work_units > UINT_MAX - units)
++    {
++      cleanup_segment();
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    }
++    jh->setup_work_units += units;
++    if (info_only)
++    {
++      if (UINT64(units) > ljpeg_setup_work_remaining)
++      {
++        cleanup_segment();
++        throw LIBRAW_EXCEPTION_TOOBIG;
++      }
++      ljpeg_setup_work_remaining -= units;
++    }
++  };
+   jh->restart = INT_MAX;
+   if (fread(data, 2, 1, ifp) != 1 || data[0] != 0xff || data[1] != 0xd8)
+     return reject_segment();
+@@ -314,7 +331,7 @@ int LibRaw::ljpeg_start(struct jhead *jh, int info_only)
+     if (segment_length < 2)
+       return reject_segment();
+     len = segment_length - 2;
+-    jh->setup_work_units += segment_length + 2U;
++    account_setup_work(segment_length + 2U);
+     if (tag <= 0xff00)
+       return reject_segment();
+     if (fread(data, 1, len, ifp) != len)
+@@ -369,7 +386,7 @@ int LibRaw::ljpeg_start(struct jhead *jh, int info_only)
+           if (!leaves || leaves > 256 ||
+               leaves > static_cast<size_t>(dht_end - probe))
+             return reject_segment();
+-          jh->setup_work_units += 2U << max_code_length;
++          account_setup_work(2U << max_code_length);
+           probe += leaves;
+         }
+         for (dp = data; dp < dht_end;)

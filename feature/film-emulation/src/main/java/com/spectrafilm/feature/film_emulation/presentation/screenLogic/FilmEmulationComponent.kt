@@ -27,6 +27,7 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import com.arkivanov.decompose.ComponentContext
+import com.spectrafilm.engine.AppRenderOutcome
 import com.spectrafilm.engine.SpektraEngine
 import com.spectrafilm.engine.SpektraParams
 import com.t8rin.imagetoolbox.core.domain.coroutines.DispatchersHolder
@@ -38,6 +39,7 @@ import com.t8rin.imagetoolbox.core.ui.utils.state.update
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
+import kotlinx.coroutines.CancellationException
 
 /** Quality mode for a run: interactive downscaled preview vs full-resolution scan. */
 enum class RenderMode { Preview, FullScan }
@@ -186,7 +188,19 @@ class FilmEmulationComponent @AssistedInject internal constructor(
                 RenderMode.Preview -> engine.simulatePreview(linear, params)
                 RenderMode.FullScan -> engine.simulate(linear, params)
             }
-            sim.toBitmap()
+            sim.use { result ->
+                try {
+                    result.toBitmap().also {
+                        result.reportOutcome(AppRenderOutcome.CONSUMED)
+                    }
+                } catch (cancelled: CancellationException) {
+                    result.reportOutcome(AppRenderOutcome.CANCELLED)
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    result.reportOutcome(AppRenderOutcome.FAILED)
+                    throw failure
+                }
+            }
         } finally {
             _isProcessing.update { false }
         }

@@ -22,14 +22,19 @@
  * Run:
  *   /tmp/test_parallel <asset_dir> <input.f64>
  */
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "runtime/stage_timer.h"
 #include "spektra.h"
 
 namespace {
@@ -96,6 +101,159 @@ bool check_identical(const char* label, const std::vector<float>& a,
     return same;
 }
 
+// Two native renders can overlap on different Dispatchers.Default threads. Make
+// that overlap deterministic without running the expensive image pipeline: A
+// opens nested preview spans, B records/completes an export, then A completes.
+// This gates caller isolation, publish-after-completion, unique correlation ids,
+// outcome metadata, stable JSON, and parent/child/wall reconciliation (#163).
+bool check_stage_timing_isolation() {
+    std::promise<void> a_started_promise;
+    std::promise<void> b_done_promise;
+    std::shared_future<void> a_started = a_started_promise.get_future().share();
+    std::shared_future<void> b_done = b_done_promise.get_future().share();
+    std::string a_timings;
+    std::string b_timings;
+    std::string a_json;
+    std::string b_json;
+    spk::StageTimingSnapshot a_snapshot;
+    spk::StageTimingSnapshot b_snapshot;
+
+    std::thread a([&] {
+        {
+            spk::ScopedRenderTiming render(spk::RTK_PREVIEW);
+            {
+                spk::ScopedStage preprocess(spk::STG_PREPROCESS);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            {
+                spk::ScopedStage scan(spk::STG_SCAN);
+                {
+                    spk::ScopedStage spatial(spk::STG_SCAN_SPATIAL);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                a_started_promise.set_value();
+                b_done.wait();
+            }
+            render.finish(0);
+        }
+        char buf[256];
+        spk_stage_timings(buf, sizeof(buf));
+        a_timings = buf;
+        char json[2048];
+        spk_stage_timings_json(json, sizeof(json));
+        a_json = json;
+        a_snapshot = spk::stage_timing_snapshot();
+    });
+    std::thread b([&] {
+        a_started.wait();
+        {
+            spk::ScopedRenderTiming render(spk::RTK_EXPORT);
+            {
+                spk::ScopedStage grain(spk::STG_GRAIN);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            render.finish(0);
+        }
+        char buf[256];
+        spk_stage_timings(buf, sizeof(buf));
+        b_timings = buf;
+        char json[2048];
+        spk_stage_timings_json(json, sizeof(json));
+        b_json = json;
+        b_snapshot = spk::stage_timing_snapshot();
+        b_done_promise.set_value();
+    });
+    a.join();
+    b.join();
+
+    const bool isolated =
+        a_timings.find("preprocess=") != std::string::npos &&
+        a_timings.find("scan=") != std::string::npos &&
+        a_timings.find("scan_spatial=") != std::string::npos &&
+        a_timings.find("grain=") == std::string::npos &&
+        b_timings.find("grain=") != std::string::npos &&
+        b_timings.find("preprocess=") == std::string::npos &&
+        b_timings.find("scan=") == std::string::npos;
+    const bool ids_ok =
+        a_snapshot.render_id != 0 && b_snapshot.render_id != 0 &&
+        a_snapshot.render_id != b_snapshot.render_id;
+    const bool metadata_ok =
+        a_snapshot.kind == spk::RTK_PREVIEW &&
+        b_snapshot.kind == spk::RTK_EXPORT &&
+        a_snapshot.outcome == spk::RTO_OK &&
+        b_snapshot.outcome == spk::RTO_OK &&
+        a_snapshot.status_code == 0 && b_snapshot.status_code == 0;
+    const bool reconciliation_ok =
+        a_snapshot.stages_ms[spk::STG_SCAN] >=
+            a_snapshot.stages_ms[spk::STG_SCAN_SPATIAL] &&
+        a_snapshot.wall_ms + 0.001 >=
+            spk::stage_timing_top_level_ms(a_snapshot) &&
+        b_snapshot.wall_ms + 0.001 >=
+            spk::stage_timing_top_level_ms(b_snapshot);
+    const std::string a_id =
+        "\"render_id\":" + std::to_string(a_snapshot.render_id);
+    const std::string b_id =
+        "\"render_id\":" + std::to_string(b_snapshot.render_id);
+    const bool json_ok =
+        a_json.find("\"schema\":\"spk.stage_timings.v1\"") !=
+            std::string::npos &&
+        a_json.find(a_id) != std::string::npos &&
+        a_json.find("\"kind\":\"preview\"") != std::string::npos &&
+        a_json.find("\"native_outcome\":\"ok\"") != std::string::npos &&
+        a_json.find("\"scan_spatial\":\"scan\"") != std::string::npos &&
+        b_json.find(b_id) != std::string::npos &&
+        b_json.find("\"kind\":\"export\"") != std::string::npos;
+
+    // Expected failures and actual exception unwinding must publish error
+    // snapshots instead of leaving the previous successful render current.
+    {
+        spk::ScopedRenderTiming error(spk::RTK_TAP);
+        error.finish(SPK_ERR_INTERNAL);
+    }
+    char error_json[2048];
+    spk_stage_timings_json(error_json, sizeof(error_json));
+    const bool error_ok =
+        std::strstr(error_json, "\"kind\":\"tap\"") != nullptr &&
+        std::strstr(error_json, "\"native_outcome\":\"error\"") != nullptr &&
+        std::strstr(error_json, "\"status_code\":5") != nullptr;
+
+    try {
+        spk::ScopedRenderTiming unwinding(spk::RTK_EXACT_RENDER);
+        throw std::runtime_error("timing unwind probe");
+    } catch (const std::runtime_error&) {
+    }
+    const spk::StageTimingSnapshot unwind_snapshot =
+        spk::stage_timing_snapshot();
+    const bool unwind_ok =
+        unwind_snapshot.outcome == spk::RTO_ERROR &&
+        unwind_snapshot.status_code == -1 &&
+        unwind_snapshot.kind == spk::RTK_EXACT_RENDER;
+
+    char small_json[64] = {'x', '\0'};
+    const bool truncation_ok =
+        spk_stage_timings_json(small_json, sizeof(small_json)) == 0 &&
+        small_json[0] == '\0';
+    char outcome_json[256];
+    const bool app_outcome_ok =
+        spk::stage_timing_outcome_json_format(
+            outcome_json, sizeof(outcome_json), a_snapshot.render_id,
+            spk::ARO_SUPERSEDED) > 0 &&
+        std::strstr(outcome_json, "\"schema\":\"spk.render_outcome.v1\"") !=
+            nullptr &&
+        std::strstr(outcome_json, "\"app_outcome\":\"superseded\"") !=
+            nullptr;
+
+    const bool ok = isolated && ids_ok && metadata_ok && reconciliation_ok &&
+                    json_ok && error_ok && unwind_ok && truncation_ok &&
+                    app_outcome_ok;
+    std::printf("[stage timing overlap] A={%s} B={%s} ids=%llu/%llu -> %s\n",
+                a_timings.c_str(), b_timings.c_str(),
+                static_cast<unsigned long long>(a_snapshot.render_id),
+                static_cast<unsigned long long>(b_snapshot.render_id),
+                ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -149,6 +307,10 @@ int main(int argc, char** argv) {
 
     bool ok = true;
     std::vector<float> r1, r8;
+
+    // 0) Render-local diagnostics: overlapping callers must never reset or
+    // merge each other's stage timings (#163).
+    ok &= check_stage_timing_isolation();
 
     // 1) Scan route, pointwise (the threaded expose + scan hot loops).
     {

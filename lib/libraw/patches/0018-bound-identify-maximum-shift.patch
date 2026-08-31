@@ -1,0 +1,70 @@
+diff --git a/src/metadata/identify.cpp b/src/metadata/identify.cpp
+--- a/src/metadata/identify.cpp
++++ b/src/metadata/identify.cpp
+@@ -1255,7 +1255,9 @@
+     tiff_bps = 12;
+   if (!maximum)
+   {
+-    maximum = (1 << tiff_bps) - 1;
++    maximum = tiff_sampleformat == 3
++                  ? 1U
++                  : (tiff_bps >= 16 ? 0xffffU : (1U << tiff_bps) - 1U);
+     if (maximum < 0x10000 && curve[maximum] > 0 &&
+         load_raw == &LibRaw::sony_arw2_load_raw)
+       maximum = curve[maximum];
+@@ -1537,9 +1539,10 @@
+ 			if (sidx >= 0 && tiff_ifd[sidx].dng_levels.dng_whitelevel[0])
+ 				COPYARR(imgdata.color.dng_levels.dng_whitelevel,
+ 					tiff_ifd[sidx].dng_levels.dng_whitelevel);
+-			else if (tiff_ifd[iifd].sample_format <= 2 && tiff_ifd[iifd].bps > 0 && tiff_ifd[iifd].bps < 32)
++			else if (tiff_ifd[iifd].sample_format <= 2 &&
++					tiff_ifd[iifd].bps > 0 && tiff_ifd[iifd].bps <= 16)
+ 				FORC4
+-				imgdata.color.dng_levels.dng_whitelevel[c] = (1 << tiff_ifd[iifd].bps) - 1;
++				imgdata.color.dng_levels.dng_whitelevel[c] = (1U << tiff_ifd[iifd].bps) - 1U;
+ 
+ 			// Copy dng opcode data for selected ifd to imgdata.color: if no opcodes present just 0/null copied
+ 			// DNG OpcodeListN should be in the selected IFD, not at global level (??)
+@@ -1927,9 +1930,12 @@
+ 	else if (makeIs(LIBRAW_CAMERAMAKER_Sony) &&
+ 		(raw_width > 3888) && !black && !cblack[0])
+ 	{
+-		black = (load_raw == &LibRaw::sony_arw2_load_raw)
+-			? 512
+-			: (128 << (tiff_bps - 12));
++		if (load_raw == &LibRaw::sony_arw2_load_raw)
++			black = 512;
++		else if (tiff_bps >= 12 && tiff_bps <= 16)
++			black = 128U << unsigned(tiff_bps - 12);
++		else
++			is_raw = 0;
+ 	}
+ 
+ 	if (is_foveon) {
+@@ -2674,8 +2680,10 @@
+ 		else if (raw_width == 6496) // Samsung NX1, NX500
+ 		{
+ 			filters = 0x61616161;
+-			if (!black && !cblack[0] && !cblack[1] && !cblack[2] && !cblack[3])
+-				black = 1 << (tiff_bps - 7);
++			if (tiff_bps < 7 || tiff_bps > 16)
++				is_raw = 0;
++			else if (!black && !cblack[0] && !cblack[1] && !cblack[2] && !cblack[3])
++				black = 1U << unsigned(tiff_bps - 7);
+ 		}
+ 		else if (!strcmp(normalized_model, "EX1")) // Samsung EX1; raw_width: 3688
+ 		{
+diff --git a/src/metadata/tiff.cpp b/src/metadata/tiff.cpp
+--- a/src/metadata/tiff.cpp
++++ b/src/metadata/tiff.cpp
+@@ -1977,8 +1977,8 @@
+         if (tiff_ifd[i].dng_levels.dng_whitelevel[0])
+           maximum = tiff_ifd[i].dng_levels.dng_whitelevel[0];
+         else if (tiff_ifd[i].sample_format <= 2 && tiff_bps > 0 &&
+-                 tiff_bps < 32) // SampleFormat: 0-default(1), 1 - Uint, 2 - Int
+-          maximum = (1 << tiff_bps) - 1;
++                 tiff_bps <= 16) // SampleFormat: 0-default(1), 1 - Uint, 2 - Int
++          maximum = (1U << tiff_bps) - 1U;
+         else if (tiff_ifd[i].sample_format == 3)
+           maximum = 1; // Defaults for FP
+       }

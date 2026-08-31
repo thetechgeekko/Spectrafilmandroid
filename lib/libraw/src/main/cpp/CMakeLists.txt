@@ -1,24 +1,19 @@
 # Spektrafilm for Android — lib:libraw native build.
 # Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
-# This module uses LibRaw (LGPL-2.1), linked into the GPLv3 app.
+# This module statically uses dual-offered LibRaw; the distribution route is a
+# fail-closed release decision tracked by the compliance tooling and ticket #166.
 #
-# Builds libsfraw.so: the rawpy-parity RAW/DNG decoder + JNI bridge, with LibRaw
-# compiled in statically.
+# Builds libsfraw.so: the RAW/DNG decoder + JNI bridge, with LibRaw compiled in
+# statically. The rawpy option contract is mirrored; exact decoder-version parity
+# remains a separate qualification gate (#189).
 #
 # --------------------------------------------------------------------------
-# VENDORING LIBRAW (reproducible, network-only)
+# VENDORING LIBRAW (reproducible and fail-closed)
 # --------------------------------------------------------------------------
-# LibRaw is obtained at configure time via CMake FetchContent, pinned to a
-# specific release tarball + SHA256 (see SFRAW_LIBRAW_VERSION / _URL / _SHA256
-# below). A clean checkout therefore builds with just a working network — no
-# git submodule, no committed third-party blob.
-#
-# To pin a different release, bump the three SFRAW_LIBRAW_* variables.
-#
-# Optional offline override: if LibRaw is already present on disk (e.g. a CI
-# cache or a hand-vendored copy), point -DSFRAW_LIBRAW_SOURCE_DIR=<dir> at a
-# stock LibRaw checkout (the directory that contains libraw/libraw.h) and
-# FetchContent is skipped.
+# The shared resolver pins the official 0.22.2 archive and SHA-256, applies the
+# hashed patch series, verifies source-level security contracts, and refuses a
+# runtime decoder stub. SFRAW_LIBRAW_SOURCE_DIR is debug/offline-only; shipping
+# builds must use the official hashed archive.
 # --------------------------------------------------------------------------
 
 cmake_minimum_required(VERSION 3.22.1)
@@ -32,6 +27,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # desktop rawpy output to within golden-vector tolerance.
 if (NOT CMAKE_CXX_FLAGS_RELEASE)
     set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+endif ()
+if (CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "(^| )-O2( |$)")
+    string(REPLACE "-O2" "-O3" CMAKE_CXX_FLAGS_RELWITHDEBINFO
+            "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
 endif ()
 
 # DEBUG BUILDS MUST STILL BE OPTIMISED. CMake's default CMAKE_CXX_FLAGS_DEBUG is
@@ -47,44 +46,10 @@ if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O")
 endif ()
 
 # --------------------------------------------------------------------------
-# Pinned LibRaw release.
+# Pinned LibRaw release + reviewed local patch series.
 # --------------------------------------------------------------------------
-set(SFRAW_LIBRAW_VERSION "0.21.4" CACHE STRING "Pinned LibRaw release version")
-set(SFRAW_LIBRAW_URL
-        "https://www.libraw.org/data/LibRaw-${SFRAW_LIBRAW_VERSION}.tar.gz"
-        CACHE STRING "LibRaw release tarball URL")
-# SHA256 of LibRaw-0.21.4.tar.gz (libraw.org). Pin so the fetch is verified.
-set(SFRAW_LIBRAW_SHA256
-        "6be43f19397e43214ff56aab056bf3ff4925ca14012ce5a1538a172406a09e63"
-        CACHE STRING "SHA256 of the pinned LibRaw tarball")
-
-# Optional: a pre-vendored LibRaw checkout (skips FetchContent when set/exists).
-set(SFRAW_LIBRAW_SOURCE_DIR "" CACHE PATH
-        "Pre-vendored LibRaw source dir (contains libraw/libraw.h); skips FetchContent")
-
-set(LIBRAW_DIR "")
-
-if (SFRAW_LIBRAW_SOURCE_DIR AND EXISTS "${SFRAW_LIBRAW_SOURCE_DIR}/libraw/libraw.h")
-    set(LIBRAW_DIR "${SFRAW_LIBRAW_SOURCE_DIR}")
-    message(STATUS "sfraw: using pre-vendored LibRaw at ${LIBRAW_DIR}")
-else ()
-    include(FetchContent)
-    message(STATUS "sfraw: fetching LibRaw ${SFRAW_LIBRAW_VERSION} from ${SFRAW_LIBRAW_URL}")
-    # NOTE: no DOWNLOAD_EXTRACT_TIMESTAMP here — that option is CMake 3.24+, and the
-    # Android-SDK-bundled CMake is 3.22.1, which folds the unknown keyword into
-    # URL_HASH and fails. 3.22 extracts fine without it.
-    FetchContent_Declare(
-            libraw_upstream
-            URL "${SFRAW_LIBRAW_URL}"
-            URL_HASH SHA256=${SFRAW_LIBRAW_SHA256}
-    )
-    # We only need the sources extracted; LibRaw's own build system is not used.
-    FetchContent_GetProperties(libraw_upstream)
-    if (NOT libraw_upstream_POPULATED)
-        FetchContent_Populate(libraw_upstream)
-    endif ()
-    set(LIBRAW_DIR "${libraw_upstream_SOURCE_DIR}")
-endif ()
+include("${CMAKE_CURRENT_LIST_DIR}/../../../cmake/LibRawVendor.cmake")
+sfraw_resolve_libraw(LIBRAW_DIR)
 
 # --------------------------------------------------------------------------
 # LibRaw static library.
@@ -93,7 +58,7 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     # LibRaw groups its sources under src/ (decoders, demosaic, metadata,
     # preprocessing, postprocessing, tables, utils, write, x3f, integration) plus
     # a top-level libraw_c_api.cpp / libraw_datastream.cpp. This glob matches the
-    # authoritative object list in LibRaw's Makefile.am for 0.21.x. The optional
+    # authoritative object layout in the pinned LibRaw 0.22.2 archive. The optional
     # integration/*.cpp glue (DNG SDK / RawSpeed) is guarded by USE_DNGSDK /
     # USE_RAWSPEED and compiles to (near) empty TUs when those are off — so it is
     # harmless to include.
@@ -114,6 +79,18 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     # Also drop any "*_common" helper packs (older LibRaw demosaic-pack layout)
     # and placeholder TUs that are #included by siblings, not compiled directly.
     list(FILTER LIBRAW_SOURCES EXCLUDE REGEX ".*(_ph|_common|placeholder)\\.cpp$")
+    list(SORT LIBRAW_SOURCES)
+
+    # Record the exact translation units selected from the hashed archive. This
+    # generated file is an audit/SBOM artifact and exposes future layout drift.
+    set(_libraw_source_manifest "")
+    foreach (_source IN LISTS LIBRAW_SOURCES)
+        file(RELATIVE_PATH _relative_source "${LIBRAW_DIR}" "${_source}")
+        string(APPEND _libraw_source_manifest "${_relative_source}\n")
+    endforeach ()
+    file(GENERATE
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libraw-sources-0.22.2.txt"
+            CONTENT "${_libraw_source_manifest}")
 
     add_library(raw STATIC ${LIBRAW_SOURCES})
     target_include_directories(raw PUBLIC "${LIBRAW_DIR}")
@@ -121,21 +98,17 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     # ----------------------------------------------------------------------
     # LibRaw build knobs.
     # ----------------------------------------------------------------------
-    # We disable the heavy optional deps we don't need (jasper/lcms). But two
-    # codecs are REQUIRED for Samsung "Expert RAW" and other modern compressed
-    # DNGs and MUST stay enabled:
+    # We disable the heavy optional deps we do not need (jasper/lcms). Keep
+    # zlib enabled for the compressed-DNG subset that pinned LibRaw 0.22.2
+    # actually implements:
     #
-    #   * DEFLATE/ZIP-compressed DNG (DNG Compression tag 8). LibRaw decodes
-    #     these via zlib's inflate(); guarded by USE_ZLIB. Samsung Expert RAW
-    #     very commonly uses deflate-compressed (often 16-bit linear) tiles, so
-    #     WITHOUT zlib LibRaw's unpack() fails with LIBRAW_DATA_ERROR /
-    #     LIBRAW_UNSUPPORTED_THUMBNAIL and the image cannot be decoded. The
-    #     Android NDK ships zlib (libz) in its sysroot, so this is cheap and
-    #     safe -> ENABLED. (Note: LibRaw's *internal* dcraw deflate path is
-    #     compiled in regardless, but the DNG/Adobe-coder deflate path is what
-    #     USE_ZLIB gates, which is the one Expert RAW exercises.)
+    #   * DEFLATE/ZIP DNG (Compression 8) with SampleFormat=3
+    #     floating-point samples. USE_ZLIB gates this path and the Android NDK
+    #     supplies libz. Integer/linear deflate is not implemented safely by
+    #     this pinned decoder and surfaces as SFRAW_ERR_DEFLATE_DNG so the app
+    #     can choose a platform/next-codec fallback.
     #
-    #   * Lossy-JPEG-compressed DNG (DNG 1.4 lossy, Compression 0x884C / 7).
+    #   * Lossy-JPEG-compressed DNG (DNG 1.4 lossy, Compression 0x884C; legacy 6).
     #     LibRaw decodes these via libjpeg; guarded by USE_JPEG. The NDK does
     #     NOT ship libjpeg, so this stays OFF unless a libjpeg target is
     #     provided (SFRAW_LIBRAW_JPEG_TARGET). When OFF, lossy-JPEG Expert RAW
@@ -143,10 +116,33 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     #     error so the app can fall back to the platform ImageDecoder.
     #
     # LIBRAW_NODLL -> static (no dllimport/export); integration glue stays out.
-    set(SFRAW_LIBRAW_DEFS NO_JASPER NO_LCMS LIBRAW_NODLL)
+    set(SFRAW_LIBRAW_DEFS
+            NO_JASPER
+            LIBRAW_NODLL
+            # Embedded ICC data is copied during open_buffer(), before the
+            # wrapper can enforce pixel limits. Keep that metadata allocation
+            # bounded for an Android process (LibRaw defaults to 256 MiB).
+            LIBRAW_MAX_PROFILE_SIZE_MB=16
+            # Cumulative member-allocator work while identify() parses metadata;
+            # prevents repeated TIFF entries from amplifying a small payload.
+            LIBRAW_MAX_METADATA_ALLOC_SIZE_MB=16
+            # Operational ceiling for per-tile decoder setup. Tiny hostile DNG
+            # tiles otherwise amplify a bounded image into millions of codec
+            # initializations. A geometry-derived limit preserves compliant
+            # 16x16 tiling; this is the absolute fail-closed ceiling.
+            LIBRAW_MAX_TILE_STREAM_COUNT=131072
+            # Deterministic zero-filled backing storage for truncated inputs.
+            LIBRAW_CALLOC_RAWSTORE)
 
-    # zlib / deflate-DNG: ON by default (NDK provides libz).
-    option(SFRAW_WITH_ZLIB "Build LibRaw with deflate-DNG (zlib) support" ON)
+    # zlib / floating-point deflate DNG: ON by default (NDK provides libz).
+    option(SFRAW_WITH_ZLIB
+            "Build LibRaw with floating-point deflate-DNG (zlib) support" ON)
+    sfraw_is_shipping_config(_sfraw_shipping_config)
+    if (_sfraw_shipping_config AND NOT SFRAW_WITH_ZLIB)
+        message(FATAL_ERROR
+                "sfraw: shipping builds require SFRAW_WITH_ZLIB=ON for "
+                "floating-point deflate DNG support")
+    endif ()
     # libjpeg / lossy-DNG: OFF by default (NDK has no libjpeg). Point
     # SFRAW_LIBRAW_JPEG_TARGET at a CMake target that provides libjpeg
     # (headers + library) to enable lossy-JPEG DNG decoding.
@@ -155,11 +151,13 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
 
     if (SFRAW_WITH_ZLIB)
         list(APPEND SFRAW_LIBRAW_DEFS USE_ZLIB)
-        message(STATUS "sfraw: deflate-compressed DNG support ENABLED (zlib)")
+        message(STATUS
+                "sfraw: floating-point deflate DNG support ENABLED (zlib)")
     else ()
         list(APPEND SFRAW_LIBRAW_DEFS NO_ZLIB)
-        message(WARNING "sfraw: deflate-compressed DNG support DISABLED; "
-                "Samsung Expert RAW deflate DNGs will fail to unpack.")
+        message(WARNING
+                "sfraw: floating-point deflate DNG support DISABLED; "
+                "Compression 8 inputs will use typed fallback.")
     endif ()
 
     if (SFRAW_LIBRAW_JPEG_TARGET STREQUAL "")
@@ -199,11 +197,9 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     set(SFRAW_HAVE_LIBRAW TRUE)
     message(STATUS "sfraw: LibRaw sources found (${LIBRAW_DIR}); RAW decode ENABLED")
 else ()
-    message(WARNING
-            "LibRaw not found at ${LIBRAW_DIR}. "
-            "libsfraw.so will build but decode() will return an error at runtime. "
-            "Provide network access (FetchContent) or -DSFRAW_LIBRAW_SOURCE_DIR.")
-    set(SFRAW_HAVE_LIBRAW FALSE)
+    message(FATAL_ERROR
+            "sfraw: verified LibRaw 0.22.2 source is absent at ${LIBRAW_DIR}; "
+            "refusing to produce a release-capable decoder stub")
 endif ()
 
 # --------------------------------------------------------------------------
@@ -217,17 +213,28 @@ endif ()
 # matter: ahd_demosaic.cpp (the default, since raw_decoder.cpp never sets
 # user_qual) and postprocessing_aux.cpp — both inside dcraw_process.
 #
-# This changes no pixel. That is precisely why it is preferred over lowering
-# user_qual, which would alter the decoded image and so be a quality decision
-# rather than a performance one. Verify byte-identical decode output before and
-# after rather than assuming it.
+# OpenMP was initially expected to preserve pixels, but the repeated compressed-
+# Fuji device corpus disproved that assumption: scheduling changes output bytes.
+# It remains a debug qualification lever, not a shipping optimization.
 #
 # -static-openmp links libomp INTO the .so instead of shipping a separate
 # libomp.so; it is an NDK driver flag, so it is only added for Android. Detection
 # is a real compile+link probe with the same flags, so a toolchain without OpenMP
 # degrades to the previous single-threaded build with a warning instead of
 # failing the build.
-option(SFRAW_ENABLE_OPENMP "Compile LibRaw with OpenMP (unlocks its demosaic pragmas)" ON)
+# Exact output has priority over speculative decode throughput. LibRaw issue #845
+# reports scheduling-dependent compressed-Fuji output, so shipping configurations
+# remain serial until #158 qualifies OpenMP against the repeated camera corpus.
+# Debug builds may opt in to exercise the patched OpenMP code under sanitizers.
+option(SFRAW_ENABLE_OPENMP
+        "Experimental: compile LibRaw with OpenMP; not qualified for exact release"
+        OFF)
+sfraw_is_shipping_config(_sfraw_shipping_config)
+if (SFRAW_ENABLE_OPENMP AND _sfraw_shipping_config)
+    message(FATAL_ERROR
+            "sfraw: OpenMP is not yet corpus-qualified for bit-identical release "
+            "decode (LibRaw #845); use the serial exact path")
+endif ()
 set(SFRAW_OPENMP_FLAGS -fopenmp)
 if (ANDROID)
     list(APPEND SFRAW_OPENMP_FLAGS -static-openmp)
@@ -257,6 +264,7 @@ endif ()
 # Our decoder + JNI bridge.
 # --------------------------------------------------------------------------
 add_library(sfraw SHARED
+        native_allocation_registry.cpp
         raw_decoder.cpp
         raw_decoder_jni.cpp
 )

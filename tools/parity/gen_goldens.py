@@ -36,8 +36,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +50,216 @@ GOLDENS_DIR = HERE / "goldens"
 
 # Deterministic seed for the synthetic image and any stochastic engine effects.
 SEED = 20260529
+ORACLE_REPOSITORY = "https://github.com/andreavolpato/spektrafilm"
+ORACLE_COMMIT = "c1d0e44b962d80a51ea096d33faea346e4f3836c"
+
+
+class OracleProvenanceError(RuntimeError):
+    """The selected spektrafilm checkout cannot be trusted as the oracle."""
+
+
+@dataclass(frozen=True)
+class OracleProvenance:
+    """Git identity verified for the checkout that supplies spektrafilm."""
+
+    repository_root: Path
+    commit: str
+    worktree: str = "clean"
+
+    def as_manifest(self) -> dict[str, str]:
+        """Return deterministic, path-free manifest provenance.
+
+        ``worktree`` follows normal Git cleanliness: repository-ignored files
+        are intentionally excluded, while every non-ignored untracked file is
+        rejected.
+        """
+        return {"commit": self.commit, "worktree": self.worktree}
+
+
+def _run_git(location: Path, *args: str, safe_directory: Path) -> str:
+    """Run a read-only Git query from *location*, failing closed on any error."""
+    candidate = Path(location).resolve()
+    working_directory = candidate if candidate.is_dir() else candidate.parent
+    if not working_directory.is_dir():
+        raise OracleProvenanceError(
+            f"oracle path does not exist or has no parent directory: {candidate}"
+        )
+    trusted_root = Path(safe_directory).resolve()
+    if not trusted_root.is_dir():
+        raise OracleProvenanceError(
+            f"oracle safe.directory is not a directory: {trusted_root}"
+        )
+    try:
+        working_directory.relative_to(trusted_root)
+    except ValueError as exc:
+        raise OracleProvenanceError(
+            f"Git query path {working_directory} is outside exact safe.directory "
+            f"{trusted_root}"
+        ) from exc
+
+    try:
+        # Ambient Git variables can redirect repository discovery or inject
+        # configuration. Preserve the ordinary process environment but remove
+        # every GIT_* override before applying the explicit read-only policy.
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.upper().startswith("GIT_")
+        }
+        environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={trusted_root.as_posix()}", *args],
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            check=False,
+        )
+    except OSError as exc:
+        raise OracleProvenanceError(
+            f"could not execute git {' '.join(args)} at {working_directory}: {exc}"
+        ) from exc
+
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "no Git diagnostic"
+        raise OracleProvenanceError(
+            f"git {' '.join(args)} failed at {working_directory} "
+            f"(exit {result.returncode}): {detail}"
+        )
+    return result.stdout
+
+
+def _find_git_marker_root(location: Path) -> Path:
+    """Find the nearest checkout root using a .git directory or gitfile."""
+    candidate = Path(location).resolve()
+    if not candidate.exists():
+        raise OracleProvenanceError(f"oracle path does not exist: {candidate}")
+    current = candidate if candidate.is_dir() else candidate.parent
+    while True:
+        marker = current / ".git"
+        if marker.is_dir() or marker.is_file():
+            return current
+        if marker.exists() or marker.is_symlink():
+            raise OracleProvenanceError(
+                f"unsupported .git marker at oracle checkout root: {marker}"
+            )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise OracleProvenanceError(
+        f"oracle path is not inside a Git checkout with a .git marker: {candidate}"
+    )
+
+
+def _resolve_git_repository_root(location: Path) -> Path:
+    """Resolve the enclosing worktree root for a checkout path."""
+    candidate = Path(location).resolve()
+    marker_root = _find_git_marker_root(candidate)
+    root_text = _run_git(
+        candidate,
+        "rev-parse",
+        "--show-toplevel",
+        safe_directory=marker_root,
+    ).strip()
+    if not root_text:
+        raise OracleProvenanceError(
+            f"git rev-parse --show-toplevel returned no path for {candidate}"
+        )
+    repository_root = Path(root_text).resolve()
+    if repository_root != marker_root:
+        raise OracleProvenanceError(
+            f"Git resolved top-level {repository_root}, but nearest .git marker "
+            f"belongs to {marker_root}"
+        )
+    try:
+        candidate.relative_to(repository_root)
+    except ValueError as exc:
+        raise OracleProvenanceError(
+            f"oracle path {candidate} is outside resolved Git root {repository_root}"
+        ) from exc
+    return repository_root
+
+
+def verify_oracle_provenance(
+    location: Path, expected_commit: str = ORACLE_COMMIT
+) -> OracleProvenance:
+    """Verify exact HEAD and a clean tracked/untracked oracle worktree."""
+    repository_root = _resolve_git_repository_root(location)
+    actual_commit = _run_git(
+        repository_root,
+        "rev-parse",
+        "HEAD",
+        safe_directory=repository_root,
+    ).strip()
+    if actual_commit != expected_commit:
+        raise OracleProvenanceError(
+            f"oracle checkout HEAD mismatch at {repository_root}: "
+            f"expected {expected_commit}; found {actual_commit or '<empty>'}"
+        )
+
+    # Repository-owned .gitignore/info-exclude rules retain normal Git meaning;
+    # global/system excludes are disabled by _run_git and cannot hide files.
+    status = _run_git(
+        repository_root,
+        "-c",
+        "core.excludesFile=",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+        safe_directory=repository_root,
+    ).rstrip("\r\n")
+    if status:
+        changes = "; ".join(status.splitlines())
+        raise OracleProvenanceError(
+            f"oracle checkout is dirty at {repository_root}; tracked, staged, "
+            f"and untracked changes are forbidden: {changes}"
+        )
+
+    return OracleProvenance(
+        repository_root=repository_root,
+        commit=actual_commit,
+    )
+
+
+def publish_verified_artifacts(
+    artifacts: list[tuple[Path, Path]],
+    staged_manifest: Path,
+    manifest_destination: Path,
+    oracle_provenance: OracleProvenance,
+) -> OracleProvenance:
+    """Publish staged outputs with the attesting manifest atomically last.
+
+    Individual artifact replacements are atomic on the shared filesystem, but
+    the set cannot be replaced in one operation. The old manifest is therefore
+    removed before the first artifact changes, and the new manifest is exposed
+    only after every artifact is in place and provenance is verified again.
+    """
+    manifest_destination.parent.mkdir(parents=True, exist_ok=True)
+    manifest_destination.unlink(missing_ok=True)
+    try:
+        for staged_path, destination in artifacts:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staged_path.replace(destination)
+
+        final_provenance = verify_oracle_provenance(
+            oracle_provenance.repository_root, oracle_provenance.commit
+        )
+        staged_manifest.replace(manifest_destination)
+    except BaseException:
+        # A partial artifact set must never retain an older or staged attestation.
+        manifest_destination.unlink(missing_ok=True)
+        raise
+    return final_provenance
 
 # Taps exposed by spektrafilm DebugParams, in pipeline order. The final RGB scan
 # is captured with debug off ("final_rgb"). The mapping value is the DebugParams
@@ -214,6 +428,11 @@ class Case:
     # three, then simulates with digest_params_first=False (see _run_tap). Grain/glare
     # stay off so the case is still deterministic/bit-stable.
     halation_off: bool = False
+    # Optional scanner-LUT route fixtures. These are generated in addition to
+    # the direct final_rgb tap so tests can compare like-for-like against the
+    # pinned oracle's intentionally approximate PCHIP path, rather than hiding
+    # its interpolation error inside a widened LUT-vs-direct tolerance.
+    scanner_lut_resolutions: tuple = ()
     notes: str = ""
     taps: tuple = field(default=tuple(TAPS.keys()))
 
@@ -226,6 +445,26 @@ CASES = [
         print_profile="kodak_portra_endura",
         scan_film=False,
         notes="Baseline negative->print->scan, all stochastic/spatial effects off.",
+    ),
+    Case(
+        case_id="print_kodak_2383_k75p",
+        film_profile="kodak_portra_400",
+        print_profile="kodak_2383",
+        scan_film=False,
+        scanner_lut_resolutions=(17,),
+        notes="Kodak 2383 print scanned under its declared Kinoton 75P viewing "
+              "illuminant. Locks the profile-driven K75P spectral integral and "
+              "K75P-to-output-white CAT without stochastic/spatial effects.",
+    ),
+    Case(
+        case_id="print_kodak_2393_k75p",
+        film_profile="kodak_portra_400",
+        print_profile="kodak_2393",
+        scan_film=False,
+        scanner_lut_resolutions=(17,),
+        notes="Kodak 2393 print scanned under its declared Kinoton 75P viewing "
+              "illuminant. Paired with the 2383 case so both affected bundled "
+              "profiles are independently oracle-gated.",
     ),
     Case(
         case_id="scan_portra",
@@ -699,13 +938,46 @@ CASES = [
 ]
 
 
-def _import_spektrafilm():
-    """Import spektrafilm or exit with an actionable message."""
+def _import_spektrafilm() -> tuple[object, OracleProvenance]:
+    """Verify and import the exact clean spektrafilm oracle checkout."""
+    try:
+        spec = importlib.util.find_spec("spektrafilm")
+    except Exception as exc:  # noqa: BLE001 - import hooks may raise arbitrary errors
+        spec = None
+        find_error = exc
+    else:
+        find_error = None
+
+    if spec is None or spec.origin is None:
+        detail = (
+            f"{type(find_error).__name__}: {find_error}"
+            if find_error is not None
+            else "module could not be resolved to a source file"
+        )
+        sys.stderr.write(
+            "ERROR: could not locate 'spektrafilm'.\n"
+            f"  ({detail})\n\n"
+            "gen_goldens.py needs a working spektrafilm source checkout to "
+            "PRODUCE goldens.\n"
+        )
+        raise SystemExit(2) from find_error
+
+    try:
+        provenance = verify_oracle_provenance(Path(spec.origin), ORACLE_COMMIT)
+    except OracleProvenanceError as exc:
+        sys.stderr.write(
+            "ERROR: refusing unverified spektrafilm oracle checkout.\n"
+            f"  {exc}\n"
+        )
+        raise SystemExit(2) from exc
+
+    previous_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
         import spektrafilm  # noqa: F401
         from spektrafilm import init_params, simulate  # noqa: F401
-        return sys.modules["spektrafilm"]
-    except Exception as exc:  # ImportError or asset/runtime errors
+        imported = sys.modules["spektrafilm"]
+    except Exception as exc:  # noqa: BLE001 - upstream can raise asset/runtime errors
         sys.stderr.write(
             "ERROR: could not import 'spektrafilm'.\n"
             f"  ({type(exc).__name__}: {exc})\n\n"
@@ -718,7 +990,35 @@ def _import_spektrafilm():
             "Reading/inspecting existing .spkvec goldens and building the C++\n"
             "comparator do NOT require spektrafilm.\n"
         )
+        raise SystemExit(2) from exc
+    finally:
+        sys.dont_write_bytecode = previous_dont_write_bytecode
+
+    imported_file = getattr(imported, "__file__", None)
+    if imported_file is None:
+        sys.stderr.write(
+            "ERROR: refusing spektrafilm import without a concrete source file.\n"
+        )
         raise SystemExit(2)
+    try:
+        imported_provenance = verify_oracle_provenance(
+            Path(imported_file), ORACLE_COMMIT
+        )
+    except OracleProvenanceError as exc:
+        sys.stderr.write(
+            "ERROR: refusing unverified imported spektrafilm oracle checkout.\n"
+            f"  {exc}\n"
+        )
+        raise SystemExit(2) from exc
+    if imported_provenance.repository_root != provenance.repository_root:
+        sys.stderr.write(
+            "ERROR: spektrafilm import resolved from a different checkout after "
+            "verification.\n"
+            f"  verified: {provenance.repository_root}\n"
+            f"  imported: {imported_provenance.repository_root}\n"
+        )
+        raise SystemExit(2)
+    return imported, imported_provenance
 
 
 def make_test_image(size: int) -> "object":
@@ -879,76 +1179,142 @@ def _run_tap(sf, params, tap_name: str, image, halation_off: bool = False):
     return np.ascontiguousarray(np.asarray(out, dtype=np.float32))
 
 
-def generate_case(sf, case: Case, size: int) -> dict:
+def generate_case(
+    sf, case: Case, size: int, oracle_provenance: OracleProvenance
+) -> dict:
     """Generate all taps for one case; write .spkvec files + return manifest dict."""
+    import colour
     import spkvec  # local module, see spkvec_format.md
 
     image = make_test_image(size)
     params = _build_params(sf, case)
 
+    GOLDENS_DIR.mkdir(parents=True, exist_ok=True)
     case_dir = GOLDENS_DIR / case.case_id
-    case_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{case.case_id}-stage-", dir=GOLDENS_DIR
+    ) as staging_directory:
+        staging_dir = Path(staging_directory)
+        artifacts: list[tuple[Path, Path]] = []
+        written = {}
+        for tap_name in case.taps:
+            if case.scan_film and tap_name in SCAN_FILM_SKIP_TAPS:
+                continue
+            buf = _run_tap(
+                sf, params, tap_name, image, halation_off=case.halation_off
+            )
+            filename = f"{tap_name}.spkvec"
+            staged_path = staging_dir / filename
+            destination = case_dir / filename
+            spkvec.write(staged_path, buf)
+            artifacts.append((staged_path, destination))
+            written[tap_name] = {
+                "file": filename,
+                "shape": list(buf.shape),
+                "min": float(buf.min()),
+                "max": float(buf.max()),
+                "mean": float(buf.mean()),
+            }
 
-    written = {}
-    for tap_name in case.taps:
-        if case.scan_film and tap_name in SCAN_FILM_SKIP_TAPS:
-            continue
-        buf = _run_tap(sf, params, tap_name, image, halation_off=case.halation_off)
-        path = case_dir / f"{tap_name}.spkvec"
-        spkvec.write(path, buf)
-        written[tap_name] = {
-            "file": f"{tap_name}.spkvec",
-            "shape": list(buf.shape),
-            "min": float(buf.min()),
-            "max": float(buf.max()),
-            "mean": float(buf.mean()),
+        # Keep the direct and accelerated scanner outputs side by side. The LUT
+        # is an upstream feature with its own deterministic output; it is not
+        # expected to be bit-identical to direct integration at a coarse grid.
+        for resolution in case.scanner_lut_resolutions:
+            import copy
+
+            lut_params = copy.deepcopy(params)
+            lut_params.settings.use_scanner_lut = True
+            lut_params.settings.lut_resolution = int(resolution)
+            tap_name = f"final_rgb_scanner_lut_{resolution}"
+            buf = _run_tap(
+                sf,
+                lut_params,
+                "final_rgb",
+                image,
+                halation_off=case.halation_off,
+            )
+            filename = f"{tap_name}.spkvec"
+            staged_path = staging_dir / filename
+            destination = case_dir / filename
+            spkvec.write(staged_path, buf)
+            artifacts.append((staged_path, destination))
+            written[tap_name] = {
+                "file": filename,
+                "shape": list(buf.shape),
+                "min": float(buf.min()),
+                "max": float(buf.max()),
+                "mean": float(buf.mean()),
+                "lut_resolution": int(resolution),
+            }
+
+        manifest = {
+            "case_id": case.case_id,
+            "film_profile": case.film_profile,
+            "print_profile": case.print_profile,
+            "scan_film": case.scan_film,
+            "image": {
+                "kind": "synthetic_ramp_macbeth",
+                "size": size,
+                "shape": [size, size, 3],
+                "input_color_space": "ProPhoto RGB (linear)",
+                "seed": SEED,
+            },
+            "toggles": {
+                "auto_exposure": case.auto_exposure,
+                "auto_exposure_method": case.auto_exposure_method,
+                "exposure_compensation_ev": case.exposure_compensation_ev,
+                "print_exposure_compensation": case.print_exposure_compensation,
+                "normalize_print_exposure": case.normalize_print_exposure,
+                "grain_active": case.grain_active,
+                "deactivate_stochastic_effects": case.deactivate_stochastic_effects,
+                "deactivate_spatial_effects": case.deactivate_spatial_effects,
+                "halation_off": case.halation_off,
+                "lens_blur_um": case.lens_blur_um,
+                "diffusion_active": case.diffusion_active,
+                "diffusion_family": case.diffusion_family,
+                "diffusion_strength": case.diffusion_strength,
+                "diffusion_spatial_scale": case.diffusion_spatial_scale,
+                "diffusion_halo_warmth": case.diffusion_halo_warmth,
+                "spectral_gaussian_blur": case.spectral_gaussian_blur,
+                "scanner_black_correction": case.scanner_black_correction,
+                "scanner_white_correction": case.scanner_white_correction,
+                "scanner_black_level": case.scanner_black_level,
+                "scanner_white_level": case.scanner_white_level,
+                "scanner_lut_resolutions": list(case.scanner_lut_resolutions),
+            },
+            "notes": case.notes,
+            "taps": written,
+            # Grain-off / spatial-off cases are deterministic, so these are tight.
+            "tolerance": {"max_abs": 1e-4, "rms": 1e-5},
+            "spkvec_version": 1,
+            "generator": "gen_goldens.py",
+            "oracle": {
+                "repository": ORACLE_REPOSITORY,
+                "colour_version": colour.__version__,
+            },
         }
-        print(f"  wrote {path.relative_to(HERE)}  shape={buf.shape}")
+        # Re-check after all oracle execution, before any attested output changes.
+        oracle_provenance = verify_oracle_provenance(
+            oracle_provenance.repository_root, ORACLE_COMMIT
+        )
+        manifest["oracle"].update(oracle_provenance.as_manifest())
+        staged_manifest = staging_dir / "manifest.json"
+        with open(staged_manifest, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True)
 
-    manifest = {
-        "case_id": case.case_id,
-        "film_profile": case.film_profile,
-        "print_profile": case.print_profile,
-        "scan_film": case.scan_film,
-        "image": {
-            "kind": "synthetic_ramp_macbeth",
-            "size": size,
-            "shape": [size, size, 3],
-            "input_color_space": "ProPhoto RGB (linear)",
-            "seed": SEED,
-        },
-        "toggles": {
-            "auto_exposure": case.auto_exposure,
-            "auto_exposure_method": case.auto_exposure_method,
-            "exposure_compensation_ev": case.exposure_compensation_ev,
-            "print_exposure_compensation": case.print_exposure_compensation,
-            "normalize_print_exposure": case.normalize_print_exposure,
-            "grain_active": case.grain_active,
-            "deactivate_stochastic_effects": case.deactivate_stochastic_effects,
-            "deactivate_spatial_effects": case.deactivate_spatial_effects,
-            "halation_off": case.halation_off,
-            "lens_blur_um": case.lens_blur_um,
-            "diffusion_active": case.diffusion_active,
-            "diffusion_family": case.diffusion_family,
-            "diffusion_strength": case.diffusion_strength,
-            "diffusion_spatial_scale": case.diffusion_spatial_scale,
-            "diffusion_halo_warmth": case.diffusion_halo_warmth,
-            "spectral_gaussian_blur": case.spectral_gaussian_blur,
-            "scanner_black_correction": case.scanner_black_correction,
-            "scanner_white_correction": case.scanner_white_correction,
-            "scanner_black_level": case.scanner_black_level,
-            "scanner_white_level": case.scanner_white_level,
-        },
-        "notes": case.notes,
-        "taps": written,
-        # Default tolerances the C++ comparator should gate on. Grain-off /
-        # spatial-off cases are deterministic, so these are tight.
-        "tolerance": {"max_abs": 1e-4, "rms": 1e-5},
-        "spkvec_version": 1,
-        "generator": "gen_goldens.py",
-    }
-    with open(case_dir / "manifest.json", "w") as fh:
-        json.dump(manifest, fh, indent=2, sort_keys=True)
+        publish_verified_artifacts(
+            artifacts,
+            staged_manifest,
+            case_dir / "manifest.json",
+            oracle_provenance,
+        )
+
+    for _, destination in artifacts:
+        tap_name = destination.stem
+        print(
+            f"  wrote {destination.relative_to(HERE)}  "
+            f"shape={written[tap_name]['shape']}"
+        )
     print(f"  wrote {(case_dir / 'manifest.json').relative_to(HERE)}")
     return manifest
 
@@ -981,12 +1347,20 @@ def main(argv=None) -> int:
     else:
         cases = CASES
 
-    sf = _import_spektrafilm()
+    sf, oracle_provenance = _import_spektrafilm()
     GOLDENS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Generating goldens into {GOLDENS_DIR} (image {args.size}x{args.size})")
     for case in cases:
         print(f"[case] {case.case_id}")
-        generate_case(sf, case, args.size)
+        try:
+            generate_case(sf, case, args.size, oracle_provenance)
+        except OracleProvenanceError as exc:
+            sys.stderr.write(
+                "ERROR: oracle provenance changed during golden generation; "
+                "manifest was not written.\n"
+                f"  {exc}\n"
+            )
+            return 2
     print("Done.")
     return 0
 

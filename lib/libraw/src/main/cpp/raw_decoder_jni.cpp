@@ -1,215 +1,484 @@
 /*
- * Spektrafilm for Android — lib:libraw JNI bridge.
+ * Spektrafilm for Android -- hardened lib:libraw JNI bridge.
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
- * Uses LibRaw (LGPL-2.1).
- *
- * Bridges com.spectrafilm.libraw.RawDecoder (Kotlin) to the native decoder.
- *
- * Design notes (mirrors engine:spektra-core's spektra_jni.cpp):
- *  - The decoded image crosses back to Kotlin as a *direct* java.nio.ByteBuffer of
- *    float32 RGB (length = width*height*3*4 bytes) so it can be handed straight to
- *    SpektraEngine.LinearImage with no per-pixel JNI traffic and no 8-bit round-trip.
- *  - Width / height / colorSpace are returned via a small Kotlin result holder
- *    (RawDecoder.NativeResult) constructed here through cached method/field IDs.
- *  - Input arrives as either a byte[] (SAF stream read fully) or a raw fd
- *    (ParcelFileDescriptor.detachFd()).
+ * Uses statically included, dual-offered LibRaw; distribution is governed by the
+ * bundled decision record and fail-closed release audit.
  */
 #include <jni.h>
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <new>
 
+#include "native_allocation_registry.h"
 #include "raw_decoder.h"
+#include "raw_decoder_jni_safety.h"
 
 #define JNI(ret, name) extern "C" JNIEXPORT ret JNICALL \
     Java_com_spectrafilm_libraw_RawDecoder_##name
 
 namespace {
 
-spectrafilm::DecodeOptions readOptions(jint wbMode, jdouble temperatureK, jdouble tint,
-                                       jboolean halfSize, jint maxLongEdge) {
-    spectrafilm::DecodeOptions opts;
-    // Must match RawDecoder.WhiteBalance.nativeMode ordinals in Kotlin.
-    switch (wbMode) {
-        case 0:  opts.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot;   break;
-        case 1:  opts.whiteBalance = spectrafilm::WhiteBalanceMode::Daylight; break;
-        case 2:  opts.whiteBalance = spectrafilm::WhiteBalanceMode::Tungsten; break;
-        case 3:  opts.whiteBalance = spectrafilm::WhiteBalanceMode::Custom;   break;
-        default: opts.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot;   break;
-    }
-    opts.temperatureK = temperatureK;
-    opts.tint = tint;
-    // halfSize: when true, LibRaw decodes at half linear dimensions (quarter
-    // pixels) using 2x2 Bayer averaging instead of full demosaic. Intended for
-    // fast, low-memory proxy decodes of large RAW/DNG files.
-    opts.halfSize = (halfSize != JNI_FALSE);
-    opts.maxLongEdge = maxLongEdge > 0 ? maxLongEdge : 0;
-    return opts;
-}
+constexpr jlong kMaxEncodedInputBytes = 64LL * 1024LL * 1024LL;
+constexpr jint kNativeReleased = 0;
+constexpr jint kNativeUnknownToken = 1;
+constexpr jint kNativeMismatch = 2;
 
-// Build a com.spectrafilm.libraw.RawDecoder$NativeResult from a DecodeResult.
-// On failure returns null and the Kotlin facade throws with `error`.
-// Throw com.spectrafilm.libraw.RawDecodeException(message, status, librawCode)
-// so the Kotlin side can branch on the failure kind (e.g. a lossy-JPEG Expert
-// RAW DNG -> platform ImageDecoder fallback). Falls back to
-// IllegalStateException if the exception class is unavailable.
-void throwDecodeException(JNIEnv* env, const spectrafilm::DecodeResult& r) {
-    const char* msg = r.error.empty() ? "RAW decode failed" : r.error.c_str();
-    jclass exClass = env->FindClass("com/spectrafilm/libraw/RawDecodeException");
-    if (exClass != nullptr) {
-        jmethodID ctor =
-            env->GetMethodID(exClass, "<init>", "(Ljava/lang/String;II)V");
-        if (ctor != nullptr) {
-            jstring jmsg = env->NewStringUTF(msg);
-            jobject ex = env->NewObject(exClass, ctor, jmsg,
-                                        static_cast<jint>(r.status),
-                                        static_cast<jint>(r.librawCode));
-            if (ex != nullptr) {
-                env->Throw(static_cast<jthrowable>(ex));
-                return;
+using CancellationLease =
+    std::shared_ptr<sfraw::NativeCancellationRegistry::Flag>;
+
+class ByteArrayElements final {
+ public:
+    ByteArrayElements(JNIEnv* env, jbyteArray array)
+        : env_(env), array_(array), data_(env->GetByteArrayElements(array, nullptr)) {}
+
+    ~ByteArrayElements() {
+        if (data_ != nullptr) env_->ReleaseByteArrayElements(array_, data_, JNI_ABORT);
+    }
+
+    ByteArrayElements(const ByteArrayElements&) = delete;
+    ByteArrayElements& operator=(const ByteArrayElements&) = delete;
+
+    jbyte* get() const { return data_; }
+
+ private:
+    JNIEnv* env_;
+    jbyteArray array_;
+    jbyte* data_;
+};
+
+void throwRawDecodeException(JNIEnv* env, const char* message, jint status,
+                             jint librawCode) noexcept {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    const char* stableMessage = message != nullptr ? message : "RAW decode failed";
+    jclass exceptionClass =
+        env->FindClass("com/spectrafilm/libraw/RawDecodeException");
+    if (exceptionClass != nullptr) {
+        jmethodID constructor = env->GetMethodID(
+            exceptionClass, "<init>", "(Ljava/lang/String;II)V");
+        if (constructor != nullptr) {
+            jstring javaMessage = env->NewStringUTF(stableMessage);
+            if (javaMessage != nullptr) {
+                jobject exception = env->NewObject(
+                    exceptionClass, constructor, javaMessage, status, librawCode);
+                if (exception != nullptr) {
+                    env->Throw(static_cast<jthrowable>(exception));
+                    return;
+                }
             }
         }
-        env->ExceptionClear();
-        env->ThrowNew(exClass, msg);  // (String) fallback
-        return;
     }
-    env->ExceptionClear();
-    jclass ise = env->FindClass("java/lang/IllegalStateException");
-    env->ThrowNew(ise, msg);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jclass fallback = env->FindClass("java/lang/RuntimeException");
+    if (fallback != nullptr) env->ThrowNew(fallback, stableMessage);
 }
 
-jobject toJavaResult(JNIEnv* env, const spectrafilm::DecodeResult& r) {
-    if (!r.ok) {
-        throwDecodeException(env, r);
+void throwDecodeResult(JNIEnv* env,
+                       const spectrafilm::DecodeResult& result) noexcept {
+    throwRawDecodeException(
+        env,
+        result.error.empty() ? "RAW decode failed" : result.error.c_str(),
+        static_cast<jint>(result.status),
+        static_cast<jint>(result.librawCode));
+}
+
+void throwCancelled(JNIEnv* env,
+                    const char* message = "RAW decode cancelled") noexcept {
+    throwRawDecodeException(env, message, spectrafilm::SFRAW_ERR_CANCELLED, 0);
+}
+
+void throwCaught(JNIEnv* env, bool noMemory) noexcept {
+    throwRawDecodeException(
+        env,
+        noMemory ? "RAW JNI bridge out of memory" : "RAW JNI bridge failure",
+        noMemory ? spectrafilm::SFRAW_ERR_NO_MEMORY
+                 : spectrafilm::SFRAW_ERR_UNKNOWN,
+        0);
+}
+
+CancellationLease acquireCancellation(JNIEnv* env, jlong token) {
+    if (token == 0) return nullptr;
+    if (token < 0) {
+        throwCancelled(env, "invalid RAW cancellation token");
+        return nullptr;
+    }
+    CancellationLease lease = sfraw::nativeCancellationRegistry().acquire(
+        static_cast<std::uint64_t>(token));
+    if (lease == nullptr) {
+        throwCancelled(env, "RAW cancellation token is closed");
+    }
+    return lease;
+}
+
+bool isCancelled(const CancellationLease& lease) {
+    return lease != nullptr && lease->load(std::memory_order_acquire);
+}
+
+bool cancellationLeaseRequested(void* opaque) noexcept {
+    const auto* lease = static_cast<const CancellationLease*>(opaque);
+    return lease != nullptr && isCancelled(*lease);
+}
+
+spectrafilm::DecodeOptions readOptions(
+    jint wbMode, jdouble temperatureK, jdouble tint, jboolean halfSize,
+    jint maxLongEdge, const CancellationLease& cancellation) {
+    spectrafilm::DecodeOptions options;
+    switch (wbMode) {
+        case 0: options.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot; break;
+        case 1: options.whiteBalance = spectrafilm::WhiteBalanceMode::Daylight; break;
+        case 2: options.whiteBalance = spectrafilm::WhiteBalanceMode::Tungsten; break;
+        case 3: options.whiteBalance = spectrafilm::WhiteBalanceMode::Custom; break;
+        default: options.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot; break;
+    }
+    options.temperatureK = temperatureK;
+    options.tint = tint;
+    options.halfSize = halfSize != JNI_FALSE;
+    options.maxLongEdge = maxLongEdge > 0 ? maxLongEdge : 0;
+    options.cancelFlag = cancellation.get();
+    return options;
+}
+
+bool checkedOutputBytes(const spectrafilm::DecodeResult& result,
+                        std::size_t* byteCount) {
+    if (result.width <= 0 || result.height <= 0) return false;
+    const std::size_t width = static_cast<std::size_t>(result.width);
+    const std::size_t height = static_cast<std::size_t>(result.height);
+    if (height > std::numeric_limits<std::size_t>::max() / width) return false;
+    const std::size_t pixels = width * height;
+    if (pixels > std::numeric_limits<std::size_t>::max() / 3U) return false;
+    const std::size_t floats = pixels * 3U;
+    if (result.rgb.size() != floats) return false;
+    if (floats > static_cast<std::size_t>(INT32_MAX) / sizeof(float)) return false;
+    *byteCount = floats * sizeof(float);
+    return *byteCount != 0U;
+}
+
+jobject toJavaResult(JNIEnv* env, const spectrafilm::DecodeResult& result,
+                     const CancellationLease& cancellation) {
+    if (!result.ok) {
+        throwDecodeResult(env, result);
         return nullptr;
     }
 
-    const jlong byteLen =
-        static_cast<jlong>(r.rgb.size()) * static_cast<jlong>(sizeof(float));
-    // Guard against >2 GiB: the Kotlin side reads this through a jint-indexed
-    // FloatBuffer, so keep the 2 GiB cap even though NewDirectByteBuffer takes a
-    // jlong. Reject before allocating. (Security review F1.)
-    if (byteLen > static_cast<jlong>(INT32_MAX)) {
-        jclass oom = env->FindClass("java/lang/OutOfMemoryError");
-        env->ThrowNew(oom, "RAW decode result too large for a direct ByteBuffer (>2 GiB)");
+    std::size_t byteCount = 0U;
+    if (!checkedOutputBytes(result, &byteCount)) {
+        throwRawDecodeException(env, "invalid RAW output geometry",
+                                spectrafilm::SFRAW_ERR_FORMAT, 0);
         return nullptr;
     }
-    // Hand Kotlin a NATIVE (off-heap) direct ByteBuffer rather than a JVM-managed one.
-    // ByteBuffer.allocateDirect is backed on Android by a non-movable byte[] on the ART
-    // managed heap, so a full-res result (~140 MB for a 12 MP DNG) hits the ~256 MB
-    // heap-growth limit — and two of them (RAW input + engine output) at export time
-    // guarantee an OutOfMemoryError. Adobe Lightroom keeps full-res pixels in native
-    // memory and never crosses them to the Java heap; we mirror that by malloc'ing the
-    // result and wrapping it with NewDirectByteBuffer. The Kotlin owner frees it via
-    // RawDecoder.freeOffHeap (nativeFree below). The buffer is direct so the engine can
-    // consume it as a LinearImage with no further copy.
-    void* native_buf = std::malloc(static_cast<size_t>(byteLen));
-    if (native_buf == nullptr) {
-        jclass oom = env->FindClass("java/lang/OutOfMemoryError");
-        env->ThrowNew(oom, "failed to allocate native buffer for RAW result");
+
+    void* nativeBuffer = std::malloc(byteCount);
+    if (nativeBuffer == nullptr) {
+        throwRawDecodeException(env, "failed to allocate native RAW output",
+                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
         return nullptr;
     }
-    std::memcpy(native_buf, r.rgb.data(), static_cast<size_t>(byteLen));
-    jobject owned = env->NewDirectByteBuffer(native_buf, byteLen);
+    if (!sfraw::jni::copyBytesCancellable(
+            nativeBuffer, result.rgb.data(), byteCount,
+            cancellationLeaseRequested,
+            const_cast<CancellationLease*>(&cancellation))) {
+        std::free(nativeBuffer);
+        throwCancelled(env);
+        return nullptr;
+    }
+
+    std::uint64_t allocationToken = 0U;
+    try {
+        allocationToken =
+            sfraw::nativeAllocationRegistry().adopt(nativeBuffer, byteCount);
+    } catch (...) {
+        std::free(nativeBuffer);
+        throw;
+    }
+
+    auto releaseRegistered = [&] {
+        sfraw::nativeAllocationRegistry().release(
+            allocationToken, nativeBuffer, byteCount);
+    };
+
+    jobject owned = env->NewDirectByteBuffer(
+        nativeBuffer, static_cast<jlong>(byteCount));
     if (owned == nullptr) {
-        std::free(native_buf);
-        jclass oom = env->FindClass("java/lang/OutOfMemoryError");
-        env->ThrowNew(oom, "failed to wrap native buffer for RAW result");
+        releaseRegistered();
+        throwRawDecodeException(env, "failed to wrap native RAW output",
+                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
         return nullptr;
     }
 
-    // NewDirectByteBuffer does NOT take ownership, so if NativeResult is never built
-    // the Kotlin side can't free native_buf — guard the remaining failure paths.
-    jclass resClass = env->FindClass("com/spectrafilm/libraw/RawDecoder$NativeResult");
-    jmethodID ctor = resClass ? env->GetMethodID(
-        resClass, "<init>",
-        "(Ljava/nio/ByteBuffer;IILjava/lang/String;)V") : nullptr;
-    if (ctor == nullptr) {
-        env->ExceptionClear();
-        std::free(native_buf);
-        jclass ise = env->FindClass("java/lang/IllegalStateException");
-        env->ThrowNew(ise, "RawDecoder$NativeResult constructor not found");
+    jclass resultClass =
+        env->FindClass("com/spectrafilm/libraw/RawDecoder$NativeResult");
+    jmethodID constructor = resultClass != nullptr
+        ? env->GetMethodID(
+              resultClass, "<init>",
+              "(Ljava/nio/ByteBuffer;IILjava/lang/String;J)V")
+        : nullptr;
+    if (constructor == nullptr) {
+        releaseRegistered();
+        throwRawDecodeException(env, "RAW NativeResult ABI mismatch",
+                                spectrafilm::SFRAW_ERR_FORMAT, 0);
         return nullptr;
     }
-    jstring cs = env->NewStringUTF(r.colorSpace.c_str());
-    jobject result = env->NewObject(
-        resClass, ctor, owned, static_cast<jint>(r.width),
-        static_cast<jint>(r.height), cs);
-    if (result == nullptr) {
-        // Construction threw (e.g. OOM building NativeResult): free the orphaned buffer.
-        std::free(native_buf);
+
+    jstring colorSpace = env->NewStringUTF(result.colorSpace.c_str());
+    if (colorSpace == nullptr) {
+        releaseRegistered();
+        throwRawDecodeException(env, "failed to create RAW color-space metadata",
+                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+        return nullptr;
     }
-    return result;
+    jobject javaResult = env->NewObject(
+        resultClass, constructor, owned, static_cast<jint>(result.width),
+        static_cast<jint>(result.height), colorSpace,
+        static_cast<jlong>(allocationToken));
+    if (javaResult == nullptr) {
+        releaseRegistered();
+        // Replace VM-specific construction failures (most commonly OOM) with
+        // the stable typed contract exposed by every other JNI failure path.
+        throwRawDecodeException(env, "failed to construct RAW result",
+                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+        return nullptr;
+    }
+    if (isCancelled(cancellation)) {
+        env->DeleteLocalRef(javaResult);
+        releaseRegistered();
+        throwCancelled(env);
+        return nullptr;
+    }
+    return javaResult;
+}
+
+bool validateDirectInput(JNIEnv* env, jobject buffer, jint length,
+                         void** address) {
+    if (buffer == nullptr) {
+        throwRawDecodeException(env, "null RAW ByteBuffer",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    const jlong capacity = env->GetDirectBufferCapacity(buffer);
+    void* directAddress = env->GetDirectBufferAddress(buffer);
+    if (capacity < 0 || directAddress == nullptr) {
+        throwRawDecodeException(env, "expected a direct RAW ByteBuffer",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    jclass bufferClass = env->GetObjectClass(buffer);
+    if (bufferClass == nullptr) {
+        throwRawDecodeException(env, "cannot inspect RAW ByteBuffer range",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    jmethodID positionMethod = env->GetMethodID(bufferClass, "position", "()I");
+    jmethodID limitMethod = env->GetMethodID(bufferClass, "limit", "()I");
+    env->DeleteLocalRef(bufferClass);
+    if (positionMethod == nullptr || limitMethod == nullptr) {
+        throwRawDecodeException(env, "cannot inspect RAW ByteBuffer range",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    const jint position = env->CallIntMethod(buffer, positionMethod);
+    if (env->ExceptionCheck()) {
+        throwRawDecodeException(env, "cannot inspect RAW ByteBuffer position",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    const jint limit = env->CallIntMethod(buffer, limitMethod);
+    if (env->ExceptionCheck()) {
+        throwRawDecodeException(env, "cannot inspect RAW ByteBuffer limit",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    std::uintptr_t resolved = 0U;
+    if (!sfraw::jni::checkedEncodedInputWindow(
+            capacity, position, limit, length, kMaxEncodedInputBytes,
+            reinterpret_cast<std::uintptr_t>(directAddress), &resolved)) {
+        throwRawDecodeException(env, "invalid RAW ByteBuffer logical range",
+                                spectrafilm::SFRAW_ERR_INPUT, 0);
+        return false;
+    }
+    *address = reinterpret_cast<void*>(resolved);
+    return true;
 }
 
 }  // namespace
 
-/*
- * nativeFree(buf) — release a native (malloc + NewDirectByteBuffer) RAW result buffer
- * handed to Kotlin by toJavaResult. Called from RawDecoder.freeOffHeap. free(nullptr)
- * is a no-op; a buffer whose direct address can't be resolved is skipped. Defined
- * OUTSIDE the anonymous namespace so it keeps external linkage and JNI can find it.
- */
-JNI(void, nativeFree)(JNIEnv* env, jobject /*thiz*/, jobject buf) {
-    if (!buf) return;
-    void* p = env->GetDirectBufferAddress(buf);
-    if (p) std::free(p);
+JNI(jint, nativeRelease)(JNIEnv* env, jobject, jlong token, jobject buffer) {
+    try {
+        if (token <= 0 || buffer == nullptr) return kNativeMismatch;
+        void* address = env->GetDirectBufferAddress(buffer);
+        const jlong capacity = env->GetDirectBufferCapacity(buffer);
+        if (address == nullptr || capacity <= 0 ||
+            static_cast<std::uint64_t>(capacity) >
+                std::numeric_limits<std::size_t>::max() ||
+            (reinterpret_cast<std::uintptr_t>(address) % alignof(float)) != 0U ||
+            (capacity % static_cast<jlong>(sizeof(float))) != 0) {
+            return kNativeMismatch;
+        }
+        switch (sfraw::nativeAllocationRegistry().release(
+            static_cast<std::uint64_t>(token), address,
+            static_cast<std::size_t>(capacity))) {
+            case sfraw::ReleaseResult::Released: return kNativeReleased;
+            case sfraw::ReleaseResult::UnknownToken: return kNativeUnknownToken;
+            case sfraw::ReleaseResult::Mismatch: return kNativeMismatch;
+        }
+    } catch (...) {
+        return kNativeMismatch;
+    }
+    return kNativeMismatch;
 }
 
-/*
- * nativeDecodeBytes(bytes, wbMode, temperatureK, tint, halfSize) -> NativeResult
- * Decodes a fully-read RAW/DNG byte[] into linear float32 ACES RGB.
- * halfSize: if JNI_TRUE, LibRaw decodes at half linear dimensions (quarter pixels,
- * ~¼ memory) using 2x2 Bayer averaging instead of full demosaic. Default false.
- */
-JNI(jobject, nativeDecodeBytes)(JNIEnv* env, jobject /*thiz*/, jbyteArray bytes,
+JNI(jlong, nativeCreateCancellation)(JNIEnv* env, jobject) {
+    try {
+        return static_cast<jlong>(sfraw::nativeCancellationRegistry().create());
+    } catch (const std::bad_alloc&) {
+        throwCaught(env, true);
+    } catch (const std::exception&) {
+        throwCaught(env, false);
+    } catch (...) {
+        throwCaught(env, false);
+    }
+    return 0;
+}
+
+JNI(jboolean, nativeCancelCancellation)(JNIEnv*, jobject, jlong token) {
+    try {
+        return token > 0 && sfraw::nativeCancellationRegistry().cancel(
+                                static_cast<std::uint64_t>(token))
+            ? JNI_TRUE
+            : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+JNI(jboolean, nativeReleaseCancellation)(JNIEnv*, jobject, jlong token) {
+    try {
+        return token > 0 && sfraw::nativeCancellationRegistry().release(
+                                static_cast<std::uint64_t>(token))
+            ? JNI_TRUE
+            : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+JNI(jobject, nativeDecodeBytes)(JNIEnv* env, jobject, jbyteArray bytes,
                                 jint wbMode, jdouble temperatureK, jdouble tint,
-                                jboolean halfSize, jint maxLongEdge) {
-    if (bytes == nullptr) {
-        jclass ise = env->FindClass("java/lang/IllegalArgumentException");
-        env->ThrowNew(ise, "null RAW byte[]");
-        return nullptr;
+                                jboolean halfSize, jint maxLongEdge,
+                                jlong cancellationToken) {
+    try {
+        if (bytes == nullptr) {
+            throwRawDecodeException(env, "null RAW byte array",
+                                    spectrafilm::SFRAW_ERR_INPUT, 0);
+            return nullptr;
+        }
+        const jsize length = env->GetArrayLength(bytes);
+        if (length <= 0 || static_cast<jlong>(length) > kMaxEncodedInputBytes) {
+            throwRawDecodeException(env, "invalid RAW byte-array length",
+                                    spectrafilm::SFRAW_ERR_INPUT, 0);
+            return nullptr;
+        }
+        CancellationLease cancellation =
+            acquireCancellation(env, cancellationToken);
+        if (cancellationToken != 0 && cancellation == nullptr) return nullptr;
+        if (isCancelled(cancellation)) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        ByteArrayElements input(env, bytes);
+        if (input.get() == nullptr) {
+            throwRawDecodeException(env, "failed to pin RAW byte array",
+                                    spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+            return nullptr;
+        }
+        if (isCancelled(cancellation)) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        const spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
+            reinterpret_cast<const std::uint8_t*>(input.get()),
+            static_cast<std::size_t>(length),
+            readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge,
+                        cancellation));
+        if (isCancelled(cancellation) && result.ok) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        return toJavaResult(env, result, cancellation);
+    } catch (const std::bad_alloc&) {
+        throwCaught(env, true);
+    } catch (const std::exception&) {
+        throwCaught(env, false);
+    } catch (...) {
+        throwCaught(env, false);
     }
-    const jsize len = env->GetArrayLength(bytes);
-    jbyte* ptr = env->GetByteArrayElements(bytes, nullptr);
-    spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
-        reinterpret_cast<const uint8_t*>(ptr), static_cast<size_t>(len),
-        readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge));
-    env->ReleaseByteArrayElements(bytes, ptr, JNI_ABORT);
-    return toJavaResult(env, result);
+    return nullptr;
 }
 
-/*
- * nativeDecodeBuffer(directBuf, len, wbMode, temperatureK, tint, halfSize) -> NativeResult
- * Same as above but reads directly from a direct ByteBuffer (zero input copy).
- * halfSize: if JNI_TRUE, decode at half linear dimensions (proxy mode).
- */
-JNI(jobject, nativeDecodeBuffer)(JNIEnv* env, jobject /*thiz*/, jobject directBuf,
-                                 jint len, jint wbMode, jdouble temperatureK, jdouble tint,
-                                 jboolean halfSize, jint maxLongEdge) {
-    void* addr = (directBuf != nullptr) ? env->GetDirectBufferAddress(directBuf) : nullptr;
-    if (addr == nullptr) {
-        jclass ise = env->FindClass("java/lang/IllegalArgumentException");
-        env->ThrowNew(ise, "expected a direct ByteBuffer for RAW input");
-        return nullptr;
+JNI(jobject, nativeDecodeBuffer)(JNIEnv* env, jobject, jobject directBuffer,
+                                 jint length, jint wbMode,
+                                 jdouble temperatureK, jdouble tint,
+                                 jboolean halfSize, jint maxLongEdge,
+                                 jlong cancellationToken) {
+    try {
+        void* address = nullptr;
+        if (!validateDirectInput(env, directBuffer, length, &address)) return nullptr;
+        CancellationLease cancellation =
+            acquireCancellation(env, cancellationToken);
+        if (cancellationToken != 0 && cancellation == nullptr) return nullptr;
+        if (isCancelled(cancellation)) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        const spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
+            reinterpret_cast<const std::uint8_t*>(address),
+            static_cast<std::size_t>(length),
+            readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge,
+                        cancellation));
+        if (isCancelled(cancellation) && result.ok) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        return toJavaResult(env, result, cancellation);
+    } catch (const std::bad_alloc&) {
+        throwCaught(env, true);
+    } catch (const std::exception&) {
+        throwCaught(env, false);
+    } catch (...) {
+        throwCaught(env, false);
     }
-    spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
-        reinterpret_cast<const uint8_t*>(addr), static_cast<size_t>(len),
-        readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge));
-    return toJavaResult(env, result);
+    return nullptr;
 }
 
-/*
- * nativeDecodeFd(fd, wbMode, temperatureK, tint, halfSize, maxLongEdge) -> NativeResult
- * Decodes from a file descriptor (e.g. ParcelFileDescriptor.detachFd()).
- * halfSize: if JNI_TRUE, decode at half linear dimensions (proxy mode).
- */
-JNI(jobject, nativeDecodeFd)(JNIEnv* env, jobject /*thiz*/, jint fd,
-                             jint wbMode, jdouble temperatureK, jdouble tint,
-                             jboolean halfSize, jint maxLongEdge) {
-    spectrafilm::DecodeResult result = spectrafilm::decodeFromFd(
-        fd, readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge));
-    return toJavaResult(env, result);
+JNI(jobject, nativeDecodeFd)(JNIEnv* env, jobject, jint fd, jint wbMode,
+                             jdouble temperatureK, jdouble tint,
+                             jboolean halfSize, jint maxLongEdge,
+                             jlong cancellationToken) {
+    try {
+        CancellationLease cancellation =
+            acquireCancellation(env, cancellationToken);
+        if (cancellationToken != 0 && cancellation == nullptr) return nullptr;
+        if (isCancelled(cancellation)) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        const spectrafilm::DecodeResult result = spectrafilm::decodeFromFd(
+            fd, readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge,
+                            cancellation));
+        if (isCancelled(cancellation) && result.ok) {
+            throwCancelled(env);
+            return nullptr;
+        }
+        return toJavaResult(env, result, cancellation);
+    } catch (const std::bad_alloc&) {
+        throwCaught(env, true);
+    } catch (const std::exception&) {
+        throwCaught(env, false);
+    } catch (...) {
+        throwCaught(env, false);
+    }
+    return nullptr;
 }

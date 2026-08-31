@@ -19,6 +19,86 @@ package com.spectrafilm.tiffwriter
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
+
+private const val PACK_COPY_CHUNK_BYTES = 64 * 1024
+
+class TiffCancellationToken {
+    private val state = AtomicBoolean(false)
+
+    val isCancelled: Boolean
+        get() = state.get()
+
+    fun cancel() {
+        state.set(true)
+    }
+
+    internal val nativeSignal: AtomicBoolean
+        get() = state
+
+    internal fun throwIfCancelled() {
+        if (isCancelled) throw CancellationException("TIFF write cancelled")
+    }
+}
+
+internal fun checkedTiffByteCount(
+    width: Int,
+    height: Int,
+    bytesPerSample: Int,
+): Int {
+    require(width > 0 && height > 0) { "TIFF dimensions must be positive" }
+    require(bytesPerSample > 0) { "TIFF bytes per sample must be positive" }
+    val total = try {
+        val rowSamples = Math.multiplyExact(width.toLong(), 3L)
+        val rowBytes = Math.multiplyExact(rowSamples, bytesPerSample.toLong())
+        Math.multiplyExact(rowBytes, height.toLong())
+    } catch (_: ArithmeticException) {
+        throw IllegalArgumentException("TIFF pixel byte count overflow")
+    }
+    require(total <= Int.MAX_VALUE.toLong()) {
+        "TIFF pixel byte count exceeds ByteBuffer limits"
+    }
+    return total.toInt()
+}
+
+internal fun checkedTiffOutputPath(outPath: String) {
+    require(outPath.isNotEmpty()) { "TIFF output path must not be empty" }
+    require('\u0000' !in outPath) { "TIFF output path must not contain NUL" }
+}
+
+internal fun packedTiffBuffer(
+    source: ByteBuffer,
+    width: Int,
+    height: Int,
+    bytesPerSample: Int,
+    cancellation: TiffCancellationToken? = null,
+): ByteBuffer {
+    val requiredBytes = checkedTiffByteCount(width, height, bytesPerSample)
+    require(source.remaining() >= requiredBytes) {
+        "pixel buffer too small: need $requiredBytes bytes, have ${source.remaining()}"
+    }
+    val selected = source.duplicate().apply {
+        limit(position() + requiredBytes)
+    }
+    cancellation?.throwIfCancelled()
+    if (selected.isDirect) {
+        require(selected.position() % bytesPerSample == 0) {
+            "direct pixel buffer position must be $bytesPerSample-byte aligned"
+        }
+        return selected.slice().order(ByteOrder.LITTLE_ENDIAN)
+    }
+    val packed = ByteBuffer.allocateDirect(requiredBytes).order(ByteOrder.LITTLE_ENDIAN)
+    while (selected.hasRemaining()) {
+        cancellation?.throwIfCancelled()
+        val previousLimit = selected.limit()
+        selected.limit(selected.position() + minOf(PACK_COPY_CHUNK_BYTES, selected.remaining()))
+        packed.put(selected)
+        selected.limit(previousLimit)
+    }
+    cancellation?.throwIfCancelled()
+    return packed.apply { flip() }
+}
 
 /**
  * EXIF ColorSpace tag values written into the EXIF sub-IFD. The authoritative
@@ -33,6 +113,14 @@ enum class ExifColorSpace(val tagValue: Int) {
 }
 
 object TiffWriter {
+
+    private object NativeLibrary {
+        init {
+            System.loadLibrary("sftiff")
+        }
+
+        fun ensureLoaded() = Unit
+    }
 
     /**
      * Write a 16-bit RGB TIFF from a direct [ByteBuffer] of little-endian uint16
@@ -60,16 +148,16 @@ object TiffWriter {
         software: String = "Spektrafilm",
         dateTime: String? = null,
         packBits: Boolean = false,
+        cancellation: TiffCancellationToken? = null,
     ): Long {
-        val direct = if (rgb16.isDirect) {
-            rgb16
-        } else {
-            ByteBuffer.allocateDirect(rgb16.remaining()).order(ByteOrder.LITTLE_ENDIAN)
-                .also { it.put(rgb16.duplicate()); it.flip() }
-        }
+        checkedTiffOutputPath(outPath)
+        val direct = packedTiffBuffer(
+            rgb16, width, height, bytesPerSample = 2, cancellation = cancellation,
+        )
+        NativeLibrary.ensureLoaded()
         return nativeWriteBuffer(
             direct, width, height, exifColorSpace.tagValue,
-            software, dateTime, icc, packBits, outPath,
+            software, dateTime, icc, packBits, outPath, cancellation?.nativeSignal,
         )
     }
 
@@ -87,10 +175,20 @@ object TiffWriter {
         software: String = "Spektrafilm",
         dateTime: String? = null,
         packBits: Boolean = false,
-    ): Long = nativeWriteShorts(
-        rgb16, width, height, exifColorSpace.tagValue,
-        software, dateTime, icc, packBits, outPath,
-    )
+        cancellation: TiffCancellationToken? = null,
+    ): Long {
+        checkedTiffOutputPath(outPath)
+        val requiredSamples = checkedTiffByteCount(width, height, bytesPerSample = 2) / 2
+        require(rgb16.size >= requiredSamples) {
+            "short buffer too small: need $requiredSamples samples, have ${rgb16.size}"
+        }
+        cancellation?.throwIfCancelled()
+        NativeLibrary.ensureLoaded()
+        return nativeWriteShorts(
+            rgb16, width, height, exifColorSpace.tagValue,
+            software, dateTime, icc, packBits, outPath, cancellation?.nativeSignal,
+        )
+    }
 
     /**
      * Write a true 32-bit IEEE-float RGB TIFF (SampleFormat=3, BitsPerSample=32) from a direct
@@ -112,16 +210,16 @@ object TiffWriter {
         software: String = "Spektrafilm",
         dateTime: String? = null,
         packBits: Boolean = false,
+        cancellation: TiffCancellationToken? = null,
     ): Long {
-        val direct = if (rgbFloat.isDirect) {
-            rgbFloat
-        } else {
-            ByteBuffer.allocateDirect(rgbFloat.remaining()).order(ByteOrder.LITTLE_ENDIAN)
-                .also { it.put(rgbFloat.duplicate()); it.flip() }
-        }
+        checkedTiffOutputPath(outPath)
+        val direct = packedTiffBuffer(
+            rgbFloat, width, height, bytesPerSample = 4, cancellation = cancellation,
+        )
+        NativeLibrary.ensureLoaded()
         return nativeWriteFloatBuffer(
             direct, width, height, exifColorSpace.tagValue,
-            software, dateTime, icc, packBits, outPath,
+            software, dateTime, icc, packBits, outPath, cancellation?.nativeSignal,
         )
     }
 
@@ -130,21 +228,20 @@ object TiffWriter {
         rgb16: ByteBuffer, width: Int, height: Int, exifColorSpace: Int,
         software: String, dateTime: String?, icc: ByteArray?,
         packBits: Boolean, outPath: String,
+        cancellationSignal: AtomicBoolean?,
     ): Long
 
     private external fun nativeWriteShorts(
         rgb16: ShortArray, width: Int, height: Int, exifColorSpace: Int,
         software: String, dateTime: String?, icc: ByteArray?,
         packBits: Boolean, outPath: String,
+        cancellationSignal: AtomicBoolean?,
     ): Long
 
     private external fun nativeWriteFloatBuffer(
         rgbFloat: ByteBuffer, width: Int, height: Int, exifColorSpace: Int,
         software: String, dateTime: String?, icc: ByteArray?,
         packBits: Boolean, outPath: String,
+        cancellationSignal: AtomicBoolean?,
     ): Long
-
-    init {
-        System.loadLibrary("sftiff")
-    }
 }

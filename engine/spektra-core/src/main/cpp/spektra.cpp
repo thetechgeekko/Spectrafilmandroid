@@ -33,6 +33,7 @@
  */
 #include "spektra.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +42,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,6 +68,23 @@
 #include "runtime/stages/scanning.h"
 
 namespace {
+
+// Status detail is caller-thread-local so concurrent preview/export calls cannot
+// overwrite each other's diagnostics. A fixed buffer keeps the error path
+// allocation-free and gives the public pointer a simple lifetime contract.
+thread_local char g_last_error_message[512] = {};
+
+void clear_last_error_message() noexcept { g_last_error_message[0] = '\0'; }
+
+void set_last_error_message(const char* message) noexcept {
+    if (!message) {
+        clear_last_error_message();
+        return;
+    }
+    std::strncpy(g_last_error_message, message,
+                 sizeof(g_last_error_message) - 1);
+    g_last_error_message[sizeof(g_last_error_message) - 1] = '\0';
+}
 
 // Build the scanning-stage tone curve from the flat spk_params control points.
 // Inactive (the default) => an inactive set whose apply() is a strict no-op. Point
@@ -351,9 +370,19 @@ static const spk::NdArray& engine_spectra(spk_engine* eng) {
     return eng->spectra_lut;
 }
 
+class ProfileAssetNotFound final : public std::runtime_error {
+ public:
+    using std::runtime_error::runtime_error;
+};
+
+class ProfileInvalid final : public std::runtime_error {
+ public:
+    using std::runtime_error::runtime_error;
+};
+
 // Load a film/print profile by id (e.g. "kodak_portra_400") through spk_read_asset.
-// Throws std::runtime_error if the asset can't be read; load_profile_string
-// throws on parse failure.
+// Asset absence and invalid content stay distinct so the additive C status and
+// JNI diagnostic do not collapse a rejected viewing-illuminant ID into "not found".
 static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) {
     {
         std::lock_guard<std::mutex> g(eng->cache_mutex);
@@ -363,8 +392,15 @@ static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) 
     std::vector<char> buf;
     std::string rel = std::string("profiles/") + id + ".json";
     if (!spk_read_asset(eng, rel, buf))
-        throw std::runtime_error("spektra: cannot read profile asset " + rel);
-    spk::Profile parsed = spk::load_profile_string(std::string(buf.data(), buf.size()));
+        throw ProfileAssetNotFound("spektra: cannot read profile asset " + rel);
+    spk::Profile parsed;
+    try {
+        parsed = spk::load_profile_string(std::string(buf.data(), buf.size()));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw ProfileInvalid("profile '" + id + "': " + e.what());
+    }
     std::lock_guard<std::mutex> g(eng->cache_mutex);
     // Insert if still absent (another thread may have raced us); either way the
     // stored value equals a fresh parse, so the result is identical.
@@ -567,6 +603,8 @@ static uint64_t compute_film_cache_key(const std::vector<double>& rgb, int width
     h = fnv1a64(h, &p->halation_renormalize, sizeof(p->halation_renormalize));
     //    Camera optical diffusion filter (9 shape fields; active folded below):
     h = fnv1a64(h, &p->camera_diffusion_strength, sizeof(p->camera_diffusion_strength));
+    h = fnv1a64(h, &p->camera_diffusion_family,
+                sizeof(p->camera_diffusion_family));
     h = fnv1a64(h, &p->camera_diffusion_spatial_scale,
                 sizeof(p->camera_diffusion_spatial_scale));
     h = fnv1a64(h, &p->camera_diffusion_halo_warmth,
@@ -624,6 +662,10 @@ static uint64_t compute_print_density_key(const std::vector<float>& film_density
     h = fnv1a64(h, &height, sizeof(height));
     if (p->film_profile) h = fnv1a64(h, p->film_profile, std::strlen(p->film_profile));
     if (p->print_profile) h = fnv1a64(h, p->print_profile, std::strlen(p->print_profile));
+    if (p->enlarger_illuminant) {
+        h = fnv1a64(h, p->enlarger_illuminant,
+                    std::strlen(p->enlarger_illuminant));
+    }
     // tc_lut shape (engine_tc_lut key inputs): the midgray exposure factor inside
     // print_expose is computed FROM the tc_lut directly — not through the film
     // bytes — so these film-side params are genuine printing-stage inputs and
@@ -674,6 +716,8 @@ static uint64_t compute_print_density_key(const std::vector<float>& film_density
     h = fnv1a64(h, p->grain_density_min, sizeof(p->grain_density_min));
     // Enlarger optical diffusion filter (print_expose spatial pass) + µm->px.
     h = fnv1a64(h, &p->enlarger_diffusion_active, sizeof(p->enlarger_diffusion_active));
+    h = fnv1a64(h, &p->enlarger_diffusion_family,
+                sizeof(p->enlarger_diffusion_family));
     h = fnv1a64(h, &p->enlarger_diffusion_strength,
                 sizeof(p->enlarger_diffusion_strength));
     h = fnv1a64(h, &p->enlarger_diffusion_spatial_scale,
@@ -775,14 +819,17 @@ void apply_user_grain(spk::GrainParams& g, const spk_params* p) {
 }
 
 // Apply the camera/enlarger optical diffusion-filter params from spk_params onto
-// the digested struct. The C API does not expose filter_family, so it stays at
-// the schema default (black_pro_mist). active defaults to 0, so default params
+// the digested struct. The family selector is validated at each route entry and
+// then copied into the native model. active defaults to 0, so default params
 // leave the diffusion filter inactive (a strict no-op). `is_camera` selects the
 // camera (filming) vs enlarger (printing) field group.
 void apply_user_diffusion_filter(spk::DiffusionFilterParams& d,
                                  const spk_params* p, bool is_camera) {
-    d.family = spk::DiffusionFamily::kBlackProMist;  // schema default family.
     if (is_camera) {
+        const int32_t family = p->camera_diffusion_family;
+        d.family = family == SPK_DIFFUSION_DEFAULT
+                       ? spk::DiffusionFamily::kBlackProMist
+                       : static_cast<spk::DiffusionFamily>(family - 1);
         d.active = (p->camera_diffusion_active != 0);
         d.strength = p->camera_diffusion_strength;
         d.spatial_scale = p->camera_diffusion_spatial_scale;
@@ -794,6 +841,10 @@ void apply_user_diffusion_filter(spk::DiffusionFilterParams& d,
         d.bloom_intensity = p->camera_diffusion_bloom_intensity;
         d.bloom_size = p->camera_diffusion_bloom_size;
     } else {
+        const int32_t family = p->enlarger_diffusion_family;
+        d.family = family == SPK_DIFFUSION_DEFAULT
+                       ? spk::DiffusionFamily::kBlackProMist
+                       : static_cast<spk::DiffusionFamily>(family - 1);
         d.active = (p->enlarger_diffusion_active != 0);
         d.strength = p->enlarger_diffusion_strength;
         d.spatial_scale = p->enlarger_diffusion_spatial_scale;
@@ -924,16 +975,141 @@ void preprocess_geometry(const spk_image* in, const spk_params* p,
                           pixel_size_um);
 }
 
+inline bool cancellation_requested(spk_cancel_check cancel,
+                                   void* cancel_user_data) noexcept {
+    return spk::parallel_cancellation_poll(cancel, cancel_user_data);
+}
+
+bool valid_diffusion_family(int32_t family) noexcept {
+    return family >= SPK_DIFFUSION_DEFAULT &&
+           family <= SPK_DIFFUSION_CINEBLOOM;
+}
+
+bool supported_input_color_space(const char* value) noexcept {
+    return value == nullptr || value[0] == '\0' ||
+           std::strcmp(value, "ProPhoto RGB") == 0;
+}
+
+bool valid_rgb_shape(const spk_image* image) noexcept {
+    if (!image || !image->data || image->width <= 0 || image->height <= 0) {
+        return false;
+    }
+    const auto pixels = static_cast<std::uint64_t>(image->width) *
+                        static_cast<std::uint64_t>(image->height);
+    return pixels <= static_cast<std::uint64_t>(
+                         std::numeric_limits<int>::max()) &&
+           pixels <= static_cast<std::uint64_t>(
+                          std::numeric_limits<std::size_t>::max() / 3u);
+}
+
+// Validate every caller-controlled geometry value before crop_resize performs
+// floating-point-to-integer casts or allocates a derived frame. The crop math
+// mirrors crop_image's NumPy round/slice semantics closely enough to prove that
+// both intermediate and final extents are non-empty and representable. The
+// final byte cap is the same one enforced by the direct-ByteBuffer JNI seam.
+bool valid_preprocess_geometry(const spk_image* image,
+                               const spk_params* params) noexcept {
+    if (!valid_rgb_shape(image) || !params) return false;
+
+    const float raw_factor = params->upscale_factor;
+    if (!std::isfinite(raw_factor) || raw_factor < 0.0f) return false;
+    const double factor = raw_factor == 0.0f
+                              ? 1.0
+                              : static_cast<double>(raw_factor);
+
+    std::int64_t crop_w = image->width;
+    std::int64_t crop_h = image->height;
+    if (params->crop != 0) {
+        for (int axis = 0; axis < 2; ++axis) {
+            const float center = params->crop_center[axis];
+            const float size = params->crop_size[axis];
+            if (!std::isfinite(center) || center < 0.0f || center > 1.0f ||
+                !std::isfinite(size) || size <= 0.0f || size > 1.0f) {
+                return false;
+            }
+        }
+
+        const double h = static_cast<double>(image->height);
+        const double w = static_cast<double>(image->width);
+        const double longest = std::max(h, w);
+        // center/size are (x,y); crop_image flips them to (row,column).
+        const std::int64_t center_row = static_cast<std::int64_t>(
+            std::nearbyint(h * params->crop_center[1]));
+        const std::int64_t center_col = static_cast<std::int64_t>(
+            std::nearbyint(w * params->crop_center[0]));
+        const std::int64_t size_rows = static_cast<std::int64_t>(
+            std::nearbyint(longest * params->crop_size[1]));
+        const std::int64_t size_cols = static_cast<std::int64_t>(
+            std::nearbyint(longest * params->crop_size[0]));
+        if (size_rows <= 0 || size_cols <= 0) return false;
+
+        std::int64_t row0 = static_cast<std::int64_t>(
+            std::nearbyint(static_cast<double>(center_row) - size_rows / 2.0));
+        std::int64_t col0 = static_cast<std::int64_t>(
+            std::nearbyint(static_cast<double>(center_col) - size_cols / 2.0));
+        if (row0 < 0) row0 = 0;
+        if (col0 < 0) col0 = 0;
+        if (row0 + size_rows > image->height) row0 = image->height - size_rows;
+        if (col0 + size_cols > image->width) col0 = image->width - size_cols;
+
+        const auto slice_extent = [](std::int64_t start, std::int64_t size,
+                                     std::int64_t dimension) noexcept {
+            std::int64_t stop = start + size;
+            if (start < 0) start += dimension;
+            if (stop < 0) stop += dimension;
+            start = std::max<std::int64_t>(0, std::min(start, dimension));
+            stop = std::max<std::int64_t>(0, std::min(stop, dimension));
+            return stop > start ? stop - start : std::int64_t{0};
+        };
+        crop_h = slice_extent(row0, size_rows, image->height);
+        crop_w = slice_extent(col0, size_cols, image->width);
+        if (crop_w <= 0 || crop_h <= 0) return false;
+    }
+
+    const double rounded_w = std::nearbyint(factor * static_cast<double>(crop_w));
+    const double rounded_h = std::nearbyint(factor * static_cast<double>(crop_h));
+    if (!std::isfinite(rounded_w) || !std::isfinite(rounded_h) ||
+        rounded_w > static_cast<double>(std::numeric_limits<int>::max()) ||
+        rounded_h > static_cast<double>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    const std::uint64_t out_w = static_cast<std::uint64_t>(
+        std::max(1.0, rounded_w));
+    const std::uint64_t out_h = static_cast<std::uint64_t>(
+        std::max(1.0, rounded_h));
+    if (out_h != 0 && out_w > std::numeric_limits<std::uint64_t>::max() / out_h) {
+        return false;
+    }
+    const std::uint64_t pixels = out_w * out_h;
+    constexpr std::uint64_t kRgbF32BytesPerPixel = 3u * sizeof(float);
+    return pixels <= static_cast<std::uint64_t>(
+                         std::numeric_limits<int>::max()) &&
+           pixels <= static_cast<std::uint64_t>(INT32_MAX) /
+                         kRgbF32BytesPerPixel &&
+           pixels <= static_cast<std::uint64_t>(
+                         std::numeric_limits<std::size_t>::max() / 3u);
+}
+
 // Run the scan_film pipeline, producing display RGB plus the intermediate taps.
 // `tap_*` pointers, when non-null, receive the corresponding intermediate.
 spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params* p,
                          std::vector<float>* final_rgb,
                          std::vector<float>* tap_log_raw,
                          std::vector<float>* tap_density_cmy,
-                         int* out_w = nullptr, int* out_h = nullptr) {
-    if (!eng || !in || !p || !in->data) return SPK_ERR_BAD_ARGS;
-    if (in->width <= 0 || in->height <= 0) return SPK_ERR_BAD_ARGS;
+                         int* out_w = nullptr, int* out_h = nullptr,
+                         spk_cancel_check cancel = nullptr,
+                         void* cancel_user_data = nullptr) try {
+    if (!eng || !p || !valid_preprocess_geometry(in, p)) {
+        return SPK_ERR_BAD_ARGS;
+    }
     if (!p->film_profile) return SPK_ERR_BAD_ARGS;
+    if (!supported_input_color_space(p->input_color_space) ||
+        !valid_diffusion_family(p->camera_diffusion_family) ||
+        !valid_diffusion_family(p->enlarger_diffusion_family)) {
+        return SPK_ERR_BAD_ARGS;
+    }
+    spk::ParallelCancellationScope cancellation_scope(cancel, cancel_user_data);
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 0) Geometry preprocess (pipeline._preprocess -> crop_and_rescale). Runs
     //    BEFORE filming, mirroring Python ordering. Default params (crop off,
@@ -943,9 +1119,9 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     PreprocessedInput pin;
     int width = 0, height = 0;
     double resize_pixel_size_um = 0.0;
-    spk::stage_timings_reset();  // per-render diagnostic (#146/#152); observation only
     { spk::ScopedStage _t(spk::STG_PREPROCESS);
       preprocess_geometry(in, p, &pin, &width, &height, &resize_pixel_size_um); }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     const int npix = width * height;
     if (out_w) *out_w = width;
     if (out_h) *out_h = height;
@@ -954,13 +1130,19 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     spk::Profile film;
     try {
         film = load_engine_profile(eng, p->film_profile);
-    } catch (const std::exception&) {
+    } catch (const std::bad_alloc&) {
+        return SPK_ERR_OOM;
+    } catch (const ProfileAssetNotFound&) {
         return SPK_ERR_PROFILE_NOT_FOUND;
+    } catch (const ProfileInvalid& e) {
+        set_last_error_message(e.what());
+        return SPK_ERR_PROFILE_INVALID;
     }
     if (film.log_sensitivity.empty() || film.log_exposure.empty() ||
         film.window_params.size() < 4) {
         return SPK_ERR_INTERNAL;  // profile lacks filming fields
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 2) Digested filming params (auto-exposure off; stochastic/grain off).
     //    Spatial effects are PER-EFFECT gated, exactly like the oracle: absent
@@ -1037,6 +1219,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
         return SPK_ERR_ASSET_IO;
     }
     const spk::NdArray& tc_lut = *tc_lut_ptr;
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 4) expose(): the image runs as float64 (ProPhoto linear). `rgb` was built
     //    by preprocess_geometry above (crop/rescale applied, float64), matching
@@ -1105,6 +1288,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
         }
         // MISS path is handled after unlocking (we don't compute under the lock).
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     if (!scan_film_cache_hit) {
         std::vector<float> log_raw(out_elems);
@@ -1115,6 +1299,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
             spk::expose(pin.rgb.data(), width, height, fparams, tc_lut,
                         log_raw.data());
         }
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (tap_log_raw) *tap_log_raw = log_raw;
 
         // The float64 image is dead past expose — at 12 MP this releases
@@ -1125,6 +1310,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
         // 5) develop(): log_raw -> density_cmy (+ DIR couplers, spatial diffusion if on).
         density_cmy.resize(out_elems);
         spk::develop(log_raw.data(), width, height, film, fparams, density_cmy.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (use_scan_film_cache) {
             std::lock_guard<std::mutex> g(eng->film_cache_mutex);
             auto& slot = eng->film_memo[spk_engine::kMemoScan];
@@ -1141,6 +1327,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     if (tap_density_cmy) *tap_density_cmy = density_cmy;
 
     if (!final_rgb) return SPK_OK;  // caller only wanted an earlier tap
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 6) scan(): density_cmy -> display RGB (output_color_space, CCTF per params).
     spk::ScanningParams sparams;
@@ -1184,7 +1371,16 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
 
     final_rgb->assign(static_cast<size_t>(npix) * 3, 0.0f);
     spk::scan(film, sparams, density_cmy.data(), width, height, final_rgb->data());
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        final_rgb->clear();
+        return SPK_ERR_CANCELLED;
+    }
     return SPK_OK;
+} catch (const spk::ParallelCancelled&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_density_cmy) tap_density_cmy->clear();
+    return SPK_ERR_CANCELLED;
 }
 
 // Run the negative -> print -> scan route, producing display RGB plus the
@@ -1195,10 +1391,20 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
                      std::vector<float>* tap_log_raw,
                      std::vector<float>* tap_film_density_cmy,
                      std::vector<float>* tap_print_density_cmy,
-                     int* out_w = nullptr, int* out_h = nullptr) {
-    if (!eng || !in || !p || !in->data) return SPK_ERR_BAD_ARGS;
-    if (in->width <= 0 || in->height <= 0) return SPK_ERR_BAD_ARGS;
+                     int* out_w = nullptr, int* out_h = nullptr,
+                     spk_cancel_check cancel = nullptr,
+                     void* cancel_user_data = nullptr) try {
+    if (!eng || !p || !valid_preprocess_geometry(in, p)) {
+        return SPK_ERR_BAD_ARGS;
+    }
     if (!p->film_profile || !p->print_profile) return SPK_ERR_BAD_ARGS;
+    if (!supported_input_color_space(p->input_color_space) ||
+        !valid_diffusion_family(p->camera_diffusion_family) ||
+        !valid_diffusion_family(p->enlarger_diffusion_family)) {
+        return SPK_ERR_BAD_ARGS;
+    }
+    spk::ParallelCancellationScope cancellation_scope(cancel, cancel_user_data);
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 0) Geometry preprocess (crop_and_rescale) BEFORE filming, mirroring the
     //    Python pipeline._preprocess. Default params -> passthrough. The print
@@ -1209,9 +1415,9 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     PreprocessedInput pin;
     int width = 0, height = 0;
     double resize_pixel_size_um = 0.0;
-    spk::stage_timings_reset();  // per-render diagnostic (#146/#152); observation only
     { spk::ScopedStage _t(spk::STG_PREPROCESS);
       preprocess_geometry(in, p, &pin, &width, &height, &resize_pixel_size_um); }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     const int npix = width * height;
     if (out_w) *out_w = width;
     if (out_h) *out_h = height;
@@ -1221,8 +1427,13 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     try {
         film = load_engine_profile(eng, p->film_profile);
         prnt = load_engine_profile(eng, p->print_profile);
-    } catch (const std::exception&) {
+    } catch (const std::bad_alloc&) {
+        return SPK_ERR_OOM;
+    } catch (const ProfileAssetNotFound&) {
         return SPK_ERR_PROFILE_NOT_FOUND;
+    } catch (const ProfileInvalid& e) {
+        set_last_error_message(e.what());
+        return SPK_ERR_PROFILE_INVALID;
     }
     if (film.log_sensitivity.empty() || film.log_exposure.empty() ||
         film.window_params.size() < 4) {
@@ -1232,6 +1443,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         prnt.density_curves.empty()) {
         return SPK_ERR_INTERNAL;  // print profile lacks printing fields
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 2) Build (or reuse the engine-cached) Hanatos2025 filming tc_lut (D55
     //    reference illuminant). Needed both by the filming expose and by the
@@ -1250,6 +1462,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         return SPK_ERR_ASSET_IO;
     }
     const spk::NdArray& tc_lut = *tc_lut_ptr;
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 3) Native print digest for ANY (film, paper) pair:
     //    (a) neutral dichroic CC resolved from neutral_print_filters.json
@@ -1257,8 +1470,13 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     //        to the schema defaults {0,0,0}, mirroring params_builder.py.
     //    (b) midgray exposure factor computed natively from the filming midgray
     //        balance + the print sensitivity/filtered illuminant.
-    const double* enl = spk::enlarger_illuminant("TH-KG3");
-    if (!enl) return SPK_ERR_INTERNAL;
+    const char* illuminant = p->enlarger_illuminant;
+    if (!illuminant || illuminant[0] == '\0') illuminant = "TH-KG3";
+    const double* enl = spk::enlarger_illuminant(illuminant);
+    if (!enl) {
+        set_last_error_message("unsupported enlarger illuminant");
+        return SPK_ERR_BAD_ARGS;
+    }
     const std::string film_stock  = !film.stock.empty() ? film.stock : p->film_profile;
     const std::string print_stock = !prnt.stock.empty() ? prnt.stock : p->print_profile;
     double neutral_cc[3];
@@ -1270,7 +1488,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         std::vector<char> nf;
         if (spk_read_asset(eng, kNeutralFiltersRel, nf)) {
             spk::resolve_neutral_cc_string(std::string(nf.data(), nf.size()),
-                                           print_stock, "TH-KG3", film_stock,
+                                           print_stock, illuminant, film_stock,
                                            neutral_cc);
         } else {
             neutral_cc[0] = neutral_cc[1] = neutral_cc[2] = 0.0;
@@ -1508,6 +1726,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         }
         // MISS path is handled after unlocking (we don't compute under the lock).
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     if (!film_cache_hit) {
         std::vector<float> film_log_raw(out_elems);
@@ -1518,6 +1737,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
             spk::expose(pin.rgb.data(), width, height, fparams, tc_lut,
                         film_log_raw.data());
         }
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (tap_log_raw) *tap_log_raw = film_log_raw;
 
         // The float64 image is dead past expose — at 12 MP this releases
@@ -1528,6 +1748,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         film_density_cmy.resize(out_elems);
         spk::develop(film_log_raw.data(), width, height, film, fparams,
                      film_density_cmy.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (use_film_cache) {
             // Store {width, height, film_density_cmy} + key under the lock, count miss.
             std::lock_guard<std::mutex> g(eng->film_cache_mutex);
@@ -1571,10 +1792,12 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
             pd_hit = true;
         }
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     if (!pd_hit) {
         std::vector<float> print_log_raw(out_elems);
         spk::print_expose(film, prnt, pparams, film_density_cmy.data(), width, height,
                           print_log_raw.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         // film_density_cmy's last read was print_expose (the tap copy was taken
         // above; the memo store below uses pd_key only) — at 12 MP this
         // releases ~144 MB before print_develop/scan run (EXPORT_FASTPATH
@@ -1583,6 +1806,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         print_density_cmy.resize(out_elems);
         spk::print_develop(prnt, pparams, print_log_raw.data(), npix,
                            print_density_cmy.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (!pd_bypass) {
             std::lock_guard<std::mutex> g(eng->film_cache_mutex);
             auto& slot = eng->print_density_memo;
@@ -1599,6 +1823,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     if (tap_print_density_cmy) *tap_print_density_cmy = print_density_cmy;
 
     if (!final_rgb) return SPK_OK;  // caller only wanted an earlier tap
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 5) Scan the print (D50 viewing illuminant, print profile's dyes).
     spk::ScanningParams sparams;
@@ -1662,7 +1887,17 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     final_rgb->assign(static_cast<size_t>(npix) * 3, 0.0f);
     spk::scan(prnt, sparams, print_density_cmy.data(), width, height,
               final_rgb->data());
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        final_rgb->clear();
+        return SPK_ERR_CANCELLED;
+    }
     return SPK_OK;
+} catch (const spk::ParallelCancelled&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_film_density_cmy) tap_film_density_cmy->clear();
+    if (tap_print_density_cmy) tap_print_density_cmy->clear();
+    return SPK_ERR_CANCELLED;
 }
 
 // Allocate an spk_image and copy `data` into it.
@@ -1733,6 +1968,14 @@ int spk_stage_timings(char* buf, int cap) {
     return spk::stage_timings_format(buf, cap);
 }
 
+uint64_t spk_stage_timing_render_id(void) {
+    return spk::stage_timing_render_id();
+}
+
+int spk_stage_timings_json(char* buf, int cap) {
+    return spk::stage_timings_json_format(buf, cap);
+}
+
 void spk_default_params(spk_params* p) {
     if (!p) return;
     const char* film = p->film_profile;
@@ -1740,6 +1983,7 @@ void spk_default_params(spk_params* p) {
     std::memset(p, 0, sizeof(*p));
     p->film_profile = film;
     p->print_profile = print;
+    p->enlarger_illuminant = "TH-KG3";
 
     // camera
     p->exposure_compensation_ev = 0.0f;
@@ -1753,6 +1997,7 @@ void spk_default_params(spk_params* p) {
     p->camera_filter_uv[0] = 0.0f; p->camera_filter_uv[1] = 410.0f; p->camera_filter_uv[2] = 8.0f;
     p->camera_filter_ir[0] = 0.0f; p->camera_filter_ir[1] = 675.0f; p->camera_filter_ir[2] = 15.0f;
     p->camera_diffusion_active = 0;
+    p->camera_diffusion_family = SPK_DIFFUSION_BLACK_PRO_MIST;
     p->camera_diffusion_strength = 0.5f;
     p->camera_diffusion_spatial_scale = 1.0f;
     p->camera_diffusion_halo_warmth = 0.0f;
@@ -1777,6 +2022,7 @@ void spk_default_params(spk_params* p) {
     p->preflash_y_filter_shift = 0.0f;
     p->preflash_m_filter_shift = 0.0f;
     p->enlarger_diffusion_active = 0;
+    p->enlarger_diffusion_family = SPK_DIFFUSION_BLACK_PRO_MIST;
     p->enlarger_diffusion_strength = 0.5f;
     p->enlarger_diffusion_spatial_scale = 1.0f;
     p->enlarger_diffusion_halo_warmth = 0.0f;
@@ -1868,6 +2114,7 @@ void spk_default_params(spk_params* p) {
     p->output_color_space = SPK_CS_SRGB;
     p->output_cctf_encoding = 1;
     p->input_cctf_decoding = 0;
+    p->input_color_space = "ProPhoto RGB";
     p->crop = 0;
     p->crop_center[0] = 0.5f; p->crop_center[1] = 0.5f;
     p->crop_size[0] = 0.1f; p->crop_size[1] = 0.1f;
@@ -1909,11 +2156,16 @@ const char* spk_status_str(spk_status s) {
         case SPK_ERR_ASSET_IO:          return "asset I/O error";
         case SPK_ERR_OOM:               return "out of memory";
         case SPK_ERR_INTERNAL:          return "internal error";
+        case SPK_ERR_PROFILE_INVALID:   return "invalid profile";
+        case SPK_ERR_CANCELLED:         return "cancelled";
         default:                        return "unknown";
     }
 }
 
+const char* spk_last_error_message(void) { return g_last_error_message; }
+
 spk_status spk_engine_create(const char* asset_dir, spk_engine** out) {
+    clear_last_error_message();
     if (!out) return SPK_ERR_BAD_ARGS;
     if (!asset_dir) return SPK_ERR_BAD_ARGS;  // filesystem mode requires a dir.
     auto eng = std::make_unique<spk_engine>();
@@ -1924,6 +2176,7 @@ spk_status spk_engine_create(const char* asset_dir, spk_engine** out) {
 }
 
 spk_status spk_engine_create_asset_manager(void* aasset_manager, spk_engine** out) {
+    clear_last_error_message();
     if (!out) return SPK_ERR_BAD_ARGS;
 #ifdef __ANDROID__
     if (!aasset_manager) return SPK_ERR_BAD_ARGS;
@@ -1944,6 +2197,7 @@ void spk_engine_destroy(spk_engine* eng) { delete eng; }
 
 spk_status spk_engine_list_profiles(spk_engine* eng, char* buf, size_t buf_len,
                                     size_t* needed) {
+    clear_last_error_message();
     if (!eng) return SPK_ERR_BAD_ARGS;
     std::string list;
 #ifdef __ANDROID__
@@ -1980,17 +2234,36 @@ spk_status spk_engine_list_profiles(spk_engine* eng, char* buf, size_t buf_len,
 
     size_t req = list.size() + 1;  // include NUL
     if (needed) *needed = req;
-    if (!buf || buf_len < req) return SPK_ERR_BAD_ARGS;  // caller resizes & retries
+    if (!buf) return needed ? SPK_OK : SPK_ERR_BAD_ARGS;
+    if (buf_len < req) return SPK_ERR_BAD_ARGS;
     std::memcpy(buf, list.c_str(), req);
     return SPK_OK;
 }
 
 spk_status spk_simulate(spk_engine* eng, const spk_image* in, const spk_params* p,
                         spk_image* out) {
+    return spk_simulate_cancellable(eng, in, p, out, nullptr, nullptr);
+}
+
+spk_status spk_simulate_cancellable(spk_engine* eng, const spk_image* in,
+                                    const spk_params* p, spk_image* out,
+                                    spk_cancel_check cancel,
+                                    void* cancel_user_data) {
+    clear_last_error_message();
+    // The C API itself cannot know whether an exact render is a user export,
+    // magnifier, or another caller. JNI supplies that logical purpose through
+    // an outer context; direct C callers get the neutral exact_render label.
+    spk::ScopedRenderTiming timing(spk::RTK_EXACT_RENDER);
     // Validate every pointer before any deref, matching spk_simulate_preview /
     // spk_simulate_tap. `in` is read for width/height just below, so guard it
     // (and its data) here rather than relying on the run_* callees.
-    if (!eng || !in || !p || !out || !in->data) return SPK_ERR_BAD_ARGS;
+    if (out) *out = {};
+    if (!eng || !p || !out || !valid_rgb_shape(in)) {
+        return timing.finish(SPK_ERR_BAD_ARGS);
+    }
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
     // EXPERIMENTAL GPU export latch (#149 option B, #154). gpu_export routes the
     // scan stage through the GPU on export, gated by scan()'s self-check + CPU
     // fallback. Only SETS the internal latch (never clears), so a preview
@@ -2007,32 +2280,53 @@ spk_status spk_simulate(spk_engine* eng, const spk_image* in, const spk_params* 
     spk_status st;
     int ow = in->width, oh = in->height;
     if (p->scan_film) {
-        st = run_scan_film(eng, in, p, &rgb, nullptr, nullptr, &ow, &oh);
+        st = run_scan_film(eng, in, p, &rgb, nullptr, nullptr, &ow, &oh,
+                           cancel, cancel_user_data);
     } else {
         // Print (enlarger) route: filming -> printing -> scan(print).
-        st = run_print(eng, in, p, &rgb, nullptr, nullptr, nullptr, &ow, &oh);
+        st = run_print(eng, in, p, &rgb, nullptr, nullptr, nullptr, &ow, &oh,
+                       cancel, cancel_user_data);
     }
-    if (st != SPK_OK) return st;
-    return fill_out_image(out, rgb, ow, oh,
-                          static_cast<int>(p->output_color_space));
+    if (st != SPK_OK) return timing.finish(st);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
+    return timing.finish(fill_out_image(out, rgb, ow, oh,
+                                        static_cast<int>(p->output_color_space)));
 }
 
 spk_status spk_simulate_preview(spk_engine* eng, const spk_image* in,
                                 const spk_params* p, spk_image* out) {
-    if (!eng || !in || !p || !out || !in->data) return SPK_ERR_BAD_ARGS;
+    return spk_simulate_preview_cancellable(eng, in, p, out, nullptr, nullptr);
+}
+
+spk_status spk_simulate_preview_cancellable(spk_engine* eng, const spk_image* in,
+                                            const spk_params* p, spk_image* out,
+                                            spk_cancel_check cancel,
+                                            void* cancel_user_data) {
+    clear_last_error_message();
+    spk::ScopedRenderTiming timing(spk::RTK_PREVIEW);
+    if (out) *out = {};
+    if (!eng || !p || !out || !valid_rgb_shape(in)) {
+        return timing.finish(SPK_ERR_BAD_ARGS);
+    }
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
     // Proxy-approximate / export-exact (docs/PERF_ROADMAP.md): the interactive preview
     // runs the approximate LUT fast-path (the scanner density->log_xyz spectral integral
-    // is PCHIP-interpolated through a 3D LUT instead of evaluated per pixel, ~5e-5 vs the
-    // direct path — see runtime/stages/scanning.h). spk_simulate (export) keeps the exact
-    // direct spectral evaluation, so the bit-exact parity goldens are untouched. We copy
-    // the caller's params and force the LUT on for the preview only.
+    // is PCHIP-interpolated through a 3D LUT instead of evaluated per pixel; error is
+    // profile/domain dependent — see runtime/stages/scanning.h). spk_simulate keeps the
+    // caller's explicit setting; the app's exact-export route keeps it off. We copy the
+    // caller's params and force the LUT on for the preview only.
     spk_params pp = *p;
     // Force BOTH spectral LUTs on for the interactive preview (proxy-approximate / export-exact):
     // the scanner density->log_xyz integral AND the enlarger print-expose integral are the two
-    // per-pixel hotspots, so PCHIP-interpolating both through their 3D LUTs (~5e-5 / ~1e-4 vs the
-    // direct evaluation) roughly halves the preview render on the print route. spk_simulate
-    // (export) keeps the exact direct evaluation, so the bit-exact parity goldens — none of which
-    // call simulate_preview — are untouched. The enlarger LUT is inert on the scan_film route.
+    // per-pixel hotspots, so PCHIP-interpolating both through their 3D LUTs roughly halves
+    // the preview render on the print route. Scanner error is profile/domain dependent;
+    // the enlarger gate remains ~1e-4 vs direct. The app's exact export keeps both LUTs off,
+    // and the bit-exact parity goldens do not call simulate_preview. The enlarger LUT is
+    // inert on the scan_film route.
     if (pp.use_scanner_lut == 0) pp.use_scanner_lut = 1;
     if (pp.use_enlarger_lut == 0) pp.use_enlarger_lut = 1;
     if (pp.lut_resolution < 2) pp.lut_resolution = 17;
@@ -2055,7 +2349,8 @@ spk_status spk_simulate_preview(spk_engine* eng, const spk_image* in,
     int longest = in->width > in->height ? in->width : in->height;
     if (longest <= max_size) {
         // Already small enough: run the full simulate on the original.
-        return spk_simulate(eng, in, p, out);
+        return timing.finish(spk_simulate_cancellable(
+            eng, in, p, out, cancel, cancel_user_data));
     }
     // Downscale (bilinear) to the preview target, preserving aspect ratio, then
     // simulate. Done in input (linear ProPhoto) space, before the pipeline.
@@ -2067,15 +2362,23 @@ spk_status spk_simulate_preview(spk_engine* eng, const spk_image* in,
 
     std::vector<float> small;
     downscale_bilinear(in->data, in->width, in->height, dw, dh, &small);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
 
     spk_image small_img{small.data(), dw, dh, in->color_space};
-    return spk_simulate(eng, &small_img, p, out);
+    return timing.finish(spk_simulate_cancellable(
+        eng, &small_img, p, out, cancel, cancel_user_data));
 }
 
 spk_status spk_simulate_tap(spk_engine* eng, const spk_image* in,
                             const spk_params* p, const char* tap_name,
                             spk_image* out) {
-    if (!out || !p || !tap_name || !in) return SPK_ERR_BAD_ARGS;
+    clear_last_error_message();
+    spk::ScopedRenderTiming timing(spk::RTK_TAP);
+    if (!out || !p || !tap_name || !in) {
+        return timing.finish(SPK_ERR_BAD_ARGS);
+    }
 
     // Debug taps feed the parity harness: hard-zero the INTERNAL GPU latch so a
     // raw C caller's allow_gpu_scan can never put GPU output into a tap
@@ -2095,50 +2398,69 @@ spk_status spk_simulate_tap(spk_engine* eng, const spk_image* in,
         // scan_film route: only the negative taps + final RGB exist.
         if (tap == "film_log_raw") {
             st = run_scan_film(eng, in, p, nullptr, &log_raw, nullptr, &ow, &oh);
-            if (st != SPK_OK) return st;
-            return fill_out_image(out, log_raw, ow, oh, in->color_space);
+            if (st != SPK_OK) return timing.finish(st);
+            return timing.finish(
+                fill_out_image(out, log_raw, ow, oh, in->color_space));
         } else if (tap == "film_density_cmy") {
             st = run_scan_film(eng, in, p, nullptr, &log_raw, &film_density_cmy,
                                &ow, &oh);
-            if (st != SPK_OK) return st;
-            return fill_out_image(out, film_density_cmy, ow, oh, in->color_space);
+            if (st != SPK_OK) return timing.finish(st);
+            return timing.finish(
+                fill_out_image(out, film_density_cmy, ow, oh, in->color_space));
         } else if (tap == "final_rgb") {
             st = run_scan_film(eng, in, p, &final_rgb, nullptr, nullptr, &ow, &oh);
-            if (st != SPK_OK) return st;
-            return fill_out_image(out, final_rgb, ow, oh,
-                                  static_cast<int>(p->output_color_space));
+            if (st != SPK_OK) return timing.finish(st);
+            return timing.finish(fill_out_image(
+                out, final_rgb, ow, oh,
+                static_cast<int>(p->output_color_space)));
         }
-        return SPK_ERR_BAD_ARGS;  // unknown / print-only tap on scan_film route
+        return timing.finish(
+            SPK_ERR_BAD_ARGS);  // unknown / print-only tap on scan_film route
     }
 
     // Print route taps (filming -> printing -> scan).
     if (tap == "film_log_raw") {
         st = run_print(eng, in, p, nullptr, &log_raw, nullptr, nullptr, &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, log_raw, ow, oh, in->color_space);
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(fill_out_image(out, log_raw, ow, oh, in->color_space));
     } else if (tap == "film_density_cmy") {
         st = run_print(eng, in, p, nullptr, nullptr, &film_density_cmy, nullptr,
                        &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, film_density_cmy, ow, oh, in->color_space);
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(
+            fill_out_image(out, film_density_cmy, ow, oh, in->color_space));
     } else if (tap == "print_density_cmy") {
         st = run_print(eng, in, p, nullptr, nullptr, nullptr, &print_density_cmy,
                        &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, print_density_cmy, ow, oh, in->color_space);
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(
+            fill_out_image(out, print_density_cmy, ow, oh, in->color_space));
     } else if (tap == "final_rgb") {
         st = run_print(eng, in, p, &final_rgb, nullptr, nullptr, nullptr, &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, final_rgb, ow, oh,
-                              static_cast<int>(p->output_color_space));
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(fill_out_image(
+            out, final_rgb, ow, oh,
+            static_cast<int>(p->output_color_space)));
     }
-    return SPK_ERR_BAD_ARGS;  // unknown tap
+    return timing.finish(SPK_ERR_BAD_ARGS);  // unknown tap
 }
 
 spk_status spk_meter_exposure_ev(spk_engine* eng, const spk_image* in,
                                  const spk_params* p, double* out_ev) {
-    if (!eng || !in || !p || !out_ev || !in->data) return SPK_ERR_BAD_ARGS;
-    if (in->width <= 0 || in->height <= 0) return SPK_ERR_BAD_ARGS;
+    return spk_meter_exposure_ev_cancellable(
+        eng, in, p, out_ev, nullptr, nullptr);
+}
+
+spk_status spk_meter_exposure_ev_cancellable(spk_engine* eng,
+                                             const spk_image* in,
+                                             const spk_params* p,
+                                             double* out_ev,
+                                             spk_cancel_check cancel,
+                                             void* cancel_user_data) {
+    clear_last_error_message();
+    if (!eng || !p || !out_ev || !valid_rgb_shape(in)) return SPK_ERR_BAD_ARGS;
+    if (!supported_input_color_space(p->input_color_space)) return SPK_ERR_BAD_ARGS;
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // AE off => the render applies no gain, so the caller's gain is unity (0 EV).
     *out_ev = 0.0;
@@ -2164,6 +2486,7 @@ spk_status spk_meter_exposure_ev(spk_engine* eng, const spk_image* in,
     *out_ev = spk::measure_auto_exposure_ev_f32(
         in->data, w, h, spk::AeColorSpace::kProPhotoRGB,
         /*apply_cctf_decoding=*/p->input_cctf_decoding != 0, method, known);
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     return SPK_OK;
 }
 
@@ -2178,8 +2501,21 @@ static inline float shaper_to_linear(float e) {
 spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
                              int32_t shaper,
                              char* out_text, size_t out_cap, size_t* needed) {
+    return spk_bake_cube_lut_cancellable(
+        eng, p, lut_size, shaper, out_text, out_cap, needed, nullptr, nullptr);
+}
+
+spk_status spk_bake_cube_lut_cancellable(
+        spk_engine* eng, const spk_params* p, int lut_size, int32_t shaper,
+        char* out_text, size_t out_cap, size_t* needed,
+        spk_cancel_check cancel, void* cancel_user_data) {
+    clear_last_error_message();
+    spk::ScopedRenderTiming timing(spk::RTK_LUT_BAKE);
     if (needed) *needed = 0;
-    if (!eng || !p) return SPK_ERR_BAD_ARGS;
+    if (!eng || !p) return timing.finish(SPK_ERR_BAD_ARGS);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
 
     // Clamp the lattice size to a sane range. 33 is the default; below 2 a 3D LUT
     // is meaningless, and >256 explodes the bake cost (N^3 lattice points).
@@ -2252,6 +2588,9 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     const bool shaped = shaper != 0;
     size_t idx = 0;
     for (int r = 0; r < n; ++r) {
+        if (cancellation_requested(cancel, cancel_user_data)) {
+            return timing.finish(SPK_ERR_CANCELLED);
+        }
         float rv = static_cast<float>(r) / denom;
         if (shaped) rv = shaper_to_linear(rv);
         for (int g = 0; g < n; ++g) {
@@ -2275,12 +2614,17 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     std::vector<float> rgb;
     spk_status st;
     if (bp.scan_film) {
-        st = run_scan_film(eng, &in_img, &bp, &rgb, nullptr, nullptr);
+        st = run_scan_film(eng, &in_img, &bp, &rgb, nullptr, nullptr,
+                           nullptr, nullptr, cancel, cancel_user_data);
     } else {
-        st = run_print(eng, &in_img, &bp, &rgb, nullptr, nullptr, nullptr);
+        st = run_print(eng, &in_img, &bp, &rgb, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, cancel, cancel_user_data);
     }
-    if (st != SPK_OK) return st;
-    if (rgb.size() != count * 3) return SPK_ERR_INTERNAL;
+    if (st != SPK_OK) return timing.finish(st);
+    if (rgb.size() != count * 3) return timing.finish(SPK_ERR_INTERNAL);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
 
     // --- Emit the .cube text -------------------------------------------------
     const char* cs_name = "sRGB";
@@ -2332,6 +2676,10 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     out += "DOMAIN_MAX 1.0 1.0 1.0\n";
 
     for (size_t i = 0; i < count; ++i) {
+        if ((i & 1023u) == 0u &&
+            cancellation_requested(cancel, cancel_user_data)) {
+            return timing.finish(SPK_ERR_CANCELLED);
+        }
         std::snprintf(line, sizeof(line), "%.6f %.6f %.6f\n",
                       static_cast<double>(rgb[i * 3 + 0]),
                       static_cast<double>(rgb[i * 3 + 1]),
@@ -2340,10 +2688,19 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     }
 
     const size_t req = out.size() + 1;  // include NUL terminator
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
     if (needed) *needed = req;
-    if (!out_text || out_cap < req) return SPK_ERR_BAD_ARGS;  // caller resizes & retries
+    // A null output with `needed` is the successful sizing-query form. Keeping
+    // it successful lets a JNI two-pass bake remain one successful logical
+    // timing context instead of poisoning it with an expected BAD_ARGS child.
+    if (!out_text) {
+        return timing.finish(needed ? SPK_OK : SPK_ERR_BAD_ARGS);
+    }
+    if (out_cap < req) return timing.finish(SPK_ERR_BAD_ARGS);
     std::memcpy(out_text, out.c_str(), req);
-    return SPK_OK;
+    return timing.finish(SPK_OK);
 }
 
 void spk_image_free(spk_image* img) {

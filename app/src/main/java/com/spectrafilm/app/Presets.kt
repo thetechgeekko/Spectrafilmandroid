@@ -21,10 +21,71 @@ import com.spectrafilm.libraw.WhiteBalance
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.math.BigDecimal
+import java.math.BigInteger
+import java.nio.charset.CharacterCodingException
 
-private const val PRESET_VERSION = 1
+internal const val PRESET_VERSION = 2
+internal const val PRESET_SCHEMA_ID = "org.spektrafilm.preset"
+
+/**
+ * Resource-amplifying parameter domains shared by the editor and every preset/recipe boundary.
+ * Keeping these ranges in one place prevents imported JSON from bypassing the UI limits and
+ * driving unbounded native image allocation or iteration counts.
+ */
+internal object OperationalParamLimits {
+    val SPECTRAL_GAUSSIAN_BLUR = 0f..20f
+    val UPSCALE_FACTOR = 0f..4f
+    val UPSCALE_NON_ZERO_FACTOR = 0.5f..4f
+    val FILM_FORMAT_MM = 8f..120f
+    val GRAIN_PARTICLE_AREA_UM2 = 0.2f..2f
+    val GRAIN_PARTICLE_SCALE = 0.1f..5f
+    val GRAIN_PARTICLE_SCALE_LAYERS = 0.25f..5f
+    val GRAIN_DENSITY_MIN = 0f..0.5f
+    val GRAIN_SUBLAYERS = 1..5
+    val HALATION_BOUNCES = 1..5
+
+    fun validate(state: ParamsState) {
+        require(state.spectralGaussianBlur in SPECTRAL_GAUSSIAN_BLUR) {
+            "input.spectralGaussianBlur must be in $SPECTRAL_GAUSSIAN_BLUR"
+        }
+        require(state.upscaleFactor == 0f || state.upscaleFactor in UPSCALE_NON_ZERO_FACTOR) {
+            "input.upscaleFactor must be 0 or in $UPSCALE_NON_ZERO_FACTOR"
+        }
+        require(state.filmFormatMm in FILM_FORMAT_MM) {
+            "camera.filmFormatMm must be in $FILM_FORMAT_MM"
+        }
+        require(state.grainParticleAreaUm2 in GRAIN_PARTICLE_AREA_UM2) {
+            "grain.particleAreaUm2 must be in $GRAIN_PARTICLE_AREA_UM2"
+        }
+        require(state.grainParticleScale.allIn(GRAIN_PARTICLE_SCALE)) {
+            "grain.particleScale components must be in $GRAIN_PARTICLE_SCALE"
+        }
+        require(state.grainParticleScaleLayers.allIn(GRAIN_PARTICLE_SCALE_LAYERS)) {
+            "grain.particleScaleLayers components must be in $GRAIN_PARTICLE_SCALE_LAYERS"
+        }
+        require(state.grainDensityMin.allIn(GRAIN_DENSITY_MIN)) {
+            "grain.densityMin components must be in $GRAIN_DENSITY_MIN"
+        }
+        require(state.grainNSubLayers in GRAIN_SUBLAYERS) {
+            "grain.nSubLayers must be in $GRAIN_SUBLAYERS"
+        }
+        require(state.halNBounces in HALATION_BOUNCES) {
+            "halation.nBounces must be in $HALATION_BOUNCES"
+        }
+    }
+
+    private fun Triple<Float, Float, Float>.allIn(range: ClosedFloatingPointRange<Float>): Boolean =
+        first in range && second in range && third in range
+}
+
+internal class UnsupportedPresetDocumentException(message: String) :
+    IllegalArgumentException(message)
 
 object Presets {
+
+    private val INT_MIN_VALUE = BigInteger.valueOf(Int.MIN_VALUE.toLong())
+    private val INT_MAX_VALUE = BigInteger.valueOf(Int.MAX_VALUE.toLong())
 
     private fun dir(ctx: Context): File =
         File(ctx.filesDir, "presets").apply { mkdirs() }
@@ -44,22 +105,21 @@ object Presets {
      * the file write to IO — avoiding a torn (partially-updated) off-thread snapshot.
      */
     fun saveJson(ctx: Context, name: String, json: String) {
-        val safe = name.trim().ifEmpty { "preset" }.replace(Regex("[^A-Za-z0-9_\\- ]"), "_")
-        File(dir(ctx), "$safe.json").writeText(json)
+        val normalized = parsePersistentJson(json).toString(2)
+        AtomicJsonStore.writeUtf8(file(ctx, name), normalized, AtomicJsonStore.MAX_PRESET_BYTES)
     }
 
     fun load(ctx: Context, name: String, into: ParamsState) {
-        val text = File(dir(ctx), "$name.json").readText()
-        fromJson(JSONObject(text), into)
+        fromJson(readPersistentJson(ctx, name), into)
     }
 
     fun delete(ctx: Context, name: String) {
-        File(dir(ctx), "$name.json").delete()
+        AtomicJsonStore.delete(file(ctx, name))
     }
 
     /** Import a preset JSON from a SAF [uri] into [into]. */
     fun import(ctx: Context, uri: Uri, into: ParamsState) {
-        fromJson(JSONObject(readUri(ctx, uri)), into)
+        fromJson(parseImportJson(readUriText(ctx, uri)), into)
     }
 
     /**
@@ -67,13 +127,10 @@ object Presets {
      * file read off the main thread and then [decode] the result on the main thread, so
      * the Compose-state write stays on main. Throws if the file is missing/unreadable.
      */
-    fun read(ctx: Context, name: String): String =
-        File(dir(ctx), "$name.json").readText()
+    fun read(ctx: Context, name: String): String = readPersistentJson(ctx, name).toString(2)
 
     /** Read a SAF preset's raw JSON text (the IO half of [import]); decode on main. */
-    fun readUri(ctx: Context, uri: Uri): String =
-        ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
-            ?: error("Could not open preset")
+    fun readUri(ctx: Context, uri: Uri): String = parseImportJson(readUriText(ctx, uri)).toString(2)
 
     /** Export the current [state] to a SAF [uri]. */
     fun export(ctx: Context, uri: Uri, state: ParamsState) {
@@ -86,12 +143,14 @@ object Presets {
      * torn-snapshot rationale as [saveJson]).
      */
     fun exportJson(ctx: Context, uri: Uri, json: String) {
-        ctx.contentResolver.openOutputStream(uri)?.use {
-            it.write(json.toByteArray())
-        } ?: error("Could not open output for preset")
+        val normalized = parsePersistentJson(json).toString(2).toByteArray(Charsets.UTF_8)
+        writeVerifiedNewDocument(ctx, uri, normalized, AtomicJsonStore.MAX_PRESET_BYTES)
     }
 
-    fun toJsonString(state: ParamsState): String = toJson(state).toString(2)
+    fun toJsonString(state: ParamsState): String {
+        OperationalParamLimits.validate(state)
+        return toJson(state).toString(2)
+    }
 
     /**
      * Reusable serialization hooks so the recipe (sidecar) layer shares this exact
@@ -100,9 +159,79 @@ object Presets {
      * envelope (source key + metadata) but the params payload is byte-for-byte the
      * same format as a saved preset.
      */
-    internal fun encode(state: ParamsState): JSONObject = toJson(state)
+    internal fun encode(state: ParamsState): JSONObject {
+        OperationalParamLimits.validate(state)
+        return toJson(state)
+    }
 
     internal fun decode(o: JSONObject, into: ParamsState) = fromJson(o, into)
+
+    /** Strict import boundary: bounded caller reads this, rejects future/foreign schemas, then commits. */
+    internal fun parseImportJson(text: String): JSONObject {
+        val root = AtomicJsonStore.parseObject(text)
+        val exactVersion = root.exactInteger("version", BigInteger.ONE)
+        val currentVersion = BigInteger.valueOf(PRESET_VERSION.toLong())
+        if (exactVersion < BigInteger.ONE || exactVersion > currentVersion) {
+            throw UnsupportedPresetDocumentException("unsupported preset version: $exactVersion")
+        }
+        val version = exactVersion.toInt()
+        val schema = root.opt("schema")
+        if (schema !== null && schema !== JSONObject.NULL && schema != PRESET_SCHEMA_ID) {
+            throw UnsupportedPresetDocumentException("unsupported preset schema: $schema")
+        }
+        if (version >= 2 && schema != PRESET_SCHEMA_ID) {
+            throw UnsupportedPresetDocumentException("preset schema is required for version $version")
+        }
+        return validateCurrent(migrate(root))
+    }
+
+    private fun parsePersistentJson(text: String): JSONObject = parseImportJson(text)
+
+    private fun readPersistentJson(ctx: Context, name: String): JSONObject {
+        val target = file(ctx, name)
+        return AtomicJsonStore.withPathLock(target) {
+            val text = try {
+                AtomicJsonStore.readUtf8(target, AtomicJsonStore.MAX_PRESET_BYTES)
+            } catch (failure: Throwable) {
+                // A bounded-size or malformed-UTF-8 failure proves corrupt content. Other I/O
+                // failures may be transient and must not move the user's last good document.
+                if (target.isFile &&
+                    (failure is DocumentLimitException || failure is CharacterCodingException)
+                ) {
+                    runCatching { AtomicJsonStore.quarantine(target) }
+                        .exceptionOrNull()
+                        ?.let(failure::addSuppressed)
+                }
+                throw failure
+            }
+            try {
+                parsePersistentJson(text)
+            } catch (failure: UnsupportedPresetDocumentException) {
+                // A newer/foreign document is not corrupt. Keep it byte-for-byte so a newer
+                // app can still open it; callers surface the unsupported-version state.
+                throw failure
+            } catch (failure: Exception) {
+                runCatching { AtomicJsonStore.quarantine(target) }
+                    .exceptionOrNull()
+                    ?.let(failure::addSuppressed)
+                throw failure
+            }
+        }
+    }
+
+    private fun readUriText(ctx: Context, uri: Uri): String {
+        require(uri.scheme == "content") { "preset source must be content://" }
+        return ctx.contentResolver.openInputStream(uri)?.use {
+            AtomicJsonStore.readUtf8(it, AtomicJsonStore.MAX_PRESET_BYTES)
+        } ?: error("Could not open preset")
+    }
+
+    private fun file(ctx: Context, name: String): File = File(dir(ctx), "${safeName(name)}.json")
+
+    private fun safeName(name: String): String = name.trim()
+        .take(96)
+        .ifEmpty { "preset" }
+        .replace(Regex("[^A-Za-z0-9_\\- ]"), "_")
 
     // --- JSON (de)serialization ---
 
@@ -113,22 +242,77 @@ object Presets {
         put(key, JSONArray().put(p.first.toDouble()).put(p.second.toDouble()))
 
     private fun JSONObject.triOf(key: String, def: Triple<Float, Float, Float>): Triple<Float, Float, Float> {
-        val a = optJSONArray(key) ?: return def
-        // optDouble tolerates a short/malformed array instead of throwing mid-decode
-        // (a partial mutation of ParamsState); a missing element falls back to the default.
+        if (!has(key)) return def
+        val a = opt(key)
+        require(a is JSONArray) { "$key must be a JSON array" }
+        require(a.length() == 3) { "$key must contain exactly 3 numbers" }
         return Triple(
-            a.optDouble(0, def.first.toDouble()).toFloat(),
-            a.optDouble(1, def.second.toDouble()).toFloat(),
-            a.optDouble(2, def.third.toDouble()).toFloat(),
+            a.finiteFloat(0, key),
+            a.finiteFloat(1, key),
+            a.finiteFloat(2, key),
         )
     }
 
     private fun JSONObject.pairOf(key: String, def: Pair<Float, Float>): Pair<Float, Float> {
-        val a = optJSONArray(key) ?: return def
-        return a.optDouble(0, def.first.toDouble()).toFloat() to a.optDouble(1, def.second.toDouble()).toFloat()
+        if (!has(key)) return def
+        val a = opt(key)
+        require(a is JSONArray) { "$key must be a JSON array" }
+        require(a.length() == 2) { "$key must contain exactly 2 numbers" }
+        return a.finiteFloat(0, key) to a.finiteFloat(1, key)
     }
 
-    private fun JSONObject.f(key: String, def: Float) = optDouble(key, def.toDouble()).toFloat()
+    private fun JSONObject.f(key: String, def: Float): Float {
+        if (!has(key)) return def
+        return finiteDouble(key).toFloat().also {
+            require(it.isFinite()) { "$key is outside the finite Float range" }
+        }
+    }
+
+    private fun JSONObject.i(key: String, def: Int): Int {
+        if (!has(key)) return def
+        val value = exactInteger(key, BigInteger.valueOf(def.toLong()))
+        require(value >= INT_MIN_VALUE && value <= INT_MAX_VALUE) { "$key is outside the Int range" }
+        return value.toInt()
+    }
+
+    private fun JSONObject.exactInteger(key: String, def: BigInteger): BigInteger {
+        if (!has(key)) return def
+        val raw = opt(key)
+        return try {
+            when (raw) {
+                is Byte, is Short, is Int, is Long -> BigInteger.valueOf((raw as Number).toLong())
+                is BigInteger -> raw
+                is BigDecimal -> raw.toBigIntegerExact()
+                is Float -> {
+                    require(raw.isFinite()) { "$key must be finite" }
+                    BigDecimal.valueOf(raw.toDouble()).toBigIntegerExact()
+                }
+                is Double -> {
+                    require(raw.isFinite()) { "$key must be finite" }
+                    BigDecimal.valueOf(raw).toBigIntegerExact()
+                }
+                else -> throw IllegalArgumentException("$key must be a JSON integer")
+            }
+        } catch (failure: ArithmeticException) {
+            throw IllegalArgumentException("$key must be an exact integer", failure)
+        }
+    }
+
+    private fun JSONObject.finiteDouble(key: String): Double {
+        val raw = opt(key)
+        require(raw is Number) { "$key must be a JSON number" }
+        return raw.toDouble().also { require(it.isFinite()) { "$key must be finite" } }
+    }
+
+    private fun JSONArray.finiteFloat(index: Int, field: String): Float {
+        val raw = opt(index)
+        require(raw is Number) { "$field[$index] must be a JSON number" }
+        val value = raw.toDouble()
+        require(value.isFinite()) { "$field[$index] must be finite" }
+        return value.toFloat().also {
+            require(it.isFinite()) { "$field[$index] is outside the finite Float range" }
+        }
+    }
 
     private fun pointsToJson(pts: List<Pair<Float, Float>>): JSONArray {
         val arr = JSONArray()
@@ -136,13 +320,16 @@ object Presets {
         return arr
     }
 
-    private fun jsonToPoints(arr: JSONArray?): List<Pair<Float, Float>> {
-        if (arr == null) return emptyList()
+    private fun JSONObject.pointsOf(key: String): List<Pair<Float, Float>> {
+        if (!has(key)) return emptyList()
+        val arr = opt(key)
+        require(arr is JSONArray) { "$key must be a JSON array" }
         val out = ArrayList<Pair<Float, Float>>(arr.length())
         for (i in 0 until arr.length()) {
-            val p = arr.optJSONArray(i) ?: continue
-            if (p.length() < 2) continue  // skip a malformed point instead of throwing
-            out.add(p.optDouble(0, 0.0).toFloat() to p.optDouble(1, 0.0).toFloat())
+            val p = arr.opt(i)
+            require(p is JSONArray) { "$key[$i] must be a JSON array" }
+            require(p.length() == 2) { "$key[$i] must contain exactly 2 numbers" }
+            out.add(p.finiteFloat(0, "$key[$i]") to p.finiteFloat(1, "$key[$i]"))
         }
         return out
     }
@@ -166,6 +353,7 @@ object Presets {
     }
 
     private fun toJson(s: ParamsState): JSONObject = JSONObject().apply {
+        put("schema", PRESET_SCHEMA_ID)
         put("version", PRESET_VERSION)
         put("filmProfile", s.filmProfile)
         put("printProfile", s.printProfile)
@@ -328,24 +516,55 @@ object Presets {
      * Bring an older preset/recipe JSON up to the current [PRESET_VERSION] before decoding. The
      * version was previously written by [toJson] but never read; reading it here gives one tested
      * place to handle field renames or changed defaults when the schema next breaks. Today every
-     * shipped preset is v1, so this is an identity pass. Newer-than-current files decode best-effort
-     * (every field below uses opt*-with-default, so unknown keys are ignored and missing keys keep
-     * the current default). When you add a field whose value for an *old* preset should differ from
-     * a fresh [ParamsState] default, apply that here for `version < N` rather than relying on the
+     * shipped preset was v1. v2 wraps masks in their independently versioned interoperable document.
+     * Newer-than-current objects passed directly to [decode] still decode known fields best-effort
+     * (unknown keys are ignored and missing keys keep the current default; present numeric fields
+     * must still be correctly typed and finite). When you add a field whose value for an *old*
+     * preset should differ from a fresh [ParamsState] default, apply that here for `version < N`
+     * rather than relying on the
      * constructor default.
      */
     private fun migrate(json: JSONObject): JSONObject {
-        val version = json.optInt("version", PRESET_VERSION)
+        val version = json.i("version", 1)
         if (version >= PRESET_VERSION) return json
-        // --- older-schema migrations land here as the schema evolves, e.g.:
-        //   if (version < 2) json.optJSONObject("camera")?.let { c ->
-        //       if (c.has("lensBlurUm") && !c.has("lensBlur")) c.put("lensBlur", c.getDouble("lensBlurUm"))
-        //   }
+        // Preserve BigInteger/BigDecimal numeric lexemes across migration on Android;
+        // JSONObject(String) would narrow decimals back through platform JSONTokener/Double.
+        val migrated = AtomicJsonStore.parseObject(json.toString())
+        if (version < 2) {
+            migrated.optJSONArray("masks")?.let {
+                migrated.put("masks", MaskJson.migrateLegacy(it))
+            }
+            migrated.put("schema", PRESET_SCHEMA_ID)
+            migrated.put("version", 2)
+        }
+        return migrated
+    }
+
+    private fun validateCurrent(json: JSONObject): JSONObject {
+        require(json.i("version", -1) == PRESET_VERSION) { "invalid preset version" }
+        require(json.opt("schema") == PRESET_SCHEMA_ID) { "unsupported preset schema" }
+        json.opt("masks")?.takeUnless { it === JSONObject.NULL }?.let { MaskJson.fromJson(it) }
+        AtomicJsonStore.validate(json)
+        validatePayload(json)
         return json
     }
 
     private fun fromJson(json: JSONObject, s: ParamsState) {
+        AtomicJsonStore.validate(json)
         val o = migrate(json)
+        AtomicJsonStore.validate(o)
+        validatePayload(o)
+        applyJson(o, s)
+    }
+
+    /** Decode once into detached state so a malformed late field cannot partly mutate live state. */
+    private fun validatePayload(json: JSONObject) {
+        val detached = ParamsState()
+        applyJson(json, detached)
+        OperationalParamLimits.validate(detached)
+    }
+
+    private fun applyJson(o: JSONObject, s: ParamsState) {
         s.filmProfile = o.optString("filmProfile", s.filmProfile)
         s.printProfile = o.optString("printProfile", s.printProfile)
 
@@ -383,7 +602,9 @@ object Presets {
             s.gamutCompress = g.f("gamutCompress", s.gamutCompress)
         }
 
-        o.optJSONArray("masks")?.let { s.localAdjustments = MaskJson.fromJson(it) }
+        o.opt("masks")?.takeUnless { it === JSONObject.NULL }?.let {
+            s.localAdjustments = MaskJson.fromJson(it)
+        }
 
         o.optJSONObject("camera")?.let { c ->
             s.exposureCompensationEv = c.f("exposureCompensationEv", s.exposureCompensationEv)
@@ -437,7 +658,7 @@ object Presets {
             s.grainBlur = g.f("blur", s.grainBlur)
             s.grainBlurDyeCloudsUm = g.f("blurDyeCloudsUm", s.grainBlurDyeCloudsUm)
             s.grainMicroStructure = g.pairOf("microStructure", s.grainMicroStructure)
-            s.grainNSubLayers = g.optInt("nSubLayers", s.grainNSubLayers)
+            s.grainNSubLayers = g.i("nSubLayers", s.grainNSubLayers)
         }
 
         o.optJSONObject("halation")?.let { h ->
@@ -454,7 +675,7 @@ object Presets {
             s.halScatterTailWeightPct = h.triOf("scatterTailWeightPct", s.halScatterTailWeightPct)
             s.halHalationStrengthPct = h.triOf("halationStrengthPct", s.halHalationStrengthPct)
             s.halFirstSigmaUm = h.triOf("firstSigmaUm", s.halFirstSigmaUm)
-            s.halNBounces = h.optInt("nBounces", s.halNBounces)
+            s.halNBounces = h.i("nBounces", s.halNBounces)
             s.halBounceDecay = h.f("bounceDecay", s.halBounceDecay)
             s.halRenormalize = h.optBoolean("renormalize", s.halRenormalize)
         }
@@ -495,10 +716,10 @@ object Presets {
 
         o.optJSONObject("toneCurve")?.let { t ->
             s.toneCurveActive = t.optBoolean("active", s.toneCurveActive)
-            s.toneCurveMaster = jsonToPoints(t.optJSONArray("master"))
-            s.toneCurveRed = jsonToPoints(t.optJSONArray("red"))
-            s.toneCurveGreen = jsonToPoints(t.optJSONArray("green"))
-            s.toneCurveBlue = jsonToPoints(t.optJSONArray("blue"))
+            s.toneCurveMaster = t.pointsOf("master")
+            s.toneCurveRed = t.pointsOf("red")
+            s.toneCurveGreen = t.pointsOf("green")
+            s.toneCurveBlue = t.pointsOf("blue")
         }
 
         // "display".previewMaxSize is deliberately NOT read back. Recipes are keyed by

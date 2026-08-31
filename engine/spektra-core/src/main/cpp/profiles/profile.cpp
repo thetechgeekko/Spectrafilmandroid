@@ -17,6 +17,7 @@
 #include <stdexcept>
 
 #include "json_min.h"
+#include "model/color_output.h"
 
 namespace spk {
 
@@ -89,7 +90,18 @@ Profile load_profile_string(const std::string& json_text) {
     if (info.has("stock")) p.stock = info.at("stock").as_string();
     if (info.has("use")) p.use = info.at("use").as_string();
     if (info.has("antihalation")) p.antihalation = info.at("antihalation").as_string();
-    p.viewing_illuminant = info.at("viewing_illuminant").as_string();
+    if (!info.has("viewing_illuminant")) {
+        throw std::runtime_error(
+            "Profile: invalid info.viewing_illuminant '<missing>'");
+    }
+    const json::Value& viewing_value = info.at("viewing_illuminant");
+    if (!viewing_value.is_string()) {
+        throw std::runtime_error(
+            "Profile: invalid info.viewing_illuminant '<non-string>'");
+    }
+    p.viewing_illuminant = viewing_value.as_string();
+    p.resolved_viewing_illuminant =
+        &require_viewing_illuminant(p.viewing_illuminant);
     if (info.has("reference_illuminant"))
         p.reference_illuminant = info.at("reference_illuminant").as_string();
 

@@ -1,0 +1,270 @@
+diff --git a/src/decoders/olympus14.cpp b/src/decoders/olympus14.cpp
+index 27ff87d..8630214 100644
+--- a/src/decoders/olympus14.cpp
++++ b/src/decoders/olympus14.cpp
+@@ -67,7 +67,8 @@ void skip_bit(uint32_t &vbits)
+   {
+     while (bitcount < wbits)
+       add_data();
+-    uint32_t ret = bitstorage << (32 - (bitcount & 0x1f)) >> (32 - wbits);
++    const unsigned align_shift = (32 - (bitcount & 0x1f)) & 0x1f;
++    uint32_t ret = bitstorage << align_shift >> (32 - wbits);
+     bitcount -= wbits;
+     return ret;
+   }
+@@ -83,7 +84,7 @@ void skip_bit(uint32_t &vbits)
+     int i = 0;
+     while (pos < datasz)
+       b[i++] = bufp[pos++];
+-    refill(2);
++    refill(2 - i);
+     for (; i < 2; i++)
+       b[i] = bufp[pos++];
+     return b[0] << 8 | b[1];
+@@ -93,7 +94,9 @@ void skip_bit(uint32_t &vbits)
+   {
+     if (pos < datasz - 3)
+     {
+-      uint32_t ret = bufp[pos] << 24 | bufp[pos + 1] << 16 | bufp[pos + 2] << 8 | bufp[pos + 3];
++      uint32_t ret = uint32_t(bufp[pos]) << 24 |
++          uint32_t(bufp[pos + 1]) << 16 |
++          uint32_t(bufp[pos + 2]) << 8 | uint32_t(bufp[pos + 3]);
+       pos += 4;
+       return ret;
+     }
+@@ -101,16 +104,19 @@ void skip_bit(uint32_t &vbits)
+     int i = 0;
+     while (pos < datasz)
+       b[i++] = bufp[pos++];
+-    refill(4);
++    refill(4 - i);
+     for (; i < 4; i++)
+       b[i] = bufp[pos++];
+-    return b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
++    return uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 |
++        uint32_t(b[2]) << 8 | uint32_t(b[3]);
+   }
+   void refill(int b)
+   {
+ 	  int r = input->read(bufp, 1, buffer.size());
++	  if (r < b)
++		  throw LIBRAW_EXCEPTION_IO_EOF;
+ 	  pos = 0;
+-	  datasz = r > b ? r : b; 
++	  datasz = r;
+   }
+ };
+ 
+@@ -148,7 +154,8 @@ inline
+ #endif
+ int32_t oly_code(buffered_bitpump_t *th, unsigned int wbits, unsigned int tag0x640,
+                            unsigned int tag0x643, int tag0x652, 
+-                           int *glc, int *t640bits, int *t643bits)
++                           int *glc, int *t640bits, int *t643bits,
++                           UINT64 *unary_work_remaining)
+ {
+   int highdatabit;
+ 
+@@ -166,6 +173,9 @@ int32_t oly_code(buffered_bitpump_t *th, unsigned int wbits, unsigned int tag0x6
+ 
+   while (1)
+   {
++    if (!*unary_work_remaining)
++      throw LIBRAW_EXCEPTION_IO_CORRUPT;
++    --*unary_work_remaining;
+     th->skip_bit(vbits);
+     if ((th->bitstorage >> vbits) & 1)
+       break;
+@@ -178,7 +188,8 @@ int32_t oly_code(buffered_bitpump_t *th, unsigned int wbits, unsigned int tag0x6
+         for (i = 15 - wbits; vbits < i;)
+           vbits = th->add_data();
+ 
+-        high = th->bitstorage << (32 - (vbits & 0x1f)) >> (wbits + 17);
++        const unsigned align_shift = (32 - (vbits & 0x1f)) & 0x1f;
++        high = th->bitstorage << align_shift >> (wbits + 17);
+         vbits -= i;
+         th->bitcount = vbits;
+       }
+@@ -193,16 +204,23 @@ int32_t oly_code(buffered_bitpump_t *th, unsigned int wbits, unsigned int tag0x6
+   {
+ 	  while (vbits < wbits)
+ 		  vbits = th->add_data();
+-	  low = th->bitstorage << (32 - (vbits & 0x1f)) >> (32 - (wbits & 0x1f));
++	  const unsigned align_shift = (32 - (vbits & 0x1f)) & 0x1f;
++	  low = th->bitstorage << align_shift >> (32 - (wbits & 0x1f));
+ 	  th->bitcount = vbits - wbits;
+   }
+   *glc = low | (high << wbits);
+-  int32_t result = *glc ^ (unsigned int)(-highdatabit);
+-  return result;
++  return highdatabit ? -1 - *glc : *glc;
+ }
+ 
+ void LibRaw::olympus_load_raw()
+ { 
++	const libraw_olympus_makernotes_t &oly = imgdata.makernotes.olympus;
++	const unsigned tag0x645_shift = oly.tagX645 & 0x1f;
++	if (oly.ValidBits < 1 || oly.ValidBits > 16 || oly.tagX640 > 16 ||
++		oly.tagX643 > 16 || oly.tagX644 > 31 || oly.tagX653 < 1 ||
++		oly.tagX653 > 8)
++		throw LIBRAW_EXCEPTION_IO_CORRUPT;
++
+ 	if (!checkhdr(libraw_internal_data.internal_data.input, imgdata.makernotes.olympus.tagX653))
+ 		throw LIBRAW_EXCEPTION_IO_CORRUPT;
+ 
+@@ -212,10 +230,11 @@ void LibRaw::olympus_load_raw()
+ 	uint32_t context[4] = { 0,0,0,0 };
+ 	buffered_bitpump_t pump(libraw_internal_data.internal_data.input, 65536);
+ 
+-	const int32_t one_shl_tag0x641 = 1 << imgdata.makernotes.olympus.tagX641;
++	const UINT64 tag0x641_threshold = oly.tagX641 >= 32
++		? UINT64_MAX : UINT64(1) << oly.tagX641;
+ 	const int32_t tag0x642 = imgdata.makernotes.olympus.tagX642;
+ 	const int32_t tag0x644 = imgdata.makernotes.olympus.tagX644;
+-	const int32_t one_shl_tag645 = 1 << (imgdata.makernotes.olympus.tagX645 & 0x1f);
++	const INT64 tag0x645_threshold = INT64(UINT64(1) << tag0x645_shift);
+ 	const int32_t tag0x646 = imgdata.makernotes.olympus.tagX646;
+ 	const int32_t tag0x647 = imgdata.makernotes.olympus.tagX647;
+ 	const int32_t tag0x648 = imgdata.makernotes.olympus.tagX648;
+@@ -223,10 +242,15 @@ void LibRaw::olympus_load_raw()
+ 	const int32_t tag0x650 = imgdata.makernotes.olympus.tagX650;
+ 	const int32_t tag0x651 = imgdata.makernotes.olympus.tagX651;
+ 	const int32_t tag0x652 = MAX(1, imgdata.makernotes.olympus.tagX652);
+-	const uint16_t datamax = 1<<imgdata.makernotes.olympus.ValidBits;
++	const uint32_t datamax = 1U << oly.ValidBits;
+ 
+     const int32_t raw_width = imgdata.sizes.raw_width;
+     ushort * const raw_image = imgdata.rawdata.raw_image;
++	if (raw_width < 1 || imgdata.sizes.raw_height < 1)
++		throw LIBRAW_EXCEPTION_IO_CORRUPT;
++	const UINT64 pixel_count = UINT64(raw_width) * imgdata.sizes.raw_height;
++	UINT64 unary_work_remaining = pixel_count > (UINT64_MAX - 65536U) / 64U
++		? UINT64_MAX : pixel_count * 64U + 65536U;
+ 
+ 	std::vector<uint32_t> bitcounts(65536);
+ 	bitcounts[0] = 0;
+@@ -244,7 +268,7 @@ void LibRaw::olympus_load_raw()
+           int32_t wbits, vbits, t640bits, t643bits;
+           int32_t p = gcode;
+ 		  gcode = glc;
+-		  int32_t psel = ((col>1) && one_shl_tag645 >= p) ? context[3] + 1 : 0;
++		  int32_t psel = ((col>1) && tag0x645_threshold >= INT64(p)) ? context[3] + 1 : 0;
+ 		  context[3] = context[2];
+ 		  context[2] = psel;
+           if (col>1)
+@@ -261,23 +285,42 @@ void LibRaw::olympus_load_raw()
+ 		  if (wbits > tag0x651) 
+             wbits = tag0x651;
+ 
+-          if (wbits >= 16)
++          if (wbits < 0 || wbits >= 16)
+             throw LIBRAW_EXCEPTION_IO_CORRUPT;
+ 
+-          int32_t gcode = oly_code(&pump, wbits, tag0x640, tag0x643, tag0x652, &glc, &t640bits, &t643bits);
++          int32_t gcode = oly_code(&pump, wbits, tag0x640, tag0x643,
++              tag0x652, &glc, &t640bits, &t643bits,
++              &unary_work_remaining);
+           if (tag0x643) 
+           {
+             if (tag0x643 == 1) 
+             {
+               int32_t v = col<2 ? 0 : pred1;
+-              gcode = t643bits + 2 * (v + gcode);
+-              vbits = v + (gcode >> 1);
++              const INT64 decoded = INT64(t643bits) +
++                  2 * (INT64(v) + INT64(gcode));
++              if (decoded < INT_MIN || decoded > INT_MAX)
++                throw LIBRAW_EXCEPTION_IO_CORRUPT;
++              gcode = int32_t(decoded);
++              const INT64 next_vbits = INT64(v) + (gcode >> 1);
++              if (next_vbits < INT_MIN || next_vbits > INT_MAX)
++                throw LIBRAW_EXCEPTION_IO_CORRUPT;
++              vbits = int32_t(next_vbits);
+             }
+             else
+             {
+               int32_t v = col<2 ? 0 : pred1;
+-              gcode = t643bits + 4 * (v + gcode);
+-              vbits = ((gcode >> 1) & 0xFFFFFFFE) + v + (gcode >> 2);
++              const INT64 decoded = INT64(t643bits) +
++                  4 * (INT64(v) + INT64(gcode));
++              if (decoded < INT_MIN || decoded > INT_MAX)
++                throw LIBRAW_EXCEPTION_IO_CORRUPT;
++              gcode = int32_t(decoded);
++              const int32_t even_half =
++                  int32_t(uint32_t(gcode >> 1) & 0xfffffffeU);
++              const INT64 next_vbits =
++                  INT64(even_half) + INT64(v) + (gcode >> 2);
++              if (next_vbits < INT_MIN || next_vbits > INT_MAX)
++                throw LIBRAW_EXCEPTION_IO_CORRUPT;
++              vbits = int32_t(next_vbits);
+             }
+           }
+           else
+@@ -287,7 +330,8 @@ void LibRaw::olympus_load_raw()
+ 		  context[0] = (tag0x644 == 15) ? 0 : vbits >> tag0x644;
+           int32_t W = col < 2 ? tag0x642 : context[1];
+           int32_t N = row < 2 ? tag0x642 : raw_image[(row - 2) * raw_width + col] >> tag0x640;
+-          int32_t NW = (row < 2 || col < 2)? tag0x642 : NW = raw_image[(row - 2) * raw_width + col - 2] >> tag0x640;
++          int32_t NW = (row < 2 || col < 2) ? tag0x642 :
++              raw_image[(row - 2) * raw_width + col - 2] >> tag0x640;
+ 
+ 		  context[1] = lpred;
+           if ((W < N) || (NW < W))
+@@ -298,20 +342,48 @@ void LibRaw::olympus_load_raw()
+ 			  {
+                 if (NW > W || W >= N)
+                 {
+-                  if (_local_iabs(N - NW) > one_shl_tag0x641)
+-                    N += W - NW;
+-                  else if (_local_iabs(W - NW) <= one_shl_tag0x641)
+-                    N = (N + W) >> 1;
++                  const INT64 n_minus_nw = INT64(N) - INT64(NW);
++                  const INT64 w_minus_nw = INT64(W) - INT64(NW);
++                  const UINT64 abs_n_minus_nw = n_minus_nw < 0
++                      ? UINT64(-n_minus_nw) : UINT64(n_minus_nw);
++                  const UINT64 abs_w_minus_nw = w_minus_nw < 0
++                      ? UINT64(-w_minus_nw) : UINT64(w_minus_nw);
++                  if (abs_n_minus_nw > tag0x641_threshold)
++                  {
++                    const INT64 next_n = INT64(N) + w_minus_nw;
++                    if (next_n < INT_MIN || next_n > INT_MAX)
++                      throw LIBRAW_EXCEPTION_IO_CORRUPT;
++                    N = int32_t(next_n);
++                  }
++                  else if (abs_w_minus_nw <= tag0x641_threshold)
++                  {
++                    const INT64 average = (INT64(N) + INT64(W)) >> 1;
++                    if (average < INT_MIN || average > INT_MAX)
++                      throw LIBRAW_EXCEPTION_IO_CORRUPT;
++                    N = int32_t(average);
++                  }
+                   else
+-                    N = N + W - NW;
++                  {
++                    const INT64 next_n = INT64(N) + w_minus_nw;
++                    if (next_n < INT_MIN || next_n > INT_MAX)
++                      throw LIBRAW_EXCEPTION_IO_CORRUPT;
++                    N = int32_t(next_n);
++                  }
+                 }
+               }
+               else
+                 N = W;
+ 		  }
+-          lpred = gcode + N;
+-          uint32_t pixel_final_value = t640bits + ((gcode + N) << tag0x640);
+-          if(((raw_image[row * raw_width + col] = (ushort)pixel_final_value) > datamax)
++          const INT64 next_lpred = INT64(gcode) + INT64(N);
++          if (next_lpred < INT_MIN || next_lpred > INT_MAX)
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
++          const INT64 scaled_lpred =
++              next_lpred * INT64(1U << unsigned(tag0x640));
++          const INT64 pixel_final_value = INT64(t640bits) + scaled_lpred;
++          if (pixel_final_value < 0 || pixel_final_value > USHRT_MAX)
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
++          lpred = int32_t(next_lpred);
++          if(((raw_image[row * raw_width + col] = ushort(pixel_final_value)) > datamax)
+ 			  && col >= imgdata.sizes.width)
+             derror();
+ 		}

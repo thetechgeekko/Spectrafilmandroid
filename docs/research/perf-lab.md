@@ -1,5 +1,11 @@
 # Perf lab — the levers we had never measured
 
+> **Historical lab notebook:** current planning and release claims live in
+> [../BIT_IDENTICAL_EXPORT_ROADMAP.md](../BIT_IDENTICAL_EXPORT_ROADMAP.md). Later sections in this
+> notebook supersede parts of the early verdict table (including whole-export core-affinity and
+> current spatial-filter conclusions). Do not quote one row without its workload/commit/state, and
+> do not present the historical 6.251 s run as a current-HEAD baseline.
+
 One branch, every performance idea that had been written down or argued about but
 never actually tried, each reduced to a number. Companion to `docs/PERF_ROADMAP.md`
 (which records what *shipped*) and `docs/research/simd-halide-experiment.md` (the
@@ -1148,6 +1154,14 @@ was a source with no saved recipe: `decode kind=PHOTO 383x510 maxEdge=1019`, hon
 > knobs are unaffected — only the size of the prize changes.
 
 Not measured — read from source, and stated as leads rather than findings.
+
+> **Superseded 2026-08-30.** This subsection is retained as investigation
+> history, not current build truth. The decoder is now pinned to patched LibRaw
+> 0.22.2. Release OpenMP is deliberately off: five debug OpenMP decodes of the
+> upstream compressed-Fuji #845 sample produced five different hashes on the
+> SM-S948W, while three serial runs were identical. Provenance, deltas, and the
+> sanitizer gate are in `docs/dependencies/LIBRAW.md`. The original "pure win"
+> hypothesis below was disproved.
 
 **LibRaw is built without OpenMP.** `lib/libraw/src/main/cpp/CMakeLists.txt` mentions
 `USE_ZLIB`, `USE_JPEG`, `USE_DNGSDK`, `USE_RAWSPEED` — and OpenMP nowhere. LibRaw

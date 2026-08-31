@@ -1,0 +1,77 @@
+diff --git a/src/decoders/fp_dng.cpp b/src/decoders/fp_dng.cpp
+--- a/src/decoders/fp_dng.cpp
++++ b/src/decoders/fp_dng.cpp
+@@ -335,6 +335,25 @@ void tile_stripe_data_t::init(tiff_ifd_t *ifd, const libraw_image_sizes_t& sizes
+             tBytes[t] = ifd->strip_byte_counts[t];
+             maxBytesInTile = MAX(maxBytesInTile, tBytes[t]);
+         }
++
++    const INT64 streamBytes = stream->size();
++    if (streamBytes < 0)
++        throw LIBRAW_EXCEPTION_IO_CORRUPT;
++    INT64 cumulativeBytes = 0;
++    for (int t = 0; t < tileCnt; ++t)
++    {
++        if (tOffsets[t] < 0 || tBytes[t] < 0 || tOffsets[t] > streamBytes ||
++            tBytes[t] > streamBytes - tOffsets[t])
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
++        if (cumulativeBytes > INT64_MAX - tBytes[t])
++            throw LIBRAW_EXCEPTION_TOOBIG;
++        cumulativeBytes += tBytes[t];
++    }
++    const INT64 compressedWorkBudget = streamBytes > INT64_MAX / 2
++        ? INT64_MAX
++        : streamBytes * 2;
++    if (cumulativeBytes > compressedWorkBudget)
++        throw LIBRAW_EXCEPTION_TOOBIG;
+ }
+ 
+ #ifdef USE_ZLIB
+@@ -381,15 +400,14 @@ void LibRaw::deflate_dng_load_raw()
+   if (rowbytes > (1LL << 22))
+     throw LIBRAW_EXCEPTION_TOOBIG;
+ 
+-  if (ifd->sample_format == 3)
+-  {
+-    INT64 raw_bytes = INT64(tiles.tileCnt) * INT64(tiles.tileWidth) * INT64(tiles.tileHeight) * INT64(ifd->samples) * sizeof(float);
+-    if (raw_bytes > INT64(imgdata.rawparams.max_raw_memory_mb) * INT64(1024 * 1024))
+-      throw LIBRAW_EXCEPTION_TOOBIG;
+-    float_raw_image = (float *)calloc(raw_bytes, 1);
+-  }
+-  else
++  if (ifd->sample_format != 3)
+     throw LIBRAW_EXCEPTION_DECODE_RAW; // Only float deflated supported
++  const INT64 raw_bytes = INT64(tiles.tileCnt) * INT64(tiles.tileWidth) *
++      INT64(tiles.tileHeight) * INT64(ifd->samples) * INT64(sizeof(float));
++  const INT64 memoryLimit = INT64(imgdata.rawparams.max_raw_memory_mb) *
++      INT64(1024 * 1024);
++  if (raw_bytes < 1 || raw_bytes > memoryLimit)
++    throw LIBRAW_EXCEPTION_TOOBIG;
+ 
+   int xFactor;
+   switch (ifd->predictor)
+@@ -411,14 +429,22 @@ void LibRaw::deflate_dng_load_raw()
+   INT64 tileBytes = tilePixels * INT64(pixelSize);
+   INT64 tileRowBytes = INT64(tiles.tileWidth) * INT64(pixelSize);
+ 
+-  if(INT64(tiles.maxBytesInTile) > INT64(imgdata.rawparams.max_raw_memory_mb) * 1024LL * 1024LL )
++  if (tiles.maxBytesInTile < 0 || tiles.maxBytesInTile > memoryLimit)
+     throw LIBRAW_EXCEPTION_TOOBIG;
+ 
+-  if (tileBytes + tileRowBytes > INT64(imgdata.rawparams.max_raw_memory_mb) * 1024LL * 1024LL)
++  if (tileBytes < 0 || tileRowBytes < 0 ||
++      tileBytes > INT64_MAX - tileRowBytes)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  const INT64 tileWorkingBytes = tileBytes + tileRowBytes;
++  if (tiles.maxBytesInTile > memoryLimit - raw_bytes ||
++      tileWorkingBytes > memoryLimit - raw_bytes - tiles.maxBytesInTile)
+     throw LIBRAW_EXCEPTION_TOOBIG;
+ 
+   std::vector<uchar> cBuffer(tiles.maxBytesInTile,0);
+   std::vector<uchar> uBuffer(tileBytes + tileRowBytes,0); // extra row for decoding
++  float_raw_image = (float *)calloc(raw_bytes, 1);
++  if (!float_raw_image)
++    throw LIBRAW_EXCEPTION_ALLOC;
+ 
+   for (size_t y = 0, t = 0; y < imgdata.sizes.raw_height; y += tiles.tileHeight)
+     {

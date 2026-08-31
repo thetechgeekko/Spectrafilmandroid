@@ -22,6 +22,8 @@
 
 namespace spk {
 
+struct ViewingIlluminant;
+
 // Mirrors the spektrafilm Profile fields used downstream. Spectral arrays are
 // stored on the profile's own wavelength grid (the bundled profiles already use
 // the 380..780 @5nm / 81-sample working shape, matching spektra.h). NaN entries
@@ -32,6 +34,11 @@ struct Profile {
     std::string type;                 // "negative" | "positive"
     std::string stock;                // e.g. "kodak_portra_400" (info.stock)
     std::string viewing_illuminant;   // e.g. "D50"
+    // Stable pointer into model/color_output's immutable exact-ID registry.
+    // Loaded profiles resolve this before any spectral payload is accepted;
+    // direct unit fixtures may leave it null and render paths will fail closed
+    // through the same registry using viewing_illuminant.
+    const ViewingIlluminant* resolved_viewing_illuminant = nullptr;
     std::string reference_illuminant;
     // Halation preset tags (info.use / info.antihalation). Drive the digested
     // halation sigma_h / strength via params_builder._HALATION_PRESETS. Default to

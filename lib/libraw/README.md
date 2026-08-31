@@ -1,14 +1,20 @@
 # lib:libraw
 
-On-device camera **RAW / DNG** decoding for Spektrafilm for Android, producing a
-**linear, scene-referred float32 RGB** buffer with **bit-parity to spektrafilm's
-desktop `rawpy` settings**.
+<!-- libraw-license-route: UNRESOLVED -->
 
-> **Status: building.** The native decoder, JNI bridge, and Kotlin facade are in
-> place, and **LibRaw is obtained at configure time via CMake `FetchContent`**
-> (pinned 0.21.4 release tarball + SHA256 — see `src/main/cpp/CMakeLists.txt`), so a
-> clean checkout builds `libsfraw.so` with just a working network. RAW/DNG decode is
-> live (verified end-to-end on a real DNG). `build.gradle.kts` mirrors
+LibRaw Android distribution route: UNRESOLVED.
+
+On-device camera **RAW / DNG** decoding for Spektrafilm for Android, producing a
+**linear, scene-referred float32 RGB** buffer with the same processing settings
+as Spektrafilm's desktop `rawpy` path. Exact decoder-version parity is tracked
+explicitly; it is not inferred from matching option names.
+
+> **Status: security-upgraded, qualification in progress.** The native decoder,
+> JNI bridge, and Kotlin facade are in place. The build fetches the official
+> LibRaw 0.22.2 archive by SHA-256, applies a hashed local hardening series, and
+> fails closed if any source/version/patch check fails. RAW/DNG decode is live;
+> final ABI/device qualification is rerun whenever the patch aggregate changes.
+> `build.gradle.kts` mirrors
 > `engine:spektra-core` (plain AGP `com.android.library` + `kotlin.android` +
 > `externalNativeBuild` CMake), so the module configures and builds standalone the
 > moment it is added to `settings.gradle.kts`.
@@ -21,19 +27,50 @@ NDK and calls it from a JNI wrapper using the identical settings, then applies t
 same white-balance colour science spektrafilm uses (see
 `spektrafilm/utils/raw_file_processor.py`).
 
-Output is interleaved RGB **float32**, row-major, normalized 16-bit → `[0,1]`
-(value / 65535), in **ACES2065-1** primaries — delivered as a direct
-`ByteBuffer` ready to become an engine `LinearImage` with no 8-bit round-trip.
+Output is interleaved RGB **float32**, row-major, normalized from LibRaw's
+16-bit linear ACES intermediate and converted to **linear ProPhoto RGB** before
+it crosses JNI. It is delivered as a direct `ByteBuffer` with no 8-bit round-trip.
+
+### Native ownership and cancellation
+
+Each native decode returns an owning `LinearResult`. Call `close()` (normally
+with Kotlin `use`) after the last consumer finishes. Close is atomic and
+idempotent; the JNI registry releases only an exact allocation-token, base, and
+capacity match, so foreign buffers, slices, stale tokens, repeated close, and
+concurrent close cannot reach `free(3)`. The legacy buffer-only `freeOffHeap`
+entry point is intentionally fail-closed because a `ByteBuffer` alone cannot
+prove ownership.
+
+Pixel access is lease-only. `withDataLease` gives every reader an independent,
+native-order view of the constructor's captured position/limit window and
+defers release until the reader returns. `acquireDataLease` supports an explicit
+ownership hand-off: the app closes the consumed `LinearResult` immediately and
+transfers its still-active lease to the export-scale `LinearImage`, whose
+`close()` finally releases the native allocation. Proxy and Coil paths copy
+inside a lease and close the result before returning.
+
+`RawDecoder.newCancellation()` creates an `AutoCloseable` cooperative
+cancellation generation that can be supplied to any decode overload. The
+bounded stream/fd readers and first-party copy, white-balance, and colour loops
+poll it at bounded intervals. The decoder also installs LibRaw 0.22.2's progress
+handler before opening the input, so long `open_buffer`, `unpack`,
+`dcraw_process`, and `dcraw_make_mem_image` phases return
+`LIBRAW_CANCELLED_BY_CALLBACK` and map to the stable `CANCELLED` Kotlin status.
+Checks immediately before and after every phase cover paths where LibRaw emits
+no progress callback. Closing the generation also cancels any native lease
+already in flight.
 
 ## Layout
 
 ```
 lib/libraw/
 ├── build.gradle.kts                 # convention plugins + externalNativeBuild(CMake); 3 ABIs
+├── cmake/LibRawVendor.cmake         # archive/hash/version/patch fail-closed resolver
+├── patches/                         # ordered, hashed, reviewable 0.22.2 hardening series
 ├── src/main/AndroidManifest.xml     # minimal (no components)
 └── src/main/
     ├── cpp/
-    │   ├── CMakeLists.txt           # builds libsfraw.so; expects libraw/upstream
+    │   ├── CMakeLists.txt           # builds libsfraw.so from the verified resolver
     │   ├── raw_decoder.h            # decode API + WB math contract
     │   ├── raw_decoder.cpp          # LibRaw params + Von-Kries adaptation (guarded)
     │   └── raw_decoder_jni.cpp      # JNI bridge -> direct float ByteBuffer + w/h/cs
@@ -45,85 +82,96 @@ lib/libraw/
 
 ## Vendoring LibRaw
 
-LibRaw is **not** committed. `src/main/cpp/CMakeLists.txt` fetches it at configure
-time via CMake **`FetchContent`**, pinned to a specific release tarball + SHA256:
+LibRaw is **not** committed. `cmake/LibRawVendor.cmake` fetches the official
+archive through CMake **`FetchContent`** and pins immutable constants:
 
 ```cmake
-SFRAW_LIBRAW_VERSION = "0.21.4"
-SFRAW_LIBRAW_URL     = "https://www.libraw.org/data/LibRaw-0.21.4.tar.gz"
-SFRAW_LIBRAW_SHA256  = "6be43f19397e43214ff56aab056bf3ff4925ca14012ce5a1538a172406a09e63"
+SFRAW_PINNED_LIBRAW_VERSION = "0.22.2"
+SFRAW_PINNED_LIBRAW_URL     = "https://www.libraw.org/data/LibRaw-0.22.2.tar.gz"
+SFRAW_PINNED_LIBRAW_SHA256  = "de86b035655accff8d4010f1a221fdf50d353cb7b1422ba26f14a0db92612cfa"
 ```
 
-A clean checkout therefore builds with just a working network — no git submodule,
-no committed third-party blob. To pin a different release, bump the three
-`SFRAW_LIBRAW_*` cache variables. For offline/CI builds, point
-`-DSFRAW_LIBRAW_SOURCE_DIR=<dir>` at a stock LibRaw checkout (the dir containing
-`libraw/libraw.h`) and `FetchContent` is skipped.
+A clean checkout therefore builds with a working network and no git submodule or
+committed upstream blob. The version/URL/hash are not cache variables, so an old
+CMake cache cannot redirect the build to 0.21.4. A local
+`-DSFRAW_LIBRAW_SOURCE_DIR=<dir>` override is accepted only for Debug/offline
+verification; shipping configurations must use the hashed official archive.
+Every build applies and verifies `patches/` idempotently, asserts exact 0.22.2
+headers and security guards, and refuses to build a runtime decoder stub.
 
-`CMakeLists.txt` then globs LibRaw's `src/**/*.cpp` (matching its own
-`Makefile.am` source list — notably **excluding the `*_ph.cpp` placeholder TUs**,
+`CMakeLists.txt` then sorts LibRaw's `src/**/*.cpp` (notably **excluding the
+`*_ph.cpp` placeholder TUs**,
 which are postprocessing-free stubs that would otherwise shadow the real
 `dcraw_process` / `dcraw_make_mem_image`), builds a static `raw` lib (with
-`NO_JASPER/NO_JPEG/NO_LCMS` to keep the `.so` small — baseline DNG + common RAW
-decode without them), and links it into `libsfraw.so`.
+`LIBRAW_CALLOC_RAWSTORE/NO_JASPER/NO_JPEG/USE_ZLIB`; LCMS stays disabled because
+no `USE_LCMS*` define is supplied), generates the exact
+source manifest, and links it into `libsfraw.so`. See
+[`docs/dependencies/LIBRAW.md`](../../docs/dependencies/LIBRAW.md) for provenance,
+patch hashes, build flags, corpus deltas, OpenMP disposition, and sanitizer evidence.
 
 > **DNG SDK add-on** (lossy / non-standard DNGs) is a separate decision tracked in
 > M2; baseline DNG + CR2/CR3/NEF/ARW/RAF/ORF/RW2 work without it.
 
 ## Mobile / Google Pixel DNG decode (native vs fallback)
 
-Most mobile DNGs — including **Google Pixel computational-RAW DNGs** — use one
-of three raw-plane compressions, **all decoded natively** by this module with
-the current build flags:
+Mobile DNG layouts vary by device and camera mode. Support is decided from the
+selected full-resolution raw plane, not from the file extension or preview:
 
 | Compression tag        | Decodes here? | How                                                   |
 |------------------------|---------------|-------------------------------------------------------|
 | 1 — uncompressed       | ✅ native     | plain unpack                                          |
-| 7 — lossless JPEG/LJ92 | ✅ native     | LibRaw **internal** lossless-JPEG (`lossless_jpeg_load_raw` / `ljpeg_start` / `ljpeg_row`, `src/decoders/dcraw_common.cpp`) — **no libjpeg required** |
-| 8 — DEFLATE/ZIP        | ✅ native     | zlib `inflate()` (`USE_ZLIB`; NDK `libz` linked)      |
+| 7 — lossless JPEG/LJ92 | ✅ native     | LibRaw **internal** lossless-JPEG (`lossless_jpeg_load_raw` / `ljpeg_start` / `ljpeg_row`, `src/decoders/decoders_dcraw.cpp`) — **no libjpeg required** |
+| 8 — DEFLATE, float (`SampleFormat=3`) | ✅ native | qualified LibRaw 0.22.2 float path + NDK zlib |
+| 8 — DEFLATE, integer/linear | ❌ fallback | pinned decoder rejects safely → `DEFLATE_DNG` |
+| 0x80B2 — Adobe deflate | ❌ fallback | no qualified 0.22.2 route → `DEFLATE_DNG` |
 | 6 — old-style JPEG     | ❌ fallback   | needs libjpeg → `LOSSY_JPEG_DNG`                      |
 | 0x884C — lossy JPEG    | ❌ fallback   | needs libjpeg → `LOSSY_JPEG_DNG`                      |
 | 0xCD42 — JPEG-XL       | ❌ fallback   | needs libjxl/dngsdk → `JPEGXL_DNG`                    |
 
-**Key point:** `USE_JPEG` is intentionally OFF and is **not** needed for Pixel
-DNGs. `USE_JPEG` only adds *lossy* baseline-JPEG (0x884C) decode and embedded
+**Key point:** `USE_JPEG` is intentionally OFF and is not needed for a DNG whose
+raw plane uses lossless JPEG/LJ92. It only adds *lossy* baseline-JPEG decode and embedded
 JPEG thumbnails; LibRaw's lossless-JPEG (LJ92) raw decoder is compiled
-unconditionally. (Evidence: libraw.org node/2639 lists `lossless_jpeg_load_raw`
-among the native unpack functions for "Lossless JPEG (Canon, some DNG)".) Pixel
-DNGs therefore decode with the prior wave's flags — **no build change was
-needed**; this wave fixes the *classification/diagnostics*.
+unconditionally. A Pixel/Samsung/other mobile DNG must still be classified from
+its actual raw IFD; model-level blanket support is not claimed.
 
 > Mobile DNGs commonly embed a large JPEG **preview** in IFD0 with the real
 > Bayer/linear raw in a **SubIFD**. The `dngsniff` sniffer walks IFD0 + SubIFDs
 > + the next-IFD chain and picks the largest **non-reduced** (`NewSubFileType`
 > bit 0 clear) image, so a JPEG preview is never mistaken for the raw
 > compression. The unpack-failure classifier only flags genuinely-unsupported
-> codecs (6 / 0x884C → `LOSSY_JPEG_DNG`, 0xCD42 → `JPEGXL_DNG`); uncompressed /
-> LJ92 / deflate that reach it are treated as real data errors (generic
-> `UNPACK`), never given a false fallback hint.
+> codecs (integer/linear Compression 8 or 0x80B2 → `DEFLATE_DNG`, 6 / 0x884C →
+> `LOSSY_JPEG_DNG`, 0xCD42 → `JPEGXL_DNG`). A failed native float-deflate,
+> uncompressed, or LJ92 decode stays a genuine data error (`UNPACK`).
 
-A host unit test (`src/test/cpp/test_dng_sniffer.cpp`) compiles `raw_decoder.cpp`
+A lightweight host unit test (`src/test/cpp/test_dng_sniffer.cpp`) compiles `raw_decoder.cpp`
 with `-include` (no LibRaw needed — the decoder guards its LibRaw include) and
 exercises the sniffer + classifier against synthesized uncompressed / LJ92 /
 deflate / lossy / old-JPEG / JPEG-XL and Pixel-style preview+SubIFD headers.
-22/22 cases pass:
+31/31 assertions pass:
 
 ```
-g++ -std=c++17 -I../../main/cpp -include ../../main/cpp/raw_decoder.cpp \
+g++ -std=c++17 -I../../main/cpp -DUSE_ZLIB=1 \
+    -include ../../main/cpp/raw_decoder.cpp \
     test_dng_sniffer.cpp -o /tmp/test_dng_sniffer && /tmp/test_dng_sniffer
 ```
 
+The security gate is the separate `src/test/host` CMake project. It builds the
+exact patched LibRaw source with Clang ASan/UBSan and exercises hostile TIFF and
+lossless-JPEG inputs through `open_buffer -> unpack -> dcraw_process`; its
+libFuzzer entry follows the official OSS-Fuzz public-seam strategy.
+
 ## Half-size (proxy) decode — memory and performance option
 
-For large RAW/DNG files (50–200 MP Expert RAW, high-resolution MFT/medium-format
-bodies) the full-resolution path in `dcraw_process()` builds a full 16-bit image
-in RAM before it is normalised to float32 and handed to the engine — a transient
-several hundred MB allocation that is the primary OOM surface on low-RAM devices.
+The current decoder is deliberately fail-closed before unpack: encoded input is
+limited to 64 MiB, LibRaw's raw store to 128 MiB, and declared/ActiveArea/
+DefaultScale geometry to 12 MiPixels on 64-bit or 8 MiPixels on 32-bit. Files
+above that geometry require the seekable/tiled design tracked by ticket #173;
+`halfSize` does not bypass this gate because some layouts ignore the request.
 
 `RawDecoder.Settings` exposes a `halfSize: Boolean` flag (default `false`):
 
 ```kotlin
-// Proxy decode — ~¼ the pixel count, ~¼ the peak memory, much faster.
+// Proxy decode — ~¼ the processed pixel count/output storage, usually faster.
 val proxy: LinearResult = RawDecoder.decodeToLinear(
     fd,
     RawDecoder.Settings(halfSize = true),
@@ -134,7 +182,7 @@ val proxy: LinearResult = RawDecoder.decodeToLinear(
 
 | Option        | Value  | Effect                                                      |
 |---------------|--------|-------------------------------------------------------------|
-| `halfSize`    | false  | Full-resolution decode (existing behaviour, unchanged).     |
+| `halfSize`    | false  | Full-resolution output within the in-memory safety limits.   |
 | `halfSize`    | true   | LibRaw `imgdata.params.half_size = 1`; each 2×2 Bayer cell  |
 |               |        | is averaged into one output pixel (no demosaic).            |
 
@@ -143,13 +191,14 @@ LibRaw's `half_size` parameter skips the full Bayer demosaic interpolation and
 instead merges each **2×2 Bayer cell** (one R + two G + one B sample) into a
 **single RGB output pixel** using a simple average.  Because the output is
 half the linear dimensions in each axis, the total pixel count is **¼ of the
-full-res decode** — and so is the peak allocation.  LibRaw updates
+full-res decode**. LibRaw's raw sensor store can remain full-sized, so this is
+not a blanket quarter-peak-memory guarantee. LibRaw updates
 `imgdata.sizes` (specifically `S.width` / `S.height`) after `dcraw_process()`,
 and `dcraw_make_mem_image` reports the post-process dimensions, so
 `LinearResult.width * LinearResult.height * 3 == rgb.size()` is always satisfied.
 
 **When to use:**
-- Fast proxy preview of a large Expert RAW on a low-RAM device.
+- Fast proxy preview of an admitted RAW on a low-RAM device.
 - "Does this file decode?" health checks where full quality is not needed.
 - App-side thumbnail generation before handing the full-res job to a background
   worker.
@@ -159,8 +208,8 @@ and `dcraw_make_mem_image` reports the post-process dimensions, so
 - Engine spectral film simulation — all processing must be at full resolution.
 
 The app module decides when to request `halfSize = true`; the lib only exposes
-the capability.  Existing call sites (`Settings()` / `Settings(whiteBalance = …)`)
-default to `halfSize = false` and are byte-for-byte unchanged.
+the capability. Existing call sites default to `halfSize = false`, which requests
+full-resolution output subject to the same safety limits.
 
 ## rawpy ↔ LibRaw parity
 
@@ -194,14 +243,20 @@ green-channel tint multiplier (`_apply_tint_adjustment`).
    `RawDecoder.decodeToLinear(...)`, then hands the `LinearResult` straight to
    `SpektraEngine.simulate` as a `LinearImage` — full 16-bit precision, no
    intermediate 8-bit bitmap.
-2. **Full-res RAW in the gallery (secondary).** `RawCoilDecoder.Factory` is a Coil 3
+2. **Sensor-decoded RAW gallery preview (secondary).** `RawCoilDecoder.Factory` is a Coil 3
    `Decoder.Factory` registered in the host's
    `core/data/.../di/ImageLoaderModule.kt` (`provideComponentRegistry`), alongside
-   the existing `NefDecoder.Factory()`, so RAW files open full-resolution
-   throughout the host app.
+   the existing `NefDecoder.Factory()`. Its current ARGB preview is an unmanaged
+   channel-wise approximation; a proper ProPhoto-to-sRGB display transform is
+   tracked separately and the engine buffer remains the authoritative path.
 
 ## License
 
-Spektrafilm for Android is **GPLv3**. This module **uses LibRaw**, which is
-**LGPL-2.1 / CDDL-1.0** dual-licensed; we link it under **LGPL-2.1**
-(GPLv3-compatible). See `../../docs/RAW_DNG.md` and `LICENSING.md`.
+Spektrafilm for Android is **GPLv3**. LibRaw is offered under LGPL-2.1-only or
+CDDL-1.0. The distribution route for this static integration is `UNRESOLVED`;
+including both upstream texts records provenance and does not elect a route.
+Release requires a human-reviewed route plus the verified source/relink, notice,
+and SBOM package. `compliance/license-decision.json` also keeps the human owner,
+rationale, approval reference, and local-patch contribution authorization
+fail-closed; changing only `license-route.txt` cannot pass release audit. See
+`../../docs/LICENSING.md` and ticket #166.

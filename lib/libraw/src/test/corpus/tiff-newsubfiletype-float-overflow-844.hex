@@ -1,0 +1,7 @@
+# LibRaw issue #844 authoritative 64-byte TIFF, decoded from the reporter's
+# base64 attachment. SHA-256 of the binary bytes:
+# 59167be5a9b4c8bdae9b926be2e91c664e8aee207b78971dcadb057eab18aa4c
+49 49 2a 00 08 00 00 00 01 00 fe 00 04 00 01 00
+00 00 01 00 00 e3 07 1b 00 00 00 00 00 00 00 00
+00 00 00 17 00 00 00 00 00 00 00 00 00 00 18 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

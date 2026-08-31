@@ -25,13 +25,48 @@ package com.spectrafilm.app
 
 import android.content.Context
 import android.net.Uri
-import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import java.nio.charset.CharacterCodingException
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 
-private const val RECIPE_VERSION = 1
+internal sealed interface RecipeLoadResult {
+    data object Missing : RecipeLoadResult
+    data class Loaded(val rotation: SourceRotation) : RecipeLoadResult
+    data class CorruptQuarantined(val quarantinePath: String?, val reason: String) : RecipeLoadResult
+    data class Unavailable(val reason: String) : RecipeLoadResult
+}
+
+internal sealed interface RecipeReadResult {
+    data object Missing : RecipeReadResult
+    data class Loaded(val document: RecipeDocument) : RecipeReadResult
+    data class CorruptQuarantined(val quarantinePath: String?, val reason: String) : RecipeReadResult
+    data class Unsupported(val version: String) : RecipeReadResult
+    data class CorruptQuarantineFailed(val reason: String) : RecipeReadResult
+    data class IoFailure(val reason: String) : RecipeReadResult
+}
 
 object Recipes {
+
+    private data class RecipeGate(var generation: Long = 0L)
+
+    private val gates = ConcurrentHashMap<String, RecipeGate>()
+
+    private fun gate(key: String): RecipeGate {
+        RecipeDocumentCodec.validateKey(key)
+        return gates.computeIfAbsent(key) { RecipeGate() }
+    }
+
+    private fun <T> withGate(key: String, block: (RecipeGate) -> T): T {
+        val operation = gate(key)
+        return synchronized(operation) { block(operation) }
+    }
+
+    internal fun <T> withOperationGate(key: String, block: () -> T): T =
+        withGate(key) { block() }
+
+    internal fun generation(key: String): Long = withGate(key) { it.generation }
 
     private fun dir(ctx: Context): File =
         File(ctx.filesDir, "recipes").apply { mkdirs() }
@@ -45,10 +80,13 @@ object Recipes {
         return sha256Hex(id)
     }
 
-    private fun file(ctx: Context, key: String): File = File(dir(ctx), "$key.json")
+    private fun file(ctx: Context, key: String): File {
+        RecipeDocumentCodec.validateKey(key)
+        return File(dir(ctx), "$key.json")
+    }
 
     fun exists(ctx: Context, key: String?): Boolean =
-        key != null && file(ctx, key).isFile
+        key != null && runCatching { file(ctx, key).isFile }.getOrDefault(false)
 
     /**
      * Save/update the recipe for [key] from a PRE-SERIALIZED params payload
@@ -64,19 +102,22 @@ object Recipes {
         paramsJson: String,
         sourceName: String,
         rotationDegrees: Int = 0,
-    ) {
-        val envelope = JSONObject().apply {
-            put("recipeVersion", RECIPE_VERSION)
-            put("sourceKey", key)
-            put("sourceName", sourceName)
-            put("updatedAt", System.currentTimeMillis())
-            // The user's MANUAL rotate step (0/90/180/270 CW), persisted alongside the
-            // params. NOT the EXIF baseline, which is derived fresh on every load.
-            put("manualRotationDeg", rotationDegrees)
-            // Params payload uses the shared preset schema verbatim.
-            put("params", JSONObject(paramsJson))
+        expectedGeneration: Long? = null,
+    ): Boolean {
+        return withGate(key) { operation ->
+            if (expectedGeneration != null && expectedGeneration != operation.generation) {
+                return@withGate false
+            }
+            val envelope = RecipeDocumentCodec.encode(
+                sourceKey = key,
+                paramsJson = paramsJson,
+                sourceName = sourceName.take(RecipeDocumentCodec.MAX_SOURCE_NAME_CHARS),
+                manualRotationDeg = rotationDegrees,
+                updatedAtMillis = System.currentTimeMillis(),
+            )
+            AtomicJsonStore.writeUtf8(file(ctx, key), envelope, AtomicJsonStore.MAX_RECIPE_BYTES)
+            true
         }
-        file(ctx, key).writeText(envelope.toString(2))
     }
 
     /**
@@ -84,14 +125,75 @@ object Recipes {
      * applied, false otherwise (leaving [into] untouched so defaults stand).
      */
     fun load(ctx: Context, key: String?, into: ParamsState): Boolean {
-        if (key == null) return false
-        val f = file(ctx, key)
-        if (!f.isFile) return false
-        val root = JSONObject(f.readText())
-        // Tolerate either an enveloped recipe or (defensively) a bare preset JSON.
-        val params = root.optJSONObject("params") ?: root
-        Presets.decode(params, into)
-        return true
+        return loadResult(ctx, key, into) is RecipeLoadResult.Loaded
+    }
+
+    /** Typed restore lets UI distinguish missing state from quarantined corruption. */
+    internal fun loadResult(ctx: Context, key: String?, into: ParamsState): RecipeLoadResult {
+        return when (val read = readResult(ctx, key)) {
+            RecipeReadResult.Missing -> RecipeLoadResult.Missing
+            is RecipeReadResult.CorruptQuarantined -> RecipeLoadResult.CorruptQuarantined(
+                read.quarantinePath,
+                read.reason,
+            )
+            is RecipeReadResult.Unsupported -> RecipeLoadResult.Unavailable(
+                "unsupported recipe version ${read.version}",
+            )
+            is RecipeReadResult.CorruptQuarantineFailed -> RecipeLoadResult.Unavailable(read.reason)
+            is RecipeReadResult.IoFailure -> RecipeLoadResult.Unavailable(read.reason)
+            is RecipeReadResult.Loaded -> {
+                Presets.decode(read.document.params, into)
+                RecipeLoadResult.Loaded(SourceRotation.fromDegrees(read.document.manualRotationDeg))
+            }
+        }
+    }
+
+    internal fun readResult(ctx: Context, key: String?): RecipeReadResult {
+        if (key == null) return RecipeReadResult.Missing
+        return try {
+            withOperationGate(key) {
+                val target = file(ctx, key)
+                AtomicJsonStore.withPathLock(target) {
+                    if (!target.isFile) return@withPathLock RecipeReadResult.Missing
+                    val text = try {
+                        AtomicJsonStore.readUtf8(target, AtomicJsonStore.MAX_RECIPE_BYTES)
+                    } catch (failure: DocumentLimitException) {
+                        return@withPathLock quarantineResult(target, failure)
+                    } catch (failure: CharacterCodingException) {
+                        return@withPathLock quarantineResult(target, failure)
+                    } catch (failure: IOException) {
+                        return@withPathLock RecipeReadResult.IoFailure(
+                            failure.message ?: "recipe read failed",
+                        )
+                    }
+                    try {
+                        val document = RecipeDocumentCodec.decode(text, key)
+                        RecipeReadResult.Loaded(document)
+                    } catch (failure: UnsupportedRecipeVersionException) {
+                        RecipeReadResult.Unsupported(failure.version)
+                    } catch (failure: Exception) {
+                        quarantineResult(target, failure)
+                    }
+                }
+            }
+        } catch (failure: IllegalArgumentException) {
+            RecipeReadResult.CorruptQuarantineFailed(failure.message ?: "invalid recipe key")
+        }
+    }
+
+    private fun quarantineResult(target: File, failure: Throwable): RecipeReadResult {
+        return try {
+            val quarantined = AtomicJsonStore.quarantine(target)
+            RecipeReadResult.CorruptQuarantined(
+                quarantinePath = quarantined.absolutePath,
+                reason = failure.message ?: failure.javaClass.simpleName,
+            )
+        } catch (quarantineFailure: Exception) {
+            failure.addSuppressed(quarantineFailure)
+            RecipeReadResult.CorruptQuarantineFailed(
+                failure.message ?: "recipe corruption could not be quarantined",
+            )
+        }
     }
 
     /**
@@ -100,18 +202,23 @@ object Recipes {
      */
     fun loadRotation(ctx: Context, key: String?): SourceRotation {
         if (key == null) return SourceRotation.NONE
-        val f = file(ctx, key)
-        if (!f.isFile) return SourceRotation.NONE
         return runCatching {
-            val deg = JSONObject(f.readText()).optInt("manualRotationDeg", 0)
-            SourceRotation.fromDegrees(deg)
+            withOperationGate(key) {
+                val f = file(ctx, key)
+                if (!f.isFile) return@withOperationGate SourceRotation.NONE
+                val text = AtomicJsonStore.readUtf8(f, AtomicJsonStore.MAX_RECIPE_BYTES)
+                SourceRotation.fromDegrees(RecipeDocumentCodec.decode(text, key).manualRotationDeg)
+            }
         }.getOrDefault(SourceRotation.NONE)
     }
 
     /** Delete the recipe for [key] (clears the saved edit). No-op if none exists. */
     fun delete(ctx: Context, key: String?) {
         if (key == null) return
-        file(ctx, key).delete()
+        withGate(key) { operation ->
+            operation.generation++
+            AtomicJsonStore.delete(file(ctx, key))
+        }
     }
 
     /**

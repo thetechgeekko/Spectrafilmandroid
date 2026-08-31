@@ -13,9 +13,13 @@ package com.spectrafilm.app
 import com.spectrafilm.engine.LinearImage
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class RotationTest {
@@ -42,8 +46,10 @@ class RotationTest {
     }
 
     private fun chan(img: LinearImage, x: Int, y: Int, c: Int): Float =
-        img.data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
-            .get((y * img.width + x) * 3 + c)
+        img.acquireDataLease().use { lease ->
+            val data = lease.data
+            data.asFloatBuffer().get((y * img.width + x) * 3 + c)
+        }
 
     /** Assert the pixel at ([x],[y]) of [img] came from source coordinate ([sx],[sy]). */
     private fun assertFrom(img: LinearImage, x: Int, y: Int, sx: Int, sy: Int) {
@@ -166,12 +172,24 @@ class RotationTest {
     }
 
     private fun floatsOf(img: LinearImage): FloatArray {
-        val f = img.data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
-        val a = FloatArray(img.width * img.height * 3)
-        f.position(0)
-        f.get(a)
-        return a
+        return img.acquireDataLease().use { lease ->
+            val data = lease.data
+            val f = data.asFloatBuffer()
+            val a = FloatArray(img.width * img.height * 3)
+            f.get(a)
+            a
+        }
     }
+
+    private fun ownedImage(plain: LinearImage, closes: AtomicInteger): LinearImage =
+        plain.acquireDataLease().use { lease ->
+            LinearImage.fromDataLease(
+                lease.data,
+                plain.width,
+                plain.height,
+                lease = AutoCloseable { closes.incrementAndGet() },
+            )
+        }
 
     /** The obvious per-pixel mapping this file used to do inline — the reference. */
     private fun naiveRotate(src: FloatArray, w: Int, h: Int, r: SourceRotation): FloatArray {
@@ -250,5 +268,110 @@ class RotationTest {
         assertEquals(1, defaultRotWorkers(63_999L))
         val cpus = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
         assertEquals(cpus, defaultRotWorkers(12_500_000L))
+    }
+
+    @Test
+    fun rotationCancellation_isObservedBeforeWorkAndClosesConsumedInput() {
+        val closes = AtomicInteger(0)
+        val plain = coordImage()
+        val owned = ownedImage(plain, closes)
+
+        try {
+            owned.rotatedWithWorkers(
+                SourceRotation.CW90,
+                workers = 1,
+                isCancelled = { true },
+            )
+            fail("cancelled rotation must throw")
+        } catch (_: CancellationException) {
+            // Expected: cancellation is a stable control-flow result, not partial output.
+        }
+
+        assertEquals("consuming transform must release its input exactly once", 1, closes.get())
+        owned.close()
+        assertEquals("LinearImage close remains idempotent", 1, closes.get())
+    }
+
+    @Test
+    fun rotationCancellation_isPolledDuringLongWork() {
+        val closes = AtomicInteger(0)
+        val checks = AtomicInteger(0)
+        val plain = noiseImage(300, 250)
+        val owned = ownedImage(plain, closes)
+
+        try {
+            owned.rotatedWithWorkers(
+                SourceRotation.CW90,
+                workers = 1,
+                isCancelled = { checks.incrementAndGet() >= 3 },
+            )
+            fail("rotation must observe cancellation after work starts")
+        } catch (_: CancellationException) {
+            // Expected.
+        }
+
+        assertTrue("long work must poll more than once", checks.get() >= 3)
+        assertEquals("cancelled consuming transform releases input", 1, closes.get())
+    }
+
+    @Test
+    fun parallelWorkerCancellation_isPropagatedInsteadOfPublishingPartialOutput() {
+        val caller = Thread.currentThread()
+        val closes = AtomicInteger(0)
+        val plain = noiseImage(300, 250)
+        val owned = ownedImage(plain, closes)
+
+        try {
+            owned.rotatedWithWorkers(
+                SourceRotation.CW90,
+                workers = 2,
+                isCancelled = { Thread.currentThread() !== caller },
+            )
+            fail("background-worker cancellation must invalidate the whole output")
+        } catch (_: CancellationException) {
+            // Expected: worker failures cross the join boundary as stable cancellation.
+        }
+
+        assertEquals("failed parallel transform releases input", 1, closes.get())
+    }
+
+    @Test
+    fun rotationRejectsTruncatedLogicalWindowBeforeReading() {
+        val closes = AtomicInteger(0)
+        val truncated = ByteBuffer.allocateDirect(16).order(ByteOrder.nativeOrder()).apply {
+            position(4)
+            limit(12) // Two floats remain; one RGB pixel requires three.
+        }
+        val owned = LinearImage.fromDataLease(
+            truncated,
+            width = 1,
+            height = 1,
+            lease = AutoCloseable { closes.incrementAndGet() },
+        )
+
+        try {
+            owned.rotatedWithWorkers(SourceRotation.CW180, workers = 1)
+            fail("truncated logical buffer must be rejected")
+        } catch (failure: IllegalArgumentException) {
+            assertTrue(failure.message.orEmpty().contains("buffer", ignoreCase = true))
+        }
+
+        assertEquals("rejected consuming transform releases input", 1, closes.get())
+    }
+
+    @Test
+    fun horizontalFlipCancellation_releasesConsumedInputWithoutOutput() {
+        val closes = AtomicInteger(0)
+        val plain = coordImage()
+        val owned = ownedImage(plain, closes)
+
+        try {
+            owned.flippedHorizontal(isCancelled = { true })
+            fail("cancelled horizontal flip must throw")
+        } catch (_: CancellationException) {
+            // Expected.
+        }
+
+        assertEquals("cancelled consuming flip releases input", 1, closes.get())
     }
 }

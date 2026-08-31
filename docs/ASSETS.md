@@ -23,6 +23,28 @@ fujifilm_velvia_100.
 **Print papers:** kodak_portra_endura, kodak_supra_endura, kodak_ultra_endura,
 kodak_endura_premier, kodak_ektacolor_edge, fujifilm_crystal_archive_typeii.
 
+### Viewing-illuminant contract
+
+Each profile's `info.viewing_illuminant` is an exact, case-sensitive runtime
+identifier, not descriptive catalog text. Most bundled profiles declare `D50`;
+`kodak_2383` and `kodak_2393` declare `K75P`, the Kinoton 75P cinema-projector
+light source. The native profile loader resolves that identifier once through a
+fail-closed registry. The registry owns the aligned 81-sample spectrum, XYZ
+normalization, and per-output-space chromatic-adaptation matrices; an unknown or
+misspelled identifier rejects the profile instead of silently falling back to D50.
+
+The same resolved record is used by the direct CPU scanner, the scanner 3D-LUT
+and its memo key, Vulkan fused/linear routes, viewing glare, and scanner
+black/white reference measurement. The K75P spectrum and matrices are compiled
+color-science constants; the profile JSON remains the source of which registered
+illuminant a stock selects. Committed `print_kodak_2383_k75p` and
+`print_kodak_2393_k75p` goldens lock both selections against the upstream oracle:
+direct and LUT17 final RGB, isolated scans in all six output spaces, plus hashed
+visual evidence under `tools/parity/goldens/viewing_illuminants/`. Malformed or
+unknown identifiers surface as `SPK_ERR_PROFILE_INVALID` with caller-thread-local
+detail (and as the same detail in the JNI exception); missing profile files remain
+the distinct `SPK_ERR_PROFILE_NOT_FOUND` case.
+
 ## Spectral-upsampling LUTs (`luts/spectral_upsampling/`, ≈ 5.7 MB bundled)
 
 | File | Size | Bundled? | Purpose |

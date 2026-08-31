@@ -1,10 +1,11 @@
 /*
  * Spektrafilm for Android — lib:libraw native decoder.
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
- * Uses LibRaw (LGPL-2.1).
+ * Uses statically included, dual-offered LibRaw; distribution is governed by the
+ * bundled decision record and fail-closed release audit.
  *
  * Decodes a camera RAW / DNG buffer into a linear, scene-referred RGB image with
- * bit-parity to spektrafilm's desktop rawpy settings:
+ * the same processing-option contract as spektrafilm's desktop rawpy path:
  *   output_color = ACES (LibRaw code 6, ACES2065-1 primaries)
  *   output_bps   = 16
  *   no_auto_bright = 1
@@ -19,6 +20,7 @@
 #ifndef SPECTRAFILM_RAW_DECODER_H
 #define SPECTRAFILM_RAW_DECODER_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -45,8 +47,7 @@ struct DecodeOptions {
     // before `dcraw_process()`, producing an image at half the linear dimensions
     // (¼ the pixel count) by averaging each 2×2 Bayer cell into one output pixel
     // instead of running full demosaic interpolation.  Benefits:
-    //   * Peak memory is ~¼ of a full-res decode (the main OOM surface for large
-    //     Expert-RAW / multi-hundred-MP DNGs on low-RAM devices).
+    //   * Processed-image memory is ~¼ of a full-res decode for Bayer layouts.
     //   * Decode is substantially faster (no demosaic, smaller copy).
     // Tradeoffs:
     //   * Lower quality: colour at each output pixel is a simple 2×2 average, not
@@ -56,7 +57,10 @@ struct DecodeOptions {
     //     reported by LibRaw for the full-res image (LibRaw updates imgdata.sizes
     //     accordingly; `dcraw_make_mem_image` reports the post-process dimensions).
     //
-    // Default false → full-resolution decode; existing behaviour is unchanged.
+    // The current in-memory safety gate is evaluated before unpack and remains
+    // 12 MiPixels on 64-bit / 8 MiPixels on 32-bit even in half-size mode;
+    // non-Bayer layouts may ignore half_size. Ticket #173 owns tiled high-MP decode.
+    // Default false requests full-resolution output within those limits.
     bool halfSize = false;
 
     // Hard cap on the output's longest edge (pixels). 0 = no cap. When > 0 and the
@@ -67,6 +71,13 @@ struct DecodeOptions {
     // 4080×3060 result is a ~150 MB float buffer that OOMs the managed heap when wrapped
     // in a Java-backed direct ByteBuffer. Proxy-grade (nearest-step subsample).
     int maxLongEdge = 0;
+
+    // Cooperative cancellation supplied by the JNI token registry. The caller
+    // keeps this flag alive for the complete synchronous decode call. LibRaw's
+    // unpack/demosaic calls do not expose an interrupt callback, so the wrapper
+    // polls before and after those noninterruptible phases and throughout its own
+    // fd-read, copy, adaptation, and colour-conversion loops.
+    const std::atomic<bool>* cancelFlag = nullptr;
 };
 
 // Stable decode status codes. These cross to Kotlin (RawDecoder.DecodeStatus)
@@ -83,10 +94,12 @@ struct DecodeOptions {
 //   * Lossless-JPEG / LJ92 DNG (Compression 7) — common Google Pixel and other
 //       computational-RAW DNGs. LibRaw decodes these with its OWN internal
 //       lossless-JPEG code (lossless_jpeg_load_raw / ljpeg_start / ljpeg_row in
-//       src/decoders/dcraw_common.cpp), which is compiled unconditionally and
+//       src/decoders/decoders_dcraw.cpp), which is compiled unconditionally and
 //       does NOT require USE_JPEG/libjpeg. (USE_JPEG only adds *lossy* baseline
 //       JPEG, below.)
-//   * DEFLATE/ZIP DNG (Compression 8)          — via USE_ZLIB (NDK libz linked).
+//   * Floating-point DEFLATE/ZIP DNG (Compression 8,
+//       SampleFormat=3) via USE_ZLIB (NDK libz linked). Integer/linear deflate
+//       remains a typed platform/next-codec fallback in pinned LibRaw 0.22.2.
 //   * Mainstream camera RAW (CR2/CR3/NEF/ARW/RAF/ORF/RW2/...).
 enum DecodeStatus {
     SFRAW_OK = 0,
@@ -98,10 +111,11 @@ enum DecodeStatus {
     SFRAW_ERR_PROCESS = 6,        // dcraw_process / make_mem_image failure
     SFRAW_ERR_NO_MEMORY = 7,
     SFRAW_ERR_FORMAT = 8,         // unexpected processed-image format
+    SFRAW_ERR_CANCELLED = 9,      // cooperative caller cancellation
 
     // ---- DNG compressions that need a platform-decoder fallback ----
-    // DEFLATE-compressed DNG but this build lacks zlib (USE_ZLIB). Should not
-    // occur in the default build (zlib is enabled); indicates a misbuild.
+    // Integer/linear DEFLATE DNG unsupported by pinned LibRaw 0.22.2, or a
+    // floating-point DEFLATE DNG in a build without USE_ZLIB.
     SFRAW_ERR_DEFLATE_DNG = 10,
 
     // Lossy-baseline-JPEG-compressed DNG (DNG 1.4 lossy, Compression 0x884C, and

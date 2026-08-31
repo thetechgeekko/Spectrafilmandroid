@@ -19,6 +19,8 @@ namespace spk {
 
 namespace {
 
+thread_local ParallelCancellationScope* g_cancellation_scope = nullptr;
+
 // Env flag helper: 1/on/true/yes enable, anything else (including unset) disable.
 bool env_enabled(const char* name) {
     const char* v = std::getenv(name);
@@ -112,6 +114,45 @@ int detect_big_cores(
 }
 
 }  // namespace
+
+ParallelCancellationScope::ParallelCancellationScope(
+        ParallelCancelCheck check, void* context) noexcept
+    : check_(check), context_(context), previous_(g_cancellation_scope) {
+    g_cancellation_scope = this;
+}
+
+ParallelCancellationScope::~ParallelCancellationScope() {
+    g_cancellation_scope = previous_;
+}
+
+bool parallel_cancellation_active() noexcept {
+    return g_cancellation_scope != nullptr &&
+           g_cancellation_scope->check_ != nullptr;
+}
+
+bool parallel_cancellation_latched() noexcept {
+    return g_cancellation_scope != nullptr &&
+           g_cancellation_scope->cancelled_;
+}
+
+bool parallel_cancellation_requested() noexcept {
+    ParallelCancellationScope* scope = g_cancellation_scope;
+    if (!scope || !scope->check_) return false;
+    if (!scope->cancelled_) {
+        scope->cancelled_ = scope->check_(scope->context_) != 0;
+    }
+    return scope->cancelled_;
+}
+
+bool parallel_cancellation_poll(ParallelCancelCheck check,
+                                void* context) noexcept {
+    if (!check) return false;
+    ParallelCancellationScope* scope = g_cancellation_scope;
+    if (scope && scope->check_ == check && scope->context_ == context) {
+        return parallel_cancellation_requested();
+    }
+    return check(context) != 0;
+}
 
 int parallel_big_core_count() {
     // The sysfs probe is cached because the topology cannot change under us; the

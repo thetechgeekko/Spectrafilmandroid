@@ -10,7 +10,135 @@
 -keep class com.spectrafilm.libraw.RawDecodeException { *; }
 -keep class com.spectrafilm.tiffwriter.TiffWriter { *; }
 -keep class com.spectrafilm.pngwriter.PngWriter { *; }
+-keep class com.spectrafilm.tiffwriter.TiffCancellationToken { *; }
+-keep class com.spectrafilm.pngwriter.PngCancellationToken { *; }
 -keepclasseswithmembernames class * { native <methods>; }
+
+# ---- Release-candidate instrumentation boundary ----
+# The separately packaged release AndroidTest APK exercises process-death recovery,
+# failure cleanup, durable URI grants, and duplicate-name MediaStore publication
+# against the exact minified app. These package-private Kotlin types are referenced
+# across the APK boundary, so R8 must not merge/remove them from the target APK.
+-keep class com.spectrafilm.app.EncodedArtifact { *; }
+-keep class com.spectrafilm.app.EncodedArtifact$Companion { *; }
+-keep class com.spectrafilm.app.ExportDestinationSpec { *; }
+-keep class com.spectrafilm.app.ExportTransaction { *; }
+-keep class com.spectrafilm.app.ExportRecoveryReport { *; }
+-keep class com.spectrafilm.app.AndroidPendingExportBackend { *; }
+-keep class com.spectrafilm.app.SharedPreferencesPendingExportJournal { *; }
+-keep class com.spectrafilm.app.StoredExportState { *; }
+-keep interface com.spectrafilm.app.PendingExportBackend { *; }
+-keep interface com.spectrafilm.app.PendingExportJournal { *; }
+-keep class com.spectrafilm.app.ExportTransactionKt { *; }
+-keep class com.spectrafilm.app.PersistedSourceRef { *; }
+-keep class com.spectrafilm.app.SourceAccessMode { *; }
+-keep class com.spectrafilm.app.SourceAccessCoordinator { *; }
+-keep class com.spectrafilm.app.SourceRestoreResult { *; }
+-keep class com.spectrafilm.app.SourceRestoreResult$* { *; }
+-keep class com.spectrafilm.app.SharedPreferencesSourceRefStore { *; }
+-keep interface com.spectrafilm.app.SourceRefStore { *; }
+-keep interface com.spectrafilm.app.UriGrantBackend { *; }
+-keep class com.spectrafilm.app.AndroidUriGrantBackend { *; }
+-keep class com.spectrafilm.app.Recipes { *; }
+
+# Process-owned native/export probes are also compiled into the separate test
+# APK. Keep their exact target-APK ABI: otherwise R8 may inline/staticize object
+# methods, remove data-class accessors, or delete Kotlin interface DefaultImpls
+# even though the instrumentation still invokes their original JVM descriptors.
+-keep class com.spectrafilm.app.EngineHolder { *; }
+-keep class com.spectrafilm.app.ExportWorkRuntime { *; }
+-keep class com.spectrafilm.app.ExportRuntimeState { *; }
+-keep class com.spectrafilm.app.ExportRuntimeState$* { *; }
+-keep class com.spectrafilm.app.ExportTerminalOutcome { *; }
+-keep class com.spectrafilm.app.ExportTerminalOutcome$* { *; }
+-keep class com.spectrafilm.app.ExportPhaseSnapshot { *; }
+-keep class com.spectrafilm.app.ExportFormat { *; }
+-keep class com.spectrafilm.app.PendingExportBackend$DefaultImpls { *; }
+
+# Kotlin inline functions in the separately packaged release AndroidTest APK
+# still emit calls to Result's JVM implementation ABI. R8 cannot see those call
+# edges while shrinking the target APK, so it may remove Result.Companion or an
+# *-impl method and leave a device-only NoSuchFieldError/NoSuchMethodError.
+# Keep this small stdlib ABI surface intact and verify the physical dex below.
+-keep class kotlin.Result { *; }
+-keep class kotlin.Result$Companion { *; }
+-keep class kotlin.Result$Failure { *; }
+-keep class kotlin.ResultKt { *; }
+
+# The release AndroidTest APK intentionally does not package a second Kotlin or
+# coroutines runtime. Its lowered suspend/use/loop code resolves these bounded
+# facades and interfaces from the target APK. Preserve only the families/types
+# proven by the final test dex; do not replace this with kotlin.**/kotlinx.**.
+# The locked stdlib's Collections/Intrinsics/Ranges facades are empty subclasses;
+# the locked coroutines Builders/Job/Flow facades are forwarding classes. Keep
+# each public owner plus its exact declaring/delegate part without retaining the
+# unrelated members of either runtime family.
+-keep class kotlin.KotlinNothingValueException { *; }
+-keep class kotlin.collections.CollectionsKt
+-keep class kotlin.collections.CollectionsKt__IterablesKt {
+    public static int collectionSizeOrDefault(java.lang.Iterable, int);
+}
+-keep class kotlin.collections.CollectionsKt__CollectionsKt {
+    public static void throwCountOverflow();
+}
+-keep class kotlin.collections.IntIterator { *; }
+-keep class kotlin.coroutines.intrinsics.IntrinsicsKt
+-keep class kotlin.coroutines.intrinsics.IntrinsicsKt__IntrinsicsKt {
+    public static java.lang.Object getCOROUTINE_SUSPENDED();
+}
+-keep class kotlin.coroutines.jvm.internal.Boxing { *; }
+-keep class kotlin.jdk7.AutoCloseableKt { *; }
+-keep class kotlin.ranges.RangesKt
+-keep class kotlin.ranges.RangesKt___RangesKt {
+    public static kotlin.ranges.IntRange until(int, int);
+}
+-keep class kotlin.ranges.IntRange { *; }
+-keep class kotlin.ranges.IntProgression {
+    public java.util.Iterator iterator();
+}
+-keep class kotlin.ranges.IntProgressionIterator {
+    public boolean hasNext();
+    public int nextInt();
+}
+-keep class kotlinx.coroutines.AwaitKt { *; }
+-keep class kotlinx.coroutines.BuildersKt {
+    public static java.lang.Object runBlocking$default(kotlin.coroutines.CoroutineContext, kotlin.jvm.functions.Function2, int, java.lang.Object);
+    public static kotlinx.coroutines.Job launch$default(kotlinx.coroutines.CoroutineScope, kotlin.coroutines.CoroutineContext, kotlinx.coroutines.CoroutineStart, kotlin.jvm.functions.Function2, int, java.lang.Object);
+    public static kotlinx.coroutines.Deferred async$default(kotlinx.coroutines.CoroutineScope, kotlin.coroutines.CoroutineContext, kotlinx.coroutines.CoroutineStart, kotlin.jvm.functions.Function2, int, java.lang.Object);
+}
+-keep class kotlinx.coroutines.BuildersKt__BuildersKt {
+    public static java.lang.Object runBlocking$default(kotlin.coroutines.CoroutineContext, kotlin.jvm.functions.Function2, int, java.lang.Object);
+}
+-keep class kotlinx.coroutines.BuildersKt__Builders_commonKt {
+    public static kotlinx.coroutines.Job launch$default(kotlinx.coroutines.CoroutineScope, kotlin.coroutines.CoroutineContext, kotlinx.coroutines.CoroutineStart, kotlin.jvm.functions.Function2, int, java.lang.Object);
+    public static kotlinx.coroutines.Deferred async$default(kotlinx.coroutines.CoroutineScope, kotlin.coroutines.CoroutineContext, kotlinx.coroutines.CoroutineStart, kotlin.jvm.functions.Function2, int, java.lang.Object);
+}
+-keep interface kotlinx.coroutines.CompletableDeferred { *; }
+-keep class kotlinx.coroutines.CompletableDeferredKt { *; }
+-keep interface kotlinx.coroutines.CoroutineScope { *; }
+-keep class kotlinx.coroutines.CoroutineScopeKt { *; }
+-keep interface kotlinx.coroutines.Deferred { *; }
+-keep class kotlinx.coroutines.DelayKt { *; }
+-keep class kotlinx.coroutines.Dispatchers { *; }
+-keep interface kotlinx.coroutines.Job { *; }
+-keep class kotlinx.coroutines.JobKt {
+    public static java.lang.Object cancelAndJoin(kotlinx.coroutines.Job, kotlin.coroutines.Continuation);
+}
+-keep class kotlinx.coroutines.JobKt__JobKt {
+    public static java.lang.Object cancelAndJoin(kotlinx.coroutines.Job, kotlin.coroutines.Continuation);
+}
+-keep class kotlinx.coroutines.TimeoutKt { *; }
+-keep class kotlinx.coroutines.CoroutineDispatcher { *; }
+-keep class kotlinx.coroutines.CoroutineStart { *; }
+-keep class kotlinx.coroutines.flow.FlowKt {
+    public static java.lang.Object first(kotlinx.coroutines.flow.Flow, kotlin.coroutines.Continuation);
+}
+-keep class kotlinx.coroutines.flow.FlowKt__ReduceKt {
+    public static java.lang.Object first(kotlinx.coroutines.flow.Flow, kotlin.coroutines.Continuation);
+}
+-keep interface kotlinx.coroutines.flow.Flow { *; }
+-keep interface kotlinx.coroutines.flow.FlowCollector { *; }
+-keep interface kotlinx.coroutines.flow.StateFlow { *; }
 
 # ---- kotlin.Triple / kotlin.Pair are ALSO part of that JNI boundary ----
 # spektra_jni.cpp reads 19 engine params out of Triple<Float,Float,Float> and

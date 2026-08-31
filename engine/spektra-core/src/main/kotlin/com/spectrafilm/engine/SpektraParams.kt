@@ -60,6 +60,7 @@ data class CameraParams(
 )
 
 data class EnlargerParams(
+    /** Native currently has the TH-KG3 SPD; unsupported IDs fail closed. */
     val illuminant: String = "TH-KG3",
     val printExposure: Float = 1.0f,
     val printExposureCompensation: Boolean = true,
@@ -141,6 +142,7 @@ data class GlareParams(
 
 data class DiffusionFilterParams(
     val active: Boolean = false,
+    /** glimmerglass, black_pro_mist, pro_mist, or cinebloom. */
     val filterFamily: String = "black_pro_mist",
     val strength: Float = 0.5f,
     val spatialScale: Float = 1.0f,
@@ -184,6 +186,7 @@ data class PrintRenderingParams(
 )
 
 data class IoParams(
+    /** Native currently accepts ProPhoto RGB (linear) and rejects other spaces. */
     val inputColorSpace: String = "ProPhoto RGB",
     val inputCctfDecoding: Boolean = false,
     val outputColorSpace: ColorSpace = ColorSpace.SRGB,
@@ -201,6 +204,10 @@ data class IoParams(
 )
 
 data class SettingsParams(
+    // The former useFastStats and previewMode knobs are intentionally absent:
+    // native has no alternate stats implementation, and preview is selected by
+    // SpektraEngine's explicit preview entry point. A repository-wide source
+    // search found no callers, so removing them avoids exposing inert controls.
     val rgbToRawMethod: Rgb2Raw = Rgb2Raw.HANATOS2025,
     val applyHanatos2025AdaptationWindow: Boolean = true,
     val applyHanatos2025AdaptationSurface: Boolean = false,
@@ -208,9 +215,7 @@ data class SettingsParams(
     val useEnlargerLut: Boolean = false,
     val useScannerLut: Boolean = false,
     val lutResolution: Int = 17,
-    val useFastStats: Boolean = false,
     val previewMaxSize: Int = 640,
-    val previewMode: Boolean = false,
     val neutralPrintFiltersFromDatabase: Boolean = true,
     /**
      * GPU preview fast-path (GPU M1, #146). When true, interactive preview

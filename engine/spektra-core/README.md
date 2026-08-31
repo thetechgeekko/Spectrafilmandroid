@@ -9,6 +9,10 @@ a thin JNI + Kotlin facade.
 > The C++ header, JNI bridge, and Kotlin facade/params are the stable contract; see
 > `../../docs/PORTING_PLAN.md` for the upstream module map and the parity strategy.
 
+Native allocation tokens, data leases, checked direct-buffer windows, cancellation checkpoints,
+and render/close verification are specified in
+[`docs/JNI_LIFETIME_SAFETY.md`](../../docs/JNI_LIFETIME_SAFETY.md).
+
 ## Layout
 
 ```

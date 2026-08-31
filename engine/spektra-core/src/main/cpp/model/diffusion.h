@@ -129,7 +129,7 @@ struct DiffusionFilterParams {
 // so. Read it after any measurement of this stage, and especially after changing
 // SPK_DIFFUSION_FFT_MAX: a nonzero count means the number you just measured is
 // the DIRECT path, not the transform size you thought you were testing.
-// Process-global and monotonic; reset it yourself around a measurement.
+// Current-thread and monotonic; reset it yourself around a measurement.
 unsigned long long diffusion_fft_fallbacks();
 void diffusion_reset_fft_fallbacks();
 

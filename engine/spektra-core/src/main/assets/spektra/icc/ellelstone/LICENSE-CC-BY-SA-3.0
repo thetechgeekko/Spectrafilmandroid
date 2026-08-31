@@ -20,6 +20,7 @@ The full legal text of the license is available at:
 A human-readable summary is at:
   https://creativecommons.org/licenses/by-sa/3.0/
 
-Note: CC BY-SA 3.0 is one-way compatible into the GNU GPL v3.0, under which
-this project (Spektrafilm for Android) as a whole is distributed. See the
-repository-root NOTICE.md and LICENSE.
+These profiles remain separate CC BY-SA 3.0 assets. Creative Commons has not
+named a non-CC license as compatible with BY-SA 3.0, so inclusion in this app
+does not relicense the profiles under the app's GPLv3 terms. See the
+repository-root NOTICE.md for attribution and distribution details.

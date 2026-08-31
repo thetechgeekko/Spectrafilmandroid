@@ -3,7 +3,7 @@
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
  * Port of spektrafilm (GPLv3) by Andrea Volpato — film modeling powered by spektrafilm.
  *
- * LOCAL-ONLY (not in the 38-gate CI table): exercising the real Vulkan branch
+ * Separate GPU gate (not in the 39-test engine-parity table): exercising the real Vulkan branch
  * needs an ICD, which CI runners don't guarantee. Locally, run it under
  * SwiftShader (Chromium bundles one):
  *   VK_ICD_FILENAMES=<...>/vk_swiftshader_icd.json /tmp/test_gpu_host <asset_dir>
@@ -11,7 +11,8 @@
  * passes: it then proves the fallback path — gpu_preview=1 must be a strict
  * no-op (byte-identical to gpu_preview=0) when no GPU is available.
  *
- * What it proves, per route (scan_film and print), per kernel class:
+ * What it proves, per route (scan_film, D50 print, and Kodak 2383/2393 K75P
+ * print), per kernel class:
  *  - LINEAR kernel (production defaults: scanner unsharp (0.7, 0.7) is ON, so
  *    interactive previews hit the linear kernel + CPU plane/encode tail).
  *  - FUSED kernel (sharpening zeroed: the full-chain sRGB shader path).
@@ -20,10 +21,14 @@
  *  2. The GPU preview render is within the oracle tolerance band (max_abs <=
  *     1e-4) of the CPU EXPORT render on the same pixels (input chosen small
  *     enough that spk_simulate_preview skips the downscale, so grids match).
- *     For scale: the CPU preview itself (scanner LUT forced on) sits ~5e-5 off.
+ *     For scale: the forced scanner LUT is profile/domain dependent at LUT17:
+ *     the locked D50 case is <=5e-5, while K75P 2383/2393 are about
+ *     0.0040/0.0073 vs direct. GPU preview bypasses that LUT when it engages.
  *  3. Warm-host determinism: repeated GPU preview renders are byte-identical.
  *  4. The one-time self-check ran and passed (spk_gpu_scan_state() == 1) when a
- *     GPU is present; without one the state stays 0 and nothing engaged.
+ *     GPU is present; K75P runs first so that global check cannot be satisfied
+ *     only by legacy D50 tables. Without a GPU the state stays 0 and nothing
+ *     engaged.
  *
  * Build (host) — full source set + -DSPK_ENABLE_VULKAN=1 -lvulkan, from the cpp
  * root (see CLAUDE.md for the base compile line; SRC already includes gpu/).
@@ -155,22 +160,38 @@ void run_case(spk_engine* eng, const spk_params& base, const char* label,
 }
 
 void run_all(spk_engine* eng, bool gpu_present) {
-    for (int scan_film = 1; scan_film >= 0; --scan_film) {
+    // The scanner self-check is process-global. Run a K75P profile first so a
+    // hard-wired D50 GPU table fails before it can arm the global state. Keep
+    // both affected Kodak profiles in the matrix, then cover the legacy scan
+    // and print routes.
+    const struct {
+        int scan_film;
+        const char* print_profile;
+        const char* label;
+    } routes[] = {
+        {0, "kodak_2383", "print/kodak_2383/K75P"},
+        {0, "kodak_2393", "print/kodak_2393/K75P"},
+        {1, "kodak_portra_endura", "scan/kodak_portra/D50"},
+        {0, "kodak_portra_endura", "print/kodak_portra_endura/D50"},
+    };
+
+    for (const auto& route : routes) {
         spk_params p;
         p.film_profile = "kodak_portra_400";
-        p.print_profile = "kodak_portra_endura";
+        p.print_profile = route.print_profile;
         spk_default_params(&p);
-        p.scan_film = scan_film;
+        p.scan_film = route.scan_film;
         p.preview_max_size = 640;  // > longest edge => preview on the same grid
 
-        const char* route = scan_film ? "scan" : "print";
         // Production defaults: scanner unsharp (0.7, 0.7) ON -> LINEAR kernel.
-        run_case(eng, p, (std::string(route) + "/linear").c_str(), gpu_present);
+        run_case(eng, p, (std::string(route.label) + "/linear").c_str(),
+                 gpu_present);
         // Sharpening off -> FUSED (full-chain sRGB) kernel.
         spk_params pf = p;
         pf.scanner_unsharp[0] = 0.0f;
         pf.scanner_unsharp[1] = 0.0f;
-        run_case(eng, pf, (std::string(route) + "/fused").c_str(), gpu_present);
+        run_case(eng, pf, (std::string(route.label) + "/fused").c_str(),
+                 gpu_present);
     }
 }
 
