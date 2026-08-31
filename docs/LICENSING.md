@@ -19,6 +19,7 @@ grant of the GPL "or any later version" option has been identified.
 | Component | Upstream license | Compatibility |
 |-----------|------------------|---------------|
 | spektrafilm (engine we port) | **GPL-3.0** | Defines the floor: any derivative must be GPLv3. |
+| spektrafilm OFX selective Vulkan adaptations | **GPL-3.0-only** | Directly compatible with this GPL-3.0-only application; preserve provenance and mark modifications. |
 | ImageToolbox (originally planned host; never vendored — row kept in case its code is ever incorporated) | **Apache-2.0** | Apache-2.0 → GPLv3 is **one-way compatible**; Apache code may be incorporated into a GPLv3 work. |
 | LibRaw (RAW decode) | Offered under a choice of **LGPL-2.1-only** or **CDDL-1.0** | Route is `UNRESOLVED`; including both texts is provenance, not election. CDDL-1.0 is not generally treated as GPL-compatible. Static-distribution obligations require human review. |
 
@@ -38,6 +39,15 @@ The Apache Software Foundation and FSF agree Apache-2.0 is compatible with GPLv3
 GPLv2). Incorporating ImageToolbox (Apache-2.0) into this GPLv3 work is allowed; we retain
 ImageToolbox's copyright headers and `LICENSE`/`NOTICE` references in the files that originate
 from it. The combined/derived whole is offered under GPLv3.
+
+## spektrafilm OFX boundary
+
+Only selected source-level Vulkan orchestration from the public GPL-3.0-only repository may be
+adapted. Each adapted file must identify the exact upstream commit and source path and describe
+the Android changes; `docs/research/spektrafilm-ofx-port.md` is the mapping record. Official
+binary-only resources, exported OFX LUTs, licensed standards data, icons/branding, Metal and
+OpenFX host glue are outside the port and must not be copied. The Android engine's locally
+validated shaders and parity corpus remain the numeric authority.
 
 ## LibRaw
 

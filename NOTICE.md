@@ -20,6 +20,19 @@ The film-simulation engine in this project is a port of **spektrafilm** by Andre
 Per the upstream request: *film modeling powered by `spektrafilm`*. Any academic use should
 cite the upstream repository.
 
+## Vulkan orchestration reference: spektrafilm OFX
+
+Selected Vulkan host and resource-lifetime orchestration is adapted from
+**spektrafilm OFX** by Aedan Oskar Otto Diez.
+
+- Upstream: https://github.com/chaert-s/spektrafilm-ofx
+- Pinned source: `86476afc5b077de77e2278e3658d1ba9309892a1`
+- License: GPL-3.0-only
+- Adaptation record: `docs/research/spektrafilm-ofx-port.md`
+
+This Android project is independent and is not endorsed by the upstream author. No official
+binary-only resources or spektrafilm OFX-exported LUTs are included.
+
 ## Color science: colour-science
 
 Color-matching functions, illuminants, chromatic adaptation, and color-space transforms follow
