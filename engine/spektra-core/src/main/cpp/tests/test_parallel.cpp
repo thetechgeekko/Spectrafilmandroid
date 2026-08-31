@@ -134,6 +134,30 @@ bool check_stage_timing_isolation() {
                 a_started_promise.set_value();
                 b_done.wait();
             }
+            {
+                spk::ScopedStageTimingSuppression suppress;
+                {
+                    spk::ScopedStage hidden_develop(spk::STG_DEVELOP);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                {
+                    spk::ScopedStageTimingSuppression nested_suppress;
+                    spk::ScopedStage hidden_print(spk::STG_PRINT_EXPOSE);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            spk::stage_timing_note_gpu_pointwise(
+                /*requested=*/true, /*attempted=*/true, /*engaged=*/true,
+                "none", /*dispatches=*/3, /*input_uploads=*/1,
+                /*final_readbacks=*/1, /*interstage_host_bytes=*/0,
+                /*pipeline_creates=*/3, /*buffer_allocations=*/4,
+                /*static_upload_bytes=*/1234);
+            spk::stage_timing_note_gpu_pointwise_self_test(
+                "ran_pass", /*duration_ms=*/4.25, /*chain_runs=*/2,
+                /*dispatches=*/6, /*input_uploads=*/2,
+                /*final_readbacks=*/2, /*interstage_host_bytes=*/0,
+                /*pipeline_creates=*/3, /*buffer_allocations=*/4,
+                /*static_upload_bytes=*/5678);
             render.finish(0);
         }
         char buf[256];
@@ -183,7 +207,41 @@ bool check_stage_timing_isolation() {
         a_snapshot.outcome == spk::RTO_OK &&
         b_snapshot.outcome == spk::RTO_OK &&
         a_snapshot.status_code == 0 && b_snapshot.status_code == 0;
+    const bool pointwise_isolation_ok =
+        a_snapshot.gpu_pointwise.requested &&
+        a_snapshot.gpu_pointwise.attempted &&
+        a_snapshot.gpu_pointwise.engaged &&
+        std::strcmp(a_snapshot.gpu_pointwise.reason, "none") == 0 &&
+        a_snapshot.gpu_pointwise.dispatches == 3 &&
+        a_snapshot.gpu_pointwise.input_uploads == 1 &&
+        a_snapshot.gpu_pointwise.final_readbacks == 1 &&
+        a_snapshot.gpu_pointwise.interstage_host_bytes == 0 &&
+        a_snapshot.gpu_pointwise.pipeline_creates == 3 &&
+        a_snapshot.gpu_pointwise.buffer_allocations == 4 &&
+        a_snapshot.gpu_pointwise.static_upload_bytes == 1234 &&
+        std::strcmp(a_snapshot.gpu_pointwise.self_test_state,
+                    "ran_pass") == 0 &&
+        a_snapshot.gpu_pointwise.self_test_duration_ms == 4.25 &&
+        a_snapshot.gpu_pointwise.self_test_chain_runs == 2 &&
+        a_snapshot.gpu_pointwise.self_test_dispatches == 6 &&
+        a_snapshot.gpu_pointwise.self_test_input_uploads == 2 &&
+        a_snapshot.gpu_pointwise.self_test_final_readbacks == 2 &&
+        a_snapshot.gpu_pointwise.self_test_interstage_host_bytes == 0 &&
+        a_snapshot.gpu_pointwise.self_test_pipeline_creates == 3 &&
+        a_snapshot.gpu_pointwise.self_test_buffer_allocations == 4 &&
+        a_snapshot.gpu_pointwise.self_test_static_upload_bytes == 5678 &&
+        !b_snapshot.gpu_pointwise.requested &&
+        !b_snapshot.gpu_pointwise.attempted &&
+        !b_snapshot.gpu_pointwise.engaged &&
+        std::strcmp(b_snapshot.gpu_pointwise.reason, "not_requested") == 0 &&
+        std::strcmp(b_snapshot.gpu_pointwise.self_test_state,
+                    "not_run") == 0 &&
+        b_snapshot.gpu_pointwise.self_test_duration_ms == 0.0 &&
+        b_snapshot.gpu_pointwise.self_test_chain_runs == 0 &&
+        b_snapshot.gpu_pointwise.self_test_dispatches == 0;
     const bool reconciliation_ok =
+        a_snapshot.stages_ms[spk::STG_DEVELOP] == 0.0 &&
+        a_snapshot.stages_ms[spk::STG_PRINT_EXPOSE] == 0.0 &&
         a_snapshot.stages_ms[spk::STG_SCAN] >=
             a_snapshot.stages_ms[spk::STG_SCAN_SPATIAL] &&
         a_snapshot.wall_ms + 0.001 >=
@@ -200,9 +258,41 @@ bool check_stage_timing_isolation() {
         a_json.find(a_id) != std::string::npos &&
         a_json.find("\"kind\":\"preview\"") != std::string::npos &&
         a_json.find("\"native_outcome\":\"ok\"") != std::string::npos &&
+        a_json.find(
+            "\"gpu_pointwise\":{\"requested\":true,\"attempted\":true,"
+            "\"engaged\":true,\"reason\":\"none\",\"dispatches\":3,"
+            "\"input_uploads\":1,\"final_readbacks\":1,"
+             "\"interstage_host_bytes\":0,\"pipeline_creates\":3,"
+             "\"buffer_allocations\":4,\"static_upload_bytes\":1234,"
+             "\"self_test_state\":\"ran_pass\","
+             "\"self_test_duration_ms\":4.250,"
+             "\"self_test_chain_runs\":2,\"self_test_dispatches\":6,"
+             "\"self_test_input_uploads\":2,"
+             "\"self_test_final_readbacks\":2,"
+             "\"self_test_interstage_host_bytes\":0,"
+             "\"self_test_pipeline_creates\":3,"
+             "\"self_test_buffer_allocations\":4,"
+             "\"self_test_static_upload_bytes\":5678}") !=
+             std::string::npos &&
         a_json.find("\"scan_spatial\":\"scan\"") != std::string::npos &&
         b_json.find(b_id) != std::string::npos &&
-        b_json.find("\"kind\":\"export\"") != std::string::npos;
+        b_json.find("\"kind\":\"export\"") != std::string::npos &&
+        b_json.find(
+            "\"gpu_pointwise\":{\"requested\":false,\"attempted\":false,"
+            "\"engaged\":false,\"reason\":\"not_requested\","
+            "\"dispatches\":0,\"input_uploads\":0,"
+             "\"final_readbacks\":0,\"interstage_host_bytes\":0,"
+             "\"pipeline_creates\":0,\"buffer_allocations\":0,"
+             "\"static_upload_bytes\":0,"
+             "\"self_test_state\":\"not_run\","
+             "\"self_test_duration_ms\":0.000,"
+             "\"self_test_chain_runs\":0,\"self_test_dispatches\":0,"
+             "\"self_test_input_uploads\":0,"
+             "\"self_test_final_readbacks\":0,"
+             "\"self_test_interstage_host_bytes\":0,"
+             "\"self_test_pipeline_creates\":0,"
+             "\"self_test_buffer_allocations\":0,"
+             "\"self_test_static_upload_bytes\":0}") != std::string::npos;
 
     // Expected failures and actual exception unwinding must publish error
     // snapshots instead of leaving the previous successful render current.
@@ -233,6 +323,19 @@ bool check_stage_timing_isolation() {
     const bool truncation_ok =
         spk_stage_timings_json(small_json, sizeof(small_json)) == 0 &&
         small_json[0] == '\0';
+    {
+        spk::ScopedRenderTiming escaped(spk::RTK_EXPORT);
+        spk::stage_timing_note_gpu_pointwise(
+            true, true, false, "dispatch\"failed\\probe\n", 0, 0, 0, 0, 0,
+            0, 0);
+        escaped.finish(0);
+    }
+    char escaped_json[2048];
+    spk_stage_timings_json(escaped_json, sizeof(escaped_json));
+    const bool escaping_ok =
+        std::strstr(escaped_json,
+                    "\"reason\":\"dispatch\\\"failed\\\\probe\\n\"") !=
+        nullptr;
     char outcome_json[256];
     const bool app_outcome_ok =
         spk::stage_timing_outcome_json_format(
@@ -243,9 +346,9 @@ bool check_stage_timing_isolation() {
         std::strstr(outcome_json, "\"app_outcome\":\"superseded\"") !=
             nullptr;
 
-    const bool ok = isolated && ids_ok && metadata_ok && reconciliation_ok &&
-                    json_ok && error_ok && unwind_ok && truncation_ok &&
-                    app_outcome_ok;
+    const bool ok = isolated && ids_ok && metadata_ok && pointwise_isolation_ok &&
+                    reconciliation_ok && json_ok && error_ok && unwind_ok &&
+                    truncation_ok && escaping_ok && app_outcome_ok;
     std::printf("[stage timing overlap] A={%s} B={%s} ids=%llu/%llu -> %s\n",
                 a_timings.c_str(), b_timings.c_str(),
                 static_cast<unsigned long long>(a_snapshot.render_id),

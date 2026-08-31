@@ -34,6 +34,9 @@
 #include "spektra.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -43,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -52,10 +56,15 @@
 #endif
 
 #include "io/npy_lut.h"
+#include "gpu/vulkan_compute.h"
 #include "kernels/lut3d_cache.h"  // spk_engine holds the spectral 3D-LUT memo by value
 #include "kernels/parallel.h"     // spk_set_big_cores -> parallel_set_big_cores
+#include "model/color_output.h"
+#include "model/density_curves.h"
 #include "model/diffusion.h"
 #include "model/color_filters.h"
+#include "model/spectral.h"
+#include "profiles/json_min.h"
 #include "profiles/profile.h"
 #include "runtime/color_reference.h"
 #include "runtime/params.h"
@@ -263,16 +272,74 @@ struct spk_engine {
     // output-only edit (scanner / output space / tone curve / glare) rerun
     // scan() alone. The entry buffer holds print_density_cmy. Same mutex.
     FilmMemoSlot print_density_memo;
+
+    // Prepared immutable f32 tables for the resident filming -> printing -> scan
+    // operation (#148). The cache compares every table byte and shape exactly;
+    // the nonzero generation is an opaque identity token for the lower-level GPU
+    // static-table cache, never a content digest. A shared_ptr lets a render keep
+    // the table storage alive after dropping this mutex and throughout the GPU
+    // submit/wait. Only one bounded latest-table entry is retained per engine.
+    struct PointwisePreparedTables {
+        uint64_t generation = 0;
+        uint32_t tc_edge = 0;
+        uint32_t film_curve_points = 0;
+        uint32_t print_curve_points = 0;
+        std::vector<float> tc_lut;
+        std::vector<float> develop_axis;
+        std::vector<float> develop_curve;
+        std::vector<float> dir_axis;
+        std::vector<float> dir_curve;
+        std::vector<float> print_dye;
+        std::vector<float> print_illuminant_sensitivity;
+        std::vector<float> paper_axis;
+        std::vector<float> paper_curve;
+        std::vector<float> scan_dye;
+        std::vector<float> scan_illuminant_cmf;
+    };
+    std::mutex pointwise_cache_mutex;
+    std::shared_ptr<const PointwisePreparedTables> pointwise_prepared;
+    uint64_t pointwise_cache_hits = 0;
+    uint64_t pointwise_cache_misses = 0;
+
+    struct PointwiseCapabilityKey {
+        uint32_t revision = 0;
+        uint32_t source_flags = 0;
+        uint64_t generation = 0;
+        uint64_t input_gain_bits = 0;
+        float values[22]{};  // film scalar/matrix + print scalars + scan matrix
+    };
+    std::mutex pointwise_capability_mutex;
+    bool pointwise_capability_valid = false;
+    bool pointwise_capability_passed = false;
+    PointwiseCapabilityKey pointwise_capability_key;
 };
 
 // Host-only accessors for the print-route film_density_cmy cache counters. The host
 // parity tests compile spektra.cpp directly into their binary and read these to
 // assert the cache actually engaged, WITHOUT touching spektra.h / the public ABI /
-// JNI. Gated on the HOST build (!__ANDROID__) so they never enter the shipped
+// JNI. Gated on HOST builds or the explicit standalone-device-test macro, so
+// they never enter the shipped library.
 // libspektra.so; not declared in any header — tests forward-declare them. The host
 // parity job (engine-parity) builds with the host g++ toolchain, so __ANDROID__ is
 // undefined and these are available there without needing an extra -D flag.
-#ifndef __ANDROID__
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+thread_local int g_spk_test_pointwise_fault = 0;
+thread_local double g_spk_test_pointwise_direct_gain = 1.0;
+thread_local size_t g_spk_test_last_asset_max_bytes = 0;
+thread_local size_t g_spk_test_last_asset_bytes_allocated = 0;
+
+void spk_test_pointwise_set_fault(int fault) {
+    g_spk_test_pointwise_fault = fault;
+}
+double spk_test_pointwise_direct_gain(void) {
+    return g_spk_test_pointwise_direct_gain;
+}
+size_t spk_test_last_asset_max_bytes(void) {
+    return g_spk_test_last_asset_max_bytes;
+}
+size_t spk_test_last_asset_bytes_allocated(void) {
+    return g_spk_test_last_asset_bytes_allocated;
+}
 uint64_t spk_test_film_cache_hits(spk_engine* eng) {
     if (!eng) return 0;
     std::lock_guard<std::mutex> g(eng->film_cache_mutex);
@@ -312,42 +379,80 @@ uint64_t spk_test_lut_cache_hits(spk_engine* eng) {
 uint64_t spk_test_lut_cache_misses(spk_engine* eng) {
     return eng ? eng->lut_cache.misses() : 0;
 }
+uint64_t spk_test_pointwise_cache_hits(spk_engine* eng) {
+    if (!eng) return 0;
+    std::lock_guard<std::mutex> g(eng->pointwise_cache_mutex);
+    return eng->pointwise_cache_hits;
+}
+uint64_t spk_test_pointwise_cache_misses(spk_engine* eng) {
+    if (!eng) return 0;
+    std::lock_guard<std::mutex> g(eng->pointwise_cache_mutex);
+    return eng->pointwise_cache_misses;
+}
+uint64_t spk_test_pointwise_cache_generation(spk_engine* eng) {
+    if (!eng) return 0;
+    std::lock_guard<std::mutex> g(eng->pointwise_cache_mutex);
+    return eng->pointwise_prepared ? eng->pointwise_prepared->generation : 0;
+}
 #endif
 
 // Read a bundled asset by its path relative to the spektra/ asset root (e.g.
 // "profiles/kodak_portra_400.json") into `out`. Returns false on open failure.
 // In AAssetManager mode (Android) it opens via AAssetManager_open; otherwise it
 // reads asset_dir/<rel_path> with std::ifstream (the historical, parity-gated
-// behavior). Throws nothing.
+// behavior). Open/size/I/O failures return false; vector allocation may throw.
+enum class AssetReadFailure : uint8_t {
+    kNone = 0,
+    kNotFound,
+    kTooLarge,
+    kIo,
+};
+
 static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
                            std::vector<char>& out,
-                           size_t max_bytes = std::numeric_limits<size_t>::max()) {
-    if (!eng) return false;
+                           size_t max_bytes = std::numeric_limits<size_t>::max(),
+                           AssetReadFailure* failure = nullptr) {
+    if (failure) *failure = AssetReadFailure::kNone;
+    const auto reject = [failure](AssetReadFailure reason) noexcept {
+        if (failure) *failure = reason;
+        return false;
+    };
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+    g_spk_test_last_asset_max_bytes = max_bytes;
+    g_spk_test_last_asset_bytes_allocated = 0;
+#endif
+    if (!eng) return reject(AssetReadFailure::kIo);
 #ifdef __ANDROID__
     if (eng->use_asset_mgr()) {
         std::string full = eng->asset_base.empty()
                                ? rel_path
                                : eng->asset_base + "/" + rel_path;
-        AAsset* a = AAssetManager_open(eng->asset_mgr, full.c_str(),
-                                       AASSET_MODE_BUFFER);
-        if (!a) return false;
-        const off_t len = AAsset_getLength(a);
-        if (len < 0 || static_cast<uintmax_t>(len) > max_bytes ||
+        std::unique_ptr<AAsset, decltype(&AAsset_close)> a(
+            AAssetManager_open(eng->asset_mgr, full.c_str(),
+                               AASSET_MODE_BUFFER),
+            &AAsset_close);
+        if (!a) return reject(AssetReadFailure::kNotFound);
+        const off_t len = AAsset_getLength(a.get());
+        if (len < 0) {
+            return reject(AssetReadFailure::kIo);
+        }
+        if (static_cast<uintmax_t>(len) > max_bytes ||
             static_cast<uintmax_t>(len) > std::numeric_limits<size_t>::max() ||
             static_cast<uintmax_t>(len) >
                 static_cast<uintmax_t>(std::numeric_limits<int>::max())) {
-            AAsset_close(a);
-            return false;
+            return reject(AssetReadFailure::kTooLarge);
         }
         const size_t size = static_cast<size_t>(len);
         out.resize(size);
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+        g_spk_test_last_asset_bytes_allocated = size;
+#endif
         bool ok = true;
         if (size > 0) {
-            const int read = AAsset_read(a, out.data(), size);
+            const int read = AAsset_read(a.get(), out.data(), size);
             ok = read >= 0 && static_cast<size_t>(read) == size;
         }
-        AAsset_close(a);
-        return ok;
+        return ok ? true : reject(AssetReadFailure::kIo);
     }
 #endif
     // Filesystem mode: read asset_dir/<rel_path> — historical ifstream behavior.
@@ -355,17 +460,21 @@ static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
     if (!path.empty() && path.back() != '/') path += '/';
     path += rel_path;
     std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) return false;
+    if (!in) return reject(AssetReadFailure::kNotFound);
     std::streamsize size = in.tellg();
-    if (size < 0) return false;
+    if (size < 0) return reject(AssetReadFailure::kIo);
     const uintmax_t unsigned_size = static_cast<uintmax_t>(size);
     if (unsigned_size > max_bytes ||
         unsigned_size > std::numeric_limits<size_t>::max()) {
-        return false;
+        return reject(AssetReadFailure::kTooLarge);
     }
     in.seekg(0, std::ios::beg);
     out.resize(static_cast<size_t>(size));
-    if (size > 0 && !in.read(out.data(), size)) return false;
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+    g_spk_test_last_asset_bytes_allocated = static_cast<size_t>(size);
+#endif
+    if (size > 0 && !in.read(out.data(), size))
+        return reject(AssetReadFailure::kIo);
     return true;
 }
 
@@ -411,8 +520,15 @@ static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) 
     }
     std::vector<char> buf;
     std::string rel = std::string("profiles/") + id + ".json";
-    if (!spk_read_asset(eng, rel, buf))
+    AssetReadFailure read_failure = AssetReadFailure::kNone;
+    if (!spk_read_asset(eng, rel, buf, spk::json::kMaxInputBytes,
+                        &read_failure)) {
+        if (read_failure == AssetReadFailure::kTooLarge) {
+            throw ProfileInvalid("profile '" + id +
+                                 "': JSON input exceeds 1 MiB limit");
+        }
         throw ProfileAssetNotFound("spektra: cannot read profile asset " + rel);
+    }
     spk::Profile parsed;
     try {
         parsed = spk::load_profile_string(std::string(buf.data(), buf.size()));
@@ -1110,6 +1226,695 @@ bool valid_preprocess_geometry(const spk_image* image,
                          std::numeric_limits<std::size_t>::max() / 3u);
 }
 
+struct PointwiseDynamicParameters {
+    float film_exposure_multiplier = 1.0f;
+    float film_coupler_shift = 0.0f;
+    float film_coupler_matrix[9]{};
+    float print_midgray = 1.0f;
+    float print_exposure_multiplier = 1.0f;
+    float scan_xyz_to_rgb[9]{};
+};
+
+bool pointwise_checked_float(double value, float* out) noexcept {
+    if (!out || !std::isfinite(value)) return false;
+    const float converted = static_cast<float>(value);
+    if (!std::isfinite(converted)) return false;
+    *out = converted;
+    return true;
+}
+
+bool pointwise_finite(const std::vector<float>& values) noexcept {
+    for (float value : values)
+        if (!std::isfinite(value)) return false;
+    return true;
+}
+
+bool pointwise_strict_axis(const std::vector<float>& axis,
+                           uint32_t points) noexcept {
+    if (points < 2 || axis.size() != static_cast<size_t>(points) * 3u ||
+        !pointwise_finite(axis)) {
+        return false;
+    }
+    for (uint32_t row = 1; row < points; ++row)
+        for (uint32_t channel = 0; channel < 3; ++channel)
+            if (!(axis[static_cast<size_t>(row - 1u) * 3u + channel] <
+                  axis[static_cast<size_t>(row) * 3u + channel])) {
+                return false;
+            }
+    return true;
+}
+
+bool pointwise_same_bytes(const std::vector<float>& a,
+                          const std::vector<float>& b) noexcept {
+    return a.size() == b.size() &&
+           (a.empty() ||
+            std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
+bool pointwise_same_tables(
+    const spk_engine::PointwisePreparedTables& a,
+    const spk_engine::PointwisePreparedTables& b) noexcept {
+    return a.tc_edge == b.tc_edge &&
+           a.film_curve_points == b.film_curve_points &&
+           a.print_curve_points == b.print_curve_points &&
+           pointwise_same_bytes(a.tc_lut, b.tc_lut) &&
+           pointwise_same_bytes(a.develop_axis, b.develop_axis) &&
+           pointwise_same_bytes(a.develop_curve, b.develop_curve) &&
+           pointwise_same_bytes(a.dir_axis, b.dir_axis) &&
+           pointwise_same_bytes(a.dir_curve, b.dir_curve) &&
+           pointwise_same_bytes(a.print_dye, b.print_dye) &&
+           pointwise_same_bytes(a.print_illuminant_sensitivity,
+                                b.print_illuminant_sensitivity) &&
+           pointwise_same_bytes(a.paper_axis, b.paper_axis) &&
+           pointwise_same_bytes(a.paper_curve, b.paper_curve) &&
+           pointwise_same_bytes(a.scan_dye, b.scan_dye) &&
+           pointwise_same_bytes(a.scan_illuminant_cmf,
+                                b.scan_illuminant_cmf);
+}
+
+// The lower-level Vulkan table cache is process-global, so opaque generations
+// must be unique across every engine instance and engine recreation. Zero is a
+// permanent exhausted sentinel: after UINT64_MAX no token is ever reused.
+std::atomic<uint64_t> g_pointwise_next_generation{1};
+
+uint64_t allocate_pointwise_generation() noexcept {
+    uint64_t current =
+        g_pointwise_next_generation.load(std::memory_order_relaxed);
+    while (current != 0) {
+        const uint64_t next =
+            current == std::numeric_limits<uint64_t>::max() ? 0 : current + 1;
+        if (g_pointwise_next_generation.compare_exchange_weak(
+                current, next, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return current;
+        }
+    }
+    return 0;
+}
+
+std::shared_ptr<const spk_engine::PointwisePreparedTables>
+cache_pointwise_tables(spk_engine* eng,
+                       spk_engine::PointwisePreparedTables candidate,
+                       bool* cache_hit) {
+    auto fresh = std::make_shared<spk_engine::PointwisePreparedTables>(
+        std::move(candidate));
+    std::lock_guard<std::mutex> lock(eng->pointwise_cache_mutex);
+    if (eng->pointwise_prepared &&
+        pointwise_same_tables(*eng->pointwise_prepared, *fresh)) {
+        ++eng->pointwise_cache_hits;
+        if (cache_hit) *cache_hit = true;
+        return eng->pointwise_prepared;
+    }
+    fresh->generation = allocate_pointwise_generation();
+    if (fresh->generation == 0) return {};
+    eng->pointwise_prepared = fresh;
+    ++eng->pointwise_cache_misses;
+    if (cache_hit) *cache_hit = false;
+    return fresh;
+}
+
+bool build_pointwise_tables(
+    const spk::Profile& film, const spk::Profile& paper,
+    const spk::NdArray& tc_lut, const spk::FilmingParams& fparams,
+    const spk::PrintingParams& pparams,
+    const spk::ViewingIlluminant& viewing,
+    spk_engine::PointwisePreparedTables* tables,
+    PointwiseDynamicParameters* dynamic) {
+    constexpr int kBands = 81;
+    constexpr int kMaxTcEdge = 1024;
+    constexpr int kMaxCurvePoints = 65536;
+    if (!tables || !dynamic || film.n_samples != kBands ||
+        paper.n_samples != kBands || film.n_density_pts < 2 ||
+        paper.n_density_pts < 2 || film.n_density_pts > kMaxCurvePoints ||
+        paper.n_density_pts > kMaxCurvePoints ||
+        film.channel_density.size() != static_cast<size_t>(kBands) * 3u ||
+        film.base_density.size() != static_cast<size_t>(kBands) ||
+        film.log_exposure.size() != static_cast<size_t>(film.n_density_pts) ||
+        film.density_curves.size() !=
+            static_cast<size_t>(film.n_density_pts) * 3u ||
+        paper.channel_density.size() != static_cast<size_t>(kBands) * 3u ||
+        paper.base_density.size() != static_cast<size_t>(kBands) ||
+        paper.log_sensitivity.size() != static_cast<size_t>(kBands) * 3u ||
+        paper.log_exposure.size() != static_cast<size_t>(paper.n_density_pts) ||
+        paper.density_curves.size() !=
+            static_cast<size_t>(paper.n_density_pts) * 3u ||
+        !viewing.spectrum || !viewing.xyz_to_rgb ||
+        !std::isfinite(viewing.normalization) || viewing.normalization == 0.0 ||
+        tc_lut.shape.size() != 3 || tc_lut.shape[0] < 2 ||
+        tc_lut.shape[0] > kMaxTcEdge || tc_lut.shape[1] != tc_lut.shape[0] ||
+        tc_lut.shape[2] != 3) {
+        return false;
+    }
+    const int edge = tc_lut.shape[0];
+    const size_t tc_count = static_cast<size_t>(edge) * edge * 3u;
+    if (tc_lut.data.size() != tc_count) return false;
+
+    tables->tc_edge = static_cast<uint32_t>(edge);
+    tables->film_curve_points = static_cast<uint32_t>(film.n_density_pts);
+    tables->print_curve_points = static_cast<uint32_t>(paper.n_density_pts);
+    tables->tc_lut.resize(tc_count);
+    for (size_t i = 0; i < tc_count; ++i)
+        if (!pointwise_checked_float(tc_lut.data[i], &tables->tc_lut[i]))
+            return false;
+
+    const int film_points = film.n_density_pts;
+    const size_t film_curve_count = static_cast<size_t>(film_points) * 3u;
+    tables->develop_curve.resize(film_curve_count);
+    spk::normalize_density_curves(film.density_curves.data(), film_points,
+                                  tables->develop_curve.data());
+    tables->develop_axis.resize(film_curve_count);
+    for (int row = 0; row < film_points; ++row) {
+        if (!std::isfinite(film.log_exposure[static_cast<size_t>(row)]))
+            return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            const float gamma = fparams.density_curve_gamma[channel];
+            if (!std::isfinite(gamma) || gamma == 0.0f) return false;
+            tables->develop_axis[static_cast<size_t>(row) * 3u + channel] =
+                film.log_exposure[static_cast<size_t>(row)] / gamma;
+        }
+    }
+    if (!pointwise_finite(tables->develop_curve) ||
+        !pointwise_strict_axis(tables->develop_axis,
+                               tables->film_curve_points)) {
+        return false;
+    }
+
+    double matrix[9]{};
+    if (fparams.dir_couplers.active)
+        spk::compute_dir_couplers_matrix(fparams.dir_couplers, matrix);
+    for (int i = 0; i < 9; ++i)
+        if (!pointwise_checked_float(matrix[i],
+                                     &dynamic->film_coupler_matrix[i]))
+            return false;
+    if (!pointwise_checked_float(
+            fparams.dir_couplers.active
+                ? fparams.dir_couplers.high_exposure_couplers_shift
+                : 0.0,
+            &dynamic->film_coupler_shift)) {
+        return false;
+    }
+    tables->dir_axis = tables->develop_axis;
+    tables->dir_curve.resize(film_curve_count);
+    if (!fparams.dir_couplers.active) {
+        tables->dir_curve = tables->develop_curve;
+    } else {
+        std::vector<double> exposure(static_cast<size_t>(film_points));
+        std::vector<double> shifted(static_cast<size_t>(film_points));
+        std::vector<double> values(static_cast<size_t>(film_points));
+        std::vector<double> interpolated(static_cast<size_t>(film_points));
+        for (int row = 0; row < film_points; ++row)
+            exposure[static_cast<size_t>(row)] =
+                static_cast<double>(film.log_exposure[static_cast<size_t>(row)]);
+        for (int channel = 0; channel < 3; ++channel) {
+            for (int row = 0; row < film_points; ++row) {
+                double amount = 0.0;
+                for (int donor = 0; donor < 3; ++donor)
+                    amount += static_cast<double>(tables->develop_curve[
+                                  static_cast<size_t>(row) * 3u + donor]) *
+                              matrix[donor * 3 + channel];
+                shifted[static_cast<size_t>(row)] =
+                    exposure[static_cast<size_t>(row)] - amount;
+                values[static_cast<size_t>(row)] =
+                    static_cast<double>(tables->develop_curve[
+                        static_cast<size_t>(row) * 3u + channel]);
+            }
+            spk::np_interp_array(exposure.data(), film_points, shifted.data(),
+                                 values.data(), film_points,
+                                 interpolated.data());
+            for (int row = 0; row < film_points; ++row)
+                if (!pointwise_checked_float(
+                        interpolated[static_cast<size_t>(row)],
+                        &tables->dir_curve[static_cast<size_t>(row) * 3u +
+                                           channel])) {
+                    return false;
+                }
+        }
+    }
+    if (!pointwise_finite(tables->dir_curve) ||
+        !pointwise_strict_axis(tables->dir_axis,
+                               tables->film_curve_points)) {
+        return false;
+    }
+
+    std::vector<double> sensitivity(static_cast<size_t>(kBands) * 3u);
+    for (int band = 0; band < kBands; ++band)
+        for (int channel = 0; channel < 3; ++channel) {
+            double value = std::pow(
+                10.0, static_cast<double>(paper.log_sensitivity[
+                          static_cast<size_t>(band) * 3u + channel]));
+            if (std::isnan(value)) value = 0.0;
+            if (!std::isfinite(value)) return false;
+            sensitivity[static_cast<size_t>(band) * 3u + channel] = value;
+        }
+
+    tables->print_dye.assign(static_cast<size_t>(kBands) * 3u, 0.0f);
+    tables->print_illuminant_sensitivity.assign(
+        static_cast<size_t>(kBands) * 3u, 0.0f);
+    for (int band = 0; band < kBands; ++band) {
+        const float* density =
+            film.channel_density.data() + static_cast<size_t>(band) * 3u;
+        const float base = film.base_density[static_cast<size_t>(band)];
+        const double illuminant = pparams.filtered_illuminant[band];
+        if (std::isnan(base) || std::isnan(illuminant) ||
+            std::isnan(density[0]) || std::isnan(density[1]) ||
+            std::isnan(density[2])) {
+            continue;  // sanctioned spectral NaN band: the CPU zeros its light
+        }
+        if (!std::isfinite(base) || !std::isfinite(illuminant)) return false;
+        const double weight =
+            std::pow(10.0, -static_cast<double>(base)) * illuminant;
+        if (!std::isfinite(weight)) return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            if (!std::isfinite(density[channel])) return false;
+            tables->print_dye[static_cast<size_t>(band) * 3u + channel] =
+                density[channel];
+            if (!pointwise_checked_float(
+                    weight * sensitivity[static_cast<size_t>(band) * 3u +
+                                         channel],
+                    &tables->print_illuminant_sensitivity[
+                        static_cast<size_t>(band) * 3u + channel])) {
+                return false;
+            }
+        }
+    }
+
+    const int paper_points = paper.n_density_pts;
+    const size_t paper_curve_count = static_cast<size_t>(paper_points) * 3u;
+    tables->paper_curve.assign(paper.density_curves.begin(),
+                               paper.density_curves.end());
+    tables->paper_axis.resize(paper_curve_count);
+    for (int row = 0; row < paper_points; ++row) {
+        if (!std::isfinite(paper.log_exposure[static_cast<size_t>(row)]))
+            return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            const float gamma = pparams.density_curve_gamma[channel];
+            if (!std::isfinite(gamma) || gamma == 0.0f) return false;
+            tables->paper_axis[static_cast<size_t>(row) * 3u + channel] =
+                paper.log_exposure[static_cast<size_t>(row)] / gamma;
+        }
+    }
+    if (!pointwise_finite(tables->paper_curve) ||
+        !pointwise_strict_axis(tables->paper_axis,
+                               tables->print_curve_points)) {
+        return false;
+    }
+
+    tables->scan_dye.assign(static_cast<size_t>(kBands) * 3u, 0.0f);
+    tables->scan_illuminant_cmf.assign(static_cast<size_t>(kBands) * 3u,
+                                       0.0f);
+    const double inverse_normalization = 1.0 / viewing.normalization;
+    for (int band = 0; band < kBands; ++band) {
+        const float* density =
+            paper.channel_density.data() + static_cast<size_t>(band) * 3u;
+        const float base = paper.base_density[static_cast<size_t>(band)];
+        if (std::isnan(base) || std::isnan(density[0]) ||
+            std::isnan(density[1]) || std::isnan(density[2])) {
+            continue;  // sanctioned spectral NaN band
+        }
+        const double illuminant =
+            static_cast<double>(viewing.spectrum[band]);
+        if (!std::isfinite(base) || !std::isfinite(illuminant)) return false;
+        const double weight = std::pow(10.0, -static_cast<double>(base)) *
+                              illuminant * inverse_normalization;
+        if (!std::isfinite(weight)) return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            if (!std::isfinite(density[channel]) ||
+                !std::isfinite(spk::kCieCmf1931[band][channel])) {
+                return false;
+            }
+            tables->scan_dye[static_cast<size_t>(band) * 3u + channel] =
+                density[channel];
+            if (!pointwise_checked_float(
+                    weight * static_cast<double>(
+                                 spk::kCieCmf1931[band][channel]),
+                    &tables->scan_illuminant_cmf[
+                        static_cast<size_t>(band) * 3u + channel])) {
+                return false;
+            }
+        }
+    }
+
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column) {
+            double value = 0.0;
+            for (int inner = 0; inner < 3; ++inner)
+                value += spk::kRGB_to_RGB_CCTF[SPK_CS_SRGB]
+                                                    [row * 3 + inner] *
+                         viewing.xyz_to_rgb[SPK_CS_SRGB]
+                                           [inner * 3 + column];
+            if (!pointwise_checked_float(
+                    value, &dynamic->scan_xyz_to_rgb[row * 3 + column])) {
+                return false;
+            }
+        }
+    return pointwise_checked_float(pparams.exposure_factor_midgray,
+                                   &dynamic->print_midgray) &&
+           pointwise_checked_float(
+               pparams.print_exposure * pparams.bw_exposure_correction,
+               &dynamic->print_exposure_multiplier) &&
+           pointwise_finite(tables->print_dye) &&
+           pointwise_finite(tables->print_illuminant_sensitivity) &&
+           pointwise_finite(tables->scan_dye) &&
+           pointwise_finite(tables->scan_illuminant_cmf);
+}
+
+spk::ScanningParams build_print_scanning_params(
+    spk_engine* eng, const spk_params* p, bool print_stochastic,
+    const spk::ColorCorrection& bw_corr) {
+    spk::ScanningParams params;
+    params.scan_film = false;
+    params.allow_gpu = (p->allow_gpu_scan != 0);
+    params.output_color_space = p->output_color_space;
+    params.output_cctf_encoding = (p->output_cctf_encoding != 0);
+    params.output_gamut_compress =
+        static_cast<spk::OutputGamutCompress>(p->output_gamut_compress);
+    if (print_stochastic && p->print_glare_active != 0) {
+        params.glare_active = true;
+        params.glare_percent = p->print_glare_percent;
+        params.glare_roughness = p->print_glare_roughness;
+        params.glare_blur = p->print_glare_blur;
+    }
+    params.lens_blur = static_cast<double>(p->scanner_lens_blur);
+    params.unsharp_sigma = p->scanner_unsharp[0];
+    params.unsharp_amount = p->scanner_unsharp[1];
+    if (p->use_scanner_lut != 0) {
+        params.use_lut = true;
+        params.lut_resolution = p->lut_resolution;
+        params.lut_cache = &eng->lut_cache;
+    }
+    params.tone_curve = build_tone_curve_set(p);
+    if (bw_corr.active) {
+        params.bw_xyz_correction = true;
+        params.bw_xyz_m = bw_corr.m;
+        params.bw_xyz_q = bw_corr.q;
+    }
+    return params;
+}
+
+const char* pointwise_route_ineligibility(
+    const spk_params* p, const spk::Profile& film,
+    const spk::Profile& paper, const spk::NdArray& tc_lut,
+    const spk::FilmingParams& fparams,
+    const spk::PrintingParams& pparams,
+    const spk::ScanningParams& sparams, std::vector<float>* final_rgb,
+    std::vector<float>* tap_log_raw,
+    std::vector<float>* tap_film_density_cmy,
+    std::vector<float>* tap_print_density_cmy, int npix) noexcept {
+    if (p->allow_gpu_scan == 0) return "not_requested";
+    if (!final_rgb) return "no_final_output";
+    if (tap_log_raw || tap_film_density_cmy || tap_print_density_cmy)
+        return "debug_tap";
+    if (npix <= 0 || static_cast<uint64_t>(npix) > UINT32_MAX)
+        return "invalid_dimensions";
+    if (p->rgb_to_raw_method != SPK_RGB2RAW_HANATOS2025)
+        return "rgb_to_raw_method";
+    if (!film.is_negative()) return "film_not_negative";
+    if (film.n_samples != 81 || paper.n_samples != 81)
+        return "profile_spectral_shape";
+    if (tc_lut.shape.size() != 3 || tc_lut.shape[0] < 2 ||
+        tc_lut.shape[0] != tc_lut.shape[1] || tc_lut.shape[2] != 3)
+        return "tc_lut_shape";
+    if (!std::isfinite(fparams.dir_couplers.diffusion_size_um) ||
+        fparams.dir_couplers.diffusion_size_um > 0.0)
+        return "dir_diffusion";
+    if (fparams.grain.active) return "grain";
+    if (fparams.halation.active) return "halation";
+    if (fparams.halation.boost_ev > 0.0) return "highlight_boost";
+    if (fparams.diffusion_filter.active) return "camera_diffusion";
+    if (fparams.lens_blur_um > 0.0) return "camera_lens_blur";
+    if (fparams.bw_exposure_correction != 1.0)
+        return "film_bw_correction";
+    if (pparams.diffusion_filter.active) return "print_diffusion";
+    if (pparams.morph.active) return "print_morph";
+    if (pparams.preflash_exposure > 0.0) return "preflash";
+    if (pparams.bw_exposure_correction != 1.0 ||
+        sparams.bw_xyz_correction)
+        return "scan_bw_correction";
+    if (sparams.scan_film) return "scan_film";
+    if (sparams.glare_active && sparams.glare_percent > 0.0f)
+        return "scan_glare";
+    if (sparams.output_gamut_compress !=
+        spk::OutputGamutCompress::kLegacyClip)
+        return "output_gamut";
+    if (sparams.lens_blur > 0.0 ||
+        (sparams.unsharp_sigma > 0.0 && sparams.unsharp_amount > 0.0))
+        return "scan_spatial";
+    if (sparams.output_color_space != SPK_CS_SRGB ||
+        !sparams.output_cctf_encoding)
+        return "output_encoding";
+    return nullptr;
+}
+
+void note_pointwise_diagnostics(
+    bool requested, bool attempted, const char* reason,
+    const spk::gpu::PointwiseChainDiagnostics& diagnostics = {}) {
+    spk::stage_timing_note_gpu_pointwise(
+        requested, attempted, diagnostics.engaged,
+        reason ? reason : spk::gpu::pointwise_fallback_reason_name(
+                              diagnostics.fallback_reason),
+        diagnostics.dispatches, diagnostics.input_uploads,
+        diagnostics.final_readbacks, diagnostics.interstage_host_bytes,
+        diagnostics.pipeline_creates, diagnostics.buffer_allocations,
+        diagnostics.static_upload_bytes);
+}
+
+bool pointwise_test_fault(int fault) noexcept {
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+    return g_spk_test_pointwise_fault == fault;
+#else
+    (void)fault;
+    return false;
+#endif
+}
+
+spk_engine::PointwiseCapabilityKey make_pointwise_capability_key(
+    uint64_t generation, const PointwiseDynamicParameters& dynamic,
+    bool direct, double input_gain) noexcept {
+    // Bump whenever the embedded lattice/oracle contract changes. The shader
+    // binaries and driver/device are bound by the lifetime of this process.
+    constexpr uint32_t kSelfTestRevision = 1;
+    spk_engine::PointwiseCapabilityKey key;
+    key.revision = kSelfTestRevision;
+    key.source_flags = direct ? 1u : 0u;
+    key.generation = generation;
+    std::memcpy(&key.input_gain_bits, &input_gain, sizeof(input_gain));
+    size_t offset = 0;
+    key.values[offset++] = dynamic.film_exposure_multiplier;
+    key.values[offset++] = dynamic.film_coupler_shift;
+    for (float value : dynamic.film_coupler_matrix)
+        key.values[offset++] = value;
+    key.values[offset++] = dynamic.print_midgray;
+    key.values[offset++] = dynamic.print_exposure_multiplier;
+    for (float value : dynamic.scan_xyz_to_rgb)
+        key.values[offset++] = value;
+    return key;
+}
+
+bool same_pointwise_capability_key(
+    const spk_engine::PointwiseCapabilityKey& a,
+    const spk_engine::PointwiseCapabilityKey& b) noexcept {
+    return a.revision == b.revision &&
+           a.source_flags == b.source_flags &&
+           a.generation == b.generation &&
+           a.input_gain_bits == b.input_gain_bits &&
+           std::memcmp(a.values, b.values, sizeof(a.values)) == 0;
+}
+
+// -2 = cache lock failure, -1 = no cached verdict, 0 = failed, 1 = passed.
+// The mutex protects only the tiny verdict copy and is never held while waiting
+// for the GPU. Catch lock failures internally because this is a fail-closed
+// acceleration seam and must never terminate a noexcept-adjacent C API call.
+int cached_pointwise_capability(
+    spk_engine* eng,
+    const spk_engine::PointwiseCapabilityKey& key) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(eng->pointwise_capability_mutex);
+        if (!eng->pointwise_capability_valid ||
+            !same_pointwise_capability_key(eng->pointwise_capability_key, key)) {
+            return -1;
+        }
+        return eng->pointwise_capability_passed ? 1 : 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+bool store_pointwise_capability(
+    spk_engine* eng, const spk_engine::PointwiseCapabilityKey& key,
+    bool passed) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(eng->pointwise_capability_mutex);
+        eng->pointwise_capability_key = key;
+        eng->pointwise_capability_passed = passed;
+        eng->pointwise_capability_valid = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+enum class PointwiseSelfTestOutcome : uint8_t {
+    passed,
+    failed,
+    cancelled,
+};
+
+struct PointwiseSelfTestResult {
+    PointwiseSelfTestOutcome outcome = PointwiseSelfTestOutcome::failed;
+    double duration_ms = 0.0;
+    uint32_t chain_runs = 0;
+    spk::gpu::PointwiseChainDiagnostics totals{};
+};
+
+void add_pointwise_self_test_diagnostics(
+    PointwiseSelfTestResult* result,
+    const spk::gpu::PointwiseChainDiagnostics& diagnostics) noexcept {
+    result->totals.dispatches += diagnostics.dispatches;
+    result->totals.input_uploads += diagnostics.input_uploads;
+    result->totals.final_readbacks += diagnostics.final_readbacks;
+    result->totals.interstage_host_bytes += diagnostics.interstage_host_bytes;
+    result->totals.pipeline_creates += diagnostics.pipeline_creates;
+    result->totals.buffer_allocations += diagnostics.buffer_allocations;
+    result->totals.static_upload_bytes += diagnostics.static_upload_bytes;
+    if (diagnostics.fallback_reason !=
+        spk::gpu::PointwiseFallbackReason::none) {
+        result->totals.fallback_reason = diagnostics.fallback_reason;
+    }
+}
+
+PointwiseSelfTestResult run_pointwise_capability_check(
+    const spk::gpu::PointwiseChainRequest& live_request,
+    const spk::Profile& film, const spk::Profile& paper,
+    const spk::NdArray& tc_lut,
+    const spk::FilmingParams& fparams,
+    const spk::PrintingParams& pparams,
+    const spk::ScanningParams& sparams, bool direct, double direct_gain,
+    spk_cancel_check cancel, void* cancel_user_data) {
+    constexpr uint32_t kPixels = 8u * 8u * 8u;
+    constexpr size_t kComponents = static_cast<size_t>(kPixels) * 3u;
+    static constexpr float kKnots[8] = {
+        -0.125f, 0.0f, 0.01f, 0.18f, 0.5f, 1.0f, 2.0f, 4.0f};
+    PointwiseSelfTestResult result;
+    const auto started = std::chrono::steady_clock::now();
+    const auto finish = [&result, started](PointwiseSelfTestOutcome outcome) {
+        result.outcome = outcome;
+        result.duration_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        return result;
+    };
+
+    std::array<float, kComponents> input{};
+    size_t pixel = 0;
+    for (float r : kKnots)
+        for (float g : kKnots)
+            for (float b : kKnots) {
+                input[pixel * 3u + 0u] = r;
+                input[pixel * 3u + 1u] = g;
+                input[pixel * 3u + 2u] = b;
+                ++pixel;
+            }
+
+    spk::gpu::PointwiseChainRequest request = live_request;
+    request.input_rgb = input.data();
+    request.input_component_count = kComponents;
+    request.pixel_count = kPixels;
+    std::array<float, kComponents> first{};
+    std::array<float, kComponents> repeat{};
+    for (uint32_t run = 0; run < 3; ++run) {
+        if (cancellation_requested(cancel, cancel_user_data))
+            return finish(PointwiseSelfTestOutcome::cancelled);
+        float* destination = run == 0 ? first.data() : repeat.data();
+        spk::gpu::PointwiseChainOutput output{destination, kComponents};
+        spk::gpu::PointwiseChainDiagnostics diagnostics{};
+        ++result.chain_runs;
+        if (!spk::gpu::render_pointwise_chain(request, &output,
+                                              &diagnostics)) {
+            add_pointwise_self_test_diagnostics(&result, diagnostics);
+            return finish(PointwiseSelfTestOutcome::failed);
+        }
+        add_pointwise_self_test_diagnostics(&result, diagnostics);
+        if (run != 0 &&
+            std::memcmp(first.data(), repeat.data(), sizeof(first)) != 0) {
+            return finish(PointwiseSelfTestOutcome::failed);
+        }
+        if (cancellation_requested(cancel, cancel_user_data))
+            return finish(PointwiseSelfTestOutcome::cancelled);
+    }
+
+    const double gain = direct ? direct_gain : 1.0;
+    if (!std::isfinite(gain))
+        return finish(PointwiseSelfTestOutcome::failed);
+    std::array<float, kComponents> film_log{};
+    std::array<float, kComponents> film_density{};
+    std::array<float, kComponents> print_log{};
+    std::array<float, kComponents> print_density{};
+    std::array<float, kComponents> cpu_rgb{};
+    try {
+        spk::ScopedStageTimingSuppression suppress_product_stage_slots;
+        // Use only the direct CPU stages. expose_f32_gain with gain=1 exactly
+        // represents the already-materialized source; the direct source folds
+        // its measured gain once, matching the live GPU request.
+        spk::expose_f32_gain(input.data(), gain, static_cast<int>(kPixels), 1,
+                             fparams, tc_lut, film_log.data());
+        spk::develop(film_log.data(), static_cast<int>(kPixels), 1, film,
+                     fparams, film_density.data());
+        spk::PrintingParams cpu_print = pparams;
+        cpu_print.allow_gpu = false;
+        cpu_print.use_enlarger_lut = false;
+        cpu_print.lut_cache = nullptr;
+        spk::print_expose(film, paper, cpu_print, film_density.data(),
+                          static_cast<int>(kPixels), 1, print_log.data());
+        spk::print_develop(paper, cpu_print, print_log.data(),
+                           static_cast<int>(kPixels), print_density.data());
+        spk::ScanningParams cpu_scan = sparams;
+        cpu_scan.allow_gpu = false;
+        cpu_scan.use_lut = false;
+        cpu_scan.lut_cache = nullptr;
+        cpu_scan.tone_curve.active = false;
+        spk::scan(paper, cpu_scan, print_density.data(),
+                  static_cast<int>(kPixels), 1, cpu_rgb.data());
+    } catch (const spk::ParallelCancelled&) {
+        return finish(PointwiseSelfTestOutcome::cancelled);
+    } catch (...) {
+        return finish(PointwiseSelfTestOutcome::failed);
+    }
+    if (cancellation_requested(cancel, cancel_user_data))
+        return finish(PointwiseSelfTestOutcome::cancelled);
+
+    double max_abs = 0.0;
+    double squared = 0.0;
+    for (size_t i = 0; i < kComponents; ++i) {
+        if (!std::isfinite(first[i]) || !std::isfinite(cpu_rgb[i])) {
+            return finish(PointwiseSelfTestOutcome::failed);
+        }
+        const double difference = std::fabs(
+            static_cast<double>(first[i]) -
+            static_cast<double>(cpu_rgb[i]));
+        max_abs = std::max(max_abs, difference);
+        squared += difference * difference;
+    }
+    const double rms = std::sqrt(squared / static_cast<double>(kComponents));
+    if (max_abs > 1e-4 || rms > 1e-5)
+        return finish(PointwiseSelfTestOutcome::failed);
+    return finish(PointwiseSelfTestOutcome::passed);
+}
+
+void note_pointwise_self_test(
+    const char* state,
+    const PointwiseSelfTestResult* result = nullptr) noexcept {
+    const spk::gpu::PointwiseChainDiagnostics empty{};
+    const spk::gpu::PointwiseChainDiagnostics& totals =
+        result ? result->totals : empty;
+    spk::stage_timing_note_gpu_pointwise_self_test(
+        state, result ? result->duration_ms : 0.0,
+        result ? result->chain_runs : 0, totals.dispatches,
+        totals.input_uploads, totals.final_readbacks,
+        totals.interstage_host_bytes, totals.pipeline_creates,
+        totals.buffer_allocations, totals.static_upload_bytes);
+}
+
 // Run the scan_film pipeline, producing display RGB plus the intermediate taps.
 // `tap_*` pointers, when non-null, receive the corresponding intermediate.
 spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params* p,
@@ -1499,17 +2304,22 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     }
     const std::string film_stock  = !film.stock.empty() ? film.stock : p->film_profile;
     const std::string print_stock = !prnt.stock.empty() ? prnt.stock : p->print_profile;
-    double neutral_cc[3];
+    // Resolver failure is failure-atomic, so initialize the schema fallback
+    // before either the asset read or JSON/key lookup can fail.
+    double neutral_cc[3] = {0.0, 0.0, 0.0};
     if (p->neutral_print_filters_from_database) {
         // Read neutral_print_filters.json via the asset abstraction (FS or AAsset),
         // then resolve from the in-memory bytes. A missing/unreadable asset yields
         // defaults {0,0,0}, mirroring the Python FileNotFoundError branch.
         spk::ScopedStage _t(spk::STG_PRINT_DIGEST);
         std::vector<char> nf;
-        if (spk_read_asset(eng, kNeutralFiltersRel, nf)) {
-            spk::resolve_neutral_cc_string(std::string(nf.data(), nf.size()),
-                                           print_stock, illuminant, film_stock,
-                                           neutral_cc);
+        if (spk_read_asset(eng, kNeutralFiltersRel, nf,
+                           spk::json::kMaxInputBytes)) {
+            if (!pointwise_test_fault(6)) {
+                (void)spk::resolve_neutral_cc_string(
+                    std::string(nf.data(), nf.size()), print_stock, illuminant,
+                    film_stock, neutral_cc);
+            }
         } else {
             neutral_cc[0] = neutral_cc[1] = neutral_cc[2] = 0.0;
         }
@@ -1695,6 +2505,324 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     fparams.halation.boost_ev = p->halation_boost_ev;
     fparams.halation.boost_range = p->halation_boost_range;
     fparams.halation.protect_ev = p->halation_protect_ev;
+    // Build scan settings before the film memo so the conservative resident
+    // route can prove that its three shaders cover the whole requested frame.
+    // The same object is reused unchanged by the CPU fallback below.
+    spk::ScanningParams sparams = build_print_scanning_params(
+        eng, p, print_stochastic, bw_corr);
+
+    const char* pointwise_ineligible = pointwise_route_ineligibility(
+        p, film, prnt, tc_lut, fparams, pparams, sparams, final_rgb,
+        tap_log_raw, tap_film_density_cmy, tap_print_density_cmy, npix);
+    if (pointwise_ineligible) {
+        note_pointwise_diagnostics(p->allow_gpu_scan != 0, false,
+                                   pointwise_ineligible);
+    } else {
+        // Any failure after full-chain eligibility disables both legacy partial
+        // GPU stages for this same CPU fallback frame.
+        bool pointwise_failed = false;
+        const char* preparation_failure = nullptr;
+        if (pointwise_test_fault(2) ||
+            cancellation_requested(cancel, cancel_user_data)) {
+            note_pointwise_diagnostics(true, false, "cancelled_before_prepare");
+            return SPK_ERR_CANCELLED;
+        }
+
+        bool pointwise_gpu_available = false;
+        try {
+            pointwise_gpu_available = spk::gpu::available();
+        } catch (...) {
+            pointwise_gpu_available = false;
+        }
+        if (!pointwise_gpu_available) {
+            note_pointwise_diagnostics(true, false, "unavailable");
+            pointwise_failed = true;
+        } else {
+          std::shared_ptr<const spk_engine::PointwisePreparedTables> prepared;
+          PointwiseDynamicParameters dynamic;
+          std::vector<float> materialized_input;
+          const float* pointwise_input = nullptr;
+          try {
+            const spk::ViewingIlluminant* viewing =
+                prnt.resolved_viewing_illuminant;
+            if (!viewing) {
+                viewing = &spk::require_viewing_illuminant(
+                    prnt.viewing_illuminant);
+            }
+            spk_engine::PointwisePreparedTables candidate;
+            if (!build_pointwise_tables(film, prnt, tc_lut, fparams, pparams,
+                                        *viewing, &candidate, &dynamic)) {
+                preparation_failure = "table_validation";
+            } else {
+                bool cache_hit = false;
+                prepared = cache_pointwise_tables(eng, std::move(candidate),
+                                                   &cache_hit);
+                (void)cache_hit;
+                if (!prepared) preparation_failure = "generation_exhausted";
+            }
+
+            double exposure_multiplier =
+                std::pow(2.0, fparams.exposure_compensation_ev);
+            if (pin.direct) exposure_multiplier *= pin.gain;
+            if (!preparation_failure &&
+                !pointwise_checked_float(
+                    exposure_multiplier,
+                    &dynamic.film_exposure_multiplier)) {
+                preparation_failure = "exposure_validation";
+            }
+
+          } catch (const std::bad_alloc&) {
+            preparation_failure = "allocation_failed";
+          } catch (const std::exception&) {
+            preparation_failure = "table_validation";
+          }
+
+          if (preparation_failure) {
+            note_pointwise_diagnostics(true, false, preparation_failure);
+            pointwise_failed = true;
+          } else if (pointwise_test_fault(3) ||
+                     cancellation_requested(cancel, cancel_user_data)) {
+            note_pointwise_diagnostics(true, false,
+                                       "cancelled_before_dispatch");
+            return SPK_ERR_CANCELLED;
+          } else {
+            const size_t component_count = static_cast<size_t>(npix) * 3u;
+            spk::gpu::PointwiseChainRequest request{};
+            request.input_rgb = pointwise_input;
+            request.input_component_count = component_count;
+            request.pixel_count = static_cast<uint32_t>(npix);
+            request.static_table_key = prepared->generation;
+            request.film.tc_lut = {prepared->tc_lut.data(),
+                                   prepared->tc_lut.size()};
+            request.film.tc_edge = prepared->tc_edge;
+            request.film.develop_axis = {prepared->develop_axis.data(),
+                                         prepared->develop_axis.size()};
+            request.film.develop_curve = {prepared->develop_curve.data(),
+                                          prepared->develop_curve.size()};
+            request.film.dir_axis = {prepared->dir_axis.data(),
+                                     prepared->dir_axis.size()};
+            request.film.dir_curve = {prepared->dir_curve.data(),
+                                      prepared->dir_curve.size()};
+            request.film.curve_points = prepared->film_curve_points;
+            request.film.exposure_multiplier =
+                dynamic.film_exposure_multiplier;
+            request.film.coupler_shift = dynamic.film_coupler_shift;
+            std::memcpy(request.film.coupler_matrix,
+                        dynamic.film_coupler_matrix,
+                        sizeof(request.film.coupler_matrix));
+            request.print.dye = {prepared->print_dye.data(),
+                                 prepared->print_dye.size()};
+            request.print.illuminant_sensitivity = {
+                prepared->print_illuminant_sensitivity.data(),
+                prepared->print_illuminant_sensitivity.size()};
+            request.print.paper_axis = {prepared->paper_axis.data(),
+                                        prepared->paper_axis.size()};
+            request.print.paper_curve = {prepared->paper_curve.data(),
+                                         prepared->paper_curve.size()};
+            request.print.curve_points = prepared->print_curve_points;
+            request.print.midgray = dynamic.print_midgray;
+            request.print.exposure_multiplier =
+                dynamic.print_exposure_multiplier;
+            request.scan.dye = {prepared->scan_dye.data(),
+                                prepared->scan_dye.size()};
+            request.scan.illuminant_cmf = {
+                prepared->scan_illuminant_cmf.data(),
+                prepared->scan_illuminant_cmf.size()};
+            std::memcpy(request.scan.xyz_to_rgb, dynamic.scan_xyz_to_rgb,
+                        sizeof(request.scan.xyz_to_rgb));
+
+            // Full-frame conversion/scratch are deferred until the tiny keyed
+            // capability verdict passes. Cached device failures therefore do
+            // not allocate or touch live image planes.
+            std::vector<float> scratch;
+            bool capability_passed = false;
+            if (!pointwise_failed) {
+                const double source_gain = pin.direct ? pin.gain : 1.0;
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+                g_spk_test_pointwise_direct_gain = source_gain;
+#endif
+                const spk_engine::PointwiseCapabilityKey capability_key =
+                    make_pointwise_capability_key(
+                        prepared->generation, dynamic, pin.direct, source_gain);
+                const int cached_capability =
+                    cached_pointwise_capability(eng, capability_key);
+                if (cached_capability == -2) {
+                    note_pointwise_self_test("not_run");
+                    note_pointwise_diagnostics(
+                        true, false, "capability_cache_failed");
+                    pointwise_failed = true;
+                } else if (cached_capability > 0) {
+                    note_pointwise_self_test("cached_pass");
+                    capability_passed = true;
+                } else if (cached_capability == 0) {
+                    // Failed verdicts are retained to avoid repeatedly running
+                    // known-bad device/shader configurations. `not_run` is the
+                    // truthful state for this render; the route reason carries
+                    // the cached failure disposition.
+                    note_pointwise_self_test("not_run");
+                    note_pointwise_diagnostics(
+                        true, false, "capability_check_failed_cached");
+                    pointwise_failed = true;
+                } else {
+                    const PointwiseSelfTestResult self_test =
+                        run_pointwise_capability_check(
+                            request, film, prnt, tc_lut, fparams, pparams,
+                            sparams, pin.direct, source_gain, cancel,
+                            cancel_user_data);
+                    if (self_test.outcome ==
+                        PointwiseSelfTestOutcome::cancelled) {
+                        // Cancellation is not a numeric/device verdict and must
+                        // never poison this exact keyed configuration.
+                        note_pointwise_self_test("ran_fail", &self_test);
+                        note_pointwise_diagnostics(
+                            true, false, "cancelled_during_self_test");
+                        return SPK_ERR_CANCELLED;
+                    }
+                    capability_passed =
+                        self_test.outcome == PointwiseSelfTestOutcome::passed;
+                    note_pointwise_self_test(
+                        capability_passed ? "ran_pass" : "ran_fail",
+                        &self_test);
+                    const bool capability_stored =
+                        store_pointwise_capability(
+                            eng, capability_key, capability_passed);
+                    if (!capability_stored) {
+                        capability_passed = false;
+                        note_pointwise_diagnostics(
+                            true, false, "capability_cache_failed");
+                        pointwise_failed = true;
+                    } else if (!capability_passed) {
+                        note_pointwise_diagnostics(
+                            true, false, "capability_check_failed");
+                        pointwise_failed = true;
+                    }
+                }
+            }
+
+            if (capability_passed && !pointwise_failed) {
+                const char* live_input_failure = nullptr;
+                try {
+                    if (pin.direct) {
+                        for (size_t i = 0; i < component_count; ++i) {
+                            if (!std::isfinite(in->data[i])) {
+                                live_input_failure = "input_nonfinite";
+                                break;
+                            }
+                        }
+                        pointwise_input = in->data;
+                    } else if (pin.rgb.size() != component_count) {
+                        live_input_failure = "input_shape";
+                    } else {
+                        materialized_input.resize(component_count);
+                        for (size_t i = 0; i < component_count; ++i) {
+                            if (!pointwise_checked_float(
+                                    pin.rgb[i], &materialized_input[i])) {
+                                live_input_failure = "input_nonfinite";
+                                break;
+                            }
+                        }
+                        pointwise_input = materialized_input.data();
+                    }
+                    if (!live_input_failure) {
+                        if (pointwise_test_fault(1)) throw std::bad_alloc();
+                        scratch.resize(component_count);
+                    }
+                } catch (const std::bad_alloc&) {
+                    live_input_failure = "allocation_failed";
+                }
+                if (live_input_failure) {
+                    note_pointwise_diagnostics(true, false,
+                                               live_input_failure);
+                    capability_passed = false;
+                    pointwise_failed = true;
+                } else {
+                    request.input_rgb = pointwise_input;
+                }
+            }
+
+            if (capability_passed && !pointwise_failed) {
+                if (cancellation_requested(cancel, cancel_user_data)) {
+                    note_pointwise_diagnostics(
+                        true, false, "cancelled_before_dispatch");
+                    return SPK_ERR_CANCELLED;
+                }
+                spk::gpu::PointwiseChainOutput output{scratch.data(),
+                                                      scratch.size()};
+                spk::gpu::PointwiseChainDiagnostics diagnostics{};
+                bool rendered = false;
+                if (pointwise_test_fault(5)) {
+                    diagnostics.fallback_reason =
+                        spk::gpu::PointwiseFallbackReason::dispatch_failed;
+                } else {
+                    rendered = spk::gpu::render_pointwise_chain(
+                        request, &output, &diagnostics);
+                }
+                // Poll immediately after the GPU returns: neither the tone
+                // post-pass nor a CPU fallback may begin for a cancelled frame.
+                if (pointwise_test_fault(4) ||
+                    cancellation_requested(cancel, cancel_user_data)) {
+                    diagnostics.engaged = false;
+                    note_pointwise_diagnostics(
+                        true, true, "cancelled_after_dispatch", diagnostics);
+                    return SPK_ERR_CANCELLED;
+                }
+                if (!rendered) {
+                    note_pointwise_diagnostics(true, true, nullptr,
+                                               diagnostics);
+                    pointwise_failed = true;
+                } else {
+                    bool finite = true;
+                    bool cancelled_after_dispatch = false;
+                    for (size_t i = 0; i < scratch.size(); ++i) {
+                        if ((i & 4095u) == 0u &&
+                            cancellation_requested(cancel, cancel_user_data)) {
+                            cancelled_after_dispatch = true;
+                            break;
+                        }
+                        finite &= std::isfinite(scratch[i]);
+                    }
+                    if (finite && !cancelled_after_dispatch &&
+                        sparams.tone_curve.active) {
+                        for (size_t i = 0; i < scratch.size(); ++i) {
+                            if ((i & 4095u) == 0u &&
+                                cancellation_requested(cancel,
+                                                       cancel_user_data)) {
+                                cancelled_after_dispatch = true;
+                                break;
+                            }
+                            scratch[i] = sparams.tone_curve.apply(
+                                static_cast<int>(i % 3u), scratch[i]);
+                            finite &= std::isfinite(scratch[i]);
+                        }
+                    }
+                    if (cancelled_after_dispatch ||
+                        cancellation_requested(cancel, cancel_user_data)) {
+                        diagnostics.engaged = false;
+                        note_pointwise_diagnostics(
+                            true, true, "cancelled_after_dispatch",
+                            diagnostics);
+                        return SPK_ERR_CANCELLED;
+                    }
+                    if (!finite) {
+                        diagnostics.engaged = false;
+                        note_pointwise_diagnostics(
+                            true, true, "nonfinite_output", diagnostics);
+                        pointwise_failed = true;
+                    } else {
+                        note_pointwise_diagnostics(true, true, "none",
+                                                   diagnostics);
+                        *final_rgb = std::move(scratch);
+                        return SPK_OK;
+                    }
+                }
+            }
+          }
+        }
+        if (pointwise_failed) {
+            pparams.allow_gpu = false;
+            sparams.allow_gpu = false;
+        }
+    }
 
     // `pin` (the preprocessed input — materialized float64 or the direct
     // float32 form) was built by preprocess_geometry above.
@@ -1846,18 +2974,13 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 5) Scan the print (D50 viewing illuminant, print profile's dyes).
-    spk::ScanningParams sparams;
-    sparams.scan_film = false;
+    // `sparams` was built before the resident route and is reused here.
     // GPU preview fast-path (#146): set only when spk_simulate_preview latched
     // allow_gpu_scan; scan() re-gates on frame eligibility + the self-check.
-    sparams.allow_gpu = (p->allow_gpu_scan != 0);
-    sparams.output_color_space = p->output_color_space;
-    sparams.output_cctf_encoding = (p->output_cctf_encoding != 0);
+    // Preserve the explicit false set after a failed full-chain attempt.
     // OPT-IN output gamut compression (print route, same scan() position as scan_film).
     // Default kLegacyClip (0) keeps the existing clip so print goldens stay byte-identical;
     // the knee stays at the ScanningParams oracle production default (0,1,6).
-    sparams.output_gamut_compress =
-        static_cast<spk::OutputGamutCompress>(p->output_gamut_compress);
     // Viewing glare on the PRINT route (scanning.py applies glare = print_render.glare
     // here, in XYZ space, before XYZ->RGB). It is STOCHASTIC (per-pixel lognormal via
     // np.random.randn) so an active result is NOT bit-exact vs the oracle (exactly
@@ -1873,37 +2996,17 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     // With the parity toggles (grain_active == 0) glare never runs. When a caller
     // turns the stochastic branch on AND enables print glare, the effect is applied
     // at the oracle position but held to a visual (not bit-exact) tolerance.
-    if (print_stochastic && p->print_glare_active != 0) {
-        sparams.glare_active = true;
-        sparams.glare_percent = p->print_glare_percent;
-        sparams.glare_roughness = p->print_glare_roughness;
-        sparams.glare_blur = p->print_glare_blur;
-    }
     // Scanner lens blur + unsharp on the print route (scanning.py runs the same
     // _apply_blur_and_unsharp on both routes). Each self-gates inside scan()
     // (sigma > 0, amount > 0, blur > 0) exactly like the oracle; the
     // deactivate_spatial_effects debug switch is expressed by passing zeros.
-    sparams.lens_blur = static_cast<double>(p->scanner_lens_blur);
-    sparams.unsharp_sigma = p->scanner_unsharp[0];
-    sparams.unsharp_amount = p->scanner_unsharp[1];
     // OPT-IN scanner 3D-LUT acceleration on the print-scan route (same
     // settings.use_scanner_lut gate; scan_film == false so scan() picks the print
     // density-curve domain bounds). Default 0 => never constructed, print goldens
     // stay bit-exact.
-    if (p->use_scanner_lut != 0) {
-        sparams.use_lut = true;
-        sparams.lut_resolution = p->lut_resolution;
-        sparams.lut_cache = &eng->lut_cache;  // memo the build (PERF, byte-identical)
-    }
-    sparams.tone_curve = build_tone_curve_set(p);
     // Scanner BLACK/WHITE XYZ correction (print route): apply the shared affine
     // (m, q) per pixel in scan(). Inactive (strict no-op) by default / when the
     // print paper is not negative.
-    if (bw_corr.active) {
-        sparams.bw_xyz_correction = true;
-        sparams.bw_xyz_m = bw_corr.m;
-        sparams.bw_xyz_q = bw_corr.q;
-    }
     final_rgb->assign(static_cast<size_t>(npix) * 3, 0.0f);
     spk::scan(prnt, sparams, print_density_cmy.data(), width, height,
               final_rgb->data());

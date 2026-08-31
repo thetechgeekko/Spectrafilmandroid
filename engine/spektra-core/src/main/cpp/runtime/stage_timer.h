@@ -132,6 +132,37 @@ inline const char* render_timing_outcome_name(RenderTimingOutcome outcome) {
     }
 }
 
+// Render-local observability for the resident filming -> printing -> scan GPU
+// operation. The values mirror gpu::PointwiseChainDiagnostics without making
+// this generic timing header depend on the Vulkan interface. `reason` always
+// points at a process-lifetime string literal owned by the route/GPU module.
+struct GpuPointwiseTimingSnapshot {
+    bool requested = false;
+    bool attempted = false;
+    bool engaged = false;
+    const char* reason = "not_requested";
+    uint32_t dispatches = 0;
+    uint32_t input_uploads = 0;
+    uint32_t final_readbacks = 0;
+    uint64_t interstage_host_bytes = 0;
+    uint32_t pipeline_creates = 0;
+    uint32_t buffer_allocations = 0;
+    uint64_t static_upload_bytes = 0;
+    // The keyed numeric capability gate is separate from the product-frame
+    // counters above: a cold verdict runs the small chain more than once and
+    // must not make the actual frame look like a multi-upload operation.
+    const char* self_test_state = "not_run";
+    double self_test_duration_ms = 0.0;
+    uint32_t self_test_chain_runs = 0;
+    uint32_t self_test_dispatches = 0;
+    uint32_t self_test_input_uploads = 0;
+    uint32_t self_test_final_readbacks = 0;
+    uint64_t self_test_interstage_host_bytes = 0;
+    uint32_t self_test_pipeline_creates = 0;
+    uint32_t self_test_buffer_allocations = 0;
+    uint64_t self_test_static_upload_bytes = 0;
+};
+
 // Immutable once published. `stages_ms` contains inclusive durations: the two
 // documented sub-measures remain nested inside scan and must not be added to it.
 struct StageTimingSnapshot {
@@ -141,6 +172,7 @@ struct StageTimingSnapshot {
     int status_code = 0;
     double wall_ms = 0.0;
     unsigned long long fft_fallbacks = 0;
+    GpuPointwiseTimingSnapshot gpu_pointwise;
     double stages_ms[STG_COUNT] = {0};
 };
 
@@ -148,6 +180,7 @@ struct StageTimingThreadState {
     StageTimingSnapshot current;
     StageTimingSnapshot completed;
     int depth = 0;
+    int stage_suppression_depth = 0;
     bool failed = false;
     std::chrono::steady_clock::time_point started;
 };
@@ -175,6 +208,47 @@ inline uint64_t stage_timing_render_id() {
 inline void stage_timing_note_fft_fallback() {
     StageTimingThreadState& state = stage_timing_state();
     if (state.depth > 0) ++state.current.fft_fallbacks;
+}
+
+inline void stage_timing_note_gpu_pointwise(
+    bool requested, bool attempted, bool engaged, const char* reason,
+    uint32_t dispatches, uint32_t input_uploads, uint32_t final_readbacks,
+    uint64_t interstage_host_bytes, uint32_t pipeline_creates,
+    uint32_t buffer_allocations, uint64_t static_upload_bytes) {
+    StageTimingThreadState& state = stage_timing_state();
+    if (state.depth <= 0) return;
+    GpuPointwiseTimingSnapshot& pointwise = state.current.gpu_pointwise;
+    pointwise.requested = requested;
+    pointwise.attempted = attempted;
+    pointwise.engaged = engaged;
+    pointwise.reason = reason ? reason : "unknown";
+    pointwise.dispatches = dispatches;
+    pointwise.input_uploads = input_uploads;
+    pointwise.final_readbacks = final_readbacks;
+    pointwise.interstage_host_bytes = interstage_host_bytes;
+    pointwise.pipeline_creates = pipeline_creates;
+    pointwise.buffer_allocations = buffer_allocations;
+    pointwise.static_upload_bytes = static_upload_bytes;
+}
+
+inline void stage_timing_note_gpu_pointwise_self_test(
+    const char* state_name, double duration_ms, uint32_t chain_runs,
+    uint32_t dispatches, uint32_t input_uploads, uint32_t final_readbacks,
+    uint64_t interstage_host_bytes, uint32_t pipeline_creates,
+    uint32_t buffer_allocations, uint64_t static_upload_bytes) {
+    StageTimingThreadState& state = stage_timing_state();
+    if (state.depth <= 0) return;
+    GpuPointwiseTimingSnapshot& pointwise = state.current.gpu_pointwise;
+    pointwise.self_test_state = state_name ? state_name : "not_run";
+    pointwise.self_test_duration_ms = duration_ms;
+    pointwise.self_test_chain_runs = chain_runs;
+    pointwise.self_test_dispatches = dispatches;
+    pointwise.self_test_input_uploads = input_uploads;
+    pointwise.self_test_final_readbacks = final_readbacks;
+    pointwise.self_test_interstage_host_bytes = interstage_host_bytes;
+    pointwise.self_test_pipeline_creates = pipeline_creates;
+    pointwise.self_test_buffer_allocations = buffer_allocations;
+    pointwise.self_test_static_upload_bytes = static_upload_bytes;
 }
 
 inline bool stage_slot_is_nested(int slot) {
@@ -308,6 +382,31 @@ inline void stage_timing_append(char* buf, int cap, int* off,
     *off += n < remaining ? n : remaining - 1;
 }
 
+inline void stage_timing_append_json_string(char* buf, int cap, int* off,
+                                            const char* value) {
+    const unsigned char* cursor = reinterpret_cast<const unsigned char*>(
+        value ? value : "unknown");
+    for (; *cursor != 0 && *off < cap - 1; ++cursor) {
+        switch (*cursor) {
+            case '"': stage_timing_append(buf, cap, off, "\\\""); break;
+            case '\\': stage_timing_append(buf, cap, off, "\\\\"); break;
+            case '\b': stage_timing_append(buf, cap, off, "\\b"); break;
+            case '\f': stage_timing_append(buf, cap, off, "\\f"); break;
+            case '\n': stage_timing_append(buf, cap, off, "\\n"); break;
+            case '\r': stage_timing_append(buf, cap, off, "\\r"); break;
+            case '\t': stage_timing_append(buf, cap, off, "\\t"); break;
+            default:
+                if (*cursor < 0x20u)
+                    stage_timing_append(buf, cap, off, "\\u%04x",
+                                        static_cast<unsigned>(*cursor));
+                else
+                    stage_timing_append(buf, cap, off, "%c",
+                                        static_cast<int>(*cursor));
+                break;
+        }
+    }
+}
+
 // Stable machine-readable schema for release benchmarks. All slots are emitted,
 // including zero-valued gated-off effects. `trace_id` is the same id embedded in
 // the Android ATrace/Perfetto render section name (`spk.render.<kind>#<id>`).
@@ -338,8 +437,53 @@ inline int stage_timings_json_format(char* buf, int cap) {
     }
     stage_timing_append(
         buf, cap, &off,
-        "},\"nested_stages\":{\"scan_spatial\":\"scan\","
-        "\"glare_field\":\"scan\"}}}");
+        "},\"gpu_pointwise\":{\"requested\":%s,\"attempted\":%s,"
+        "\"engaged\":%s,\"reason\":\"",
+        snapshot.gpu_pointwise.requested ? "true" : "false",
+        snapshot.gpu_pointwise.attempted ? "true" : "false",
+        snapshot.gpu_pointwise.engaged ? "true" : "false");
+    stage_timing_append_json_string(buf, cap, &off,
+                                    snapshot.gpu_pointwise.reason);
+    stage_timing_append(
+        buf, cap, &off,
+        "\",\"dispatches\":%u,"
+        "\"input_uploads\":%u,\"final_readbacks\":%u,"
+        "\"interstage_host_bytes\":%llu,\"pipeline_creates\":%u,"
+        "\"buffer_allocations\":%u,\"static_upload_bytes\":%llu,"
+        "\"self_test_state\":\"",
+        snapshot.gpu_pointwise.dispatches,
+        snapshot.gpu_pointwise.input_uploads,
+        snapshot.gpu_pointwise.final_readbacks,
+        static_cast<unsigned long long>(
+            snapshot.gpu_pointwise.interstage_host_bytes),
+        snapshot.gpu_pointwise.pipeline_creates,
+        snapshot.gpu_pointwise.buffer_allocations,
+        static_cast<unsigned long long>(snapshot.gpu_pointwise.static_upload_bytes));
+    stage_timing_append_json_string(buf, cap, &off,
+                                    snapshot.gpu_pointwise.self_test_state);
+    stage_timing_append(
+        buf, cap, &off,
+        "\",\"self_test_duration_ms\":%.3f,"
+        "\"self_test_chain_runs\":%u,\"self_test_dispatches\":%u,"
+        "\"self_test_input_uploads\":%u,"
+        "\"self_test_final_readbacks\":%u,"
+        "\"self_test_interstage_host_bytes\":%llu,"
+        "\"self_test_pipeline_creates\":%u,"
+        "\"self_test_buffer_allocations\":%u,"
+        "\"self_test_static_upload_bytes\":%llu},"
+        "\"nested_stages\":{\"scan_spatial\":\"scan\","
+        "\"glare_field\":\"scan\"}}}",
+        snapshot.gpu_pointwise.self_test_duration_ms,
+        snapshot.gpu_pointwise.self_test_chain_runs,
+        snapshot.gpu_pointwise.self_test_dispatches,
+        snapshot.gpu_pointwise.self_test_input_uploads,
+        snapshot.gpu_pointwise.self_test_final_readbacks,
+        static_cast<unsigned long long>(
+            snapshot.gpu_pointwise.self_test_interstage_host_bytes),
+        snapshot.gpu_pointwise.self_test_pipeline_creates,
+        snapshot.gpu_pointwise.self_test_buffer_allocations,
+        static_cast<unsigned long long>(
+            snapshot.gpu_pointwise.self_test_static_upload_bytes));
     buf[off < cap ? off : cap - 1] = '\0';
     return off;
 }
@@ -369,6 +513,23 @@ inline int stage_timing_outcome_json_format(char* buf, int cap,
     return n;
 }
 
+// Nestable render-local bracket used by validation work which deliberately calls
+// CPU stages but must not masquerade as product-frame stage time. It leaves wall
+// time and the explicit self-test duration observable.
+struct ScopedStageTimingSuppression {
+    ScopedStageTimingSuppression() noexcept {
+        ++stage_timing_state().stage_suppression_depth;
+    }
+    ~ScopedStageTimingSuppression() {
+        StageTimingThreadState& state = stage_timing_state();
+        if (state.stage_suppression_depth > 0)
+            --state.stage_suppression_depth;
+    }
+    ScopedStageTimingSuppression(const ScopedStageTimingSuppression&) = delete;
+    ScopedStageTimingSuppression& operator=(
+        const ScopedStageTimingSuppression&) = delete;
+};
+
 // RAII bracket: adds its lifetime (ms) to `slot` on destruction. Bracket a whole
 // stage/filter call on the orchestrator thread.
 struct ScopedStage {
@@ -377,7 +538,9 @@ struct ScopedStage {
     std::chrono::steady_clock::time_point t0;
     explicit ScopedStage(int s)
         : slot(s),
-          active(stage_timing_state().depth > 0 && s >= 0 && s < STG_COUNT),
+          active(stage_timing_state().depth > 0 &&
+                 stage_timing_state().stage_suppression_depth == 0 &&
+                 s >= 0 && s < STG_COUNT),
           t0(std::chrono::steady_clock::now()) {
 #ifdef __ANDROID__
         if (active && ATrace_isEnabled()) {
