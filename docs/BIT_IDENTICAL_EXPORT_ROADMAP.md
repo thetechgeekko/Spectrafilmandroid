@@ -261,6 +261,27 @@ Required architecture:
 - startup/upgrade self-test, at least 100 repeat digests and CPU-oracle corpus sweep;
 - watchdog, allocation limits, kill switch and fail-closed Strict Exact CPU fallback.
 
+The “LUTs” in this graph do not mean a baked whole-look 3D cube. Scientific response tables,
+density curves and an explicitly selected user LUT may be resident resources; the normal Fast GPU
+render must evaluate the direct shader graph. `.cube`/CLF baking remains an export operation.
+
+### 2026-08-31 resident pointwise checkpoint
+
+Ticket #148 now has a code-reviewed low-level filming -> printing -> scan Vulkan chain with one
+frame upload, exactly three compute dispatches, device-local ping-pong intermediates and one final
+readback. It has overflow-safe 2D dispatch planning, keyed static-table residency, copy-last
+failure behavior, explicit NaN/Inf containment, O(log n) curve lookup and completion diagnostics.
+
+The current shaders pass O2 and shipping-flag software-Vulkan runs against an asymmetric f64
+reference (`max_abs` approximately `1.8e-7`), changed-table cache invalidation, 100 warm
+byte-determinism repeats and an executed 4,194,241-pixel two-row dispatch. Android native builds
+pass for all three configured ABIs, and the full native engine suite passes 39/39 at both O2 and
+shipping flags. This is **not** yet the application route: live profile folding,
+capability caching/self-test, render-local engagement reporting, cancellation integration and
+spatial/stochastic stages remain open. The final revised Adreno-device rerun is also pending after
+the phone disconnected. The 12/50/200 MP checks are planner-only and no 1-2 s timing claim follows
+from this checkpoint.
+
 Vulkan's specification does not promise cross-implementation pixel identity. A device that fails the
 self-test simply cannot expose Fast GPU export.
 

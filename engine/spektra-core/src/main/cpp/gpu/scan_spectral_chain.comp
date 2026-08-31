@@ -1,0 +1,52 @@
+#version 450
+// SPDX-FileCopyrightText: 2026 Spektrafilm Android contributors
+// SPDX-License-Identifier: GPL-3.0-only
+// Resident-chain variant of gpu/scan_spectral.comp. Its spectral and color math
+// is intentionally unchanged; only the invocation index is flattened over a 2D
+// dispatch so one frame-wide dispatch can exceed 65,535 workgroups.
+#define NB 81
+#define WG 64
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer InBuf  { float cmy[]; };
+layout(std430, binding = 1) writeonly buffer OutBuf { float rgb[]; };
+layout(std430, binding = 2) readonly buffer Dye { float dye[]; };
+layout(std430, binding = 3) readonly buffer Cmf { float icmf[]; };
+layout(push_constant) uniform Push {
+    uint npix;
+    uint groups_x;
+    uint total_groups;
+    float m[12];
+} pc;
+
+float cctf(float v) {
+    return (v <= 0.0031308) ? (12.92 * v) : (1.055 * pow(v, 1.0 / 2.4) - 0.055);
+}
+
+float finite_or(float v, float fallback) {
+    return (isnan(v) || isinf(v)) ? fallback : v;
+}
+
+void main() {
+    uint group = gl_WorkGroupID.y * pc.groups_x + gl_WorkGroupID.x;
+    if (group >= pc.total_groups) return;
+    uint p = group * WG + gl_LocalInvocationID.x;
+    if (p >= pc.npix) return;
+    float c = finite_or(cmy[p * 3u + 0u], 1e4);
+    float mch = finite_or(cmy[p * 3u + 1u], 1e4);
+    float y = finite_or(cmy[p * 3u + 2u], 1e4);
+    float X = 0.0, Y = 0.0, Z = 0.0;
+    for (int b = 0; b < NB; ++b) {
+        float D = c * dye[b * 3 + 0] + mch * dye[b * 3 + 1] + y * dye[b * 3 + 2];
+        float T = finite_or(pow(10.0, -finite_or(D, 1e4)), 0.0);
+        X += T * icmf[b * 3 + 0];
+        Y += T * icmf[b * 3 + 1];
+        Z += T * icmf[b * 3 + 2];
+    }
+    float r = pc.m[0] * X + pc.m[1] * Y + pc.m[2] * Z;
+    float g = pc.m[4] * X + pc.m[5] * Y + pc.m[6] * Z;
+    float bch = pc.m[8] * X + pc.m[9] * Y + pc.m[10] * Z;
+    rgb[p * 3u + 0u] = clamp(finite_or(cctf(r), 0.0), 0.0, 1.0);
+    rgb[p * 3u + 1u] = clamp(finite_or(cctf(g), 0.0), 0.0, 1.0);
+    rgb[p * 3u + 2u] = clamp(finite_or(cctf(bch), 0.0), 0.0, 1.0);
+}

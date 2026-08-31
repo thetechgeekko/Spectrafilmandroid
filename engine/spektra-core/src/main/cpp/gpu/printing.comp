@@ -1,0 +1,93 @@
+#version 450
+// SPDX-FileCopyrightText: 2026 Spektrafilm Android contributors
+// SPDX-License-Identifier: GPL-3.0-only
+// Spektrafilm for Android - production PRINTING pointwise kernel (#148).
+// Promoted and modified from tools/gpu_probe/printing.comp after the #147 M2
+// connected-device oracle/determinism gate. Modifications: production bindings,
+// explicit non-finite containment, and resident-DAG documentation. No OFX shader
+// source or binary resource is used here.
+//
+// fp32 port of the direct printing chain (LUT/morph/spatial effects off):
+//   negative density -> 81-band enlarger integral -> exposure -> paper curves
+#define NB 81
+#define WG 64
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer InBuf      { float cmy[];         };
+layout(std430, binding = 1) writeonly buffer OutBuf     { float dens[];        };
+layout(std430, binding = 2) readonly  buffer Dye        { float dye[];         };
+layout(std430, binding = 3) readonly  buffer ISens      { float isens[];       };
+layout(std430, binding = 4) readonly  buffer PaperAxis  { float paper_axis[];  };
+layout(std430, binding = 5) readonly  buffer PaperCurve { float paper_curve[]; };
+layout(push_constant) uniform Push {
+    uint  npix;
+    uint  groups_x;
+    uint  total_groups;
+    int   n;
+    float midgray;
+    float mult;
+    float pf0, pf1, pf2;
+} pc;
+
+float finite_or(float v, float fallback) {
+    return (isnan(v) || isinf(v)) ? fallback : v;
+}
+
+float log10f(float v) { return log2(v) * 0.30102999566398119521; }
+
+float interp_paper(float x, int c) {
+    int n = pc.n;
+    float x0 = paper_axis[c], xN = paper_axis[(n - 1) * 3 + c];
+    if (x <= x0) return paper_curve[c];
+    if (x >= xN) return paper_curve[(n - 1) * 3 + c];
+    int low = 0;
+    int high = n - 1;
+    while (high - low > 1) {
+        int middle = low + (high - low) / 2;
+        if (x < paper_axis[middle * 3 + c]) high = middle;
+        else low = middle;
+    }
+    float xl = paper_axis[low * 3 + c], xh = paper_axis[high * 3 + c];
+    float dx = xh - xl;
+    float t = (dx != 0.0) ? (x - xl) / dx : 0.0;
+    float y0 = paper_curve[low * 3 + c], y1 = paper_curve[high * 3 + c];
+    return y0 + t * (y1 - y0);
+}
+
+void main() {
+    uint group = gl_WorkGroupID.y * pc.groups_x + gl_WorkGroupID.x;
+    if (group >= pc.total_groups) return;
+    uint p = group * WG + gl_LocalInvocationID.x;
+    if (p >= pc.npix) return;
+
+    // A bad upstream density must never leave the resident chain as NaN. 1e4
+    // makes spectral transmittance underflow to zero, matching scan containment.
+    float c0 = finite_or(cmy[p * 3u + 0u], 1e4);
+    float c1 = finite_or(cmy[p * 3u + 1u], 1e4);
+    float c2 = finite_or(cmy[p * 3u + 2u], 1e4);
+    float R0 = 0.0, R1 = 0.0, R2 = 0.0;
+    for (int l = 0; l < NB; ++l) {
+        float D = c0 * dye[l * 3 + 0] + c1 * dye[l * 3 + 1] + c2 * dye[l * 3 + 2];
+        float T = pow(10.0, -D);
+        R0 += T * isens[l * 3 + 0];
+        R1 += T * isens[l * 3 + 1];
+        R2 += T * isens[l * 3 + 2];
+    }
+    R0 = R0 * pc.midgray + pc.pf0;
+    R1 = R1 * pc.midgray + pc.pf1;
+    R2 = R2 * pc.midgray + pc.pf2;
+
+    float lr0 = log10f(max(R0, 0.0) + 1e-10);
+    float lr1 = log10f(max(R1, 0.0) + 1e-10);
+    float lr2 = log10f(max(R2, 0.0) + 1e-10);
+    float r0 = pow(10.0, lr0) * pc.mult;
+    float r1 = pow(10.0, lr1) * pc.mult;
+    float r2 = pow(10.0, lr2) * pc.mult;
+    lr0 = log10f(max(r0, 0.0) + 1e-10);
+    lr1 = log10f(max(r1, 0.0) + 1e-10);
+    lr2 = log10f(max(r2, 0.0) + 1e-10);
+
+    dens[p * 3u + 0u] = finite_or(interp_paper(lr0, 0), 1e4);
+    dens[p * 3u + 1u] = finite_or(interp_paper(lr1, 1), 1e4);
+    dens[p * 3u + 2u] = finite_or(interp_paper(lr2, 2), 1e4);
+}

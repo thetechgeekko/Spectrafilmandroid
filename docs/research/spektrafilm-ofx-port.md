@@ -1,8 +1,10 @@
 # spektrafilm OFX to Android port record
 
-Status: first Vulkan orchestration slice in progress under tickets
-[#148](https://github.com/thetechgeekko/Spektrafilm-android/issues/148) and
-[#149](https://github.com/thetechgeekko/Spektrafilm-android/issues/149).
+Status: the low-level resident pointwise Vulkan slice is implemented and independently
+code-reviewed under [#148](https://github.com/thetechgeekko/Spektrafilm-android/issues/148).
+[#149](https://github.com/thetechgeekko/Spektrafilm-android/issues/149) remains the future
+tolerance-bounded GPU-export/product-routing track. Capability persistence, spatial stages and
+the final current-binary Adreno rerun remain open.
 
 ## Source pin and license
 
@@ -42,6 +44,58 @@ in the first slice. OFX contributes the resident-DAG orchestration pattern: one 
 shared device-resident pointwise chain with explicit compute barriers, cached static f32 tables,
 and one final readback. The existing Strict Exact CPU route remains unchanged and authoritative;
 Fast GPU is opt-in, device-self-tested, tolerance-bounded, and fails closed to CPU.
+
+## Phase A implementation checkpoint (2026-08-31)
+
+The first production-shaped seam now exists in `gpu/vulkan_compute.{h,cpp}` with locally
+generated `filming.comp`, `printing.comp` and `scan_spectral_chain.comp` shaders. One call:
+
+1. validates span pointers/counts, exact table shapes, finite tables/scalars, strict axes and
+   host-size arithmetic before pointwise buffer allocation; device-limit and heap checks follow
+   Vulkan context initialization;
+2. uploads one RGB frame to a persistently mapped staging buffer;
+3. dispatches filming, printing and scanning exactly once each over two device-local ping-pong
+   buffers, with compute barriers and no inter-stage host copy;
+4. reads one final RGB frame back, validates every result is finite, then and only then copies it
+   into caller-owned output; and
+5. returns an explicit CPU-fallback reason on any failure, including allocation exceptions at the
+   `noexcept` public seam.
+
+Pipelines, grow-only frame buffers and complete f32 static tables persist across warm calls. The
+caller supplies an opaque nonzero table-generation token; live engine ownership is not yet wired.
+The Vulkan layer also compares the full table layout before treating it as resident.
+Frame-operation diagnostics are completion counters:
+success is `1 upload / 3 dispatches / 1 readback / 0 interstage host bytes`. Static-upload bytes
+are separately documented as host-staged/attempted work and may be nonzero if a later GPU step
+fails.
+
+The dispatch planner is two-dimensional and guards the padded group before multiplying the flat
+index. Planner assertions cover 12, 50 and 200 MP; the standalone WSL/lavapipe runtime gate
+executes the first two-row boundary at 4,194,241 pixels. They do **not** claim that 12/50/200 MP
+allocations fit a particular phone.
+Approximate three-buffer payload residency is 432 MB, 1.8 GB and 7.2 GB respectively, before
+alignment and driver overhead; 200 MP also exceeds the application's current single-Java-buffer
+handoff and remains planning-only.
+
+Current frozen-slice evidence:
+
+- independent code review: APPROVE, no Critical/High finding;
+- pinned NDK r27 regeneration is reproducible and all three modules pass Vulkan 1.1 `spirv-val`;
+- arm64 O2 and shipping-flag warning builds pass; a fresh post-change Android
+  `externalNativeBuildRelease` also passes for arm64-v8a, armeabi-v7a and x86_64;
+- the full native engine parity suite passes 39/39 at O2 and 39/39 with the shipping
+  `-O3 -ffast-math -fno-finite-math-only` flags;
+- current shaders pass both O2 and shipping-flag WSL/lavapipe runtime gates, including an
+  asymmetric combined f64 oracle (`max_abs` about `1.8e-7`), changed-key/table re-upload,
+  100 byte-identical warm repeats and a real 4,194,241-pixel two-row dispatch; and
+- the final revised O2/shipping binaries are prepared for the connected Android device, but that
+  rerun is still pending because ADB disconnected. Earlier device results do not substitute for
+  this current-binary gate.
+
+This checkpoint proves the low-level direct renderer, not app/export engagement and not a 1-2 s
+SLO. The next slice must build exact folded tables from live profiles, apply conservative route
+eligibility before the CPU memos, publish render-local diagnostics, run the capability self-test,
+and fail closed to the unchanged CPU route. Full tap-to-gallery performance remains ticket #177.
 
 ## LUT audit: 65 is an export choice, not the engine's universal grid
 
