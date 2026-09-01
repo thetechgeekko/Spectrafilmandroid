@@ -2201,6 +2201,11 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
         return SPK_ERR_CANCELLED;
     }
     return SPK_OK;
+} catch (const std::bad_alloc&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_density_cmy) tap_density_cmy->clear();
+    return SPK_ERR_OOM;
 } catch (const spk::ParallelCancelled&) {
     if (final_rgb) final_rgb->clear();
     if (tap_log_raw) tap_log_raw->clear();
@@ -3015,6 +3020,12 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         return SPK_ERR_CANCELLED;
     }
     return SPK_OK;
+} catch (const std::bad_alloc&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_film_density_cmy) tap_film_density_cmy->clear();
+    if (tap_print_density_cmy) tap_print_density_cmy->clear();
+    return SPK_ERR_OOM;
 } catch (const spk::ParallelCancelled&) {
     if (final_rgb) final_rgb->clear();
     if (tap_log_raw) tap_log_raw->clear();

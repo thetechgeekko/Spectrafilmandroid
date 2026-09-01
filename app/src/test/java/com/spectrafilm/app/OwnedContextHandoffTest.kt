@@ -18,6 +18,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Test
 
 class OwnedContextHandoffTest {
@@ -78,6 +79,20 @@ class OwnedContextHandoffTest {
 
         assertEquals(0, closes.get())
         resource.close()
+        assertEquals(1, closes.get())
+    }
+
+    @Test
+    fun constructionFailureDisposesAlreadyCreatedOwnedValue() {
+        val closes = AtomicInteger()
+        val resource = Resource(closes)
+        val oom = OutOfMemoryError("post-create scratch allocation")
+
+        val observed = runCatching {
+            disposeOnFailure(resource, Resource::close) { throw oom }
+        }.exceptionOrNull()
+
+        assertSame(oom, observed)
         assertEquals(1, closes.get())
     }
 }

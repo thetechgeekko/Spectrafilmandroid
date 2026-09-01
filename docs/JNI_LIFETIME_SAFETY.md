@@ -104,7 +104,8 @@ watchdog interval.
 | Release app | R8-minified assembly; exact separate-APK AndroidTest ABI classes, fields, method prototypes, facade ancestry, and interface dispatch; signed in-place device install; native-result Activity recreation; foreground-service rapid-completion replay; storage process-death recovery; exact installed-APK bytes; and fatal-log rejection |
 
 The shared host runner is `tools/release/run_native_safety.sh`. Its sanitizer evidence covers native
-helpers, the real engine C render/cancel path, allocation registries, and writers. It does **not**
+helpers, the real engine C render/cancel path, fork/join exception containment, allocation
+registries, and writers. It does **not**
 claim ASan/TSan instrumentation of the Android JNI bridge. Actual JNI behavior is a separate required
 API 35 x86_64 engine instrumentation gate and connected-device arm64 check. The release app is
 separately R8/Dex-gated, installed, instrumented, and launched; the standalone engine test APK does

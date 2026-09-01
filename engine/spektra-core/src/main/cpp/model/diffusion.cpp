@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 #include "kernels/exponential_filter.h"
@@ -354,14 +355,9 @@ double bloom_max_lambda_um(const FamilyCfg& cfg) {
 //
 // SPK_DIFFUSION_FFT=0 forces the direct loop (A/B measurement, and an escape hatch
 // if a device ever mis-measures); =1 forces the FFT even where direct would win.
-// Counts the times the cost model chose the FFT but fft_convolve_same REFUSED it
-// (an allocation failure at the chosen transform size, in practice) and we ran the
-// direct O(w*h*ks^2) loop instead. That fallback is correct but can be ~100x
-// slower, and it is otherwise completely invisible: no error, no log, just an
-// export that takes minutes instead of seconds. Anything measuring this stage --
-// especially anyone raising SPK_DIFFUSION_FFT_MAX -- must read this afterwards,
-// because a "the bigger transform didn't help" result and a "the bigger transform
-// never ran" result look identical in a timing alone.
+// Kept for the stable diagnostics ABI. Cost-selected FFT work no longer falls
+// back to the direct O(w*h*ks^2) loop: scratch denial propagates as OOM, so this
+// counter must remain zero. A non-zero value is therefore a regression alarm.
 thread_local std::atomic<unsigned long long> g_fft_fallbacks{0};
 
 // Transform-size cap, overridable so the trade can be MEASURED rather than assumed.
@@ -373,10 +369,9 @@ thread_local std::atomic<unsigned long long> g_fft_fallbacks{0};
 // has ks = 1725, so N = 2048 leaves a usable block of only 324 (2.5% of each
 // transform) and needs 130 tiles, where N = 4096 gives a block of 2372 and needs
 // 4. But 402.8 MB is a lot to ask of a phone mid-export, and if the allocation
-// fails fft_convolve_same returns false and we fall through to the DIRECT loop --
-// i.e. raising the cap past what the device can allocate makes this stage
-// dramatically SLOWER, silently. spk::diffusion_fft_fallbacks() counts those
-// events so the failure is at least observable; check it after any change here.
+// fails, fft_convolve_same throws std::bad_alloc and the render boundary reports
+// a controlled OOM. It must never fall through to the direct loop: at 12 MP that
+// can turn resource pressure into hours of unbounded work.
 // An r2c f32 transform would buy N=4096's block size at roughly N=2048's memory.
 // Read a tuning knob that must be settable on a SHIPPING build.
 //
@@ -588,21 +583,18 @@ void apply_diffusion_filter_um(double* raw, int w, int h,
         // Both paths ARE byte-identical across worker counts, which is the contract
         // that matters here.
         //
-        // The direct loop stays and stays reachable: it wins for small kernels,
-        // it is the reference the FFT path is gated against, and it is the fallback
-        // if the transform buffers cannot be allocated.
+        // The direct loop stays reachable only when the cost model selects it for
+        // a small kernel. Once FFT is selected, memory denial must fail closed.
         if (use_fft(w, h, ks)) {
-            if (fft_convolve_same(padded.data(), pw, ph, kern.data(), ks, w, h,
-                                  blurred.data(), /*out_stride=*/3, /*out_offset=*/c,
-                                  fft_max_transform())) {
-                continue;
+            if (!fft_convolve_same(padded.data(), pw, ph, kern.data(), ks, w, h,
+                                   blurred.data(), /*out_stride=*/3, /*out_offset=*/c,
+                                   fft_max_transform())) {
+                // All dimensions above are constructed from the same validated
+                // image/kernel geometry. False therefore means an internal
+                // invariant bug, not a recoverable request for the direct path.
+                throw std::logic_error("diffusion FFT rejected valid geometry");
             }
-            // The cost model wanted the FFT and it was refused -- almost always a
-            // failed scratch allocation at this transform size. Falling through to
-            // the direct loop is CORRECT but potentially ~100x slower, so record it
-            // rather than letting the render just be mysteriously slow.
-            g_fft_fallbacks.fetch_add(1, std::memory_order_relaxed);
-            stage_timing_note_fft_fallback();
+            continue;
         }
         // Each output row is an independent O(w*ks^2) accumulation over the
         // read-only padded plane.

@@ -109,7 +109,12 @@ fi
 pids=()
 for entry in "${TESTS[@]}"; do
   name="${entry%%|*}"
+  test_defs=()
+  if [ "$name" = "test_fft_convolve" ]; then
+    test_defs=(-DSPK_FFT_CONVOLVE_TEST_HOOKS=1)
+  fi
   ( g++ -std=c++17 -O2 -pthread -I. -I"$ROOT/tools/parity" "${DEF[@]}" \
+      "${test_defs[@]}" \
       ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
       "tests/$name.cpp" "${SRC[@]}" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} \
       -o "$OUT/$name" 2> "$OUT/$name.build" ) &

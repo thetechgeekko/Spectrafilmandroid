@@ -48,8 +48,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import com.spectrafilm.engine.TONE_CURVE_MAX_POINTS
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.round
@@ -361,9 +360,18 @@ private val TONE_CHANNELS = listOf("Master", "Red", "Green", "Blue")
 fun ToneCurveSection(s: ParamsState, preview: Bitmap?) {
     var expanded by remember { mutableStateOf(true) }
     var channel by remember { mutableIntStateOf(0) }
-    var hist by remember { mutableStateOf<Histogram?>(null) }
+    // A new preview must not temporarily show the prior source/frame's bins. Sampling itself owns
+    // the off-main dispatch and bitmap read lease in computeHistogram.
+    var hist by remember(preview) { mutableStateOf<Histogram?>(null) }
     LaunchedEffect(preview) {
-        hist = preview?.let { withContext(Dispatchers.Default) { computeHistogram(it) } }
+        hist = try {
+            preview?.let { computeHistogram(it) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            Diag.w("tone-curve histogram unavailable: ${failure.message}")
+            null
+        }
     }
 
     val points = when (channel) {

@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,6 +36,17 @@
 #include "kernels/parallel.h"
 
 namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+void set_test_environment(const char* name, const char* value) {
+#if defined(_WIN32)
+    const int result = _putenv_s(name, value ? value : "");
+#else
+    const int result = value ? setenv(name, value, 1) : unsetenv(name);
+#endif
+    if (result != 0) throw std::runtime_error("failed to mutate test environment");
+}
 
 int reflect(int p, int n) {
     if (n == 1) return 0;
@@ -91,7 +104,8 @@ std::vector<double> make_psf(int ks) {
             double r = std::sqrt(dx * dx + dy * dy);
             double v = 0.0;
             for (int t = 0; t < 3; ++t)
-                v += wgt[t] * std::exp(-r / lam[t]) / (2.0 * M_PI * lam[t] * lam[t]);
+                v += wgt[t] * std::exp(-r / lam[t]) /
+                     (2.0 * kPi * lam[t] * lam[t]);
             k[static_cast<size_t>(y) * ks + x] = v;
             sum += v;
         }
@@ -151,7 +165,7 @@ int main() {
     // Without this the fixtures are below kParallelMinChunk and parallel_for runs
     // everything on one worker -- the 1-vs-8 comparison below would then be
     // comparing two single-threaded runs and would pass no matter what.
-    ::setenv("SPK_PARALLEL_MIN_CHUNK", "64", /*overwrite=*/1);
+    set_test_environment("SPK_PARALLEL_MIN_CHUNK", "64");
 
     const Case cases[] = {
         {  64,  64,  9, 2048, "single transform, ks=9"      },
@@ -175,9 +189,9 @@ int main() {
     std::printf("\n-- thread invariance (1 vs 8 workers) --\n");
     for (const Case& cs : cases) {
         std::vector<double> a, b;
-        setenv("SPK_NUM_THREADS", "1", 1);
+        set_test_environment("SPK_NUM_THREADS", "1");
         run_case(cs, &a);
-        setenv("SPK_NUM_THREADS", "8", 1);
+        set_test_environment("SPK_NUM_THREADS", "8");
         run_case(cs, &b);
         const bool same = a.size() == b.size() &&
                           std::memcmp(a.data(), b.data(), a.size() * sizeof(double)) == 0;
@@ -185,7 +199,32 @@ int main() {
                     same ? "PASS (byte-identical)" : "FAIL (differs)");
         ok &= same;
     }
-    unsetenv("SPK_NUM_THREADS");
+    set_test_environment("SPK_NUM_THREADS", nullptr);
+
+    // Deterministic scratch-denial seam: a cost-selected FFT must surface OOM,
+    // not return false and invite the 10.9-hour direct fallback.
+    {
+        const int w = 8, h = 8, ks = 3, radius = 1;
+        const int pw = w + 2 * radius, ph = h + 2 * radius;
+        std::vector<double> image(static_cast<size_t>(w) * h, 0.5);
+        const std::vector<double> padded = make_padded(image, w, h, radius);
+        const std::vector<double> kernel = make_psf(ks);
+        std::vector<double> output(static_cast<size_t>(w) * h, -7.0);
+        bool denied = false;
+        try {
+            (void)spk::fft_convolve_same_denied_scratch_for_test(
+                padded.data(), pw, ph, kernel.data(), ks, w, h,
+                output.data(), 1, 0, 64);
+        } catch (const std::bad_alloc&) {
+            denied = true;
+        }
+        const bool untouched =
+            std::all_of(output.begin(), output.end(), [](double v) { return v == -7.0; });
+        std::printf("[scratch denial] bad_alloc=%s output_untouched=%s -> %s\n",
+                    denied ? "yes" : "no", untouched ? "yes" : "no",
+                    (denied && untouched) ? "PASS" : "FAIL");
+        ok &= denied && untouched;
+    }
 
     std::printf("\n%s\n", ok ? "ALL PASS" : "FAILURES PRESENT");
     return ok ? 0 : 1;

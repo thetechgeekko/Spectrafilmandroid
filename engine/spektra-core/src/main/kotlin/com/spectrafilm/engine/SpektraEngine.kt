@@ -38,6 +38,22 @@ enum class AppRenderOutcome(internal val nativeCode: Int) {
     FAILED(4),
 }
 
+/** Stable stage ids used by the process-wide native/JVM memory budget. */
+enum class MemoryBudgetStage(internal val nativeCode: Int) {
+    UNKNOWN(0),
+    JNI_SIM_RESULT(1),
+    JNI_DIRECT_BUFFER(2),
+    DECODE(3),
+    FILMING(4),
+    SCANNING(5),
+    PRINTING(6),
+    SPATIAL(7),
+    GRAIN(8),
+    LUT(9),
+    WRITER(10),
+    GPU(11),
+}
+
 /** Thread-safe cooperative cancellation signal for a native engine call. */
 class RenderCancellation {
     @Volatile private var requested = false
@@ -66,6 +82,14 @@ class DataLease internal constructor(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) releaseLease()
+    }
+}
+
+internal fun interface DataLeaseFactory {
+    fun create(data: ByteBuffer, release: () -> Unit): DataLease
+
+    companion object {
+        val DEFAULT = DataLeaseFactory { data, release -> DataLease(data, release) }
     }
 }
 
@@ -105,6 +129,7 @@ class LinearImage private constructor(
     val height: Int,
     val colorSpace: String = "ProPhoto RGB",
     private val release: () -> Unit = {},
+    private val dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
 ) : AutoCloseable {
     // Capture the caller's logical sample window once. A duplicate keeps later
     // position/limit mutations on the constructor argument from changing what
@@ -129,10 +154,15 @@ class LinearImage private constructor(
             check(state != Int.MAX_VALUE) { "LinearImage has too many active leases" }
             if (lifecycle.compareAndSet(state, state + 1)) break
         }
-        return DataLease(
-            backingData.duplicate().order(ByteOrder.nativeOrder()),
-            ::releaseDataLease,
-        )
+        return try {
+            dataLeaseFactory.create(
+                backingData.duplicate().order(ByteOrder.nativeOrder()),
+                ::releaseDataLease,
+            )
+        } catch (failure: Throwable) {
+            releaseDataLease()
+            throw failure
+        }
     }
 
     private fun releaseDataLease() {
@@ -174,7 +204,10 @@ class LinearImage private constructor(
             colorSpace: String = "ProPhoto RGB",
             lease: AutoCloseable,
         ): LinearImage = try {
-            LinearImage(data, width, height, colorSpace) { lease.close() }
+            LinearImage(
+                data, width, height, colorSpace,
+                release = { lease.close() },
+            )
         } catch (failure: Throwable) {
             try {
                 lease.close()
@@ -190,7 +223,8 @@ class LinearImage private constructor(
             height: Int,
             colorSpace: String = "ProPhoto RGB",
             release: () -> Unit,
-        ): LinearImage = LinearImage(data, width, height, colorSpace, release)
+            dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
+        ): LinearImage = LinearImage(data, width, height, colorSpace, release, dataLeaseFactory)
     }
 }
 
@@ -203,6 +237,7 @@ class NativeBufferOwner private constructor(
     data: ByteBuffer,
     private val token: Long,
     private val release: (ByteBuffer, Long) -> Unit,
+    private val dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
 ) : AutoCloseable {
     // JNI NewDirectByteBuffer does not tag its Java view with native byte order.
     // This owner is the native allocation boundary, so normalize its private view;
@@ -225,10 +260,15 @@ class NativeBufferOwner private constructor(
             check(state != Int.MAX_VALUE) { "NativeBufferOwner has too many active leases" }
             if (lifecycle.compareAndSet(state, state + 1)) break
         }
-        return DataLease(
-            backingData.duplicate().order(ByteOrder.nativeOrder()),
-            ::releaseDataLease,
-        )
+        return try {
+            dataLeaseFactory.create(
+                backingData.duplicate().order(ByteOrder.nativeOrder()),
+                ::releaseDataLease,
+            )
+        } catch (failure: Throwable) {
+            releaseDataLease()
+            throw failure
+        }
     }
 
     fun transferToLinearImage(
@@ -264,9 +304,23 @@ class NativeBufferOwner private constructor(
     companion object {
         private const val CLOSED = Int.MIN_VALUE
 
-        /** Allocate native memory, returning an opaque owner or null on OOM. */
-        fun allocate(size: Long): NativeBufferOwner? =
-            SimResult.allocateNativeBuffer(size)?.let(::fromNative)
+        /**
+         * Allocate coordinator-admitted native memory or fail closed.
+         *
+         * A null JNI result is never permission to allocate the same bytes on
+         * the ART heap: that would bypass the process-wide ceiling precisely
+         * when admission denied a large export buffer.
+         */
+        fun allocate(size: Long): NativeBufferOwner {
+            require(size in 1..Int.MAX_VALUE.toLong()) {
+                "NativeBufferOwner size is invalid: $size"
+            }
+            val allocation = SimResult.allocateNativeBuffer(size)
+                ?: throw OutOfMemoryError(
+                    "native memory allocation denied or failed for $size bytes",
+                )
+            return fromNative(allocation)
+        }
 
         private fun fromNative(allocation: NativeBufferAllocation): NativeBufferOwner = try {
             NativeBufferOwner(allocation.data, allocation.token, SimResult::releaseNativeBuffer)
@@ -279,9 +333,13 @@ class NativeBufferOwner private constructor(
             throw failure
         }
 
-        internal fun forTest(data: ByteBuffer, release: (ByteBuffer) -> Unit): NativeBufferOwner =
+        internal fun forTest(
+            data: ByteBuffer,
+            dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
+            release: (ByteBuffer) -> Unit,
+        ): NativeBufferOwner =
             try {
-                NativeBufferOwner(data, 1L) { buffer, _ -> release(buffer) }
+                NativeBufferOwner(data, 1L, { buffer, _ -> release(buffer) }, dataLeaseFactory)
             } catch (failure: Throwable) {
                 try {
                     release(data)
@@ -306,6 +364,7 @@ class SimResult private constructor(
     val renderId: Long,
     private val allocationToken: Long,
     private val release: (ByteBuffer, Long) -> Unit,
+    private val dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
 ) : AutoCloseable {
     // NewDirectByteBuffer exposes BIG_ENDIAN metadata by default even when the
     // underlying native floats use the device's native order. Keep an isolated,
@@ -355,10 +414,15 @@ class SimResult private constructor(
             check(state != Int.MAX_VALUE) { "SimResult has too many active leases" }
             if (lifecycle.compareAndSet(state, state + 1)) break
         }
-        return DataLease(
-            backingData.duplicate().order(ByteOrder.nativeOrder()),
-            ::releaseDataLease,
-        )
+        return try {
+            dataLeaseFactory.create(
+                backingData.duplicate().order(ByteOrder.nativeOrder()),
+                ::releaseDataLease,
+            )
+        } catch (failure: Throwable) {
+            releaseDataLease()
+            throw failure
+        }
     }
 
     private fun releaseDataLease() {
@@ -391,9 +455,11 @@ class SimResult private constructor(
             colorSpace: ColorSpace,
             renderId: Long,
             release: (ByteBuffer) -> Unit,
+            dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
         ): SimResult = SimResult(
             data, width, height, colorSpace, renderId, 1L,
-        ) { buffer, _ -> release(buffer) }
+            { buffer, _ -> release(buffer) }, dataLeaseFactory,
+        )
 
         /**
          * Free a native (`NewDirectByteBuffer`-wrapped `malloc`) engine-output buffer.
@@ -660,6 +726,35 @@ class SpektraEngine private constructor(
         const val SHAPER_NONE = 0
         const val SHAPER_SRGB = 1
 
+        /** Configure the shared native/JVM admission ceiling for this process. */
+        @JvmStatic
+        fun configureMemoryBudget(limitBytes: Long) {
+            require(limitBytes > 0L) { "memory budget limit must be positive" }
+            nativeConfigureMemoryBudget(limitBytes)
+        }
+
+        /**
+         * Account externally-owned ART/Bitmap bytes. A positive opaque token
+         * owns the reservation; `0L` means the request exceeded the ceiling.
+         */
+        @JvmStatic
+        fun reserveJvmMemory(
+            bytes: Long,
+            stage: MemoryBudgetStage = MemoryBudgetStage.UNKNOWN,
+        ): Long {
+            require(bytes > 0L) { "external JVM reservation must be positive" }
+            return nativeReserveJvmMemory(bytes, stage.nativeCode)
+        }
+
+        /** Release one external reservation; stale, duplicate, and zero tokens return false. */
+        @JvmStatic
+        fun releaseJvmMemory(token: Long): Boolean =
+            token > 0L && nativeReleaseJvmMemory(token)
+
+        /** Deterministic `spk.memory_budget.v1` diagnostic snapshot. */
+        @JvmStatic
+        fun memoryBudgetSnapshotJson(): String = nativeMemoryBudgetSnapshotJson()
+
         /**
          * Pin the render pool to the device's performance cores.
          *
@@ -692,6 +787,10 @@ class SpektraEngine private constructor(
         @JvmStatic private external fun nativeSetBigCores(mode: Int)
         @JvmStatic private external fun nativeBigCoreCount(): Int
         @JvmStatic private external fun nativeDebugMarshalledParams(params: Any?): String
+        @JvmStatic private external fun nativeConfigureMemoryBudget(limitBytes: Long)
+        @JvmStatic private external fun nativeReserveJvmMemory(bytes: Long, stageCode: Int): Long
+        @JvmStatic private external fun nativeReleaseJvmMemory(token: Long): Boolean
+        @JvmStatic private external fun nativeMemoryBudgetSnapshotJson(): String
 
         @JvmStatic private external fun nativeCreate(assetDir: String?): Long
         @JvmStatic private external fun nativeCreateFromAssets(assetManager: AssetManager): Long

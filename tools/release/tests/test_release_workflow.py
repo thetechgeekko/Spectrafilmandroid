@@ -443,12 +443,14 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             (
                 "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety",
                 "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation",
+                "asan-ubsan|engine-parallel-exception-containment|engine-parallel-exceptions",
                 "asan-ubsan|engine-json-profile-hostile-inputs|engine-json-profile",
                 "asan-ubsan|engine-npy-hostile-inputs|engine-npy",
                 "asan-ubsan|png-writer-hostile-jni-helpers|png-writer",
                 "asan-ubsan|tiff-writer-hostile-jni-helpers|tiff-writer",
                 "tsan|engine-c-cancellation-race|engine-c-cancellation",
                 "tsan|engine-jni-allocation-registry-race|engine-jni-safety",
+                "tsan|engine-parallel-exception-race|engine-parallel-exceptions",
                 "tsan|png-writer-cancellation-race|png-writer",
                 "tsan|tiff-writer-cancellation-race|tiff-writer",
             ),
@@ -474,6 +476,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             "-fsanitize=thread",
             "tests/test_jni_safety.cpp",
             "tests/test_cancellation_api.cpp",
+            "tests/test_parallel_exceptions.cpp",
             "tests/test_png_writer.cpp",
             "tests/test_tiff_writer.cpp",
         ):

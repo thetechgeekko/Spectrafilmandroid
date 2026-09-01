@@ -49,6 +49,10 @@ object EngineHolder {
      */
     private fun create(ctx: Context): SpektraEngine {
         val app = ctx.applicationContext
+        // Establish one shared native/JVM admission ceiling before the engine, caches, or first
+        // decoded frame can allocate. The policy is physical-RAM based and intentionally ignores
+        // largeHeap so native/GPU/writer allocations cannot escape an ART-only allowance.
+        AppMemoryBudget.configure(app)
         // Apply the stored core-affinity choice before the first render. The engine
         // gates this on an env var, which a running JVM cannot set for itself, so it
         // has to be pushed in from here. Cheap and side-effect-free when off.

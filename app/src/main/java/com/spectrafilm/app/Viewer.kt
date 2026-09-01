@@ -70,7 +70,10 @@ import kotlin.math.min
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
+import java.util.IdentityHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -553,17 +556,24 @@ private fun CompareTag(text: String, alignment: Alignment) {
 
 /**
  * A compact, translucent histogram overlaid on the TOP EDGE of the live preview
- * (Lightroom-mobile style). Reuses [computeHistogram] (run off the main thread)
- * and [drawHistogram]; recomputes when the preview [bitmap] identity changes.
- *
- * The bitmap is the live preview reference — the render path replaces (never
- * recycles) it, so the background read here cannot hit a recycled buffer.
+ * (Lightroom-mobile style). Sampling and binning both run off-main under an explicit read lease.
+ * Replacing the bitmap resets the remembered bins synchronously, and retirement defers recycle
+ * until any already-running reader releases its lease.
  */
 @Composable
 fun PreviewHistogramOverlay(bitmap: Bitmap, modifier: Modifier = Modifier) {
-    var hist by remember { mutableStateOf<Histogram?>(null) }
+    // Keying state by identity prevents the previous frame's bins from being displayed while the
+    // new frame is sampled. LaunchedEffect cancellation also rejects any late old-frame result.
+    var hist by remember(bitmap) { mutableStateOf<Histogram?>(null) }
     LaunchedEffect(bitmap) {
-        hist = withContext(Dispatchers.Default) { computeHistogram(bitmap) }
+        hist = try {
+            computeHistogram(bitmap)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            Diag.w("preview histogram unavailable: ${failure.message}")
+            null
+        }
     }
     val h = hist ?: return
     Box(
@@ -586,31 +596,137 @@ class Histogram(
     val peak: Int,
 )
 
-/** Sample the bitmap (stride-decimated for speed) into 256-bin RGB + luma histograms. */
-fun computeHistogram(bmp: Bitmap): Histogram {
+/**
+ * Small identity-keyed read-lease registry. The owner may retire a value immediately; physical
+ * release is deferred until existing readers close, and new readers are rejected after retirement.
+ */
+internal class RetirableReadLeaseRegistry<T : Any>(
+    private val isPhysicallyRetired: (T) -> Boolean,
+    private val physicallyRetire: (T) -> Unit,
+    private val beforeLeaseConstruction: () -> Unit = {},
+) {
+    private data class State(var readers: Int = 0, var retired: Boolean = false)
+
+    internal class Lease<T : Any>(
+        val value: T,
+        private val release: () -> Unit,
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean(false)
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) release()
+        }
+    }
+
+    private val states = IdentityHashMap<T, State>()
+
+    @Synchronized
+    fun acquire(value: T): Lease<T>? {
+        if (isPhysicallyRetired(value)) return null
+        val state = states.getOrPut(value) { State() }
+        if (state.retired) return null
+        state.readers++
+        return try {
+            beforeLeaseConstruction()
+            Lease(value) { release(value, state) }
+        } catch (failure: Throwable) {
+            state.readers--
+            if (state.readers == 0 && !state.retired) states.remove(value)
+            throw failure
+        }
+    }
+
+    @Synchronized
+    fun retire(value: T) {
+        if (isPhysicallyRetired(value)) return
+        val state = states[value]
+        if (state == null) {
+            // Retire under the same monitor as acquire. This closes the acquire/recycle window.
+            physicallyRetire(value)
+            return
+        }
+        if (state.retired) return
+        state.retired = true
+        if (state.readers == 0) retireNow(value, state)
+    }
+
+    @Synchronized
+    private fun release(value: T, expected: State) {
+        val state = states[value]
+        check(state === expected && state.readers > 0) { "read-lease registry underflow" }
+        state.readers--
+        if (state.retired && state.readers == 0) retireNow(value, state)
+    }
+
+    /** Caller holds this registry's monitor. */
+    private fun retireNow(value: T, expected: State) {
+        check(states[value] === expected)
+        physicallyRetire(value)
+        states.remove(value)
+    }
+}
+
+private val previewBitmapReadLeases = RetirableReadLeaseRegistry<Bitmap>(
+    isPhysicallyRetired = { bitmap -> bitmap.isRecycled },
+    physicallyRetire = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
+)
+
+/** Retire a preview deterministically once every histogram reader has released it. */
+internal fun retirePreviewBitmap(bitmap: Bitmap) {
+    previewBitmapReadLeases.retire(bitmap)
+}
+
+/** Bitmap-independent immutable sample set; safe to bin after its Bitmap is retired. */
+internal class HistogramSamples internal constructor(pixels: IntArray) {
+    internal val pixels: IntArray = pixels.copyOf()
+}
+
+/** Capture stride-decimated pixels while the caller holds a preview read lease. */
+private fun sampleHistogram(bmp: Bitmap): HistogramSamples {
     val w = bmp.width
     val h = bmp.height
-    val r = IntArray(256); val g = IntArray(256); val b = IntArray(256); val l = IntArray(256)
-    // Cap the number of sampled pixels for responsiveness on large bitmaps.
     val total = w.toLong() * h.toLong()
     val targetSamples = 200_000L
     val stride = max(1, (total / targetSamples).toInt())
-    val px = IntArray(w)
+    val sampledWidth = (w + stride - 1) / stride
+    val sampledHeight = (h + stride - 1) / stride
+    val samples = IntArray(sampledWidth * sampledHeight)
+    val row = IntArray(w)
+    var sampleIndex = 0
     var sy = 0
     while (sy < h) {
-        bmp.getPixels(px, 0, w, 0, sy, w, 1)
+        bmp.getPixels(row, 0, w, 0, sy, w, 1)
         var sx = 0
         while (sx < w) {
-            val c = px[sx]
-            val rr = (c shr 16) and 0xFF
-            val gg = (c shr 8) and 0xFF
-            val bb = c and 0xFF
-            r[rr]++; g[gg]++; b[bb]++
-            val y = ((rr * 54 + gg * 183 + bb * 19) shr 8).coerceIn(0, 255)
-            l[y]++
+            samples[sampleIndex++] = row[sx]
             sx += stride
         }
         sy += stride
+    }
+    check(sampleIndex == samples.size) { "histogram sample geometry mismatch" }
+    return HistogramSamples(samples)
+}
+
+/**
+ * Sample a bitmap (stride-decimated for speed) into 256-bin RGB + luma histograms. The entire
+ * Bitmap access runs on Dispatchers.Default and is protected from deterministic recycle by a read
+ * lease. A frame retired before the worker acquires it produces no histogram.
+ */
+suspend fun computeHistogram(bmp: Bitmap): Histogram? = withContext(Dispatchers.Default) {
+    val lease = previewBitmapReadLeases.acquire(bmp) ?: return@withContext null
+    lease.use { computeHistogram(sampleHistogram(it.value)) }
+}
+
+/** Bin a Bitmap-independent sample captured by [sampleHistogram]. */
+internal fun computeHistogram(samples: HistogramSamples): Histogram {
+    val r = IntArray(256); val g = IntArray(256); val b = IntArray(256); val l = IntArray(256)
+    for (c in samples.pixels) {
+        val rr = (c shr 16) and 0xFF
+        val gg = (c shr 8) and 0xFF
+        val bb = c and 0xFF
+        r[rr]++; g[gg]++; b[bb]++
+        val y = ((rr * 54 + gg * 183 + bb * 19) shr 8).coerceIn(0, 255)
+        l[y]++
     }
     var peak = 1
     for (i in 0 until 256) {

@@ -16,6 +16,24 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DecodedSourceCacheTest {
+    private class ThrowingConstructionHooks : DecodedSourceCacheConstructionHooks {
+        var failTicket = false
+        var failEntry = false
+        var failLease = false
+
+        override fun beforeTicketConstruction() {
+            if (failTicket) throw OutOfMemoryError("ticket construction")
+        }
+
+        override fun beforeEntryConstruction() {
+            if (failEntry) throw OutOfMemoryError("entry construction")
+        }
+
+        override fun beforeLeaseConstruction() {
+            if (failLease) throw OutOfMemoryError("lease construction")
+        }
+    }
+
     private fun image(closes: AtomicInteger) = LinearImage.fromDataLease(
         data = ByteBuffer.allocateDirect(3 * 4).order(ByteOrder.nativeOrder()),
         width = 1,
@@ -90,6 +108,87 @@ class DecodedSourceCacheTest {
         cache.invalidate()
 
         assertFalse(cache.publish(ticket, image(closes)))
+        assertEquals(1, closes.get())
+        assertNull(cache.acquire(ticket))
+    }
+
+    @Test
+    fun requestChangeRetiresOldEntryImmediatelyButDefersCloseForActiveLease() {
+        val closes = AtomicInteger()
+        val cache = DecodedSourceCache()
+        val oldTicket = cache.beginRequest(request("content://source/old"))
+        assertTrue(cache.publish(oldTicket, image(closes)))
+        val lease = requireNotNull(cache.acquire(oldTicket))
+
+        val newTicket = cache.beginRequest(request("content://source/new"))
+
+        assertEquals(0, closes.get())
+        assertNull(cache.acquire(oldTicket))
+        assertNull(cache.acquire(newTicket))
+        lease.close()
+        assertEquals(1, closes.get())
+    }
+
+    @Test
+    fun requestChangeClosesUnleasedOldEntryEvenWhenReplacementNeverPublishes() {
+        val closes = AtomicInteger()
+        val cache = DecodedSourceCache()
+        val oldTicket = cache.beginRequest(request("content://source/old"))
+        assertTrue(cache.publish(oldTicket, image(closes)))
+
+        cache.beginRequest(request("content://source/new"))
+
+        assertEquals(1, closes.get())
+        assertNull(cache.acquire(oldTicket))
+    }
+
+    @Test
+    fun leaseConstructionOomRollsBackPinSoInvalidationCanCloseImage() {
+        val hooks = ThrowingConstructionHooks()
+        val closes = AtomicInteger()
+        val cache = DecodedSourceCache(hooks)
+        val ticket = cache.beginRequest(request())
+        assertTrue(cache.publish(ticket, image(closes)))
+        hooks.failLease = true
+
+        assertTrue(cache.runCatching { acquire(ticket) }.exceptionOrNull() is OutOfMemoryError)
+        cache.invalidate()
+
+        assertEquals("phantom lease must not retain the image", 1, closes.get())
+    }
+
+    @Test
+    fun ticketConstructionOomLeavesPreviousRequestAndEntryIntact() {
+        val hooks = ThrowingConstructionHooks()
+        val closes = AtomicInteger()
+        val cache = DecodedSourceCache(hooks)
+        val original = cache.beginRequest(request("content://source/old"))
+        assertTrue(cache.publish(original, image(closes)))
+        hooks.failTicket = true
+
+        assertTrue(
+            cache.runCatching { beginRequest(request("content://source/new")) }
+                .exceptionOrNull() is OutOfMemoryError,
+        )
+
+        hooks.failTicket = false
+        cache.acquire(original).use { assertTrue(it != null) }
+        assertEquals(0, closes.get())
+        cache.invalidate()
+        assertEquals(1, closes.get())
+    }
+
+    @Test
+    fun entryConstructionOomClosesIncomingImageAndPublishesNothing() {
+        val hooks = ThrowingConstructionHooks()
+        val closes = AtomicInteger()
+        val cache = DecodedSourceCache(hooks)
+        val ticket = cache.beginRequest(request())
+        val incoming = image(closes)
+        hooks.failEntry = true
+
+        assertTrue(cache.runCatching { publish(ticket, incoming) }.exceptionOrNull() is OutOfMemoryError)
+
         assertEquals(1, closes.get())
         assertNull(cache.acquire(ticket))
     }

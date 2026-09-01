@@ -26,6 +26,14 @@ internal class RenderPublicationGate {
 
     fun nextRevision(): Long = revisions.incrementAndGet()
 
+    /** Reject every outstanding ticket before an unrelated source generation is installed. */
+    @Synchronized
+    fun invalidate() {
+        revisions.incrementAndGet()
+        current = null
+        claimed = false
+    }
+
     @Synchronized
     fun begin(
         revision: Long,
@@ -33,6 +41,10 @@ internal class RenderPublicationGate {
     ): RenderPublicationTicket {
         require(revision > 0L) { "render publication revision must be positive" }
         val ticket = RenderPublicationTicket(revision, priority, ++serial)
+        // nextRevision() is the authority source and invalidate() advances the same floor. A
+        // delayed coroutine may call begin only after invalidation; returning an inert ticket keeps
+        // its normal cleanup path intact without ever re-authorising stale pixels.
+        if (revision < revisions.get()) return ticket
         val active = current
         if (
             active == null ||

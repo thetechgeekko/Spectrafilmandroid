@@ -3,9 +3,10 @@
 # Offline host sanitizer qualification shared by CI and release.
 #
 # This executes JSON/profile/neutral-filter hostile-input regressions, JNI safety
-# helpers, and the engine C cancellation ABI. The actual Android JNI bridge is
-# exercised separately by EngineBoundaryInstrumentation; this host runner must
-# never be described as runtime sanitizer coverage of that bridge.
+# helpers, the engine C cancellation ABI, and fork/join exception containment.
+# The actual Android JNI bridge is exercised separately by
+# EngineBoundaryInstrumentation; this host runner must never be described as
+# runtime sanitizer coverage of that bridge.
 
 set -euo pipefail
 shopt -s nullglob
@@ -20,12 +21,14 @@ cd -- "$repo_root"
 readonly SUITE_SPECS=(
   "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety"
   "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation"
+  "asan-ubsan|engine-parallel-exception-containment|engine-parallel-exceptions"
   "asan-ubsan|engine-json-profile-hostile-inputs|engine-json-profile"
   "asan-ubsan|engine-npy-hostile-inputs|engine-npy"
   "asan-ubsan|png-writer-hostile-jni-helpers|png-writer"
   "asan-ubsan|tiff-writer-hostile-jni-helpers|tiff-writer"
   "tsan|engine-c-cancellation-race|engine-c-cancellation"
   "tsan|engine-jni-allocation-registry-race|engine-jni-safety"
+  "tsan|engine-parallel-exception-race|engine-parallel-exceptions"
   "tsan|png-writer-cancellation-race|png-writer"
   "tsan|tiff-writer-cancellation-race|tiff-writer"
 )
@@ -114,6 +117,13 @@ run_suite() {
       run_args+=(
         "$ENGINE_CPP/../assets/spektra"
         "$ENGINE_CPP/tests/scan_portra_input_rgb.f64"
+      )
+      ;;
+    engine-parallel-exceptions)
+      command+=(
+        -I "$ENGINE_CPP"
+        "$ENGINE_CPP/tests/test_parallel_exceptions.cpp"
+        "$ENGINE_CPP/kernels/parallel.cpp"
       )
       ;;
     engine-npy)

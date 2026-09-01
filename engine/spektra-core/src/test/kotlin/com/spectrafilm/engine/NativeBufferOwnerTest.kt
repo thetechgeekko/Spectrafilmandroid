@@ -117,4 +117,21 @@ class NativeBufferOwnerTest {
 
         assertEquals(1, released.get())
     }
+
+    @Test
+    fun dataLeaseConstructionOomRollsBackRefcount() {
+        val released = AtomicInteger()
+        val owner = NativeBufferOwner.forTest(
+            data = ByteBuffer.allocateDirect(12).order(ByteOrder.nativeOrder()),
+            release = { released.incrementAndGet() },
+            dataLeaseFactory = DataLeaseFactory { _, _ ->
+                throw OutOfMemoryError("DataLease construction")
+            },
+        )
+
+        assertTrue(owner.runCatching { acquireDataLease() }.exceptionOrNull() is OutOfMemoryError)
+        owner.close()
+
+        assertEquals("phantom lease must not retain native allocation", 1, released.get())
+    }
 }

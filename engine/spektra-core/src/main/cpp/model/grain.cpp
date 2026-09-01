@@ -21,11 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 #include "kernels/gaussian.h"
@@ -134,49 +130,11 @@ void layer_particle_model(const float* density, int npix, int width, int height,
     };
     int nthreads = spk::parallel_num_threads();
     if (nthreads > nblocks) nthreads = nblocks < 1 ? 1 : nblocks;
-    if (spk::parallel_cancellation_active()) {
-        // Unlike the regular path below, the caller remains an orchestrator so
-        // it can safely sample its thread-affine JNI callback while grain's
-        // dynamically scheduled workers run. Fixed block seeds make this
-        // callback-false path byte-identical despite the scheduling change.
-        std::atomic<bool> stop{false};
-        std::atomic<int> workers_left{nthreads};
-        std::mutex wait_mutex;
-        std::condition_variable wait_cv;
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(nthreads));
-        for (int t = 0; t < nthreads; ++t) {
-            pool.emplace_back([&]() {
-                worker(&stop);
-                workers_left.fetch_sub(1, std::memory_order_release);
-                wait_cv.notify_one();
-            });
-        }
-        while (workers_left.load(std::memory_order_acquire) > 0) {
-            if (spk::parallel_cancellation_requested()) {
-                stop.store(true, std::memory_order_relaxed);
-                break;
-            }
-            std::unique_lock<std::mutex> lock(wait_mutex);
-            wait_cv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
-                return workers_left.load(std::memory_order_acquire) == 0;
-            });
-        }
-        for (auto& t : pool) t.join();
-        if (spk::parallel_cancellation_latched()) {
-            throw spk::ParallelCancelled{};
-        }
-    } else if (nthreads <= 1) {
-        worker(nullptr);
-    } else {
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(nthreads) - 1);
-        for (int t = 1; t < nthreads; ++t) {
-            pool.emplace_back([&]() { worker(nullptr); });
-        }
-        worker(nullptr);                // the calling thread pulls its share too
-        for (auto& t : pool) t.join();
-    }
+    // The dynamic dispatcher preserves the fixed-block arithmetic above while
+    // containing worker and partial thread-construction failures. With an
+    // active JNI cancellation callback it keeps this caller as the sole polling
+    // orchestrator; otherwise the caller participates in the work queue.
+    spk::detail::parallel_dispatch_dynamic(nthreads, worker);
 
     // Per-particle dye-cloud blur: grain.py uses
     //   grain = fast_gaussian_filter(grain, blur_particle*sqrt(od_particle))

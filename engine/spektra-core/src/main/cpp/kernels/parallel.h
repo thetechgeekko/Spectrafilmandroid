@@ -33,8 +33,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // OPT-IN Intel oneTBB backend (CMake SPK_USE_TBB, default OFF). When enabled the
@@ -159,6 +161,35 @@ constexpr int kCancellationPollWork = 1024;
 
 namespace detail {
 
+// std::thread terminates the process when an exception escapes its entry point.
+// Capture the first failure, ask sibling chunks not yet started to stop, join the
+// whole pool, and only then rethrow on the dispatch owner.
+class ParallelFailureState final {
+public:
+    void capture_current() noexcept {
+        stop_.store(true, std::memory_order_release);
+        const std::exception_ptr captured = std::current_exception();
+        while (lock_.test_and_set(std::memory_order_acquire)) {}
+        if (!failure_) failure_ = captured;
+        lock_.clear(std::memory_order_release);
+    }
+
+    bool stop_requested() const noexcept {
+        return stop_.load(std::memory_order_acquire);
+    }
+
+    void rethrow_if_captured() const {
+        // Called only by the owner after every successfully-created worker has
+        // joined, so no writer can still race this read.
+        if (failure_) std::rethrow_exception(failure_);
+    }
+
+private:
+    std::atomic<bool> stop_{false};
+    std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+    std::exception_ptr failure_;
+};
+
 // Dispatch [begin, end) as ceil-divided chunks across nthreads workers (the
 // caller has already resolved and clamped nthreads to >= 2). Chunk boundaries
 // are a pure function of (count, nthreads) — never of thread scheduling.
@@ -192,15 +223,37 @@ void parallel_dispatch(int begin, int end, int nthreads, const Body& body) {
 #else
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(nthreads - 1));
-    for (int t = 1; t < nthreads; ++t) {
-        const int cb = begin + t * chunk;
-        if (cb >= end) break;
-        const int ce = std::min(cb + chunk, end);
-        workers.emplace_back([&body, cb, ce]() { body(cb, ce); });
+    ParallelFailureState failure;
+    try {
+        for (int t = 1; t < nthreads; ++t) {
+            if (failure.stop_requested()) break;
+            const int cb = begin + t * chunk;
+            if (cb >= end) break;
+            const int ce = std::min(cb + chunk, end);
+            workers.emplace_back([&body, &failure, cb, ce]() {
+                if (failure.stop_requested()) return;
+                try {
+                    body(cb, ce);
+                } catch (...) {
+                    failure.capture_current();
+                }
+            });
+        }
+    } catch (...) {
+        // Includes std::thread construction/system failures after earlier
+        // workers have already launched.
+        failure.capture_current();
     }
     // The calling thread runs the first chunk while the workers run theirs.
-    body(begin, std::min(begin + chunk, end));
+    if (!failure.stop_requested()) {
+        try {
+            body(begin, std::min(begin + chunk, end));
+        } catch (...) {
+            failure.capture_current();
+        }
+    }
     for (auto& w : workers) w.join();
+    failure.rethrow_if_captured();
 #endif  // SPK_USE_TBB
 }
 
@@ -237,6 +290,7 @@ void parallel_dispatch_cancellable(int begin, int end, int nthreads,
     const int chunk = (count + nthreads - 1) / nthreads;
     std::atomic<bool> stop{false};
     std::atomic<int> workers_left{0};
+    ParallelFailureState failure;
     std::mutex wait_mutex;
     std::condition_variable wait_cv;
     std::vector<std::thread> workers;
@@ -246,21 +300,38 @@ void parallel_dispatch_cancellable(int begin, int end, int nthreads,
         if (cb >= end) break;
         const int ce = std::min(cb + chunk, end);
         workers_left.fetch_add(1, std::memory_order_relaxed);
-        workers.emplace_back([&, cb, ce]() {
-            run_blocks(cb, ce, &stop, false);
-            workers_left.fetch_sub(1, std::memory_order_release);
-            wait_cv.notify_one();
-        });
+        try {
+            workers.emplace_back([&, cb, ce]() {
+                try {
+                    run_blocks(cb, ce, &stop, false);
+                } catch (...) {
+                    failure.capture_current();
+                    stop.store(true, std::memory_order_release);
+                }
+                workers_left.fetch_sub(1, std::memory_order_release);
+                wait_cv.notify_one();
+            });
+        } catch (...) {
+            workers_left.fetch_sub(1, std::memory_order_relaxed);
+            failure.capture_current();
+            stop.store(true, std::memory_order_release);
+            break;
+        }
     }
 
     bool cancelled = false;
-    try {
-        run_blocks(begin, std::min(begin + chunk, end), &stop, true);
-    } catch (const ParallelCancelled&) {
-        // A nested owner-thread map may surface the same marker. Stop this
-        // dispatch too, join its workers, then rethrow below.
-        cancelled = true;
-        stop.store(true, std::memory_order_relaxed);
+    if (!failure.stop_requested()) {
+        try {
+            run_blocks(begin, std::min(begin + chunk, end), &stop, true);
+        } catch (const ParallelCancelled&) {
+            // A nested owner-thread map may surface the same marker. Stop this
+            // dispatch too, join its workers, then rethrow below.
+            cancelled = true;
+            stop.store(true, std::memory_order_relaxed);
+        } catch (...) {
+            failure.capture_current();
+            stop.store(true, std::memory_order_release);
+        }
     }
 
     // Normally equal-sized chunks finish together. If a worker has a heavier
@@ -279,7 +350,102 @@ void parallel_dispatch_cancellable(int begin, int end, int nthreads,
         });
     }
     for (auto& worker : workers) worker.join();
+    failure.rethrow_if_captured();
     if (cancelled || parallel_cancellation_latched()) throw ParallelCancelled{};
+}
+
+// Dynamic worker pool for stages whose independently-seeded work units have
+// highly variable cost (currently film grain). The caller owns the atomic work
+// queue; this helper owns every thread lifetime and the exception boundary.
+//
+// With an active cancellation scope the owner thread remains an orchestrator so
+// only it samples the thread-affine callback. Otherwise the owner participates
+// in the work exactly like the fixed-chunk dispatcher. In both modes a worker
+// exception or a partial std::thread construction failure stops the remaining
+// work, joins every successfully-created thread, then rethrows on the owner.
+// `thread_factory` is injectable solely so the host regression can prove the
+// partial-construction path without exhausting process thread resources.
+template <typename Worker, typename ThreadFactory>
+void parallel_dispatch_dynamic_with_factory(int nthreads, const Worker& worker,
+                                            const ThreadFactory& thread_factory) {
+    if (nthreads < 1) nthreads = 1;
+    const bool cancellable = parallel_cancellation_active();
+    if (!cancellable && nthreads == 1) {
+        worker(nullptr);
+        return;
+    }
+    if (cancellable && parallel_cancellation_requested()) {
+        throw ParallelCancelled{};
+    }
+
+    parallel_pin_to_big_cores();
+    std::atomic<bool> stop{false};
+    std::atomic<int> workers_left{0};
+    ParallelFailureState failure;
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    std::vector<std::thread> workers;
+    const int background_workers = cancellable ? nthreads : nthreads - 1;
+    workers.reserve(static_cast<size_t>(background_workers));
+
+    for (int t = 0; t < background_workers; ++t) {
+        workers_left.fetch_add(1, std::memory_order_relaxed);
+        try {
+            workers.emplace_back(thread_factory([&]() {
+                try {
+                    worker(&stop);
+                } catch (...) {
+                    failure.capture_current();
+                    stop.store(true, std::memory_order_release);
+                }
+                workers_left.fetch_sub(1, std::memory_order_release);
+                wait_cv.notify_one();
+            }));
+        } catch (...) {
+            workers_left.fetch_sub(1, std::memory_order_relaxed);
+            failure.capture_current();
+            stop.store(true, std::memory_order_release);
+            break;
+        }
+    }
+
+    bool cancelled = false;
+    if (cancellable) {
+        while (!stop.load(std::memory_order_acquire) &&
+               workers_left.load(std::memory_order_acquire) > 0) {
+            if (parallel_cancellation_requested()) {
+                cancelled = true;
+                stop.store(true, std::memory_order_release);
+                break;
+            }
+            std::unique_lock<std::mutex> lock(wait_mutex);
+            wait_cv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
+                return workers_left.load(std::memory_order_acquire) == 0 ||
+                       stop.load(std::memory_order_acquire);
+            });
+        }
+    } else if (!failure.stop_requested()) {
+        try {
+            worker(&stop);
+        } catch (...) {
+            failure.capture_current();
+            stop.store(true, std::memory_order_release);
+        }
+    }
+
+    for (auto& thread : workers) thread.join();
+    failure.rethrow_if_captured();
+    if (cancelled || (cancellable && parallel_cancellation_latched())) {
+        throw ParallelCancelled{};
+    }
+}
+
+template <typename Worker>
+void parallel_dispatch_dynamic(int nthreads, const Worker& worker) {
+    const auto thread_factory = [](auto&& entry) {
+        return std::thread(std::forward<decltype(entry)>(entry));
+    };
+    parallel_dispatch_dynamic_with_factory(nthreads, worker, thread_factory);
 }
 
 }  // namespace detail

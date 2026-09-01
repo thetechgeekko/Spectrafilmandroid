@@ -48,15 +48,15 @@ the limits/guarantees being certified.
 
 [Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
 adds a second mandatory native-safety layer. Before accepting a candidate, require the fixed shared
-host inventory (four ASan+UBSan and four TSan suites), the standalone engine JNI boundary runner with
+host inventory (seven ASan+UBSan and five TSan suites), the standalone engine JNI boundary runner with
 `ENGINE_BOUNDARY_INSTRUMENTATION: PASS` and instrumentation code `-1`, and the release-targeted app
 runner's native-result Activity-recreation marker. The release gate must also resolve the separately
 packaged AndroidTest APK's exact target classes, field types, method prototypes, facade ancestry, and
 interface dispatch in the physical minified DEX; member-name checks alone are insufficient. Retain
 the deterministic foreground-service rapid-completion/watchdog regression and native-owned direct-
 buffer byte-order tests. The host sanitizer runner covers native helpers, the real C render/cancel
-path, allocation-token races, and writers; it does not claim sanitizer instrumentation of the Android
-JNI bridge. The exact ownership and evidence contract is in
+path, fork/join exception containment, allocation-token races, and writers; it does not claim
+sanitizer instrumentation of the Android JNI bridge. The exact ownership and evidence contract is in
 [JNI_LIFETIME_SAFETY.md](JNI_LIFETIME_SAFETY.md). Local connected-device qualification must use the
 fail-closed `tools/android/run_release_device_gate.ps1` helper documented in
 [TRANSACTIONAL_STORAGE.md](TRANSACTIONAL_STORAGE.md), not an unchecked sequence of native commands.

@@ -4,8 +4,9 @@
 #   • engine-native   — compiles C++ engine + JNI bridge into libspektra.so (host toolchain)
 #   • native-safety-writers — ordinary + ASan/UBSan + bounded fuzz gates for native
 #                        JSON/profile/neutral-filter hostile input; ASan/UBSan + TSan
-#                        for JNI safety helpers, the engine C cancellation ABI, and
-#                        PNG/TIFF hostile-input, cancellation, and JNI-helper tests
+#                        for JNI safety helpers, fork/join exception containment,
+#                        the engine C cancellation ABI, and PNG/TIFF hostile-input,
+#                        cancellation, and JNI-helper tests
 #   • engine-parity   — deterministic stage parity tests against committed goldens (bit-exact
 #                        gate: scan_portra, print_portra, print_ektar + spatial/crop/autoexp/
 #                        diffusion; runs on push/PR)
@@ -134,8 +135,9 @@ jobs:
   # Offline native safety gate. These are direct host builds of committed tests:
   # no downloaded fixtures, generated sources, Android device, or network service
   # is involved. ASan+UBSan cover bounds/overflow/exception paths; the separate
-  # TSan builds exercise the allocation-registry and writer cancellation races.
-  # This is JNI safety helpers + engine C cancellation ABI coverage; the actual
+  # TSan builds exercise fork/join containment, the allocation-registry, and
+  # writer cancellation races. This is JNI safety helpers + engine C cancellation ABI
+  # plus fork/join exception containment coverage; the actual
   # Android JNI bridge is executed by the required android-emulator job below.
   # ---------------------------------------------------------------------------
   native-safety-writers:
@@ -365,7 +367,11 @@ jobs:
           fail=0
           build_run() { # name, binary-args...
             local name="$1"; shift
-            g++ -std=c++17 $SPK_OPT -pthread -I. -I"$GITHUB_WORKSPACE/tools/parity" $DEF \
+            local test_def=""
+            if [ "$name" = "test_fft_convolve" ]; then
+              test_def="-DSPK_FFT_CONVOLVE_TEST_HOOKS=1"
+            fi
+            g++ -std=c++17 $SPK_OPT -pthread -I. -I"$GITHUB_WORKSPACE/tools/parity" $DEF $test_def \
               "tests/$name.cpp" $SRC -o "/tmp/$name"
             echo "::group::$name"
             # Capture the TEST's exit code (PIPESTATUS[0], not tee's). The `if`

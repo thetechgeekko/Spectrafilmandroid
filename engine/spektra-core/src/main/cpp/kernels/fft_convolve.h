@@ -50,13 +50,10 @@ namespace spk {
 //
 // Raising the cap makes large-kernel cases markedly faster (fewer, better-filled
 // tiles) at quadratic memory cost -- see fft_convolve.cpp's overlap-save notes.
-// READ THIS FIRST if you are tempted to raise it: an allocation failure here is
-// NOT an error. fft_convolve_same catches bad_alloc and returns false, and every
-// caller then runs the DIRECT O(w*h*ks^2) loop instead -- which for Black
-// Pro-Mist at 12 MP is the ~10.9-hour path this file exists to remove. So a cap
-// that does not fit the device's free memory does not fail loudly; it silently
-// reverts to the worst case. Raise it only together with a way to observe that
-// fallback (spk::diffusion_fft_fallbacks in model/diffusion.h).
+// READ THIS FIRST if you are tempted to raise it: scratch allocation failure is
+// a controlled std::bad_alloc denial. It must propagate to the render boundary;
+// callers must never replace it with the DIRECT O(w*h*ks^2) loop, which for
+// Black Pro-Mist at 12 MP is the ~10.9-hour path this file exists to remove.
 constexpr int kFftConvMaxTransform = 2048;
 
 // `padded` is the reflect-padded plane, (h + ks - 1) rows by (w + ks - 1) cols
@@ -64,13 +61,22 @@ constexpr int kFftConvMaxTransform = 2048;
 // `kern` is ks x ks row-major. ks must be odd and >= 1.
 // Writes the h x w output window into out[(y*w + x) * out_stride + out_offset].
 //
-// Returns false and writes nothing if the arguments are inconsistent or a
-// transform buffer could not be allocated -- callers fall back to the direct loop.
+// Returns false and writes nothing only if the arguments are inconsistent.
+// Scratch allocation failure throws std::bad_alloc so a cost-selected FFT can
+// never silently become an effectively unbounded direct convolution.
 bool fft_convolve_same(const double* padded, int pw, int ph,
                        const double* kern, int ks,
                        int w, int h,
                        double* out, int out_stride, int out_offset,
                        int max_transform = kFftConvMaxTransform);
+
+#if defined(SPK_FFT_CONVOLVE_TEST_HOOKS)
+// Allocation-free denial seam compiled only into the dedicated host regression.
+bool fft_convolve_same_denied_scratch_for_test(
+    const double* padded, int pw, int ph, const double* kern, int ks,
+    int w, int h, double* out, int out_stride, int out_offset,
+    int max_transform = kFftConvMaxTransform);
+#endif
 
 // The transform size fft_convolve_same would choose. Exposed for tests and for
 // cost/memory reporting; no side effects.

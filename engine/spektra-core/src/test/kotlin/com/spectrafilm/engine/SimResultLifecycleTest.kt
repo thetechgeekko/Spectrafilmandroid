@@ -130,4 +130,25 @@ class SimResultLifecycleTest {
 
         assertEquals(1, released.get())
     }
+
+    @Test
+    fun dataLeaseConstructionOomRollsBackRefcount() {
+        val released = AtomicInteger()
+        val result = SimResult.forTest(
+            data = ByteBuffer.allocateDirect(12).order(ByteOrder.nativeOrder()),
+            width = 1,
+            height = 1,
+            colorSpace = ColorSpace.SRGB,
+            renderId = 0L,
+            release = { released.incrementAndGet() },
+            dataLeaseFactory = DataLeaseFactory { _, _ ->
+                throw OutOfMemoryError("DataLease construction")
+            },
+        )
+
+        assertTrue(result.runCatching { acquireDataLease() }.exceptionOrNull() is OutOfMemoryError)
+        result.close()
+
+        assertEquals("phantom lease must not retain SimResult", 1, released.get())
+    }
 }

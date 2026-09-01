@@ -208,7 +208,11 @@ fun bitmapToLinearProPhoto(
     if (isCancelled()) throw CancellationException("bitmap conversion cancelled")
     val nativeOwner = if (offHeap) NativeBufferOwner.allocate(byteCount.toLong()) else null
     val nativeLease = nativeOwner?.acquireDataLease()
-    val buf = (nativeLease?.data ?: ByteBuffer.allocateDirect(byteCount)).order(ByteOrder.nativeOrder())
+    val buf = if (offHeap) {
+        checkNotNull(nativeLease).data
+    } else {
+        ByteBuffer.allocateDirect(byteCount)
+    }.order(ByteOrder.nativeOrder())
     val image = try {
         if (nativeLease != null) {
             LinearImage.fromDataLease(buf, w, h, "ProPhoto RGB", nativeLease)
@@ -859,11 +863,12 @@ suspend fun saveSimResultAsTiff(
         } else {
             // Quantise float [0,1] -> uint16 [0,65535] into an OFF-HEAP direct buffer (LE uint16).
             // ByteBuffer.allocateDirect is a managed byte[] on Android — at 100 MP that's ~600 MB on
-            // the ~256 MB ART heap and OOMs. Allocate natively (malloc + NewDirectByteBuffer); fall
-            // back to managed only if the native alloc fails. Freed after the writer consumes it.
+            // the ~256 MB ART heap and OOMs. Allocate through the global native
+            // coordinator and fail closed on denial; bypassing into ART would
+            // violate the same hard ceiling. Freed after the writer consumes it.
             val nativeOwner = NativeBufferOwner.allocate(rgb16Bytes.toLong())
-            val nativeLease = nativeOwner?.acquireDataLease()
-            val rgb16Buf = (nativeLease?.data ?: ByteBuffer.allocateDirect(rgb16Bytes))
+            val nativeLease = nativeOwner.acquireDataLease()
+            val rgb16Buf = nativeLease.data
                 .order(ByteOrder.LITTLE_ENDIAN)
             try {
                 result.acquireDataLease().use { lease ->
@@ -894,8 +899,8 @@ suspend fun saveSimResultAsTiff(
                     )
                 }
             } finally {
-                nativeLease?.close()
-                nativeOwner?.close()
+                nativeLease.close()
+                nativeOwner.close()
             }
         }
 
@@ -1198,11 +1203,11 @@ suspend fun saveSimResultAsPng16(
     try {
         // Quantise float [0,1] -> uint16 [0,65535] into an OFF-HEAP direct buffer (LE uint16).
         // ByteBuffer.allocateDirect is a managed byte[] on Android — ~600 MB at 100 MP → ART OOM.
-        // Allocate natively, falling back to managed only if the native alloc fails; freed after
-        // the writer consumes it.
+        // Allocate through the global native coordinator and fail closed on
+        // denial; falling back to ART would escape the hard ceiling.
         val nativeOwner = NativeBufferOwner.allocate(rgb16Bytes.toLong())
-        val nativeLease = nativeOwner?.acquireDataLease()
-        val rgb16Buf = (nativeLease?.data ?: ByteBuffer.allocateDirect(rgb16Bytes))
+        val nativeLease = nativeOwner.acquireDataLease()
+        val rgb16Buf = nativeLease.data
             .order(ByteOrder.LITTLE_ENDIAN)
         val encodedBytes = try {
             result.acquireDataLease().use { lease ->
@@ -1229,8 +1234,8 @@ suspend fun saveSimResultAsPng16(
                 )
             }
         } finally {
-            nativeLease?.close()
-            nativeOwner?.close()
+            nativeLease.close()
+            nativeOwner.close()
         }
 
         ensureExportActive()

@@ -28,4 +28,29 @@ class RenderPublicationGateTest {
         assertFalse(gate.tryClaim(export))
         assertTrue(gate.tryClaim(nextEdit))
     }
+
+    @Test
+    fun sourceInvalidationRejectsEveryOutstandingTicket() {
+        val gate = RenderPublicationGate()
+        val pending = gate.begin(gate.nextRevision(), RenderPublicationPriority.SETTLE)
+
+        gate.invalidate()
+
+        assertFalse(gate.tryClaim(pending))
+        val replacement = gate.begin(gate.nextRevision(), RenderPublicationPriority.DRAFT)
+        assertTrue(gate.tryClaim(replacement))
+    }
+
+    @Test
+    fun delayedBeginAfterSourceInvalidationCannotReauthorizeOldRevision() {
+        val gate = RenderPublicationGate()
+        val staleRevision = gate.nextRevision()
+
+        gate.invalidate()
+        val delayedOldSource = gate.begin(staleRevision, RenderPublicationPriority.SETTLE)
+
+        assertFalse(gate.tryClaim(delayedOldSource))
+        val replacement = gate.begin(gate.nextRevision(), RenderPublicationPriority.DRAFT)
+        assertTrue(gate.tryClaim(replacement))
+    }
 }

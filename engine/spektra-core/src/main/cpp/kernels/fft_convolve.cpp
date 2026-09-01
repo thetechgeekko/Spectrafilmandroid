@@ -121,11 +121,12 @@ int fft_convolve_transform_size(int w, int h, int ks, int max_transform) {
     return std::min(ideal, cap);
 }
 
-bool fft_convolve_same(const double* padded, int pw, int ph,
-                       const double* kern, int ks,
-                       int w, int h,
-                       double* out, int out_stride, int out_offset,
-                       int max_transform) {
+static bool fft_convolve_same_impl(const double* padded, int pw, int ph,
+                                   const double* kern, int ks,
+                                   int w, int h,
+                                   double* out, int out_stride, int out_offset,
+                                   int max_transform,
+                                   bool deny_scratch_for_test) {
     if (!padded || !kern || !out) return false;
     if (ks < 1 || (ks % 2) == 0) return false;          // odd kernels only
     if (w < 1 || h < 1) return false;
@@ -139,14 +140,13 @@ bool fft_convolve_same(const double* padded, int pw, int ph,
     const size_t spec_sz  = static_cast<size_t>(n) * bins * 2;
     const size_t plane_sz = static_cast<size_t>(n) * n;
 
-    std::vector<double> kspec, tspec, plane;
-    try {
-        kspec.assign(spec_sz, 0.0);
-        tspec.assign(spec_sz, 0.0);
-        plane.assign(plane_sz, 0.0);
-    } catch (const std::bad_alloc&) {
-        return false;                                    // caller falls back
-    }
+    // Fail closed on scratch denial. The diffusion caller selected this path
+    // because the direct convolution is prohibitively expensive; returning
+    // false here used to turn memory pressure into an hours-long fallback.
+    if (deny_scratch_for_test) throw std::bad_alloc{};
+    std::vector<double> kspec(spec_sz, 0.0);
+    std::vector<double> tspec(spec_sz, 0.0);
+    std::vector<double> plane(plane_sz, 0.0);
 
     const RfftPlan rp(n);
     const FftPlan  cp(n);
@@ -214,5 +214,26 @@ bool fft_convolve_same(const double* padded, int pw, int ph,
     }
     return true;
 }
+
+bool fft_convolve_same(const double* padded, int pw, int ph,
+                       const double* kern, int ks,
+                       int w, int h,
+                       double* out, int out_stride, int out_offset,
+                       int max_transform) {
+    return fft_convolve_same_impl(
+        padded, pw, ph, kern, ks, w, h, out, out_stride, out_offset,
+        max_transform, /*deny_scratch_for_test=*/false);
+}
+
+#if defined(SPK_FFT_CONVOLVE_TEST_HOOKS)
+bool fft_convolve_same_denied_scratch_for_test(
+        const double* padded, int pw, int ph, const double* kern, int ks,
+        int w, int h, double* out, int out_stride, int out_offset,
+        int max_transform) {
+    return fft_convolve_same_impl(
+        padded, pw, ph, kern, ks, w, h, out, out_stride, out_offset,
+        max_transform, /*deny_scratch_for_test=*/true);
+}
+#endif
 
 }  // namespace spk

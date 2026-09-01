@@ -83,6 +83,7 @@ import com.spectrafilm.engine.RenderKind
 import com.spectrafilm.engine.Rgb2Raw
 import com.spectrafilm.engine.SimResult
 import com.spectrafilm.engine.SpektraEngine
+import com.spectrafilm.app.masks.MaskCompositor
 import com.spectrafilm.libraw.RawDecodeException
 import com.spectrafilm.libraw.DecodeStatus
 import com.spectrafilm.libraw.WhiteBalance
@@ -506,6 +507,13 @@ class MainActivity : ComponentActivity() {
         val zoomDecodeFlight = remember { SingleFlight<Unit>() }
         val previewDecodeFlight = remember { SingleFlight<Unit>() }
         DisposableEffect(Unit) { onDispose { zoomSourceCache.invalidate() } }
+        DisposableEffect(Unit) {
+            onDispose {
+                gradeCache.close()
+                zoomDecodeFlight.invalidate()
+                previewDecodeFlight.invalidate()
+            }
+        }
 
         // bundled catalog (friendly stock names + grouping) and built-in presets
         var builtInGroups by remember { mutableStateOf<Map<String, List<BuiltInPreset>>>(emptyMap()) }
@@ -527,6 +535,17 @@ class MainActivity : ComponentActivity() {
         var sourceRestoreChecked by remember { mutableStateOf(false) }
         var preview by remember { mutableStateOf<Bitmap?>(null) }
         var beforePreview by remember { mutableStateOf<Bitmap?>(null) }
+        // The histogram captures its pixels during composition and never retains either Bitmap.
+        // Once a frame is replaced (or the editor leaves composition), no asynchronous reader can
+        // still touch it, so release the native pixel storage deterministically after composition.
+        DisposableEffect(preview) {
+            val owned = preview
+            onDispose { owned?.let(::retirePreviewBitmap) }
+        }
+        DisposableEffect(beforePreview) {
+            val owned = beforePreview
+            onDispose { owned?.let(::retirePreviewBitmap) }
+        }
         var status by remember { mutableStateOf("initializing…") }
         var previewBusy by remember { mutableStateOf(false) }
         var decoding by remember { mutableStateOf(false) }
@@ -620,6 +639,36 @@ class MainActivity : ComponentActivity() {
         val roiPublicationGate = remember { RoiRenderPublicationGate() }
         val latestRoiRenderKey by rememberUpdatedState(previewTick)
         val latestMagnifierRenderKey by rememberUpdatedState(previewTick)
+
+        /** Retire every source-derived resource before committing a different source identity. */
+        fun retireSourceResources() {
+            publicationGate.invalidate()
+            sourceCache.invalidate()
+            zoomSourceCache.invalidate()
+            gradeCache.clear()
+            previewDecodeFlight.invalidate()
+            zoomDecodeFlight.invalidate()
+
+            // A failed authorization/decode must not leave pixels from the prior source visible or
+            // retained. State removal drives the DisposableEffects above, whose read leases defer
+            // physical recycle only until an already-running histogram sample completes.
+            preview = null
+            beforePreview = null
+
+            gpuProxyLease?.close()
+            gpuProxyLease = null
+            gpuLut = null
+            gpuGain = 1f
+
+            roiPublicationGate.invalidate()
+            roiJobRef.value?.cancel()
+            roiOverlay = null
+            magnifierPublicationGate.invalidate()
+            magnifierJobRef.value?.cancel()
+            magnifierBitmap = null
+            magnifierRendering = false
+        }
+
         // Invalidate an old edit generation before its next main-thread publication, cancel its
         // remaining native work, and retire its overlay while the replacement preview is pending.
         LaunchedEffect(previewTick) {
@@ -1014,7 +1063,9 @@ class MainActivity : ComponentActivity() {
         fun reconcileVisibleSourceAfterFailure(durable: SourceRestoreResult?) {
             when (durable) {
                 is SourceRestoreResult.Ready -> {
-                    val switched = sourceUri?.toString() != durable.ref.uri
+                    val switched = sourceUri?.toString() != durable.ref.uri ||
+                        sourceKind.name != durable.ref.kind
+                    if (switched) retireSourceResources()
                     sourceUri = Uri.parse(durable.ref.uri)
                     sourceKind = SourceKind.valueOf(durable.ref.kind)
                     sourceName = durable.ref.displayName
@@ -1023,7 +1074,9 @@ class MainActivity : ComponentActivity() {
                     status = "selection failed · previous source restored"
                 }
                 is SourceRestoreResult.NeedsAuthorization -> {
-                    val switched = sourceUri?.toString() != durable.ref.uri
+                    val switched = sourceUri?.toString() != durable.ref.uri ||
+                        sourceKind.name != durable.ref.kind
+                    if (switched) retireSourceResources()
                     sourceUri = Uri.parse(durable.ref.uri)
                     sourceKind = SourceKind.valueOf(durable.ref.kind)
                     sourceName = durable.ref.displayName
@@ -1032,6 +1085,9 @@ class MainActivity : ComponentActivity() {
                     status = "selection failed · previous source needs authorization"
                 }
                 SourceRestoreResult.None -> {
+                    if (sourceUri != null || sourceKind != SourceKind.DEMO) {
+                        retireSourceResources()
+                    }
                     sourceUri = null
                     sourceKind = SourceKind.DEMO
                     sourceName = "synthetic demo image"
@@ -1060,6 +1116,9 @@ class MainActivity : ComponentActivity() {
                 when (outcome) {
                     is ReconciledSourceMutation.Applied -> {
                         val ref = outcome.value
+                        if (sourceUri?.toString() != uri.toString() || sourceKind != kind) {
+                            retireSourceResources()
+                        }
                         sourceUri = uri
                         sourceKind = kind
                         sourceName = displayName
@@ -1203,7 +1262,9 @@ class MainActivity : ComponentActivity() {
                     // The FIFO restore and generation post-check make this durable result
                     // authoritative. A recreated SavedState may still name source A when a
                     // process-owned acquisition of B committed after the old Activity died.
-                    val switched = sourceUri?.toString() != restored.ref.uri
+                    val switched = sourceUri?.toString() != restored.ref.uri ||
+                        sourceKind.name != restored.ref.kind
+                    if (switched) retireSourceResources()
                     sourceUri = Uri.parse(restored.ref.uri)
                     sourceKind = SourceKind.valueOf(restored.ref.kind)
                     sourceName = restored.ref.displayName
@@ -1213,6 +1274,11 @@ class MainActivity : ComponentActivity() {
                     previewTick++
                 }
                 is SourceRestoreResult.NeedsAuthorization -> {
+                    if (sourceUri?.toString() != restored.ref.uri ||
+                        sourceKind.name != restored.ref.kind
+                    ) {
+                        retireSourceResources()
+                    }
                     sourceUri = Uri.parse(restored.ref.uri)
                     sourceKind = SourceKind.valueOf(restored.ref.kind)
                     sourceName = restored.ref.displayName
@@ -1634,14 +1700,26 @@ class MainActivity : ComponentActivity() {
                 // Grade-only edit? Re-grade the retained full-quality settle result in
                 // pure Kotlin — zero native work, and it beats a low-res draft on quality.
                 gradeCache.lookup(gradeCacheKey(fullEdge))?.let { pristine ->
-                    runCatching {
-                        withContext(Dispatchers.Default) {
-                            gradeBufferToBitmap(pristine.scratchCopy(), pristine.width,
-                                pristine.height, pristine.colorSpace, state.savingCctfEncoding,
-                                state.saturation, state.vibrance, state.gamutCompress,
-                                state.localAdjustments)
+                    val gradeResult = try {
+                        runCatching {
+                            withOwnedContext(
+                                context = Dispatchers.Default,
+                                dispose = { bitmap: Bitmap ->
+                                    if (!bitmap.isRecycled) bitmap.recycle()
+                                },
+                            ) {
+                                pristine.withScratch { scratch ->
+                                    gradeBufferToBitmap(scratch, pristine.width,
+                                        pristine.height, pristine.colorSpace, state.savingCctfEncoding,
+                                        state.saturation, state.vibrance, state.gamutCompress,
+                                        state.localAdjustments)
+                                }
+                            }
                         }
-                    }.onSuccess { bmp ->
+                    } finally {
+                        pristine.close()
+                    }
+                    gradeResult.onSuccess { bmp ->
                         withContext(Dispatchers.Main) {
                             if (publicationGate.tryClaim(publicationTicket)) {
                                 preview = bmp
@@ -1667,7 +1745,12 @@ class MainActivity : ComponentActivity() {
                 var renderId = 0L
                 val draftResult = proxyLease.use { lease ->
                     runCatching {
-                        withContext(Dispatchers.Default) {
+                        withOwnedContext(
+                            context = Dispatchers.Default,
+                            dispose = { bitmap: Bitmap ->
+                                if (!bitmap.isRecycled) bitmap.recycle()
+                            },
+                        ) {
                             runCancellableNative(
                                 onLateResult = { late ->
                                     late.reportOutcome(AppRenderOutcome.SUPERSEDED)
@@ -1729,66 +1812,112 @@ class MainActivity : ComponentActivity() {
             // Key built on MAIN (reads Compose state); the same snapshot renders below,
             // so the key and the render can never disagree.
             val cacheKey = gradeCacheKey(fullEdge)
+            val cacheStoreTicket = gradeCache.beginStore(cacheKey)
             val cached = gradeCache.lookup(cacheKey)
             val prevBefore = beforePreview
             var renderId = 0L
-            val result = runCatching {
-                withContext(Dispatchers.Default) {
-                    if (cached != null && prevBefore != null) {
-                        // Grade-only edit (identical engine inputs): re-grade the retained
-                        // pristine engine result — ZERO native work. The ungraded `before`
-                        // is unchanged by construction.
-                        Triple(
-                            prevBefore,
-                            gradeBufferToBitmap(cached.scratchCopy(), cached.width,
-                                cached.height, cached.colorSpace, state.savingCctfEncoding,
-                                state.saturation, state.vibrance, state.gamutCompress,
-                                state.localAdjustments),
-                            false,
-                        )
-                    } else {
-                        decoding = true
+            val result = try {
+                runCatching {
+                    withOwnedContext(
+                        context = Dispatchers.Default,
+                        dispose = { submission: Triple<Bitmap, Bitmap, Boolean> ->
+                            if (!submission.second.isRecycled) submission.second.recycle()
+                            if (submission.third && !submission.first.isRecycled) {
+                                submission.first.recycle()
+                            }
+                        },
+                    ) {
+                        if (cached != null && prevBefore != null) {
+                            // Grade-only edit (identical engine inputs): re-grade the retained
+                            // pristine engine result — ZERO native work. The ungraded `before`
+                            // is unchanged by construction.
+                            var after: Bitmap? = null
+                            var transferred = false
+                            try {
+                                val rendered = cached.withScratch { scratch ->
+                                    gradeBufferToBitmap(scratch, cached.width,
+                                        cached.height, cached.colorSpace, state.savingCctfEncoding,
+                                        state.saturation, state.vibrance, state.gamutCompress,
+                                        state.localAdjustments)
+                                }
+                                after = rendered
+                                val submission = Triple(prevBefore, rendered, false)
+                                transferred = true
+                                submission
+                            } finally {
+                                if (!transferred) after?.let { if (!it.isRecycled) it.recycle() }
+                            }
+                        } else {
+                            decoding = true
                         // The live DRAFT effect above already paints a fast low-res proxy during the
                         // edit, so this settle pass goes straight to the crisp full render (no separate
                         // coarse pass / extra fresh decode). Cached proxy source — re-decodes only when
                         // a decode-affecting key (URI/kind/WB/temp/tint/rotation/edge) changed;
                         // look-param edits reuse it.
-                        loadSourceCachedForPreview(fullEdge).use { lease ->
-                            decoding = false
-                            val before = linearToDisplayBitmap(lease.image)
-                            // Fit preview skips grain/halation (the user's "grain at 100%" choice): they
-                            // are rendered by the zoom ROI, the magnifier and export, never the fit settle.
-                            // Render with cacheKey.engineParams — the exact snapshot the key hashed.
-                            val after = runCancellableNative(
-                                onLateResult = { late ->
-                                    late.reportOutcome(AppRenderOutcome.SUPERSEDED)
-                                    late.close()
-                                },
-                            ) { cancellation ->
-                                e.simulatePreview(
-                                    lease.image,
-                                    cacheKey.engineParams,
-                                    cancellation = cancellation,
-                                )
-                            }.use { res ->
-                                renderId = res.renderId
-                                // Retain the PRISTINE engine output BEFORE the grade mutates it.
-                                res.acquireDataLease().use { lease ->
-                                    val data = lease.data
-                                    gradeCache.store(
-                                        cacheKey,
-                                        data,
-                                        res.width,
-                                        res.height,
-                                        res.colorSpace,
-                                    )
+                            var before: Bitmap? = null
+                            var after: Bitmap? = null
+                            var transferred = false
+                            try {
+                                val submission = loadSourceCachedForPreview(fullEdge).use { lease ->
+                                    decoding = false
+                                    val ownedBefore = linearToDisplayBitmap(lease.image)
+                                    before = ownedBefore
+                                    // Fit preview skips grain/halation (the user's "grain at 100%" choice): they
+                                    // are rendered by the zoom ROI, the magnifier and export, never the fit settle.
+                                    // Render with cacheKey.engineParams — the exact snapshot the key hashed.
+                                    val ownedAfter = runCancellableNative(
+                                        onLateResult = { late ->
+                                            late.reportOutcome(AppRenderOutcome.SUPERSEDED)
+                                            late.close()
+                                        },
+                                    ) { cancellation ->
+                                        e.simulatePreview(
+                                            lease.image,
+                                            cacheKey.engineParams,
+                                            cancellation = cancellation,
+                                        )
+                                    }.use { res ->
+                                        renderId = res.renderId
+                                        // Retain the PRISTINE engine output BEFORE the grade mutates it.
+                                        res.acquireDataLease().use { resultLease ->
+                                            val cacheOutcome = storeGradeCacheBestEffort {
+                                                gradeCache.store(
+                                                    cacheStoreTicket,
+                                                    cacheKey,
+                                                    resultLease.data,
+                                                    res.width,
+                                                    res.height,
+                                                    res.colorSpace,
+                                                )
+                                            }
+                                            if (cacheOutcome == GradeCacheStoreOutcome.CAPACITY_DENIED) {
+                                                Diag.w("grade cache skipped: memory admission denied")
+                                            }
+                                        }
+                                        simResultToBitmapGraded(
+                                            res,
+                                            state.savingCctfEncoding,
+                                            state.saturation,
+                                            state.vibrance,
+                                            state.gamutCompress,
+                                            state.localAdjustments,
+                                        ).also { rendered -> after = rendered }
+                                    }
+                                    Triple(ownedBefore, ownedAfter, true)
                                 }
-                                simResultToBitmapGraded(res, state.savingCctfEncoding, state.saturation, state.vibrance, state.gamutCompress, state.localAdjustments)
+                                transferred = true
+                                submission
+                            } finally {
+                                if (!transferred) {
+                                    after?.let { if (!it.isRecycled) it.recycle() }
+                                    before?.let { if (!it.isRecycled) it.recycle() }
+                                }
                             }
-                            Triple(before, after, true)
                         }
                     }
                 }
+            } finally {
+                cached?.close()
             }
             decoding = false
             if (!isActive || !publicationGate.tryClaim(publicationTicket)) {
@@ -1904,22 +2033,6 @@ class MainActivity : ComponentActivity() {
                 Diag.w("gpu lut bake failed: ${it.message} -> CPU preview")
             }
         }
-
-        // MEMORY (#2): `preview` and `beforePreview` are intentionally LEFT TO GC, not recycled
-        // on swap. Recycling them is NOT provably safe: `preview` is consumed by
-        // PreviewHistogramOverlay (Viewer.kt), which reads its pixels with getPixels() from a
-        // background coroutine
-        // (LaunchedEffect(bitmap){ withContext(Dispatchers.Default){ computeHistogram(bitmap) } }).
-        // computeHistogram is a tight, non-suspending loop, so when `preview` swaps mid-compute
-        // the previous coroutine is NOT actually cancelled (cancellation is cooperative) and runs
-        // to completion on the OLD bitmap. Recycling that bitmap on the recomposition swap would
-        // race the still-running getPixels() -> "Can't call getPixels() on a recycled bitmap"
-        // crash, and a check-then-recycle can't close that window without coordinating with the
-        // histogram coroutine. Per the audit's correctness-over-aggressiveness rule these orphaned
-        // ARGB_8888 bitmaps (incl. the full-res export bitmap, which becomes `preview`) are left
-        // for the GC, which reclaims them promptly under the memory pressure that actually
-        // matters. Only the magnifier crop — which has NO async reader — is recycled
-        // deterministically (see the magnifier overlay's DisposableEffect below).
 
         // re-trigger preview on any change to the params snapshot / source / rotation.
         //
@@ -2407,6 +2520,9 @@ class MainActivity : ComponentActivity() {
                                 onOpenRaw = { rawPicker.launch(arrayOf("*/*")) },
                                 onUseDemo = {
                                     val selectionGeneration = sourceMutationGate.begin()
+                                    if (sourceUri != null || sourceKind != SourceKind.DEMO) {
+                                        retireSourceResources()
+                                    }
                                     sourceUri = null; sourceKind = SourceKind.DEMO
                                     sourceName = "synthetic demo image"; rotation = SourceRotation.NONE
                                     sourceAuthorizationRequired = false
@@ -2826,28 +2942,56 @@ class MainActivity : ComponentActivity() {
                                                     "Engine result color space disagrees with output contract"
                                                 }
                                                 val tGrade0 = System.currentTimeMillis()
-                                                 val bmp0 = simResultToBitmapGraded(
-                                                    res,
-                                                    exportCctf,
-                                                    exportSaturation,
-                                                    exportVibrance,
-                                                    exportGamutCompress,
-                                                     exportAdjustments,
-                                                 )
-                                                 // Take ownership immediately. If downscaling or any
-                                                 // pre-commit step throws, the outer failure path recycles it.
-                                                 previewCandidate = bmp0
-                                                 // Post-render downscale for the bitmap formats (high-bit-depth
-                                                 // is always full-res → longEdge null). Free the full-res bitmap.
-                                                 val bmp = longEdge?.let { edge ->
-                                                     scaleBitmapToLongEdge(bmp0, edge).also { scaled ->
-                                                         if (scaled !== bmp0) {
-                                                             previewCandidate = scaled
-                                                             runCatching { bmp0.recycle() }
-                                                         }
-                                                     }
-                                                 } ?: bmp0
-                                                 previewCandidate = bmp
+                                                val bitmapEncoder = when (outputDescriptor.encoder) {
+                                                    OutputEncoder.ANDROID_BITMAP_PNG,
+                                                    OutputEncoder.ANDROID_BITMAP_JPEG,
+                                                    -> true
+                                                    OutputEncoder.NATIVE_TIFF_UINT16,
+                                                    OutputEncoder.NATIVE_TIFF_FLOAT32,
+                                                    OutputEncoder.NATIVE_PNG16,
+                                                    -> false
+                                                    else -> error("Scene-linear encoder reached rendered branch")
+                                                }
+                                                val bmp = if (bitmapEncoder) {
+                                                    val full = simResultToBitmapGraded(
+                                                        res,
+                                                        exportCctf,
+                                                        exportSaturation,
+                                                        exportVibrance,
+                                                        exportGamutCompress,
+                                                        exportAdjustments,
+                                                    )
+                                                    // Take ownership immediately. If downscaling or any
+                                                    // pre-commit step throws, the outer failure path recycles it.
+                                                    previewCandidate = full
+                                                    // Post-render downscale for Bitmap encoders only. Native
+                                                    // high-bit writers consume the float buffer without ever
+                                                    // materialising a full-resolution ARGB_8888 Bitmap.
+                                                    longEdge?.let { edge ->
+                                                        scaleBitmapToLongEdge(full, edge).also { scaled ->
+                                                            if (scaled !== full) {
+                                                                previewCandidate = scaled
+                                                                runCatching { full.recycle() }
+                                                            }
+                                                        }
+                                                    } ?: full
+                                                } else {
+                                                    // Preserve WYSIWYG grading in the writer's float source while
+                                                    // avoiding the additional ~4 bytes/pixel full-res Bitmap.
+                                                    res.acquireDataLease().use { lease ->
+                                                        ColorGrade.applyInPlace(
+                                                            lease.data, res.width, res.height, res.colorSpace,
+                                                            exportCctf, exportSaturation, exportVibrance,
+                                                            exportGamutCompress,
+                                                        )
+                                                        MaskCompositor.applyInPlace(
+                                                            lease.data, res.width, res.height, res.colorSpace,
+                                                            exportCctf, exportAdjustments,
+                                                        )
+                                                    }
+                                                    null
+                                                }
+                                                previewCandidate = bmp
                                                 phGrade = System.currentTimeMillis() - tGrade0
                                                 val tEnc0 = System.currentTimeMillis()
                                                 withContext(Dispatchers.IO) {
@@ -2870,7 +3014,9 @@ class MainActivity : ComponentActivity() {
                                                         OutputEncoder.ANDROID_BITMAP_PNG,
                                                         OutputEncoder.ANDROID_BITMAP_JPEG -> saveToGallery(
                                                             exportContext,
-                                                            bmp,
+                                                            requireNotNull(bmp) {
+                                                                "Bitmap encoder missing graded bitmap"
+                                                            },
                                                             outputDescriptor,
                                                             exportJpegQuality,
                                                             srcExif,
@@ -2881,6 +3027,8 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
                                                 phEnc = System.currentTimeMillis() - tEnc0
+                                                // Native high-bit exports deliberately retain no preview; the
+                                                // existing editor preview stays visible at bounded fit size.
                                                 bmp
                                             } finally {
                                                 res.close()
@@ -2897,11 +3045,14 @@ class MainActivity : ComponentActivity() {
                                         runCatching { bitmap?.recycle() }
                                         null
                                     }
+                                    // Keep cleanup authority pointed at the final proxy until the terminal
+                                    // outcome object is successfully constructed and owns it.
+                                    previewCandidate = retainedBitmap
                                     runCatching {
                                         SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
                                     }
                                     val totalMs = System.currentTimeMillis() - exportStartMs
-                                    ExportTerminalOutcome.Success(
+                                    val success = ExportTerminalOutcome.Success(
                                         format = exportFmt,
                                         renderId = renderId,
                                         bitmap = retainedBitmap,
@@ -2915,6 +3066,8 @@ class MainActivity : ComponentActivity() {
                                             encodeMs = phEnc,
                                         ),
                                     )
+                                    previewCandidate = null
+                                    success
                                 } catch (failure: Throwable) {
                                     if (destinationCommit.isPublished) {
                                         // Publication is the transaction's linearization point.
@@ -3154,10 +3307,8 @@ class MainActivity : ComponentActivity() {
 
             // Compact translucent histogram overlaid at the TOP EDGE of the preview
             // (Lightroom-style). Driven by the same `showHistogram` state as the
-            // Source-panel toggle. computeHistogram runs on a bg coroutine inside
-            // PreviewHistogramOverlay; it reads pixels from `bmp` which is the live
-            // preview reference — the preview swap path replaces (not recycles) this
-            // bitmap, so there is no recycle race here.
+            // Source-panel toggle. PreviewHistogramOverlay acquires an explicit read lease and
+            // samples off-main; preview retirement defers recycle until that lease closes.
             if (showHistogram && bmp != null) {
                 PreviewHistogramOverlay(
                     bitmap = bmp,

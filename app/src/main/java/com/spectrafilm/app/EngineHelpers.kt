@@ -24,11 +24,10 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.max
@@ -431,6 +430,22 @@ const val ROI_DRAFT_MAX_PX = 640
  *  This is Lightroom's draft/final loupe behaviour, ported to the spectral CPU engine. */
 const val DRAFT_RENDER_MAX_PX = 384
 
+/** Dispose an already-created owned value if any later construction/fill step throws. */
+internal inline fun <T, R> disposeOnFailure(
+    owned: T,
+    dispose: (T) -> Unit,
+    block: (T) -> R,
+): R = try {
+    block(owned)
+} catch (failure: Throwable) {
+    try {
+        dispose(owned)
+    } catch (disposeFailure: Throwable) {
+        runCatching { failure.addSuppressed(disposeFailure) }
+    }
+    throw failure
+}
+
 /**
  * Run a resource-producing block on [context] without leaking its result in
  * [withContext]'s prompt-cancellation return window.
@@ -473,21 +488,70 @@ internal suspend fun <T : Any> withOwnedContext(
  * caller awaits the same one (or, by then, hits the now-warm cache). Not for different keys — those
  * just start their own flight (a source/WB/rotation change, never a per-gesture event).
  */
-class SingleFlight<T> {
-    private val mutex = Mutex()
+internal class SingleFlight<T> {
+    private val lock = Any()
     private var key: Any? = null
     private var inflight: Deferred<T>? = null
 
     suspend fun run(key: Any, scope: CoroutineScope, block: suspend () -> T): T {
-        val deferred = mutex.withLock {
+        var superseded: Deferred<T>? = null
+        var created: Deferred<T>? = null
+        val deferred = synchronized(lock) {
             val cur = inflight
             if (this.key == key && cur != null && cur.isActive) {
                 cur
             } else {
-                scope.async { block() }.also { this.key = key; inflight = it }
+                if (cur?.isActive == true) superseded = cur
+                scope.async { block() }.also {
+                    this.key = key
+                    inflight = it
+                    created = it
+                }
             }
         }
-        return deferred.await()
+        // Cleanup belongs to the stable-scope operation, not to an arbitrary waiter. A caller can
+        // be cancelled while the detached decode legitimately continues; its finally block then
+        // runs before completion and cannot clear the retained Deferred. invokeOnCompletion also
+        // runs immediately when an Unconfined/fast block completed before registration.
+        created?.let { owned ->
+            owned.invokeOnCompletion {
+                synchronized(lock) {
+                    if (inflight === owned) {
+                        inflight = null
+                        this.key = null
+                    }
+                }
+            }
+        }
+        // A different request cannot publish useful work. Cancellation is cooperative: a native
+        // decoder that is already inside a non-cancellable call may finish, but its stale ticket is
+        // rejected by DecodedSourceCache.publish and the result is closed there.
+        superseded?.cancel(CancellationException("single-flight request superseded"))
+        return try {
+            deferred.await()
+        } finally {
+            // A completed Deferred retains its coroutine closure and captured request graph. Drop
+            // both it and the key promptly; same-key waiters already hold their own local reference.
+            synchronized(lock) {
+                if (inflight === deferred && deferred.isCompleted) {
+                    inflight = null
+                    this.key = null
+                }
+            }
+        }
+    }
+
+    /** Cancel and forget the current generation (source replacement / editor teardown). */
+    fun invalidate() {
+        val previous = synchronized(lock) {
+            key = null
+            inflight.also { inflight = null }
+        }
+        previous?.cancel(CancellationException("single-flight invalidated"))
+    }
+
+    internal fun isIdle(): Boolean = synchronized(lock) {
+        key == null && inflight == null
     }
 }
 
@@ -518,7 +582,20 @@ class SingleFlight<T> {
  * .IO sequentially per render); methods are `@Synchronized` as cheap insurance since
  * [invalidate] may be called from a different scope.
  */
-internal class DecodedSourceCache {
+internal interface DecodedSourceCacheConstructionHooks {
+    fun beforeTicketConstruction() = Unit
+    fun beforeEntryConstruction() = Unit
+    fun beforeLeaseConstruction() = Unit
+
+    companion object {
+        val NONE: DecodedSourceCacheConstructionHooks = object : DecodedSourceCacheConstructionHooks {}
+    }
+}
+
+internal class DecodedSourceCache(
+    private val constructionHooks: DecodedSourceCacheConstructionHooks =
+        DecodedSourceCacheConstructionHooks.NONE,
+) {
     /** Everything that affects the DECODE of the proxy source — and nothing that doesn't. */
     data class Request(
         val uri: String?,
@@ -549,6 +626,7 @@ internal class DecodedSourceCache {
     private class Entry(
         val request: Request,
         val image: LinearImage,
+        private val constructionHooks: DecodedSourceCacheConstructionHooks,
     ) {
         private var leases = 0
         private var retired = false
@@ -557,7 +635,15 @@ internal class DecodedSourceCache {
         fun acquire(): Lease? {
             if (retired) return null
             leases++
-            return Lease(image, ::release)
+            return try {
+                constructionHooks.beforeLeaseConstruction()
+                Lease(image, ::release)
+            } catch (failure: Throwable) {
+                // Lease construction owns the increment. Roll it back before the exception can
+                // escape, otherwise retirement permanently believes a phantom reader is active.
+                release()
+                throw failure
+            }
         }
 
         @Synchronized
@@ -595,13 +681,27 @@ internal class DecodedSourceCache {
      * Begin or join the newest decode generation. A different immutable request invalidates old
      * publication authority before its detached decode can complete.
      */
-    @Synchronized
     fun beginRequest(request: Request): Ticket {
-        if (requested != request) {
-            requested = request
-            generation++
+        var stale: Entry? = null
+        val ticket = synchronized(this) {
+            val changed = requested != request
+            val ticketGeneration = if (changed) generation + 1L else generation
+            // Construct authority before mutating/detaching current state. OOME here leaves the
+            // previous request and entry fully intact instead of creating a half-switched cache.
+            constructionHooks.beforeTicketConstruction()
+            val created = Ticket(request, ticketGeneration)
+            if (changed) {
+                requested = request
+                generation = ticketGeneration
+                stale = entry
+                entry = null
+            }
+            created
         }
-        return Ticket(request, generation)
+        // Never strand the previous source while a replacement decode is pending or fails. Active
+        // leases still pin it; Entry.retire closes only after the final reader exits.
+        stale?.retire()
+        return ticket
     }
 
     /**
@@ -629,19 +729,25 @@ internal class DecodedSourceCache {
      */
     fun publish(ticket: Ticket, img: LinearImage): Boolean {
         var accepted = false
-        val previous = synchronized(this) {
-            if (ticket.generation != generation || ticket.request != requested) {
-                null
-            } else {
-                accepted = true
-                val current = entry
-                if (current?.image !== img) {
-                    entry = Entry(ticket.request, img)
-                    current
-                } else {
+        val previous = try {
+            synchronized(this) {
+                if (ticket.generation != generation || ticket.request != requested) {
                     null
+                } else {
+                    val current = entry
+                    if (current?.image !== img) {
+                        // Entry construction is the ownership-transfer point for img. If it fails,
+                        // the catch below closes the still-unowned incoming image exactly once.
+                        constructionHooks.beforeEntryConstruction()
+                        entry = Entry(ticket.request, img, constructionHooks)
+                    }
+                    accepted = true
+                    if (current?.image !== img) current else null
                 }
             }
+        } catch (failure: Throwable) {
+            img.close()
+            throw failure
         }
         if (accepted) {
             previous?.retire()
@@ -682,29 +788,34 @@ fun simResultToBitmap(
     // Tag the bitmap with the engine output space so the system color-manages it to the panel
     // (and embeds the right ICC on Bitmap.compress export) instead of assuming sRGB. native; no IntArray.
     val bmp = createTaggedBitmap(w, h, colorSpace)
-    // Scratch is now a FLOAT strip plus the int strip, so the band is sized by the float
-    // budget (~4 MB = 1M floats) rather than the int one. Total managed scratch stays in the
-    // same class as the single 4 MB IntArray this replaced, and stays independent of image
-    // megapixels — the OOM note above still holds.
-    val bandRows = (1024 * 1024 / (w * 3)).coerceIn(1, h)
-    val src = FloatArray(w * bandRows * 3)
-    val strip = IntArray(w * bandRows)
-    var y = 0
-    while (y < h) {
-        val rows = minOf(bandRows, h - y)
-        val n = w * rows
-        // Bulk-read the strip instead of three bounds-checked FloatBuffer.get() per pixel.
-        // A device variant ladder put per-element buffer ops at ~51% of an equivalent
-        // per-pixel loop's cost, with sequential reads costing nothing once bulk
-        // (docs/research/perf-lab.md §16.9). This loop has no scatter, so that is the
-        // whole of the win here.
-        f.position(y * w * 3)
-        f.get(src, 0, n * 3)
-        packToArgb(src, strip, n)
-        bmp.setPixels(strip, 0, w, 0, y, w, rows)
-        y += rows
+    return disposeOnFailure(
+        owned = bmp,
+        dispose = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
+    ) { ownedBitmap ->
+        // Scratch is now a FLOAT strip plus the int strip, so the band is sized by the float
+        // budget (~4 MB = 1M floats) rather than the int one. Total managed scratch stays in the
+        // same class as the single 4 MB IntArray this replaced, and stays independent of image
+        // megapixels — the OOM note above still holds.
+        val bandRows = (1024 * 1024 / (w * 3)).coerceIn(1, h)
+        val src = FloatArray(w * bandRows * 3)
+        val strip = IntArray(w * bandRows)
+        var y = 0
+        while (y < h) {
+            val rows = minOf(bandRows, h - y)
+            val n = w * rows
+            // Bulk-read the strip instead of three bounds-checked FloatBuffer.get() per pixel.
+            // A device variant ladder put per-element buffer ops at ~51% of an equivalent
+            // per-pixel loop's cost, with sequential reads costing nothing once bulk
+            // (docs/research/perf-lab.md §16.9). This loop has no scatter, so that is the
+            // whole of the win here.
+            f.position(y * w * 3)
+            f.get(src, 0, n * 3)
+            packToArgb(src, strip, n)
+            ownedBitmap.setPixels(strip, 0, w, 0, y, w, rows)
+            y += rows
+        }
+        ownedBitmap
     }
-    return bmp
 }
 
 /**
@@ -782,7 +893,7 @@ fun simResultToBitmapGraded(
 /**
  * The buffer-level core of [simResultToBitmapGraded]: grade [data] IN PLACE and
  * convert to a bitmap. Also the re-grade entry point for [GradeCache] hits —
- * pass a [GradeCache.Pristine.scratchCopy], never the retained master.
+ * use [GradeCache.Pristine.withScratch], never the retained master.
  */
 fun gradeBufferToBitmap(
     data: java.nio.ByteBuffer,

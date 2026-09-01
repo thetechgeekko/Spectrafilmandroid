@@ -22,6 +22,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -43,6 +44,17 @@
 namespace {
 
 spk::jni::AllocationRegistry g_allocations;
+spk::jni::ExternalReservationRegistry g_jvm_reservations(
+    spk::memory::MemoryDomain::Jvm);
+
+bool free_registered_allocation(void* base, std::size_t size,
+                                std::uint64_t token) {
+    auto owned = g_allocations.take(base, size, token);
+    if (!owned) return false;
+    std::free(owned.base());
+    // `owned` releases budget accounting only after free() has completed.
+    return true;
+}
 
 // Throw a java.lang.RuntimeException carrying `msg` so a real, specific failure
 // reaches Kotlin instead of collapsing to a bare null return (which the facade
@@ -85,6 +97,27 @@ void throw_status(JNIEnv* env, spk_status st) noexcept {
         env->ExceptionClear();
     }
     throw_runtime(env, msg);
+}
+
+void throw_illegal_argument(JNIEnv* env, const char* msg) noexcept {
+    if (env->ExceptionCheck()) return;
+    jclass cls = env->FindClass("java/lang/IllegalArgumentException");
+    if (cls) {
+        env->ThrowNew(cls, msg);
+        env->DeleteLocalRef(cls);
+    } else {
+        throw_runtime(env, msg);
+    }
+}
+
+bool memory_stage_from_code(jint code,
+                            spk::memory::MemoryStage* stage) noexcept {
+    if (!stage || code < 0 ||
+        code >= static_cast<jint>(spk::memory::MemoryStage::Count)) {
+        return false;
+    }
+    *stage = static_cast<spk::memory::MemoryStage>(code);
+    return true;
 }
 
 // A C++ exception must NEVER unwind through the extern "C" JNI boundary — that
@@ -1222,6 +1255,13 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     }
     const size_t out_bytes = static_cast<size_t>(out_bytes64);
 
+    auto native_reservation = g_allocations.reserve(
+        out_bytes, spk::memory::MemoryStage::JniSimResult);
+    if (!native_reservation) {
+        spk_image_free(&out);
+        throw_native_oom(env);
+        return nullptr;
+    }
     void* native_buf = std::malloc(out_bytes);
     if (!native_buf) {
         spk_image_free(&out);
@@ -1258,7 +1298,9 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     std::uint64_t allocation_token = 0;
     bool registered = false;
     try {
-        registered = g_allocations.add(native_buf, out_bytes, &allocation_token);
+        registered = g_allocations.add_reserved(
+            native_buf, out_bytes, &allocation_token,
+            native_reservation);
     } catch (...) {
         std::free(native_buf);
         throw;
@@ -1279,7 +1321,7 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     if (!csCls) {
         env->ExceptionClear();
         env->DeleteLocalRef(outBuf);
-        if (g_allocations.take(native_buf, out_bytes, allocation_token)) std::free(native_buf);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         throw_runtime(env, "spektra: ColorSpace class not found");
         return nullptr;
     }
@@ -1305,7 +1347,7 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         if (csArr) env->DeleteLocalRef(csArr);
         if (csObj) env->DeleteLocalRef(csObj);
         env->DeleteLocalRef(outBuf);
-        if (g_allocations.take(native_buf, out_bytes, allocation_token)) std::free(native_buf);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         throw_runtime(env, "spektra: SimResult class not found");
         return nullptr;
     }
@@ -1328,7 +1370,7 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     if (!result) {
         // Kotlin init may already have token-released the buffer; `take` makes
         // this constructor rollback exact-once either way.
-        if (g_allocations.take(native_buf, out_bytes, allocation_token)) std::free(native_buf);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         throw_runtime(env, "spektra: failed to construct SimResult");
         return nullptr;
     }
@@ -1340,7 +1382,7 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     if (final_cancel_check &&
         final_cancel_check(cancellation_probe.context()) != 0) {
         env->DeleteLocalRef(result);
-        if (g_allocations.take(native_buf, out_bytes, allocation_token)) std::free(native_buf);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         timing.finish(SPK_ERR_CANCELLED);
         if (!env->ExceptionCheck()) throw_status(env, SPK_ERR_CANCELLED);
         return nullptr;
@@ -1379,7 +1421,8 @@ Java_com_spectrafilm_engine_SimResult_freeDirectBuffer(JNIEnv* env, jclass /*cla
         return;
     }
     const size_t size = static_cast<size_t>(capacity);
-    if (g_allocations.take(p, size, static_cast<std::uint64_t>(token))) std::free(p);
+    (void)free_registered_allocation(
+        p, size, static_cast<std::uint64_t>(token));
 } catch (const std::bad_alloc&) {
     throw_native_oom(env);
 } catch (const std::exception& e) {
@@ -1446,26 +1489,40 @@ Java_com_spectrafilm_engine_SimResult_allocDirectBuffer(JNIEnv* env, jclass /*cl
             static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         return nullptr;
     }
+    auto native_reservation = g_allocations.reserve(
+        static_cast<size_t>(size),
+        spk::memory::MemoryStage::JniDirectBuffer);
+    if (!native_reservation) {
+        throw_native_oom(env);
+        return nullptr;
+    }
     void* p = std::malloc(static_cast<size_t>(size));
-    if (!p) return nullptr;
+    if (!p) {
+        throw_native_oom(env);
+        return nullptr;
+    }
     jobject buf = env->NewDirectByteBuffer(p, size);
     if (!buf) { std::free(p); return nullptr; }  // wrap failed -> don't leak
     std::uint64_t allocation_token = 0;
     bool registered = false;
     try {
-        registered = g_allocations.add(p, static_cast<size_t>(size), &allocation_token);
+        registered = g_allocations.add_reserved(
+            p, static_cast<size_t>(size), &allocation_token,
+            native_reservation);
     } catch (...) {
         std::free(p);
         throw;
     }
     if (!registered || allocation_token == 0) {
         std::free(p);
+        throw_native_oom(env);
         return nullptr;
     }
     jclass allocation_cls = env->FindClass("com/spectrafilm/engine/NativeBufferAllocation");
     if (!allocation_cls) {
         env->ExceptionClear();
-        if (g_allocations.take(p, static_cast<size_t>(size), allocation_token)) std::free(p);
+        (void)free_registered_allocation(
+            p, static_cast<size_t>(size), allocation_token);
         return nullptr;
     }
     jmethodID allocation_ctor = env->GetMethodID(
@@ -1479,7 +1536,8 @@ Java_com_spectrafilm_engine_SimResult_allocDirectBuffer(JNIEnv* env, jclass /*cl
     env->DeleteLocalRef(buf);
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (!allocation) {
-        if (g_allocations.take(p, static_cast<size_t>(size), allocation_token)) std::free(p);
+        (void)free_registered_allocation(
+            p, static_cast<size_t>(size), allocation_token);
         return nullptr;
     }
     return allocation;
@@ -1640,6 +1698,89 @@ JNI(jobject, nativeBakeCubeLut)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         return nullptr;
     }
     timing.finish(SPK_OK);
+    return result;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return nullptr;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
+}
+
+/*
+ * Process-wide memory-budget control. External JVM reservations account bytes
+ * owned by ART/Bitmap callers without giving native code permission to free
+ * them; opaque tokens release only the diagnostic/admission reservation.
+ */
+JNI(void, nativeConfigureMemoryBudget)(JNIEnv* env, jclass /*clazz*/,
+                                       jlong limit_bytes) try {
+    if (limit_bytes <= 0) {
+        throw_illegal_argument(env, "memory budget limit must be positive");
+        return;
+    }
+    spk::memory::process_memory_budget().set_limit_bytes(
+        static_cast<std::uint64_t>(limit_bytes));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+}
+
+JNI(jlong, nativeReserveJvmMemory)(JNIEnv* env, jclass /*clazz*/,
+                                   jlong bytes, jint stage_code) try {
+    spk::memory::MemoryStage stage = spk::memory::MemoryStage::Unknown;
+    if (bytes <= 0 ||
+        static_cast<std::uint64_t>(bytes) >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max()) ||
+        !memory_stage_from_code(stage_code, &stage)) {
+        throw_illegal_argument(
+            env, "invalid external JVM memory reservation request");
+        return 0;
+    }
+    return static_cast<jlong>(g_jvm_reservations.reserve(
+        static_cast<std::size_t>(bytes), stage));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return 0;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return 0;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return 0;
+}
+
+JNI(jboolean, nativeReleaseJvmMemory)(JNIEnv* env, jclass /*clazz*/,
+                                      jlong token) try {
+    if (token <= 0) return JNI_FALSE;
+    return g_jvm_reservations.release(static_cast<std::uint64_t>(token))
+               ? JNI_TRUE
+               : JNI_FALSE;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return JNI_FALSE;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return JNI_FALSE;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return JNI_FALSE;
+}
+
+JNI(jstring, nativeMemoryBudgetSnapshotJson)(JNIEnv* env,
+                                              jclass /*clazz*/) try {
+    const std::string json = spk::memory::memory_budget_snapshot_json(
+        spk::memory::process_memory_budget().snapshot());
+    jstring result = env->NewStringUTF(json.c_str());
+    if (!result && !env->ExceptionCheck()) {
+        throw_runtime(env, "spektra: failed to create memory budget snapshot");
+    }
     return result;
 } catch (const std::bad_alloc&) {
     throw_native_oom(env);

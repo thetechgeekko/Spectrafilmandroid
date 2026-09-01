@@ -22,16 +22,17 @@ import java.util.concurrent.atomic.AtomicReference
 // export rotation of a large image (e.g. a 12 MP photo = 144 MB) doesn't OOM the ~256 MB ART
 // heap — exactly the managed-buffer trap that hit the decode path. Small (preview-scale)
 // buffers stay managed (GC handles them). Returns the buffer + the matching LinearImage
-// onClose (null for managed). Falls back to managed if the native alloc fails.
+// onClose (null for managed). Large-buffer coordinator denial fails closed; it is
+// never reallocated on the ART heap outside the process budget.
 private const val ROT_OFFHEAP_THRESHOLD_FLOATS = 16_000_000  // ~64 MB of float32
 
 private fun allocRotBuf(floats: Int): Pair<ByteBuffer, AutoCloseable?> {
     if (floats > ROT_OFFHEAP_THRESHOLD_FLOATS) {
         val owner = NativeBufferOwner.allocate(floats.toLong() * 4)
-        if (owner != null) {
-            val lease = owner.acquireDataLease()
-            owner.close()
-            return lease.data.order(ByteOrder.nativeOrder()) to lease
+        val lease = owner.acquireDataLease()
+        owner.close()
+        return handoffOrClose(lease) { retainedLease ->
+            retainedLease.data.order(ByteOrder.nativeOrder()) to retainedLease
         }
     }
     // Long-widen the byte count (floats * 4 overflows Int above ~536M floats) and fail

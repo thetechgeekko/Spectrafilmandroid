@@ -125,4 +125,23 @@ class LinearImageLifecycleTest {
             assertEquals(16, later.limit())
         }
     }
+
+    @Test
+    fun dataLeaseConstructionOomRollsBackRefcount() {
+        val cleanupCount = AtomicInteger()
+        val image = LinearImage.forTest(
+            data = ByteBuffer.allocateDirect(12).order(ByteOrder.nativeOrder()),
+            width = 1,
+            height = 1,
+            release = { cleanupCount.incrementAndGet() },
+            dataLeaseFactory = DataLeaseFactory { _, _ ->
+                throw OutOfMemoryError("DataLease construction")
+            },
+        )
+
+        assertTrue(image.runCatching { acquireDataLease() }.exceptionOrNull() is OutOfMemoryError)
+        image.close()
+
+        assertEquals("phantom lease must not retain LinearImage", 1, cleanupCount.get())
+    }
 }

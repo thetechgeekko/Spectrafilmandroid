@@ -10,6 +10,44 @@ option(SPK_JSON_PROFILE_FUZZER "Build the bounded JSON/profile libFuzzer target"
 
 find_package(Threads REQUIRED)
 
+add_executable(spektra_jni_safety_regression
+    test_jni_safety.cpp
+)
+target_compile_features(spektra_jni_safety_regression PRIVATE cxx_std_17)
+target_include_directories(spektra_jni_safety_regression PRIVATE ..)
+target_link_libraries(spektra_jni_safety_regression PRIVATE Threads::Threads)
+
+add_executable(spektra_parallel_exceptions_regression
+    test_parallel_exceptions.cpp
+    ../kernels/parallel.cpp
+)
+target_compile_features(spektra_parallel_exceptions_regression PRIVATE cxx_std_17)
+target_include_directories(spektra_parallel_exceptions_regression PRIVATE ..)
+target_link_libraries(spektra_parallel_exceptions_regression PRIVATE Threads::Threads)
+
+add_executable(spektra_fft_convolve_regression
+    test_fft_convolve.cpp
+    ../kernels/fft.cpp
+    ../kernels/fft_convolve.cpp
+    ../kernels/parallel.cpp
+)
+target_compile_features(spektra_fft_convolve_regression PRIVATE cxx_std_17)
+target_compile_definitions(spektra_fft_convolve_regression PRIVATE
+    SPK_FFT_CONVOLVE_TEST_HOOKS=1)
+target_include_directories(spektra_fft_convolve_regression PRIVATE ..)
+target_link_libraries(spektra_fft_convolve_regression PRIVATE Threads::Threads)
+
+# These small regression executables use assert as their fail-closed test primitive. CMake's
+# Release flags define NDEBUG; explicitly undo it so CI/release builds execute every assertion
+# instead of compiling the tests into no-ops.
+foreach(target spektra_jni_safety_regression spektra_parallel_exceptions_regression)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${target} PRIVATE -UNDEBUG)
+    endif()
+endforeach()
+
 add_executable(spektra_npy_lut_regression
     test_npy_lut.cpp
     ../io/npy_lut.cpp
@@ -38,7 +76,12 @@ target_link_libraries(spektra_json_profile_regression PRIVATE Threads::Threads)
 
 if(SPK_NPY_TEST_SANITIZERS OR SPK_NATIVE_INPUT_TEST_SANITIZERS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        foreach(target spektra_npy_lut_regression spektra_json_profile_regression)
+        foreach(target
+                spektra_jni_safety_regression
+                spektra_parallel_exceptions_regression
+                spektra_fft_convolve_regression
+                spektra_npy_lut_regression
+                spektra_json_profile_regression)
             target_compile_options(${target} PRIVATE
                 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
                 -fno-sanitize-recover=all)
@@ -49,6 +92,18 @@ if(SPK_NPY_TEST_SANITIZERS OR SPK_NATIVE_INPUT_TEST_SANITIZERS)
         message(FATAL_ERROR "Native input sanitizers require Clang or GCC")
     endif()
 endif()
+
+add_test(NAME spektra.jni-safety.memory-budget
+    COMMAND spektra_jni_safety_regression)
+set_tests_properties(spektra.jni-safety.memory-budget PROPERTIES TIMEOUT 10)
+
+add_test(NAME spektra.parallel.exception-containment
+    COMMAND spektra_parallel_exceptions_regression)
+set_tests_properties(spektra.parallel.exception-containment PROPERTIES TIMEOUT 10)
+
+add_test(NAME spektra.fft-convolve.denial-and-parity
+    COMMAND spektra_fft_convolve_regression)
+set_tests_properties(spektra.fft-convolve.denial-and-parity PROPERTIES TIMEOUT 30)
 
 add_test(NAME spektra.npy-lut.hostile-inputs
     COMMAND spektra_npy_lut_regression
