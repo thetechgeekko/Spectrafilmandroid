@@ -1007,7 +1007,9 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
           script: |
-            set -euo pipefail
+            # The action runs this under `sh -c` (dash): no `-o pipefail`, no
+            # PIPESTATUS. Hand the body to bash on stdin.
+            bash -euo pipefail -s <<'EMULATOR_SCRIPT'
             mkdir -p build/device-smoke
             adb logcat -c
             adb install --no-streaming -r signed/app-release.apk
@@ -1098,6 +1100,7 @@ jobs:
             fi
             printf 'PASS\n' > build/device-smoke/api35-device-smoke.txt
 
+            EMULATOR_SCRIPT
       - name: Retain exact-candidate device evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -952,40 +952,12 @@ jobs:
           arch: x86_64
           profile: pixel_6
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
-          # The action's own animation-disable runs the instant boot-complete
-          # flips and dies with "adb: device offline" when emulator 37.1.x
-          # flaps right after boot (runner issue #136 - both completed attempts
-          # of this job failed exactly there, sh exit 2, emulator still alive
-          # at cleanup). We disable animations ourselves after owning the
-          # readiness wait below.
-          disable-animations: false
           script: |
-            set -euo pipefail
+            # The action runs this under `sh -c` (dash on ubuntu-latest), which
+            # rejects `set -o pipefail` and has no PIPESTATUS. Hand the body to
+            # bash on stdin so the same script is portable across both workflows.
+            bash -euo pipefail -s <<'EMULATOR_SCRIPT'
             mkdir -p emulator-artifacts
-
-            # Own the readiness wait: device must be in "device" state AND
-            # boot-completed, sampled stable across two consecutive polls,
-            # before anything talks to it.
-            ready=0
-            for attempt in $(seq 1 120); do
-              state=$(adb get-state 2>/dev/null || true)
-              boot=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
-              if [ "$state" = "device" ] && [ "$boot" = "1" ]; then
-                ready=$((ready + 1))
-                [ "$ready" -ge 2 ] && break
-              else
-                ready=0
-              fi
-              sleep 2
-            done
-            if [ "$ready" -lt 2 ]; then
-              echo "::error::emulator never reached a stable ready state"
-              adb devices || true
-              exit 1
-            fi
-            adb shell settings put global window_animation_scale 0
-            adb shell settings put global transition_animation_scale 0
-            adb shell settings put global animator_duration_scale 0
 
             APK=$(ls apk/*.apk | head -1)
             echo "Installing APK: $APK"
@@ -1055,6 +1027,7 @@ jobs:
             fi
 
             echo "--- Smoke test complete ---"
+            EMULATOR_SCRIPT
 
       # Always upload screenshot + logcat so failures are debuggable.
       - name: Upload emulator artifacts
