@@ -6,10 +6,9 @@ bokeh + film simulation — to be researched and kept on file. Nothing here is c
 scheduled, or started. Every claim below was checked against a primary source on
 2026-08-28; the ones that still need a device are marked.
 
-Companion to `docs/PERF_ROADMAP.md` (what shipped) and `docs/MOBILE_STRATEGY.md`.
-**Note:** `docs/research/perf-lab.md` is cited throughout for measured numbers, but it
-lives on branch `claude/perf-lab` (PR #156) and is not on `main` yet — read it with
-`git show claude/perf-lab:docs/research/perf-lab.md` until that merges.
+Companion to `docs/PERF_ROADMAP.md` (historical performance narrative) and
+`docs/MOBILE_STRATEGY.md`. `docs/research/perf-lab.md` is now present in this tree; it remains a
+historical measurement notebook rather than an execution queue.
 
 ---
 

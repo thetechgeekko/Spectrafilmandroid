@@ -1,6 +1,7 @@
 # Performance roadmap — toward Lightroom-class speed
 
 > **Current plan (2026-08-29):** use
+> [EXECUTION_INDEX.md](EXECUTION_INDEX.md) and
 > [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md) for the 1–2 second export
 > architecture, exactness levels, current ticket graph and OSS decisions. This file preserves the
 > shipped/historical performance narrative. The 6.251 s device run predates current-HEAD exact CPU

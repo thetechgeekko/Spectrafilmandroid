@@ -1,8 +1,8 @@
 # Spektrafilm production-readiness implementation plan
 
-Status: canonical execution plan, created 2026-08-29 against `8aef76b` on
-`claude/perf-lab` and updated 2026-08-31. Implementation and offline evidence are complete for
-some child tickets; ticket-specific sections below identify the remaining release and device gates.
+Status: canonical release-acceptance and implementation plan, reconciled 2026-08-31. The live
+Wayfinder graph owns ticket state, blockers, priority, and claims; this document owns the required
+outcomes and architecture. Start at [EXECUTION_INDEX.md](EXECUTION_INDEX.md).
 
 Tracker: [Wayfinder map: production-ready Spektrafilm + 1–2 s exact
 export](https://github.com/thetechgeekko/Spektrafilm-android/issues/164)
@@ -51,23 +51,29 @@ If the owner requires cold 1–2 seconds and cross-device byte identity simultan
 research frontier is a versioned fixed-point/integer `ARCHIVAL_V2` engine. It would be a new numeric
 contract and cannot also reproduce every current floating-point byte cheaply.
 
-## Current release blockers
+## Release-gate ownership
 
-| Area | Current evidence | Owning ticket |
+Do not infer open/closed state from this table. Run `python tools/wayfinder/frontier.py` or open the
+production map for the live dependency graph. This table only routes each release-gate family to
+its owning ticket; native dependencies decide execution order.
+
+| Gate family | Required outcome | Owning ticket(s) |
 |---|---|---|
-| Exactness/SLO | “Bit-identical” currently mixes at least five different guarantees | [Define “bit-identical” and pin the 1–2 s export SLO matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/126) |
-| Performance evidence | Process-global stage timers can mix preview and export | [Make stage timing render-local before automated performance claims](https://github.com/thetechgeekko/Spektrafilm-android/issues/163) |
-| RAW security | Patched LibRaw 0.22.2 is SHA-pinned and fail-closed; hostile public-seam ASan/UBSan/fuzz and device-corpus evidence are recorded in `docs/dependencies/LIBRAW.md` | [Patch LibRaw to 0.22.2 and add hostile-RAW regression coverage](https://github.com/thetechgeekko/Spektrafilm-android/issues/165) |
-| Output truth | Flat 1x1 gain map, transfer/ICC/tagging ownership and scene-linear combinations are inconsistent | [Define and test one OutputDescriptor for color space, transfer, depth, and format](https://github.com/thetechgeekko/Spektrafilm-android/issues/174) |
-| Legal | Static-link docs/notices/About, canonical source/relink ZIP and semantic SPDX are implemented; release remains fail-closed until the owner records one supported LibRaw route and patch-rights approval | [Resolve LibRaw static-link compliance and publish a complete license/source bundle](https://github.com/thetechgeekko/Spektrafilm-android/issues/166) |
-| Signing | Implemented fail-closed exact-candidate chain: run/attempt + artifact-ID/digest binding, parity/JVM/lint/R8/16 KiB gates, production-signed app/test pair, API 35 installed-byte instrumentation, provenance, and immutable numeric-ID publication. Activation still requires the protected Environment, scoped publisher token, immutable-releases setting, and tag ruleset. | [Make production signing and exact release-candidate verification fail closed](https://github.com/thetechgeekko/Spektrafilm-android/issues/168) |
-| Android behavior / Play policy | Android 16 is unverified; target SDK 34 is below the API 36 requirement for Google Play updates beginning 2026-08-31 | [Validate Android 16 behavior and meet API 36 policy where distributed](https://github.com/thetechgeekko/Spektrafilm-android/issues/171) |
-| Android build system | AGP 8.7.3, the external Kotlin plugin and Gradle 8.14.3 need an isolated compatibility migration | [Migrate AGP 9.3 and Gradle 9.5 to AGP built-in Kotlin](https://github.com/thetechgeekko/Spektrafilm-android/issues/188) |
-| Native toolchain | NDK r27 needs an independent digest/performance and real 16 KiB-environment migration | [Upgrade the NDK independently and prove 16 KiB compatibility on every ABI](https://github.com/thetechgeekko/Spektrafilm-android/issues/187) |
-| Memory | 50 MP masks and retained full-resolution buffers can exceed a practical device budget | [Release full-resolution buffers promptly and enforce one global memory budget](https://github.com/thetechgeekko/Spektrafilm-android/issues/176) |
-| Coverage | The exact signed candidate now has a minimal release `androidTest` lifecycle/legal-assets smoke; an export-digest benchmark and broader application/Macrobenchmark gate are still absent | [Create a release export-digest benchmark and instrumented device gate](https://github.com/thetechgeekko/Spektrafilm-android/issues/177) |
+| Exactness and SLO | One approved matrix for engine samples, decoded samples/metadata, containers, routes, workloads, devices, and cold/warm statistics | [Define “bit-identical” and pin the 1–2 s export SLO matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/126) |
+| Output and HDR truth | One descriptor for color/transfer/depth/format and an honest, user-visible Ultra HDR contract | [Define and test one OutputDescriptor for color space, transfer, depth, and format](https://github.com/thetechgeekko/Spektrafilm-android/issues/174); [Choose and implement an honest Ultra HDR contract](https://github.com/thetechgeekko/Spektrafilm-android/issues/140) |
+| RAW/color parity | Implement the oracle-locked CAT02 fixture on the production RAW path and preserve native sample precision where supported | [Implement oracle-locked CAT02 RAW white balance and exact cast-order goldens](https://github.com/thetechgeekko/Spektrafilm-android/issues/192); [Preserve declared native RAW sample precision through linear conversion](https://github.com/thetechgeekko/Spektrafilm-android/issues/190) |
+| Input safety | Retain completed native NPY/JSON/profile and vendor-RAW gates; finish explicit byte/depth/count budgets, hostile inputs, and atomic failure for app documents | [Patch LibRaw to 0.22.2 and add hostile-RAW regression coverage](https://github.com/thetechgeekko/Spektrafilm-android/issues/165); [Bound and fuzz remaining recipe, preset, sidecar, mask, and import parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173) |
+| Legal distribution | A human-approved LibRaw route agrees across notices, About UI, SPDX, and source/relink materials | [Resolve LibRaw static-link compliance and publish a complete license/source bundle](https://github.com/thetechgeekko/Spektrafilm-android/issues/166) |
+| Android platform | The chosen distribution route passes Android 16/API 36 policy, build-system, NDK, and real 16 KiB-environment gates | [Validate Android 16 behavior and meet API 36 policy where distributed](https://github.com/thetechgeekko/Spektrafilm-android/issues/171); [Migrate AGP 9.3 and Gradle 9.5 to AGP built-in Kotlin](https://github.com/thetechgeekko/Spektrafilm-android/issues/188); [Upgrade the NDK independently and prove 16 KiB compatibility on every ABI](https://github.com/thetechgeekko/Spektrafilm-android/issues/187) |
+| Memory and application behavior | Approved 12.5/50 MP budgets, prompt ownership release, durable sessions/exports, and truthful UI controls | [Release full-resolution buffers promptly and enforce one global memory budget](https://github.com/thetechgeekko/Spektrafilm-android/issues/176) and the other live production-map children |
+| Release evidence | A versioned export-digest device gate, current release/R8 baseline, approved SLO proof, synchronized docs, then one immutable release | [Create a release export-digest benchmark and instrumented device gate](https://github.com/thetechgeekko/Spektrafilm-android/issues/177); [Record the canonical release/R8 export baseline and digest matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/119); [Prove the approved 1–2 s exact-export SLO on the release candidate](https://github.com/thetechgeekko/Spektrafilm-android/issues/186); [Ship the next security- and correctness-gated release](https://github.com/thetechgeekko/Spektrafilm-android/issues/138) |
 
-### Exact release-candidate evidence (ticket #168)
+Render-local timing, the patched/fuzz-gated LibRaw baseline, fail-closed signing mechanics, stock
+viewing illuminants, and transactional storage are completed foundations recorded in the parent
+map's Decisions section. Completion of those implementation tickets does not activate production
+secrets, approve the legal route, or waive their downstream release gates.
+
+### Exact release-candidate evidence — [Make production signing and exact release-candidate verification fail closed](https://github.com/thetechgeekko/Spektrafilm-android/issues/168)
 
 The implementation retains one auditable chain from source to publication:
 
@@ -97,9 +103,9 @@ supplies four signing secrets, `RELEASE_CERT_SHA256`, and
 immutable releases are enabled, the stable-tag ruleset is active, and the human
 LibRaw distribution-route decision is recorded.
 
-### Exact JNI lifetime evidence (ticket #172)
+### Exact JNI lifetime evidence — [Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
 
-Ticket #172 is implemented and verified: native allocations use explicit owners and leases; JNI
+The implementation evidence is complete: native allocations use explicit owners and leases; JNI
 boundaries validate logical buffer windows and checked geometry; native-owned direct-buffer views
 normalize Java byte-order metadata; engine render/close, cancellation, result publication, and
 exact-once release are linearized; foreground-service start/stop commands are generation-safe; and
@@ -120,33 +126,14 @@ device procedure is in [TRANSACTIONAL_STORAGE.md](TRANSACTIONAL_STORAGE.md).
 
 ## Execution order
 
-```text
-owner exactness/SLO decision + render-local timing + digest harness + patched LibRaw
-                                  |
-                                  v
-                  current-HEAD release/R8 device baseline
-                                  |
-                +-----------------+------------------+
-                |                 |                  |
-                v                 v                  v
-        exact idle cache   exact CPU/memory    Fast GPU research
-                           and writer work     (separate contract)
-                |                 |                  |
-                +-----------------+------------------+
-                                  |
-                                  v
-                    signed release-candidate SLO proof
-                                  |
-                                  v
-                       synchronized release documents
-                                  |
-                                  v
-                 security- and correctness-gated release
-```
+The critical measured sequence is the owner-approved exactness/SLO contract, then the
+matched-resolution timing harness, then the HITL baseline recording, then only the optimizations
+selected by those measurements, followed by signed-candidate SLO proof and terminal documentation
+synchronization. Correctness, color, legal, lifecycle, storage, accessibility, memory, and build
+work can run in parallel when their native dependencies permit it.
 
-Correctness, color, legal, lifecycle, storage, accessibility and build work can run in parallel
-after their direct prerequisites. Native GitHub `blocked-by` edges are the authority for the live
-frontier; this document explains why they exist.
+Native GitHub sub-issue order and `blocked-by` edges are the authority for the exact live frontier;
+this document explains the acceptance sequence without freezing a duplicate ticket queue.
 
 ## Phase 0 — resolve contracts and make evidence trustworthy
 
@@ -245,8 +232,9 @@ mapping. The security ticket owns the reachability proof.
 
 Owner: [Resolve LibRaw static-link compliance and publish a complete license/source bundle](https://github.com/thetechgeekko/Spektrafilm-android/issues/166)
 
-The current CMake builds LibRaw as a static library inside the native RAW module, contradicting
-`docs/LICENSING.md`. A maintainer or counsel must select the dual-license route. Then update exact
+The current CMake builds LibRaw as a static library inside the native RAW module. That route is
+recorded in `docs/LICENSING.md` as an unresolved release blocker. A maintainer or counsel must
+select the dual-license route. Then update exact
 notices, license texts, source/relink materials as applicable, About/licenses UI, SBOM and release
 artifact together. Also remove unsupported blanket compatibility claims.
 
@@ -255,7 +243,7 @@ artifact together. Also remove unsupported blanket compatibility claims.
 Owners:
 
 - [Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
-- [Bound and fuzz NPY, JSON, profile, recipe, mask, and RAW parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173)
+- [Bound and fuzz remaining recipe, preset, sidecar, mask, and import parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173)
 
 [Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
 implements checked allocation geometry, direct-buffer range and byte-order validation, contained
@@ -263,7 +251,7 @@ C++ exceptions, one-shot native release, an explicit render/close lease state ma
 generation-safe foreground-service teardown, and exact cross-APK R8 ABI checks. Its offline and
 connected arm64 API 36 device evidence is complete.
 
-[Bound and fuzz NPY, JSON, profile, recipe, mask, and RAW parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173)
+[Bound and fuzz remaining recipe, preset, sidecar, mask, and import parsers](https://github.com/thetechgeekko/Spektrafilm-android/issues/173)
 now has a frozen, independently approved native JSON/profile/neutral-filter slice. JSON input is
 capped at 1 MiB before allocation, with depth 8, 16,384 nodes, 512 array elements, 64 object
 members, 4,096 decoded bytes per string/key and 128 bytes per number token. The parser rejects
@@ -377,7 +365,7 @@ The strict ordering is:
 4. [Decide the grain numeric contract and remove pathological sampler cost](https://github.com/thetechgeekko/Spektrafilm-android/issues/180).
 5. [Finish RAW decode optimization on patched LibRaw release builds](https://github.com/thetechgeekko/Spektrafilm-android/issues/158).
 6. [Finish diffusion FFT/R2C optimization under the exact-output gate](https://github.com/thetechgeekko/Spektrafilm-android/issues/160).
-7. [Measure and reduce matched-resolution cold-start and first-touch cost](https://github.com/thetechgeekko/Spektrafilm-android/issues/152).
+7. [Measure the dominant matched-resolution cold-start and first-touch mechanism](https://github.com/thetechgeekko/Spektrafilm-android/issues/152).
 
 Do not ship hard prime-core pinning: prior whole-export evidence showed it worsening runtime. Do not
 replace the deterministic engine executor with oneTBB without a whole-render win and digest proof.
@@ -386,7 +374,7 @@ replace the deterministic engine executor with oneTBB without a whole-render win
 
 Owners:
 
-- [Expand the full-chain Vulkan preview DAG under the canonical baseline](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
+- [Complete the Fast GPU resident DAG beyond the qualified pointwise chain](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
 - [Experimental tolerance-bounded GPU export — not the strict exact path](https://github.com/thetechgeekko/Spektrafilm-android/issues/149)
 
 One persistent Vulkan DAG owns 81-band buffers from filming through print/scan, spatial effects and
@@ -395,7 +383,7 @@ simulation. Require fixed per-pixel accumulation order, explicit NaN/Inf/index b
 driver fingerprints, same-device repeat tests, CPU-oracle sweeps, watchdog, remote kill switch and
 fail-closed CPU fallback.
 
-[Expand the full-chain Vulkan preview DAG under the canonical baseline](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
+[Complete the Fast GPU resident DAG beyond the qualified pointwise chain](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
 now has an independently approved, frozen product route for eligible pointwise filming, printing
 and scan work. It uses one upload, three resident dispatches and one readback; folds live tables;
 keeps prepared tables under full-byte keys; runs a keyed CPU-oracle capability self-test; reports
@@ -459,7 +447,7 @@ Owners:
 
 - [Add Compose accessibility, localization, adaptive-layout, and E2E coverage](https://github.com/thetechgeekko/Spektrafilm-android/issues/181)
 - [Harden backup, diagnostics, updater, and privacy disclosures](https://github.com/thetechgeekko/Spektrafilm-android/issues/183)
-- [Remove or implement controls and output modes that silently lie](https://github.com/thetechgeekko/Spektrafilm-android/issues/143)
+- [Decide inert engine controls that silently render unchanged pixels](https://github.com/thetechgeekko/Spektrafilm-android/issues/143)
 - [Ratchet build hygiene and remove dead pseudo-modules](https://github.com/thetechgeekko/Spektrafilm-android/issues/184)
 - [Make README and project status truthful for the next release](https://github.com/thetechgeekko/Spektrafilm-android/issues/144)
 

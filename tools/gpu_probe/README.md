@@ -4,8 +4,10 @@ Standalone arm64 probes that measure the fp32 Vulkan per-pixel engine kernels
 against f64 CPU references mirroring each shader 1:1, on real device hardware.
 Produces the "does fp32 sit inside the oracle tolerance (`max_abs ≤ 1e-4`,
 `rms ≤ 1e-5`)" numbers that `docs/research/gpu-bit-exact.md` §10.3 calls the
-decider for #127 / option B. **This wires nothing into the app; the
-GPU-preview-only law is untouched either way.**
+decider for #127 / option B. **Historical scope:** these probe binaries wire nothing into the app.
+Their results later supported a separately qualified resident Fast GPU product route, so the old
+preview-only policy is superseded. Strict Exact CPU remains the parity-bearing fallback; this probe
+alone does not qualify spatial/stochastic work, other devices, or export performance.
 
 Two binaries:
 - `gpu_probe` (M1, #135 E3): the SCAN integral via the **unmodified**

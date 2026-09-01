@@ -30,9 +30,11 @@ Gradle modules actually built (`settings.gradle.kts`):
 - **`:lib:tiffwriter`** (`libsftiff.so`) and **`:lib:pngwriter`** (`libsfpng.so`) — 16-bit
   TIFF/PNG export writers.
 
-Ignore `feature/film-emulation/` and the aspirational `core/`/55-feature layout described in
-`docs/ARCHITECTURE.md` — that doc is the *target* (ImageToolbox-host) design; `feature:film-emulation`
-is **not** in `settings.gradle.kts` and is not compiled. The real app is the standalone `:app` module.
+Ignore `feature/film-emulation/`; it is **not** in `settings.gradle.kts` and is not compiled. The
+real app is the standalone `:app` module documented in `docs/ARCHITECTURE.md`. The abandoned
+ImageToolbox-host proposal survives only as historical decision input in `docs/DECISION.md` and
+`docs/maps/IMAGETOOLBOX_MAP.md`. Start at `docs/EXECUTION_INDEX.md` for the current authority order
+and live-work protocol.
 
 ## Engine architecture (C++, `engine/spektra-core/src/main/cpp/`)
 
@@ -216,13 +218,14 @@ explicitly signs it with the committed public debug key, and runs the 16 KB pre-
   nothing announces it. `tools/r8_check/check_release_dex.sh` now reads the shrunk dex and
   fails if any JNI-resolved member is gone (wired into `release.yml` and `r8-smoke.yml`; validated against both
   a good and a deliberately shrunk dex). Still smoke-test a release build
-  on a device before tagging. (Last validated 2026-06-04 on SM-S948W/Android 16: minified build did
-  full RAW import → render → 12 MP PNG/TIFF export, JNI libs load under R8 — see `docs/AUDIT.md` §D.)
+  on a device before tagging. Later exact candidate/device evidence and the mandatory commands live
+  in `docs/RELEASE_CHECKLIST.md`; dated audit sections are not current release evidence.
 - **Attribution "Film modeling powered by spektrafilm" must stay** (GPLv3 requirement).
 - Unit tests put real `org.json` on the test classpath (the `android.jar` stub throws "not mocked")
   so `Presets` JSON round-trips on the plain JVM.
-- `HANDOFF.md` carries the latest session state; `docs/AUDIT.md` tracks open/incomplete items with
-  severity. Stage-by-stage parity numbers and the porting map are in `docs/`.
+- `docs/EXECUTION_INDEX.md` defines documentation authority and the dependency-aware execution loop.
+  GitHub Wayfinder maps own live status; `HANDOFF.md` and `docs/AUDIT.md` are historical evidence,
+  not current queues. Run `python tools/docs/check_docs_consistency.py` before a documentation handoff.
 
 ## Agent skills
 

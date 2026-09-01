@@ -3,6 +3,11 @@
 *Owner asked for this after the export profile came in. It is a decision document,
 not a plan — nothing here is committed to or started.*
 
+> **Outcome:** do not wholesale-adopt vkdt. Keep it as an architecture/shader reference and audit
+> any borrowed file independently for model fit and license provenance. Spektrafilm now owns a
+> resident pointwise Vulkan route; finishing its spatial/stochastic graph remains tracked in the
+> [current performance roadmap](../BIT_IDENTICAL_EXPORT_ROADMAP.md).
+
 > **Renumbered 2026-08-29.** The first version of this document was costed against a
 > **debug** export (12189 ms), before it was discovered that three of the four native
 > modules compiled at `-O0` in debug (`perf-lab.md` §19). Every figure below is now the

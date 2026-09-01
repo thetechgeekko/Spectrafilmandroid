@@ -1,11 +1,12 @@
 # Maintainer Release Checklist
 
 > **Release hold (2026-08-29):** do not tag the current tree. The active blockers and ordered
-> implementation plan live in [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md) and the
-> [production-readiness Wayfinder map](https://github.com/thetechgeekko/Spektrafilm-android/issues/164).
+> implementation plan live in [EXECUTION_INDEX.md](EXECUTION_INDEX.md),
+> [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md), and the
+> [Wayfinder map: production-ready Spektrafilm + 1–2 s exact export](https://github.com/thetechgeekko/Spektrafilm-android/issues/164).
 > The release pipeline now builds without secrets, transfers a hash-bound unsigned candidate, and
-> signs only inside the protected Environment. The remaining LibRaw/security/licensing and
-> color/output blockers on the map must still close before tagging.
+> signs only inside the protected Environment. Every open release-blocking child on the live map,
+> including human legal/product decisions, must close before tagging.
 > If the artifact is a Google Play update, target SDK 36 must replace target SDK 34; a GitHub-only
 > route must be an explicit owner decision and still pass the Android 16 behavior matrix.
 
@@ -22,14 +23,16 @@ and you should never copy a built APK into the repo.
 Current in-tree version: **v0.9.0 / versionCode 11** (`minSdk 24`, `targetSdk`/`compileSdk 34`);
 latest released tag is **v0.9.0** (tagged 2026-08-26).
 
-Ticket #168's local test candidate was validated on 2026-08-30 on an API 36
+[Make production signing and exact release-candidate verification fail closed](https://github.com/thetechgeekko/Spektrafilm-android/issues/168)
+produced a local test candidate validated on 2026-08-30 on an API 36
 SM-S948W: both release APKs installed, instrumentation passed, the pulled
 `base.apk` was byte-identical, R8/JNI and 16 KiB checks passed, and cold launch
 completed without app-fatal logs. That test used the repository's public debug
 certificate solely to exercise the mechanics; it is not production-signing
 evidence and cannot satisfy the protected Environment gate.
 
-Ticket #170 adds a release-targeted transactional-storage suite. Before a
+[Make MediaStore exports, URI imports, recipes, and masks transactional and versioned](https://github.com/thetechgeekko/Spektrafilm-android/issues/170)
+adds a release-targeted transactional-storage suite. Before a
 candidate is accepted, run its normal storage smoke plus the documented
 `seed -> force-stop -> recover` phases on a real API 29+ device. The recovery
 phase must remove the exact app-owned pending row and durable journal entry;
@@ -58,13 +61,16 @@ JNI bridge. The exact ownership and evidence contract is in
 fail-closed `tools/android/run_release_device_gate.ps1` helper documented in
 [TRANSACTIONAL_STORAGE.md](TRANSACTIONAL_STORAGE.md), not an unchecked sequence of native commands.
 
-Ticket #172's final local candidate passed on 2026-08-31 on an arm64 API 36 SM-S948W. The app and
+The final local candidate for
+[Harden JNI lifetime, buffer bounds, cancellation, and render-close races](https://github.com/thetechgeekko/Spektrafilm-android/issues/172)
+passed on 2026-08-31 on an arm64 API 36 SM-S948W. The app and
 AndroidTest SHA-256 values were
 `EE1A1BA636FA123C93186EB4A3E80E964281080462B5AB8E24B790DE361318E8` and
 `6368EF2697FFD4A557E4418C22B7052F831D518AE4340E04473776CABB6E0F4A`; pulled installed bytes matched
 both. Full instrumentation passed twice, process-death recovery preserved and recovered the exact
 token, standalone engine/LibRaw suites passed, and cold launch had no app-scoped fatal log. As with
-#168, the repository debug key was used only for local mechanics; this is not production-signing
+the signing-mechanics ticket above, the repository debug key was used only for local
+mechanics; this is not production-signing
 evidence.
 
 ---
@@ -178,7 +184,7 @@ job rejects a receipt from any earlier attempt. After any failed release job, us
   configured exactly as described in §4.
 - [ ] Confirm `lib/libraw/compliance/license-route.txt` records the exact
   human-reviewed SPDX route. `UNRESOLVED` is the intentional repository default
-  while ticket #166 is open and is a hard release failure. Including both
+  while the linked LibRaw legal-distribution ticket is open and is a hard release failure. Including both
   upstream texts does not select a route.
 - [ ] Recheck LibRaw OSS-Fuzz mirrors [#840](https://github.com/LibRaw/LibRaw/issues/840)
   and [#843](https://github.com/LibRaw/LibRaw/issues/843). If either discloses

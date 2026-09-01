@@ -1,5 +1,10 @@
 # Experiment: Highway SIMD + Halide codegen on the engine's spatial kernels
 
+> **Historical/negative experiment.** Broad Halide integration and a whole-engine Highway rewrite
+> are not active execution routes. The measurements remain useful per-kernel evidence; references to
+> a 38-case gate describe the experiment's then-current branch, while the current authority uses 39
+> cases at both flag legs. See [../BIT_IDENTICAL_EXPORT_ROADMAP.md](../BIT_IDENTICAL_EXPORT_ROADMAP.md).
+
 *Branch `claude/perf-halide-highway` — an owner-commissioned experiment ("implement both,
 we'll test at home"), NOT a merge candidate on its own. Everything here is opt-in and the
 default build is byte-identical to `main`.*

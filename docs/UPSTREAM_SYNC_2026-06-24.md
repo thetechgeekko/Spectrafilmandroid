@@ -1,5 +1,11 @@
 # Spektrafilm Upstream Sync Plan — 2026-06-24
 
+> **Historical upstream snapshot.** Strategy A was executed, but this file does not prove parity
+> with latest upstream and its 38-gate references predate the current 39-case matrix. Current
+> upstream coverage is owned by the live parity-manifest ticket linked from
+> [EXECUTION_INDEX.md](EXECUTION_INDEX.md). Oklrab subsequently landed; the older “still open” list
+> below is preserved only as the dated plan's input.
+>
 > **STATUS 2026-07-02: Strategy A executed.** Shipped opt-in/default-OFF: output aces_rgc GC
 > (`gamut_out_aces`), the Oklch perceptual output GC (`gamut_out_oklch`, PR #111 — P2 #6 slice 1),
 > input xy locus bake (`gamut_in_xy`), print-curve morph (`print_curves_morph`), plus the

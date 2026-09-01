@@ -1,13 +1,13 @@
 # Roadmap
 
 > **Production/readiness execution moved (2026-08-29):** see
+> [EXECUTION_INDEX.md](EXECUTION_INDEX.md),
 > [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md),
 > [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md), and the
-> [Wayfinder map](https://github.com/thetechgeekko/Spektrafilm-android/issues/164). The milestone
+> [Wayfinder map: production-ready Spektrafilm + 1–2 s exact export](https://github.com/thetechgeekko/Spektrafilm-android/issues/164). The milestone
 > history below is retained, but it is not the release-blocker or 1–2 second export plan.
 
-> **ℹ️ Status synced to v0.9.0 (versionCode 11) — read `CHANGELOG.md` + `HANDOFF.md` +
-> `docs/AUDIT.md` for the live snapshot.** The milestone *structure* below is still a useful
+> **ℹ️ Historical milestone record through v0.9.0 (versionCode 11).** The milestone *structure* below is still a useful
 > overview, and the per-item status markers have been corrected to match the merged state:
 > - ✅ **v0.8.0 wave:** masking v1, Lightroom-style export sheet (incl. TIFF32F/scene-linear),
 >   `.cube`/CLF LUT export, WB wave, opt-in gamut compression (output ACES-RGC + Oklch

@@ -625,7 +625,7 @@ jobs:
   # — see tools/parity/README.md.)
   # ---------------------------------------------------------------------------
   python-lint:
-    name: Python tooling (compile + release policy tests)
+    name: Python tooling (compile + policy/consistency tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -640,6 +640,10 @@ jobs:
             tools/parity/gen_goldens.py \
             tools/parity/raw_wb_cat_research.py \
             tools/parity/spkvec.py \
+            tools/docs/check_docs_consistency.py \
+            tools/docs/tests/test_check_docs_consistency.py \
+            tools/wayfinder/frontier.py \
+            tools/wayfinder/tests/test_frontier.py \
             tools/compliance/libraw_bundle.py \
             tools/compliance/tests/test_libraw_bundle.py \
             tools/release/app_spdx.py \
@@ -658,6 +662,14 @@ jobs:
 
       - name: Test fail-closed release tooling and workflow policy
         run: python -m unittest discover -s tools/release/tests -p 'test_*.py'
+
+      - name: Check current documentation against repository facts
+        run: python tools/docs/check_docs_consistency.py
+
+      - name: Test documentation and Wayfinder reconciliation tooling
+        run: |
+          python -m unittest discover -s tools/docs/tests -p 'test_*.py'
+          python -m unittest discover -s tools/wayfinder/tests -p 'test_*.py'
 
   # ---------------------------------------------------------------------------
   # Android build: assemble the debug APK (app + engine:spektra-core, with the

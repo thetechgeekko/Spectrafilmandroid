@@ -111,7 +111,7 @@ and add LibRaw for the real decode.)
 
 ## Output
 
-Editing results are exported through ImageToolbox's existing save pipeline: 8/16-bit
-PNG/TIFF/JPEG with EXIF (`ExifInterface`) and embedded ICC matching the chosen output color
-space (sRGB / Adobe RGB / ProPhoto / Rec.2020 / ACES), reproducing spektrafilm's `io.py`
-behavior on the formats Android supports natively.
+The standalone app exports JPEG/PNG8, PNG16, TIFF16, TIFF32F, scene-linear TIFF32F, and a
+separately gated Ultra HDR container through its own `ImagePipeline` plus native PNG/TIFF writers.
+Output color space/transfer/depth/format is being unified under the live OutputDescriptor contract.
+Source EXIF carry-through currently applies to JPEG; do not infer all-format metadata parity.

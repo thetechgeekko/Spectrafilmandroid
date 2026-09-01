@@ -1,5 +1,11 @@
 # Spektrafilm Android — Session Handoff
 
+> **Historical session transcript — not the current queue.** Entries below preserve measurements,
+> failed experiments, and old handoffs in reverse chronological layers. Do not execute a `Next`,
+> reset/push command, or policy statement from this file without revalidating it against the current
+> tree. Live status, claims, dependencies, and the fast execution loop are in
+> [`docs/EXECUTION_INDEX.md`](docs/EXECUTION_INDEX.md) and the linked Wayfinder maps.
+
 ---
 
 ## THE SEPARABLE f64 FILTER WAS 42% DATA MOVEMENT (2026-08-30)

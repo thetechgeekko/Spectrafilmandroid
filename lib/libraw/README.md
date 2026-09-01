@@ -109,8 +109,10 @@ source manifest, and links it into `libsfraw.so`. See
 [`docs/dependencies/LIBRAW.md`](../../docs/dependencies/LIBRAW.md) for provenance,
 patch hashes, build flags, corpus deltas, OpenMP disposition, and sanitizer evidence.
 
-> **DNG SDK add-on** (lossy / non-standard DNGs) is a separate decision tracked in
-> M2; baseline DNG + CR2/CR3/NEF/ARW/RAF/ORF/RW2 work without it.
+> **DNG SDK add-on:** there is no current adoption commitment. Evaluate it only after the canonical
+> per-format baseline under the numeric, coverage, security, licensing, APK-size, and maintenance
+> gates in [`docs/BIT_IDENTICAL_EXPORT_ROADMAP.md`](../../docs/BIT_IDENTICAL_EXPORT_ROADMAP.md).
+> Baseline DNG + CR2/CR3/NEF/ARW/RAF/ORF/RW2 support does not depend on it.
 
 ## Mobile / Google Pixel DNG decode (native vs fallback)
 
@@ -222,33 +224,33 @@ full-resolution output subject to the same safety limits.
 | `use_camera_wb` (as-shot)    | `True`                 | `use_camera_wb = 1`              |
 | normalization                | `/ 65535.0` → float32  | done in `raw_decoder.cpp`        |
 
-### White balance (mirrors `raw_file_processor.py`)
+### White balance (current compatibility state)
 
 | Mode       | Behavior                                                                  |
 |------------|---------------------------------------------------------------------------|
 | `AS_SHOT`  | LibRaw camera WB (`use_camera_wb`) during demosaic.                        |
 | `DAYLIGHT` | LibRaw daylight-balanced base output; no adaptation.                       |
-| `TUNGSTEN` | Von-Kries adapt **2850 K → 6504 K** reference, tint = 1.0, in linear ACES. |
-| `CUSTOM`   | Von-Kries adapt **`temperature` K → 6504 K**, green/magenta `tint`.        |
+| `TUNGSTEN` | Current direct-XYZ **2850 K → 6504 K** approximation in linear ACES.       |
+| `CUSTOM`   | Current direct-XYZ **`temperature` K → 6504 K** approximation plus `tint`. |
 
 Whitepoints come from CCT: **CIE daylight locus** for ≥ 4000 K, **Kang 2002**
-Planckian approximation below — matching `_whitepoint_xyz_from_temperature`. The
-adaptation is `method='Von Kries'` in CIE XYZ, applied in ACES2065-1, then the
-green-channel tint multiplier (`_apply_tint_adjustment`).
+Planckian approximation below. Upstream's generic Von-Kries call resolves to CAT02, but the
+shipping native implementation still applies direct XYZ scaling, combines the green-channel tint
+multiply into the final float32 cast, and therefore does not reproduce upstream's separate
+float32 CAT/tint rounding boundary. Tungsten/custom are not yet upstream-exact; the accepted
+CAT02 decision and implementation gate are tracked by
+[`docs/research/raw-wb-chromatic-adaptation.md`](../../docs/research/raw-wb-chromatic-adaptation.md)
+and [Implement oracle-locked CAT02 RAW white balance and exact cast-order goldens](https://github.com/thetechgeekko/Spektrafilm-android/issues/192).
 
-## Two integration points (docs/RAW_DNG.md)
+## Integration points (docs/RAW_DNG.md)
 
-1. **Engine input (primary).** `feature:film-emulation` asks `lib:libraw` to decode
-   a picked RAW `Uri` → direct float32 linear RGB (+ width/height/primaries) via
-   `RawDecoder.decodeToLinear(...)`, then hands the `LinearResult` straight to
-   `SpektraEngine.simulate` as a `LinearImage` — full 16-bit precision, no
-   intermediate 8-bit bitmap.
-2. **Sensor-decoded RAW gallery preview (secondary).** `RawCoilDecoder.Factory` is a Coil 3
-   `Decoder.Factory` registered in the host's
-   `core/data/.../di/ImageLoaderModule.kt` (`provideComponentRegistry`), alongside
-   the existing `NefDecoder.Factory()`. Its current ARGB preview is an unmanaged
-   channel-wise approximation; a proper ProPhoto-to-sRGB display transform is
-   tracked separately and the engine buffer remains the authoritative path.
+1. **Shipping engine input.** The standalone `:app` asks `RawDecoder` to decode a picked content
+   `Uri` to direct float32 linear RGB (+ width/height/primaries), then constructs a
+   `LinearImage`. There is no intermediate 8-bit bitmap. Source sample depth and the
+   float32 working boundary are separate contracts.
+2. **Non-shipping reference.** `RawCoilDecoder.Factory` exists in this library but is not registered
+   by the standalone app. The never-built ImageToolbox host path and dormant
+   `feature:film-emulation` module are not production integration points.
 
 ## License
 

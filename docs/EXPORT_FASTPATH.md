@@ -5,6 +5,7 @@
 > remains the engineering history of landed/rejected fast-path ideas. “Bit-identical” must now be
 > qualified as engine samples, decoded samples/metadata, or complete container bytes; Fast GPU is a
 > separate oracle-equivalent route, not the strict exact route.
+> The repository authority order and live frontier are in [EXECUTION_INDEX.md](EXECUTION_INDEX.md).
 
 Mandate: make export as fast as possible **without ever trading quality**. Speed comes from
 better engineering, not from computing less. Every item below is either provably bit-exact,

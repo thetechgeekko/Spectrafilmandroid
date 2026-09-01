@@ -1,5 +1,9 @@
 # Improvement backlog — reverse-engineered from Lightroom mobile 11.3.3
 
+> **Idea catalog, not a ranked release queue.** An item becomes executable only after it is accepted
+> as a native Wayfinder child with dependencies and acceptance criteria. See
+> [EXECUTION_INDEX.md](EXECUTION_INDEX.md).
+
 Static RE of Adobe Lightroom mobile (`com.adobe.lrmobile` 11.3.3, APK only) vs Spektrafilm
 today. Evidence keys: `ICB*` = native engine bridge methods in `libLrAndroid.so`;
 `layout/*.xml` = decompiled UI; `native:` = `libLrAndroid.so` symbols. **Spektrafilm baseline:

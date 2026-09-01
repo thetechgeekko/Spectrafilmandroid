@@ -1,9 +1,12 @@
-# Audit — incomplete / open items (updated 2026-08-29)
+# Audit — 2026-08-29 finding snapshot
 
-> **Current execution source:** [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md),
+> **Historical finding inventory, not live status.** Findings were ticketed after this snapshot and
+> some statements below have since been resolved or superseded. Do not infer current issue state,
+> gate count, or GPU policy from this file. Start at [EXECUTION_INDEX.md](EXECUTION_INDEX.md),
+> [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md),
 > [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md), and the
-> [production-readiness Wayfinder map](https://github.com/thetechgeekko/Spektrafilm-android/issues/164).
-> This audit remains the detailed finding inventory; native GitHub dependencies are the live
+> [Wayfinder map: production-ready Spektrafilm + 1–2 s exact export](https://github.com/thetechgeekko/Spektrafilm-android/issues/164).
+> This audit remains evidence for why tickets exist; native GitHub dependencies are the only live
 > implementation frontier.
 
 New release-blocking findings from the full-codebase pass are now ticketed: patched LibRaw plus

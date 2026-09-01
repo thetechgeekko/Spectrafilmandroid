@@ -1,6 +1,8 @@
 # Exact and 1–2 second export roadmap
 
-Status: canonical performance architecture, created 2026-08-29 against `8aef76b`.
+Status: canonical numeric-contract and performance architecture, reconciled 2026-08-31. The live
+Wayfinder graph owns ticket state and dependency order. Start at
+[EXECUTION_INDEX.md](EXECUTION_INDEX.md).
 
 Parent plan: [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md)
 
@@ -93,14 +95,16 @@ The separate named-preset/effects ladder was roughly 9.8 seconds, with grain, ha
 couplers contributing roughly 7.9 seconds; Pro-Mist added about 9.9 seconds in another cell. Those
 measurements use different state/workload details and must not be added to the 6.251 s base run.
 
-The current GPU export latch accelerates only the scan slice. Prior scan-only work was bounded to
-about a 1.2x whole-export improvement by Amdahl's law. Cold 1–2 seconds needs a full resident graph,
-not more isolated scan shaders.
+The historical GPU export latch accelerated only the scan slice and was bounded to about a 1.2x
+whole-export improvement by Amdahl's law. The current eligible pointwise print route now keeps
+filming, printing, and scan in one resident three-dispatch Vulkan chain, but spatial/stochastic
+effects still fall back to CPU. Cold 1–2 seconds needs the remaining resident graph, not more
+isolated shaders.
 
 ## Missing measurements before implementation claims
 
 - no current-HEAD release-device rerun after the latest planar filter/coupler changes;
-- no render-local timing while preview and export overlap;
+- no canonical current-HEAD release-device baseline using the implemented render-local timing;
 - no release Macrobenchmark/simpleperf/Perfetto flamegraph tied to the exact APK;
 - no statistically valid 10–15-run p95/confidence interval baseline;
 - no fully pinned source/parameter/format manifest for the 6.251 s run;
@@ -108,7 +112,8 @@ not more isolated scan shaders.
 - no per-format quantize/encode/publish split;
 - no peak RSS/PSS, energy, thermal, battery and cpuset series;
 - no full base/effect/route/format matrix;
-- no full-chain GPU engagement/copy/fallback timing; and
+- no full-chain spatial/stochastic GPU engagement/copy/fallback timing (the pointwise route is
+  instrumented and functionally device-gated); and
 - no exported engine/decoded/container digest matrix across supported ABIs.
 
 Until these exist, performance numbers are hypotheses or historical observations, not release
@@ -144,10 +149,10 @@ The cache path should target p50 at or below 1 second and p95 at or below 2 seco
 
 ## Stage 0 — build the referee
 
-Required tickets:
+Required tickets and completed foundation:
 
 - [Define “bit-identical” and pin the 1–2 s export SLO matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/126)
-- [Make stage timing render-local before automated performance claims](https://github.com/thetechgeekko/Spektrafilm-android/issues/163)
+- [Make stage timing render-local before automated performance claims](https://github.com/thetechgeekko/Spektrafilm-android/issues/163) — completed; `spk.stage_timings.v1` and overlap-isolation tests are the required timing substrate
 - [Create a release export-digest benchmark and instrumented device gate](https://github.com/thetechgeekko/Spektrafilm-android/issues/177)
 - [Record the canonical release/R8 export baseline and digest matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/119)
 
@@ -229,9 +234,11 @@ large memory improvement and a tail-latency improvement, not the simulation solu
 
 Owner: [Finish RAW decode optimization on patched LibRaw release builds](https://github.com/thetechgeekko/Spektrafilm-android/issues/158)
 
-OpenMP already exists. The historical release path spent roughly 546 ms in decode and 325 ms in
-`dcraw_process`; even an ideal 2x demosaic gain saves about 160 ms. Patch security first, then profile
-copies, allocation, JNI handoff and thread oversubscription. Consider NDK `AImageDecoder` only for
+An OpenMP qualification build exists, but shipping LibRaw remains serial until a fixed RAW corpus
+proves deterministic decoded outputs, memory, and thermal behavior. The historical release path
+spent roughly 546 ms in decode and 325 ms in `dcraw_process`; even an ideal 2x demosaic gain saves
+about 160 ms. Profile copies, allocation and JNI handoff first; enable parallel decode only through
+the qualification gate and a bounded global thread budget. Consider NDK `AImageDecoder` only for
 eligible non-RAW inputs and only after an OS-version corpus comparison.
 
 ### Tune diffusion after evidence
@@ -246,7 +253,7 @@ from reassociation; their shipping status follows the resolved exactness level.
 
 Required tickets:
 
-- [Expand the full-chain Vulkan preview DAG under the canonical baseline](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
+- [Complete the Fast GPU resident DAG beyond the qualified pointwise chain](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
 - [Experimental tolerance-bounded GPU export — not the strict exact path](https://github.com/thetechgeekko/Spektrafilm-android/issues/149)
 
 Required architecture:
@@ -267,13 +274,14 @@ render must evaluate the direct shader graph. `.cube`/CLF baking remains an expo
 
 ### 2026-08-31 resident pointwise product-route checkpoint
 
-[Expand the full-chain Vulkan preview DAG under the canonical baseline](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
+[Complete the Fast GPU resident DAG beyond the qualified pointwise chain](https://github.com/thetechgeekko/Spektrafilm-android/issues/148)
 now routes eligible production `run_print` renders through one resident filming -> printing -> scan
 Vulkan pointwise chain: one frame upload, three compute dispatches, device-local intermediates and
 one final readback. It folds the live film, DIR, print and scan tables, applies direct-input gain
 exactly once, and reuses prepared tables under full-byte cache keys. GPU output stays private until
-the whole chain succeeds; unavailable, allocation, dispatch or cancellation failures therefore
-fall back to Strict Exact CPU without exposing partial pixels or partially bypassing CPU memos.
+the whole chain succeeds; non-cancellation availability, validation, allocation, or dispatch
+failures fall back to Strict Exact CPU without exposing partial pixels or partially bypassing CPU
+memos. Cancellation terminates the render and never restarts it on CPU.
 
 The keyed capability verdict exercises a 512-point 8 x 8 x 8 lattice three times against the direct
 f64 CPU stages at `max_abs <= 1e-4` and `RMS <= 1e-5`. Render-local diagnostics report route
@@ -310,7 +318,7 @@ license texts, SBOM entry, ABI/16 KiB check, fuzz/update owner and measured rele
 | NDK `AImageDecoder` (API 30+) | narrow spike | Supported non-RAW decode into native memory | OS codec output may vary; keep API 24–29 and RAW fallbacks |
 | Highway 1.4.0 | narrow per-kernel spike | Independent FP32 pointwise/LUT/quantization kernels | Local f64 was slower; FP32 gained 2.1–2.7x but changed last bits. `memcmp` each candidate |
 | VkFFT 1.3.4 (MIT) | Fast GPU Pro-Mist/diffusion spike only | Large-radius R2C/overlap-save after measured crossover | Runtime shader/build/Android integration cost; approximate GPU contract only |
-| NDK LLVM OpenMP | keep for LibRaw only | Existing RAW demosaic parallelism | Cap threads and avoid engine-pool oversubscription |
+| NDK LLVM OpenMP | qualification-only until corpus approval | Potential LibRaw demosaic parallelism | Shipping stays serial; require deterministic decode, memory/thermal evidence, capped threads, and no engine-pool oversubscription |
 | existing custom CPU R2C FFT | keep | Current CPU diffusion fallback | It beat the tested NumHalide path; do not replace without real A/B |
 | libjpeg-turbo 3.2.0 | optional format-specific spike | JPEG/lossy-DNG only if encoding becomes material | Codestream and possibly decoded samples change; historical Amdahl ceiling is small |
 | Little CMS 2.19.1 | feature-dependent, not speed | Arbitrary external ICC support only | Larger untrusted parser surface; will not reproduce current fixed-transform pixels |

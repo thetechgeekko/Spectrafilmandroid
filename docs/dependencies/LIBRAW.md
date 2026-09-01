@@ -133,7 +133,7 @@ The changed buffers are not silently labelled “bit-identical.” Current stabl
 rawpy `0.27.0` uses LibRaw `0.22.1`; direct uint16 postprocess comparisons also
 produce different digests for both DNGs and the Fuji sample under 0.22.1 versus
 0.22.2. The security-upgraded 0.22.2 serial output is the Android candidate
-baseline. [Pin and port the latest Spektrafilm upstream with a parity manifest](https://github.com/thetechgeekko/Spektrafilm-android/issues/189)
+baseline. [Pin the latest Spektrafilm upstream and generate a parity manifest](https://github.com/thetechgeekko/Spektrafilm-android/issues/189)
 must pin the desktop rawpy/LibRaw build to the same reviewed decoder or explicitly
 approve and version the deviation before global parity can be claimed.
 
@@ -205,7 +205,7 @@ real Olympus/OM 14-bit captures against the unary policy, add isolated causal
 controls for the Olympus carry-refill and shift-31 branches, and add real RAWs
 when Panasonic publishes a codebook not represented by GH6/GH7/G9M2/S5M2.
 Android must also keep `USE_X3FTOOLS` disabled until the
-[X3F qualification gate](https://github.com/thetechgeekko/Spektrafilm-android/issues/191)
+[Qualify optional X3F support before Android enablement](https://github.com/thetechgeekko/Spektrafilm-android/issues/191)
 closes the property-list minimum/even-length contract (including the current
 `data_size / 2 - 2` underflow) and adds MemorySanitizer coverage for initialized
 metadata strings. The host-only model-boundary tests are not that enablement

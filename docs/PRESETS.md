@@ -9,18 +9,18 @@ written are described in `presets.json` itself.)
 
 ## How presets work
 
-A preset only sets the fields it deliberately changes. Everything else falls back to the
-engine defaults in `SpektraParams.kt`, which already reproduce spektrafilm's out-of-the-box
-look for a given film/print pair. So the presets are intentionally light-touch: pick the
-right film + print combination first (that does most of the work), then nudge contrast,
-grain, halation, and exposure to flatter the stock.
+A built-in preset is a sparse overlay: it changes only the fields authored in `presets.json`, and
+`BuiltInPresets.apply` leaves every omitted field at its current editor value. On a fresh/reset
+editor those values are the `ParamsState` defaults; after prior edits or another built-in preset,
+they may not be. These are intentionally light-touch looks rather than full state snapshots. User
+presets use a separate full-state schema.
 
 Key knobs used here:
 
 - **`camera.exposureCompensationEv`** — overall exposure. Positive opens up shadows / pushes
   toward the bright, airy end of a negative's latitude.
-- **`filmRender.densityCurveGamma`** — film contrast. `>1` snappier, `<1` softer. Kept within
-  ~0.9–1.1 so curves stay physically sane.
+- **`filmRender.densityCurveGamma`** — film contrast. `>1` snappier, `<1` softer. The bundled
+  values span 0.88–1.18; Faded Matte and Bleach Bypass are the deliberate endpoints.
 - **`filmRender.grain.blur`** — grain softness. Higher = smoother/finer-looking; lower =
   grittier. `agxParticleScale` (R,G,B) enlarges grain when we want it visible.
 - **`filmRender.halation.*`** — the glow bright lights scatter into the emulsion.
@@ -33,11 +33,13 @@ Key knobs used here:
   stage. This is the correct path for reversal/slide stocks (they are already positives) and
   for anyone who wants the "raw scan" negative look.
 - **`scanner.unsharpMask`** — capture sharpening; raised for the crispest, finest-grain stocks.
-- **`enlarger.*`** — left at neutral database values throughout; the bundled neutral print
-  filters already balance each paper, so we avoid arbitrary color casts.
+- **`enlarger.*`** — untouched unless a preset explicitly authors a filter shift or preflash.
+  Several creative/stock-specific looks do so; all other presets preserve the current enlarger
+  state.
 
 Presets are grouped: Portrait, Landscape, Slide / Chrome, Cinema, Low Light / Night,
-Nostalgic / Consumer, and Neutral.
+Nostalgic / Consumer, Creative, and Neutral. The IDs below are checked against `presets.json` by
+`tools/docs/check_docs_consistency.py`; the asset is authoritative for exact parameter values.
 
 ---
 
@@ -88,6 +90,11 @@ mixed scenes where you want Ektar's saturation without Ultra's harder contrast c
 and skies.
 Tuning: neutral `densityCurveGamma 1.0`, `grain.blur 0.85`, `halation 0.7`,
 `dirCouplers.amount 1.1`.
+
+### Superia X-TRA 400 — Cool Greens  (`superia400_crystalarchive_landscape`)
+**Fujifilm Superia X-TRA 400 → Crystal Archive Type II.** A foliage-oriented variant that keeps
+Fuji's green/cyan signature and adds a faint cool print balance. It uses a small enlarger-filter
+shift, lightly stronger density/coupler settings, and restrained grain/halation.
 
 ---
 
@@ -153,6 +160,10 @@ Tuning: neutral contrast (the 2383 print supplies the cinema contrast), `grain.b
 Tuning: `grain.blur 0.85` (50D is very fine), `halation 0.9`, `scanner.unsharpMask [0.9, 0.7]`
 for the extra crispness this stock is known for.
 
+### Vision3 200T — Tungsten Interior  (`vision3_200t_2383_interior`)
+**Kodak Vision3 200T → 2383.** A low-grain tungsten-balanced interior look with a slightly warm
+print balance, gentle highlight glow, and otherwise neutral exposure/contrast.
+
 ### Verita 200D — Warm Cinema  (`verita200d_2383_warmcine`)
 **Kodak Verita 200D → 2383.** Kodak's new (2026) daylight cine negative with bold saturation,
 warm skin, and a deliberately shorter, classically cinematic tonal range.
@@ -187,6 +198,10 @@ Tuning: `densityCurveGamma 1.1` (highest contrast in the set), `grain.blur 0.5` 
 `agxParticleScale [1.1, 1.3, 2.5]` (heavy grain), halation maxed (`halationAmount 1.9`,
 `scatterAmount 1.4`, `boostEv 1.2`, `halationStrength [0.11, 0.025, 0.0]`).
 
+### Vision3 500T — Halation Glow  (`vision3_500t_halation_glow`)
+**Kodak Vision3 500T → 2383.** A deliberately stronger neon-night treatment than the base cinema
+preset: warm scatter bloom, lifted print, larger grain, and high halation around point highlights.
+
 ---
 
 ## Nostalgic / Consumer
@@ -215,6 +230,30 @@ Tuning: `grain.blur 0.55` + `agxParticleScale [1.0, 1.2, 2.3]` (chunky), neutral
 **Fujifilm C200 → Crystal Archive Type II.** The economical everyday negative: crisp, slightly
 cool color with accurate skin — cleaner and finer-grained than the 400 consumer stocks.
 Tuning: neutral contrast, `grain.blur 0.65` (finer than the 400s), `halation 0.9`.
+
+---
+
+## Creative
+
+### Dreamy Pro-Mist — Portra 400  (`portra400_promist_dreamy`)
+**Kodak Portra 400 → Portra Endura.** Activates the camera diffusion stage, spectral blur, soft
+scanner sharpening, and a warm highlight bloom. The current asset does not author
+`filterFamily`: a fresh editor therefore uses its Black Pro-Mist default, but a previously selected
+Glimmerglass/CineBloom family survives the sparse overlay. The state-independent Black Pro-Mist
+promise is tracked by [Make Dreamy Pro-Mist select Black Pro-Mist independently of prior editor state](https://github.com/thetechgeekko/Spektrafilm-android/issues/194).
+
+### Faded Matte — Lifted Blacks  (`portra400_faded_matte`)
+**Kodak Portra 400 → Portra Endura.** A flashed, low-contrast print with an explicit master tone
+curve that lifts shadows and rolls off highlights. This is a creative grade, not a stock-neutral
+reference.
+
+### Bleach Bypass — High Contrast  (`ektar100_bleach_bypass`)
+**Kodak Ektar 100 → Ultra Endura.** Uses reduced coupler influence, steeper film/print density,
+black correction, and an S-curve for muted color and crushed silver-retention-style contrast.
+
+### Wide-Gamut Glow — Portra 800  (`portra800_wide_gamut_glow`)
+**Kodak Portra 800 → Supra Endura.** Selects Adobe RGB output with veiling glare, warm highlight
+bloom, visible grain, and a wide-gamut print-oriented finish.
 
 ---
 
