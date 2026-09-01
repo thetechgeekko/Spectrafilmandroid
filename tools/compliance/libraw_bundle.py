@@ -54,8 +54,8 @@ PROJECT_LICENSE_BUNDLE_PATH = "release/LICENSE.GPL-3.0"
 LICENSING_REPOSITORY_PATH = Path("docs/LICENSING.md")
 LICENSING_BUNDLE_PATH = "release/docs/LICENSING.md"
 AUDITED_FILE_COUNT = 100
-MODIFIED_FILE_COUNT = 17
-MODIFICATION_DATE = "2026-08-30"
+MODIFIED_FILE_COUNT = 19
+MODIFICATION_DATE = "2026-09-01"
 MAX_ARCHIVE_FILES = 20_000
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_BUNDLE_FILES = 20_000
@@ -1186,7 +1186,12 @@ def _modified_paths(repo_root: Path, pins: Pins) -> tuple[str, ...]:
 
 
 def _verify_modification_notices(source_root: Path, modified_paths: Sequence[str]) -> None:
-    first = b"Modified by Spektrafilm Android contributors, 2026-08-30; see the"
+    # Patches are authored on different dates; each file carries its own dated
+    # notice (0001-0023 stamp 2026-08-30, 0024/0025 stamp 2026-09-01).
+    first = re.compile(
+        rb"Modified by Spektrafilm Android contributors, "
+        rb"[0-9]{4}-[0-9]{2}-[0-9]{2}; see the"
+    )
     second = b"corresponding source distribution's bundled patch manifest."
     for relative in modified_paths:
         path = source_root.joinpath(*PurePosixPath(relative).parts)
@@ -1194,7 +1199,7 @@ def _verify_modification_notices(source_root: Path, modified_paths: Sequence[str
             data = path.read_bytes()
         except OSError as error:
             raise BundleError(f"cannot read modified LibRaw file {relative}: {error}") from error
-        if data.count(first) != 1 or data.count(second) != 1:
+        if len(first.findall(data)) != 1 or data.count(second) != 1:
             raise BundleError(
                 f"modified LibRaw file lacks the exact dated contributor notice: {relative}"
             )

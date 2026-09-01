@@ -1458,15 +1458,20 @@ int main() {
             xtransResult.descriptor.cfaPatternCount == 36U,
         "verified X-Trans 6x6 geometry and full pattern are published",
         describe(xtransResult));
-  // Regression pin for the X-Trans route in the CI host environment. Patch 0024
-  // rewrites `-i << c` (UB: left shift of a negative value) as `-(i << c)`, which
-  // is the value two's-complement gcc/clang produced for the UB form at these
-  // small shift magnitudes, so the patch is arithmetic-neutral by construction.
-  // The digest below is the stable output observed across independent CI runs of
-  // this suite (it is compiler/flag-sensitive float output, so it is pinned to
-  // CI, not to any local toolchain); any future drift in the X-Trans decode
-  // fails here.
+  // Regression pin for the X-Trans route. Patch 0024 rewrites `-i << c` (UB:
+  // left shift of a negative value) as `-(i << c)`, which is the value
+  // two's-complement gcc/clang produced for the UB form at these small shift
+  // magnitudes; pre-fix and patched digests were captured identical in the
+  // shipping-serial configuration, proving the rewrite arithmetic-neutral.
+  // The float digest is build-configuration-sensitive: the serial leg and the
+  // OpenMP leg each produce their own stable value (verified identical across
+  // independent CI runs per leg). Pin per configuration; any future drift in
+  // the X-Trans decode fails here.
+#if defined(SFRAW_HOST_OPENMP_ACTIVE)
   constexpr std::uint64_t kCiXtransDigest = 2892219489530756344ULL;
+#else
+  constexpr std::uint64_t kCiXtransDigest = 5238915555911424415ULL;
+#endif
   check(xtransResult.ok && exactDigest(xtransResult) == kCiXtransDigest,
         "defined X-Trans index arithmetic matches the pinned CI reference digest",
         xtransResult.ok

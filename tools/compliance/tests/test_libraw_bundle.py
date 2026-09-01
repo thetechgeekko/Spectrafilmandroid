@@ -164,7 +164,7 @@ class FixtureRepository:
             "// corresponding source distribution's bundled patch manifest.\n"
         )
         patch_parts: list[str] = []
-        for index in range(17):
+        for index in range(BUNDLE_TOOL.MODIFIED_FILE_COUNT):
             old = "old reviewed line" if index == 0 else f"source {index}"
             new = "new reviewed line" if index == 0 else f"source {index}"
             relative = f"src/file{index:03d}.cpp"
@@ -199,7 +199,7 @@ class FixtureRepository:
         upstream["README.md"] = b"fixture LibRaw source\n"
 
         patched = dict(upstream)
-        for index in range(17):
+        for index in range(BUNDLE_TOOL.MODIFIED_FILE_COUNT):
             line = "new reviewed line\n" if index == 0 else f"source {index}\n"
             patched[f"src/file{index:03d}.cpp"] = (notice + line).encode("utf-8")
         if not ambiguous_offset:
@@ -1090,18 +1090,18 @@ class LibRawBundleCliTest(unittest.TestCase):
             self.assertIn("STATIC_LINK", relationship_types)
             self.assertNotIn("or-later", sbom_bytes.decode("utf-8"))
 
-            self.assertIn("Modification date: `2026-08-30`", modifications)
+            self.assertIn(f"Modification date: `{BUNDLE_TOOL.MODIFICATION_DATE}`", modifications)
             self.assertIn(
                 "Contributor: `Spektrafilm Android contributors`", modifications
             )
-            self.assertIn("## Modified upstream files (17)", modifications)
+            self.assertIn(f"## Modified upstream files ({BUNDLE_TOOL.MODIFIED_FILE_COUNT})", modifications)
             modified_lines = [
                 line
                 for line in modifications.splitlines()
                 if line.startswith("- `src/file")
             ]
             self.assertEqual(
-                [f"- `src/file{index:03d}.cpp`" for index in range(17)],
+                [f"- `src/file{index:03d}.cpp`" for index in range(BUNDLE_TOOL.MODIFIED_FILE_COUNT)],
                 modified_lines,
             )
             self.assertLess(
