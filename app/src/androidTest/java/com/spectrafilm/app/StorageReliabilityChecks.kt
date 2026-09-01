@@ -290,6 +290,10 @@ object StorageReliabilityChecks {
             bitmap = null,
             totalMs = totalMs,
             phases = ExportPhaseSnapshot(0L, 0L, 0L, simulateMs, 0L, 0L),
+            // Explicit so this cross-APK call targets the primary constructor the
+            // release-dex check pins, never a synthetic default-args bridge.
+            publishedUri = null,
+            publishedMimeType = null,
         )
 
     /**

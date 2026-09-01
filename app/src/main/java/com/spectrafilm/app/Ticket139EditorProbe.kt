@@ -799,6 +799,8 @@ internal object Ticket139EditorProbe {
                             bitmap,
                             1L,
                             ExportPhaseSnapshot(0, 0, 0, 0, 0, 0),
+                            publishedUri = null,
+                            publishedMimeType = null,
                         )
                     }
                     if (accepted == null) delay(1)

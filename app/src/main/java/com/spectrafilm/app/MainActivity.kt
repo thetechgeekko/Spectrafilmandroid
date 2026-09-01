@@ -16,7 +16,10 @@
  */
 package com.spectrafilm.app
 
+import android.content.ActivityNotFoundException
+import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
@@ -354,9 +357,23 @@ internal enum class Category(val label: String) {
 private val PARAM_DEFAULTS = ParamsState()
 
 class MainActivity : ComponentActivity() {
+    /**
+     * #162 inbound import: the latest unconsumed VIEW/SEND intent. Compose state so the
+     * live editor observes delivery through onNewIntent (singleTask) as well as a cold
+     * start; consumed exactly once by the editor's LaunchedEffect.
+     */
+    private val incomingImageIntent = androidx.compose.runtime.mutableStateOf<Intent?>(null)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        incomingImageIntent.value = intent
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        incomingImageIntent.value = intent
         // Wide-gamut compositing so the color-managed preview bitmaps (tagged Adobe/ProPhoto/Rec2020
         // per the output space) are not clamped to sRGB at composition on wide-gamut panels. No-op on
         // sRGB displays. API 26+; minSdk is 24.
@@ -952,6 +969,10 @@ class MainActivity : ComponentActivity() {
         val exportInFlight = exportPhase == EditorExportPhase.RUNNING
         val exportDone = exportPhase == EditorExportPhase.SUCCESS
         val exportMaskVisible = exportInFlight || exportDone
+        // #162: content URI + OutputDescriptor MIME of the export this session claimed;
+        // drives the result mask's Share action. Session-local by design — a recreated
+        // Activity restoring SUCCESS still shows the result, just without one-tap share.
+        var lastExportShare by remember { mutableStateOf<Pair<String, String>?>(null) }
         // Lightroom-style export sheet: per-export format / quality / size / colour / name, instead
         // of the global Settings defaults. Seeded from Settings and remembered back on export.
         var showExportSheet by remember {
@@ -1333,6 +1354,9 @@ class MainActivity : ComponentActivity() {
                                     "residual=${outcome.totalMs - accounted} total=${outcome.totalMs}",
                             )
                             Diag.i("export format=${outcome.format.name} ok in ${outcome.totalMs}ms")
+                            lastExportShare = outcome.publishedUri?.let { published ->
+                                published to (outcome.publishedMimeType ?: "image/*")
+                            }
                             exportPhase = EditorExportPhase.SUCCESS
                             status = "saved to Pictures/Spektrafilm"
                         }
@@ -1951,10 +1975,10 @@ class MainActivity : ComponentActivity() {
                 adoptSource(uri, SourceKind.PHOTO, displayName, "photo selected")
             }
         }
-        val rawPicker = rememberLauncherForActivityResult(
-            ActivityResultContracts.OpenDocument()
-        ) { uri ->
-            if (uri != null) {
+        // Shared RAW/photo dispatch for the document picker AND #162 inbound VIEW/SEND:
+        // one mcraw guard, one MIME/extension routing decision, one adoption path.
+        fun adoptIncomingImage(uri: Uri) {
+            run {
                 val name = uri.lastPathSegment ?: "raw"
                 if (McrawContainer.isMcrawFileName(name)) {
                     // MotionCam RAW-video container: recognized (see McrawContainer /
@@ -1984,6 +2008,27 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+        val rawPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri != null) adoptIncomingImage(uri)
+        }
+        // #162 inbound import: consume the Activity's pending VIEW/SEND exactly once and
+        // route it through the same dispatch as a picked document. A rejected shape
+        // (non-content scheme, missing stream) surfaces a status instead of adopting.
+        val pendingIncoming by incomingImageIntent
+        LaunchedEffect(pendingIncoming) {
+            val intent = pendingIncoming ?: return@LaunchedEffect
+            incomingImageIntent.value = null
+            val action = intent.action
+            if (action != Intent.ACTION_VIEW && action != Intent.ACTION_SEND) return@LaunchedEffect
+            val incoming = incomingImageUri(intent)
+            if (incoming == null) {
+                status = "couldn't open the shared image (unsupported source)"
+                return@LaunchedEffect
+            }
+            adoptIncomingImage(incoming)
         }
         val presetImporter = rememberLauncherForActivityResult(
             ActivityResultContracts.OpenDocument()
@@ -3608,9 +3653,26 @@ class MainActivity : ComponentActivity() {
                 ExportMask(
                     done = exportDone,
                     onDismiss = {
+                        lastExportShare = null
                         exportPhase = EditorExportPhase.IDLE
                         exportRuntimeRunId = null
                         checkpointEditorSession()
+                    },
+                    onShare = lastExportShare?.let { (published, mime) ->
+                        {
+                            // Content URI + minimum read grant; the exported row's exact
+                            // OutputDescriptor MIME — never a filesystem path (#162).
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = mime
+                                putExtra(Intent.EXTRA_STREAM, Uri.parse(published))
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            try {
+                                ctx.startActivity(Intent.createChooser(send, "Share export"))
+                            } catch (_: ActivityNotFoundException) {
+                                status = "no installed app can receive this image"
+                            }
+                        }
                     },
                     onCancel = {
                         val running = exportRuntimeState as? ExportRuntimeState.Running
@@ -3738,6 +3800,9 @@ class MainActivity : ComponentActivity() {
                                 var renderId = 0L
                                 val destinationCommit = ExportCommitLinearization()
                                 var previewCandidate: Bitmap? = null
+                                // #162: the committed MediaStore row, threaded into the terminal
+                                // outcome so the result UI can open/share it by content URI.
+                                var publishedUri: Uri? = null
                                 try {
                                     val bitmap =
                                     withContext(Dispatchers.Default) {
@@ -3762,7 +3827,7 @@ class MainActivity : ComponentActivity() {
                                             // engine) as a 32-bit float TIFF; the engine is skipped.
                                             val tEnc0 = System.currentTimeMillis()
                                             try {
-                                                withContext(Dispatchers.IO) {
+                                                publishedUri = withContext(Dispatchers.IO) {
                                                     saveLinearInputAsTiff32f(
                                                         exportContext,
                                                         image,
@@ -3866,7 +3931,7 @@ class MainActivity : ComponentActivity() {
                                                 previewCandidate = bmp
                                                 phGrade = System.currentTimeMillis() - tGrade0
                                                 val tEnc0 = System.currentTimeMillis()
-                                                withContext(Dispatchers.IO) {
+                                                publishedUri = withContext(Dispatchers.IO) {
                                                     when (outputDescriptor.encoder) {
                                                         OutputEncoder.NATIVE_TIFF_UINT16,
                                                         OutputEncoder.NATIVE_TIFF_FLOAT32 -> saveSimResultAsTiff(
@@ -3929,6 +3994,8 @@ class MainActivity : ComponentActivity() {
                                         renderId = renderId,
                                         bitmap = retainedBitmap,
                                         totalMs = totalMs,
+                                        publishedUri = publishedUri?.toString(),
+                                        publishedMimeType = exportFmt.mime,
                                         phases = ExportPhaseSnapshot(
                                             setupMs = phSetup,
                                             decodeMs = phDecode,
@@ -3955,6 +4022,8 @@ class MainActivity : ComponentActivity() {
                                             renderId = renderId,
                                             bitmap = null,
                                             totalMs = System.currentTimeMillis() - exportStartMs,
+                                            publishedUri = publishedUri?.toString(),
+                                            publishedMimeType = exportFmt.mime,
                                             phases = ExportPhaseSnapshot(
                                                 setupMs = phSetup,
                                                 decodeMs = phDecode,
@@ -4821,6 +4890,7 @@ class MainActivity : ComponentActivity() {
     private fun ExportMask(
         done: Boolean,
         onDismiss: () -> Unit,
+        onShare: (() -> Unit)? = null,
         onCancel: () -> Unit,
     ) {
         Box(
@@ -4858,6 +4928,9 @@ class MainActivity : ComponentActivity() {
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Button(onClick = onDismiss) { Text("View result") }
+                    if (onShare != null) {
+                        Button(onClick = onShare) { Text("Share") }
+                    }
                 }
             }
         }
@@ -5558,3 +5631,19 @@ private fun Modifier.clickableNoRipple(
         onClick = onClick,
     )
 )
+
+/**
+ * #162: the one accepted inbound shape — a content:// image from VIEW (data) or SEND
+ * (EXTRA_STREAM). Anything else (file:// paths, missing streams, foreign actions) is null
+ * and never adopted; the decode route itself stays content-sniffed fail-closed (#190).
+ */
+internal fun incomingImageUri(intent: Intent?): Uri? = when (intent?.action) {
+    Intent.ACTION_VIEW -> intent.data
+    Intent.ACTION_SEND -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+    }
+    else -> null
+}?.takeIf { it.scheme == ContentResolver.SCHEME_CONTENT }

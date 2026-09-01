@@ -36,6 +36,12 @@ internal sealed interface ExportTerminalOutcome {
         val bitmap: Bitmap?,
         val totalMs: Long,
         val phases: ExportPhaseSnapshot,
+        // #162: the published MediaStore row and its OutputDescriptor-derived MIME type,
+        // so the result UI can open/share the exact exported row by content URI without
+        // guessing from filesystem paths or re-querying MediaStore. Null when publication
+        // committed but the row identity was lost (crash-window success) or pre-API-29.
+        val publishedUri: String? = null,
+        val publishedMimeType: String? = null,
     ) : ExportTerminalOutcome
 
     data class Failure(

@@ -43,13 +43,30 @@
         <profileable
             android:shell="true"
             tools:targetApi="29" />
+        <!-- singleTask: an incoming VIEW/SEND must reach the one live editor through
+             onNewIntent — a second Activity instance would fight the process-owned
+             export/session runtimes for ownership. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- #162 inbound import. content:// only — a file:// path is never adopted
+                 (no path trust, no pre-scoped-storage semantics). MIME is advisory here;
+                 the actual decode route is content-sniffed fail-closed (#190). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
             </intent-filter>
         </activity>
 

@@ -212,7 +212,7 @@ check_member 'Lcom/spectrafilm/app/ExportWorkRuntime;' method 'claimFinished' '(
 check_member 'Lcom/spectrafilm/app/ExportRuntimeState$Finished;' method 'getRunId' '()J'
 check_member 'Lcom/spectrafilm/app/ExportRuntimeState$Finished;' method 'getOutcome' '()Lcom/spectrafilm/app/ExportTerminalOutcome;'
 check_member 'Lcom/spectrafilm/app/ExportRuntimeState$Running;' method 'getRunId' '()J'
-check_member 'Lcom/spectrafilm/app/ExportTerminalOutcome$Success;' method '<init>' '(Lcom/spectrafilm/app/ExportFormat;JLandroid/graphics/Bitmap;JLcom/spectrafilm/app/ExportPhaseSnapshot;)V'
+check_member 'Lcom/spectrafilm/app/ExportTerminalOutcome$Success;' method '<init>' '(Lcom/spectrafilm/app/ExportFormat;JLandroid/graphics/Bitmap;JLcom/spectrafilm/app/ExportPhaseSnapshot;Ljava/lang/String;Ljava/lang/String;)V'
 check_member 'Lcom/spectrafilm/app/ExportPhaseSnapshot;' method '<init>' '(JJJJJJ)V'
 check_member 'Lcom/spectrafilm/app/ExportFormat;' field 'PNG16' 'Lcom/spectrafilm/app/ExportFormat;'
 check_class 'Lcom/spectrafilm/app/ExportRuntimeState$Idle;'
