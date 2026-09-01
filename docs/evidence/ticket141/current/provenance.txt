@@ -1,0 +1,14 @@
+﻿captured_utc=2026-09-01T17:23:58.8001112Z
+source_commit=34f8ab3182a1bb05654abd60052c431aa8851ec4
+source_tree=af63154a31314200a5efa7a193136f6a0c22fdb0
+source_manifest_sha256=01b4d0ccf75513452fb1e2e76ad37ca03b6451d3438fa4a6246aecb31eb66813
+mask_count=4
+repeats=2
+cells=4096x3052,8192x6104
+serial=R5GL13Z3S6L
+manufacturer=samsung
+model=SM-S948W
+api=36
+fingerprint=samsung/m3qcsx/m3q:16/BP4A.251205.006/S948WVLS4AZG3_OYV4AZG3:user/release-keys
+target_sha256=9617d5417c6b0a6c9f72886b6f6b7dc81a21882888517eec0583474c51b44135
+test_sha256=424d5dd88a85f7d66c337fba80956e7bb1a662e5acabbd065f7a7eadbc4f73f8
