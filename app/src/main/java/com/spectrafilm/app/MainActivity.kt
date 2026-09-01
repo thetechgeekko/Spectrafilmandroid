@@ -258,7 +258,7 @@ private suspend fun decodeSourceRequest(
 }
 
 /** Top-level navigation destinations. */
-internal enum class Screen { EDITOR, SETTINGS, ABOUT, CURVES_FILM, CURVES_PRINT, DIAGNOSTICS }
+internal enum class Screen { EDITOR, SETTINGS, ABOUT, CURVES_FILM, CURVES_PRINT, DIAGNOSTICS, CAMERA }
 
 private data class EditorStartupRead(
     val session: EditorSessionReadResult,
@@ -722,6 +722,7 @@ class MainActivity : ComponentActivity() {
                             activeCategoryState = editorCategory,
                             onOpenSettings = { navigateTo(Screen.SETTINGS) },
                             onOpenAbout = { navigateTo(Screen.ABOUT) },
+                            onOpenCamera = { navigateTo(Screen.CAMERA) },
                             onProfileGroups = { f, p -> settingsFilmGroups = f; settingsPrintGroups = p },
                             onOpenFilmCurves = { id, name ->
                                 curvesFilmId = id; curvesFilmName = name; navigateTo(Screen.CURVES_FILM)
@@ -756,6 +757,16 @@ class MainActivity : ComponentActivity() {
                         profileId = curvesPrintId,
                         displayName = curvesPrintName,
                         onBack = { navigateTo(Screen.EDITOR) },
+                    )
+                    Screen.CAMERA -> com.spectrafilm.app.camera.CameraScreen(
+                        onClose = { navigateTo(Screen.EDITOR) },
+                        onCaptured = { uri ->
+                            // The capture enters the editor through the SAME importer path a
+                            // picked document or incoming VIEW uses (#162/#196): one dispatch,
+                            // one adoption, one precision contract.
+                            navigateTo(Screen.EDITOR)
+                            incomingImageIntent.value = Intent(Intent.ACTION_VIEW).setData(uri)
+                        },
                     )
                 }
             }
@@ -823,6 +834,7 @@ class MainActivity : ComponentActivity() {
         activeCategoryState: MutableState<Category?>,
         onOpenSettings: () -> Unit,
         onOpenAbout: () -> Unit,
+        onOpenCamera: () -> Unit,
         onProfileGroups: (List<DropdownGroup>, List<DropdownGroup>) -> Unit,
         onOpenFilmCurves: (id: String, name: String) -> Unit,
         onOpenPrintCurves: (id: String, name: String) -> Unit,
@@ -898,6 +910,10 @@ class MainActivity : ComponentActivity() {
         var sourceKind by remember { mutableStateOf(restoredSource.kind) }
         var sourceName by remember { mutableStateOf(restoredSource.displayName) }
         val sourceRuntime = remember(ctx.applicationContext) { sourceAccessRuntime(ctx) }
+        // #196: one runtime capability probe decides whether the Camera action exists at all.
+        val cameraAvailable = remember {
+            com.spectrafilm.app.camera.cameraCaptureAvailable(ctx.applicationContext)
+        }
         val sourceAccess = sourceRuntime.coordinator
         val sourceMutationGate = sourceRuntime.mutations
         var sourceAuthorizationRequired by remember {
@@ -3416,6 +3432,8 @@ class MainActivity : ComponentActivity() {
                                     )
                                 },
                                 onOpenRaw = { rawPicker.launch(arrayOf("*/*")) },
+                                cameraAvailable = cameraAvailable,
+                                onOpenCamera = onOpenCamera,
                                 onUseDemo = {
                                     val selectionGeneration = sourceMutationGate.begin()
                                     // Commit an explicit demo tombstone before changing either the
@@ -4829,6 +4847,8 @@ class MainActivity : ComponentActivity() {
         onReauthorize: () -> Unit,
         onPickPhoto: () -> Unit,
         onOpenRaw: () -> Unit,
+        cameraAvailable: Boolean,
+        onOpenCamera: () -> Unit,
         onUseDemo: () -> Unit,
         onResetEdits: () -> Unit,
     ) {
@@ -4848,6 +4868,10 @@ class MainActivity : ComponentActivity() {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = onPickPhoto, modifier = Modifier.weight(1f)) { Text("Pick photo") }
             Button(onClick = onOpenRaw, modifier = Modifier.weight(1f)) { Text("Open RAW/DNG") }
+        }
+        if (cameraAvailable) {
+            // #196: offered only when the runtime capability probe succeeded — never a dead tile.
+            Button(onClick = onOpenCamera, modifier = Modifier.fillMaxWidth()) { Text("Camera") }
         }
         OutlinedButton(onClick = onUseDemo, modifier = Modifier.fillMaxWidth()) { Text("Use demo image") }
 
