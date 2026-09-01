@@ -109,8 +109,8 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
-    implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation(libs.androidx.datastore.preferences)
+    implementation(libs.androidx.exifinterface)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
     implementation(libs.androidx.ui.graphics)
@@ -120,7 +120,7 @@ dependencies {
     testImplementation(libs.junit)
     // Real org.json on the unit-test classpath (the android.jar stub throws "not
     // mocked"); lets Presets JSON round-trip be tested on the plain JVM.
-    testImplementation("org.json:json:20231013")
+    testImplementation(libs.org.json)
 }
 
 // Canonical provenance input: Gradle's `dependencies` console report includes

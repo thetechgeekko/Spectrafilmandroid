@@ -4497,7 +4497,7 @@ class MainActivity : ComponentActivity() {
         onDismiss: () -> Unit,
         content: @Composable ColumnScope.() -> Unit,
     ) {
-        val maxH = (LocalConfigurationHeightDp() * 0.38f).dp
+        val maxH = (localConfigurationHeightDp() * 0.38f).dp
         Surface(
             tonalElevation = 3.dp,
             shadowElevation = 8.dp,
@@ -5164,7 +5164,7 @@ class MainActivity : ComponentActivity() {
         SectionCard("Simulation", expanded, { expanded = it }) {
             // Lightroom-style sub-tabs split this tool's four groups (Film / Print / Scanner /
             // Output) so only one shows at a time, instead of one long scroll behind dividers.
-            var simTab by remember { mutableStateOf(0) }
+            var simTab by remember { mutableIntStateOf(0) }
             SubTabRow(listOf("Film", "Print", "Scanner", "Output"), simTab, { simTab = it })
             when (simTab) {
                 0 -> {
@@ -5618,7 +5618,7 @@ private fun avgRgb(img: com.spectrafilm.engine.LinearImage): Triple<Float, Float
 }
 
 @Composable
-private fun LocalConfigurationHeightDp(): Int =
+private fun localConfigurationHeightDp(): Int =
     androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp
 
 private fun Modifier.clickableNoRipple(

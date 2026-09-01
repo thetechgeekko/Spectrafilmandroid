@@ -44,6 +44,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -180,7 +182,7 @@ fun ZoomableImage(
     // "+" button so zoom-in lands already zoomed instead of at fit. Default 1f (fit) everywhere else.
     initialScale: Float = 1f,
 ) {
-    var scale by remember { mutableStateOf(initialScale) }
+    var scale by remember { mutableFloatStateOf(initialScale) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     // While zoomed, an edit (renderKey bump) makes the current sharp ROI crop stale: hide it so the
@@ -484,8 +486,8 @@ fun CompareSlider(
     after: Bitmap,
     modifier: Modifier = Modifier,
 ) {
-    var split by remember { mutableStateOf(0.5f) }
-    var width by remember { mutableStateOf(0) }
+    var split by remember { mutableFloatStateOf(0.5f) }
+    var width by remember { mutableIntStateOf(0) }
     val aspect = after.width.toFloat() / after.height.toFloat()
     val beforeImg = remember(before) { before.asImageBitmap() }
     val afterImg = remember(after) { after.asImageBitmap() }

@@ -30,7 +30,8 @@ Gradle modules actually built (`settings.gradle.kts`):
 - **`:lib:tiffwriter`** (`libsftiff.so`) and **`:lib:pngwriter`** (`libsfpng.so`) — 16-bit
   TIFF/PNG export writers.
 
-Ignore `feature/film-emulation/`; it is **not** in `settings.gradle.kts` and is not compiled. The
+`feature/film-emulation/` was a never-compiled pseudo-module (never in `settings.gradle.kts`);
+it was deleted by #184 — its history survives in git and in `docs/DECISION.md`. The
 real app is the standalone `:app` module documented in `docs/ARCHITECTURE.md`. The abandoned
 ImageToolbox-host proposal survives only as historical decision input in `docs/DECISION.md` and
 `docs/maps/IMAGETOOLBOX_MAP.md`. Start at `docs/EXECUTION_INDEX.md` for the current authority order
