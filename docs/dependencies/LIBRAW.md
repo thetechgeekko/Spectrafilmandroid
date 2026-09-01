@@ -57,7 +57,7 @@ The complete manifest and patch hashes are in
 | `0021-harden-panasonic-c8-decoder.patch` | Preserves raw C8 metadata counts, validates tables, destination geometry and each in-file source range, enforces bit budgets, and defines predictor arithmetic plus OpenMP error reduction. |
 | `0022-bound-fixed-header-string-reads.patch` | Bounds identify and MakerNote fixed-header comparisons and the dormant X3F model probe. The host gate enables X3FTOOLS to qualify this seam; it does not qualify the full optional parser for Android. |
 | `0023-record-local-modification-notices.patch` | Adds a dated Spektrafilm Android modification notice to every upstream file changed by patches 0001–0022. This is a notice-only patch; aggregate `2fb59481…` is retained only as the exact migration input to the 23-patch notice tree. |
-| `0024-define-xtrans-negative-index-arithmetic.patch` | Rewrites X-Trans neighbor offsets from undefined `-i << c` to the intended `-(i << c)`. A valid 520 x 520 public-seam X-Trans DNG keeps the exact pre-fix float digest `5238915555911424415` while ASan/UBSan stays clean. |
+| `0024-define-xtrans-negative-index-arithmetic.patch` | Rewrites X-Trans neighbor offsets from undefined `-i << c` to the intended `-(i << c)`. A valid 520 x 520 public-seam X-Trans DNG kept the exact pre-fix float digest (`5238915555911424415` in the Clang 18.1.3 capture environment) while ASan/UBSan stays clean; the digest is toolchain-sensitive, so the host contract test pins the CI value `2892219489530756344`. |
 | `0025-define-icc-s15fixed16-conversion.patch` | Rounds generated ICC XYZ coefficients in the signed domain before defined s15Fixed16 word encoding, preserving negative ACES matrix entries without floating-to-unsigned undefined behavior. |
 
 Panasonic C8 codebooks are intentionally decoded in metadata order. Requiring a
@@ -169,7 +169,9 @@ Local decoder evidence at implementation time used a byte-verified official
 archive plus the 22 behavioral hardening patches. Patch 0023 subsequently added
 notices only. Patch 0024 then defined X-Trans negative-neighbor index arithmetic
 without changing its exact float output: the independently captured pre-fix and
-patched digest is `5238915555911424415`. Patch 0025 defines signed ICC
+patched digests were identical (`5238915555911424415` under Clang 18.1.3), proving
+the rewrite arithmetic-neutral. The float digest itself is toolchain-sensitive:
+CI’s host suite deterministically produces and now pins `2892219489530756344`. Patch 0025 defines signed ICC
 s15Fixed16 conversion while retaining negative ACES profile coefficients. The
 current 25-patch `bc463c30…` aggregate passed all 7/7 shipping-serial host CTests
 under Clang 18.1.3 ASan + UBSan + float-cast-overflow on 2026-09-01, including
