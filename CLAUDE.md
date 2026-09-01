@@ -99,10 +99,10 @@ g++ -std=c++17 -O2 -pthread -I. -I../../../../../tools/parity \
 A test passes when its output contains no `FAIL` line. `tools/parity/run_engine_parity.sh`
 builds and runs the whole suite locally with the same argv as CI (it fails loudly if its table
 drifts from the workflow's `build_run` count). `engine-parity` is a **two-leg matrix** — the same
-39 tests at `-O2` and at the shipping `-O3 -ffast-math -fno-finite-math-only`, because the release
+40 tests at `-O2` and at the shipping `-O3 -ffast-math -fno-finite-math-only`, because the release
 APK's numerics were otherwise never gated. A plain local run reproduces the `-O2` leg only; for the
 other, prefix `SPK_PARITY_EXTRA_FLAGS="-O3 -ffast-math -fno-finite-math-only"`. CI `engine-parity`
-gates (39 tests):
+gates (40 tests):
 `simulate_e2e` (goldens + BOTH film-density memos + the print-density memo + per-param key
 completeness), `filming`, `spatial`, `crop_resize`, `downscale` (minification AA prefilter),
 `autoexposure`, `small_preview_aa` (AE metering downscale AA), `diffusion` (+`_e2e`),
@@ -124,7 +124,10 @@ compression), the spektral-param wiring gates
 **`test_parallel`** (thread-invariance, fresh engine per thread count), and the
 statistical grain gates `test_grain` + `test_grain_sublayer` (mean preservation +
 noise std vs committed oracle references — the stochastic stage byte goldens
-cannot cover). The param-wiring
+cannot cover), and `test_binomial_shortcircuit` (element-wise: `fast_binomial_one`'s
+degenerate-CDF short-circuit against a verbatim transcription of the loop it replaces,
+variate AND surviving RNG stream — the two grain gates above are statistical and
+cannot see a sampler change). The param-wiring
 goldens are pinned to oracle SHA `c1d0e44` (see `tools/parity/setup_env.sh`). The exact
 per-test argv is in `.github/workflows/ci.yml` — copy from there rather than guessing.
 
@@ -133,7 +136,7 @@ per-test argv is in `.github/workflows/ci.yml` — copy from there rather than g
 - Engine `CMAKE_CXX_FLAGS_RELEASE` is `-O3 -ffast-math -fno-finite-math-only`.
   **`-fno-finite-math-only` is required** — the scanning stage relies on NaN propagation through
   `density_to_light` to match spektrafilm's profile null handling. Do not strip it.
-  All 39 gates pass at these flags as well as at `-O2`; note this holds for the **band**, not for
+  All 40 gates pass at these flags as well as at `-O2`; note this holds for the **band**, not for
   byte-equality between the two builds — `-ffast-math` reassociates, which is exactly what
   invalidated a Highway f64 byte-identity claim proven only at `-O2` (`docs/research/perf-lab.md` §14).
 - `tools/parity/` is the standalone `.spkvec` golden-vector comparator (CMake + ctest self-test,
@@ -171,7 +174,7 @@ explicitly signs it with the committed public debug key, and runs the 16 KB pre-
   parity suite will NOT catch it if you forget.** The host parity build compiles with a
   glob (`kernels/*.cpp model/*.cpp ...`, see the build line above); the Android build
   enumerates every source explicitly. A file missing from CMakeLists therefore passes all
-  39 gates locally and fails only at the Android `ninja ... spektra` step, as an undefined
+  40 gates locally and fails only at the Android `ninja ... spektra` step, as an undefined
   reference. Check a new source the way CI links: `g++ -std=c++17 -O2 -pthread -fPIC
   -shared -I. <CMakeLists sources, minus spektra_jni.cpp> -Wl,--no-undefined -o /tmp/x.so`.
   (Cost a red CI run on `551c57f`.)
