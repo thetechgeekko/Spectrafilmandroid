@@ -182,6 +182,19 @@ job rejects a receipt from any earlier attempt. After any failed release job, us
 - [ ] Confirm the five protected Environment secrets, signer-fingerprint
   variable, required reviewer, immutable-releases setting, and tag ruleset are
   configured exactly as described in §4.
+- [ ] Re-run the privacy boundary suites: `AppUpdaterTest`, `DiagnosticsTest`, and
+  `BackupSecurityConfigTest`. Inspect the merged release manifest and require the
+  narrow backup/data-extraction rules, cleartext denial, exact updater domain,
+  `restoreAnyVersion=false`, no `REQUEST_INSTALL_PACKAGES`/`READ_LOGS`/broad media-read
+  permission, and a non-exported `dataSync` export service. See
+  [PRIVACY.md](PRIVACY.md) and [UPDATER_SECURITY.md](UPDATER_SECURITY.md).
+- [ ] Reconcile the store privacy policy and Data Safety form with the exact candidate.
+  The present app has no automatic telemetry; standard Auto Backup/cross-platform transfer is
+  disabled and the OEM-D2D defense-in-depth rules allow only settings/back-exit state, the updater
+  contacts GitHub only after a user tap, and diagnostics leave only through an explicit Copy/Share
+  target. Treat any new
+  SDK, endpoint, permission, backup path, or update/download behavior as a release block
+  until code, UI disclosure, tests, and both documents agree.
 - [ ] Confirm `lib/libraw/compliance/license-route.txt` records the exact
   human-reviewed SPDX route. `UNRESOLVED` is the intentional repository default
   while the linked LibRaw legal-distribution ticket is open and is a hard release failure. Including both

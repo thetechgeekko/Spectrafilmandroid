@@ -279,7 +279,8 @@ fun SettingsScreen(
                 title = { Text("Update available") },
                 text = {
                     Text("A newer version (${info.latestTag}) is available. You're on " +
-                        "${info.currentVersion}. Open the release page to download the signed APK?")
+                        "${info.currentVersion}. Open the canonical GitHub release page in your " +
+                        "browser? Spektrafilm does not download, install, or verify an APK.")
                 },
                 confirmButton = {
                     TextButton(onClick = { AppUpdater.openRelease(ctx, info); pendingUpdate = null }) {

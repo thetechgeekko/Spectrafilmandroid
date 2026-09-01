@@ -1,82 +1,189 @@
 /*
- * Spektrafilm for Android — in-app update check. GPLv3.
+ * Spektrafilm for Android — advisory update check. GPLv3.
  * Film modeling powered by spektrafilm.
  *
- * Spektrafilm ships as a signed APK via GitHub Releases (release.yml). This checks the
- * repo's latest release, compares its `vMAJOR.MINOR.PATCH` tag to the installed
- * versionName, and — when newer — surfaces an update prompt that opens the release page
- * in the browser to download. We deliberately do NOT auto-download/-install the APK
- * (that needs REQUEST_INSTALL_PACKAGES + a PackageInstaller flow); opening the signed
- * GitHub Release is the safe, reviewable path. Nothing is sent; it's a single GET.
- *
- * Clean-room (uses only the public GitHub REST API + org.json from the platform).
+ * The in-app check reads one bounded response from the repository's fixed GitHub API
+ * endpoint, then opens only that repository's canonical HTTPS release page in the
+ * browser. It never downloads, verifies, or installs an APK. Android's package-signature
+ * continuity is the install-time integrity gate; this file must not claim a signing or
+ * hash contract the repository does not ship.
  */
 package com.spectrafilm.app
 
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URI
+import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 
 data class UpdateInfo(
-    val latestTag: String,        // e.g. "v0.9.0"
-    val currentVersion: String,   // installed versionName
-    val releaseUrl: String,       // html_url of the release page
+    val latestTag: String,
+    val currentVersion: String,
+    val releaseUrl: String,
     val isNewer: Boolean,
 )
 
 object AppUpdater {
-    // The app's own releases.
+    internal const val MAX_RESPONSE_BYTES = 64 * 1024
+
+    private const val MAX_TAG_CHARS = 32
+    private const val CONNECT_TIMEOUT_MS = 5_000
+    private const val READ_TIMEOUT_MS = 5_000
+    private const val API_HOST = "api.github.com"
+    private const val BROWSER_HOST = "github.com"
+    private const val REPOSITORY_PATH = "/thetechgeekko/Spektrafilm-android"
     private const val LATEST_API =
-        "https://api.github.com/repos/thetechgeekko/Spectrafilmandroid/releases/latest"
+        "https://api.github.com/repos/thetechgeekko/Spektrafilm-android/releases/latest"
+    private val STABLE_TAG = Regex(
+        """v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)""",
+    )
 
     /**
-     * Query the latest release. Returns null on any network/parse failure (caller treats
-     * null as "couldn't check"). Runs on IO.
+     * Query advisory release metadata. Any transport, policy, or parse failure returns
+     * null; no response may choose a different endpoint or browser destination.
      */
     suspend fun checkForUpdate(context: Context): UpdateInfo? = withContext(Dispatchers.IO) {
         val current = runCatching {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName
         }.getOrNull() ?: return@withContext null
 
-        val json = runCatching {
-            val conn = (URL(LATEST_API).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 8000
-                readTimeout = 8000
-                setRequestProperty("Accept", "application/vnd.github+json")
-                setRequestProperty("User-Agent", "Spektrafilm-Android")
-            }
-            try {
-                if (conn.responseCode != 200) return@runCatching null
-                conn.inputStream.bufferedReader().readText()
-            } finally {
-                conn.disconnect()
-            }
-        }.getOrNull() ?: return@withContext null
+        fetchLatest(current)
+    }
 
-        runCatching {
-            val obj = JSONObject(json)
-            val tag = obj.getString("tag_name")
-            val url = obj.optString("html_url")
+    private fun fetchLatest(currentVersion: String): UpdateInfo? {
+        val endpoint = runCatching { URI(LATEST_API) }.getOrNull()
+            ?.takeIf(::isAllowedApiEndpoint)
+            ?: return null
+        return try {
+            val connection = URL(endpoint.toASCIIString()).openConnection() as? HttpURLConnection
+                ?: return null
+            try {
+                connection.apply {
+                    instanceFollowRedirects = false
+                    useCaches = false
+                    doOutput = false
+                    requestMethod = "GET"
+                    connectTimeout = CONNECT_TIMEOUT_MS
+                    readTimeout = READ_TIMEOUT_MS
+                    setRequestProperty("Accept", "application/vnd.github+json")
+                    setRequestProperty("User-Agent", "Spektrafilm-Android")
+                }
+                val statusCode = connection.responseCode
+                if (statusCode != HttpURLConnection.HTTP_OK) return null
+                connection.inputStream.use { body ->
+                    evaluateResponse(
+                        currentVersion = currentVersion,
+                        statusCode = statusCode,
+                        contentType = connection.contentType,
+                        declaredLength = connection.contentLengthLong,
+                        body = body,
+                    )
+                }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** HTTP response policy seam, exercised with hostile response streams in JVM tests. */
+    internal fun evaluateResponse(
+        currentVersion: String,
+        statusCode: Int,
+        contentType: String?,
+        declaredLength: Long,
+        body: InputStream,
+    ): UpdateInfo? {
+        if (statusCode != HttpURLConnection.HTTP_OK) return null
+        val mediaType = contentType
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase(Locale.ROOT)
+        if (mediaType != "application/json" && mediaType != "application/vnd.github+json") {
+            return null
+        }
+        if (declaredLength < -1L || declaredLength > MAX_RESPONSE_BYTES) return null
+        val json = readBoundedUtf8(body) ?: return null
+        return runCatching {
+            val metadata = JSONObject(json)
+            if (metadata.opt("draft") != false || metadata.opt("prerelease") != false) return null
+            val tag = metadata.opt("tag_name") as? String ?: return null
+            val releaseUrl = metadata.opt("html_url") as? String ?: return null
+            if (tag.length > MAX_TAG_CHARS ||
+                !STABLE_TAG.matches(tag) ||
+                validatedReleaseUrl(releaseUrl, tag) == null
+            ) return null
             UpdateInfo(
                 latestTag = tag,
-                currentVersion = current,
-                releaseUrl = url,
-                isNewer = isNewer(current, tag),
+                currentVersion = currentVersion,
+                releaseUrl = releaseUrl,
+                isNewer = isNewer(currentVersion, tag),
             )
         }.getOrNull()
     }
 
-    /** Open the release page (browser) so the user can grab the signed APK. */
-    fun openRelease(context: Context, info: UpdateInfo) {
-        val target = info.releaseUrl.ifBlank {
-            "https://github.com/thetechgeekko/Spectrafilmandroid/releases/latest"
+    private fun readBoundedUtf8(input: InputStream): String? {
+        val output = ByteArrayOutputStream(minOf(MAX_RESPONSE_BYTES, 8 * 1024))
+        val buffer = ByteArray(4 * 1024)
+        var total = 0
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            // InputStream promises progress for a non-empty buffer. Treat a broken or
+            // adversarial implementation as a failed response instead of spinning.
+            if (read == 0) return null
+            if (total > MAX_RESPONSE_BYTES - read) return null
+            output.write(buffer, 0, read)
+            total += read
         }
+        return runCatching {
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(output.toByteArray()))
+                .toString()
+        }.getOrNull()
+    }
+
+    private fun isAllowedApiEndpoint(uri: URI): Boolean =
+        uri.scheme.equals("https", ignoreCase = true) &&
+            uri.host.equals(API_HOST, ignoreCase = true) &&
+            uri.port == -1 &&
+            uri.rawUserInfo == null &&
+            uri.rawQuery == null &&
+            uri.rawFragment == null &&
+            uri.rawPath == "/repos$REPOSITORY_PATH/releases/latest"
+
+    private fun validatedReleaseUrl(raw: String, tag: String): String? {
+        if (tag.length > MAX_TAG_CHARS || !STABLE_TAG.matches(tag)) return null
+        val uri = runCatching { URI(raw) }.getOrNull() ?: return null
+        val valid = uri.scheme.equals("https", ignoreCase = true) &&
+            uri.host.equals(BROWSER_HOST, ignoreCase = true) &&
+            uri.port == -1 &&
+            uri.rawUserInfo == null &&
+            uri.rawQuery == null &&
+            uri.rawFragment == null &&
+            uri.rawPath == "$REPOSITORY_PATH/releases/tag/$tag"
+        return raw.takeIf { valid }
+    }
+
+    /** Revalidate at the Intent boundary even if an UpdateInfo was caller-constructed. */
+    internal fun browserTarget(info: UpdateInfo): String? =
+        validatedReleaseUrl(info.releaseUrl, info.latestTag)
+
+    /** Open a validated release page in the user's browser. */
+    fun openRelease(context: Context, info: UpdateInfo) {
+        val target = browserTarget(info) ?: return
         runCatching {
             context.startActivity(
                 Intent(Intent.ACTION_VIEW, Uri.parse(target)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -84,21 +191,23 @@ object AppUpdater {
         }
     }
 
-    /** True if [tag] (e.g. "v0.9.0") is a strictly newer semver than installed [current]. */
+    /** True if [tag] is a strictly newer semver than installed [current]. */
     internal fun isNewer(current: String, tag: String): Boolean {
-        val c = parseSemver(current) ?: return false
-        val t = parseSemver(tag) ?: return false
+        val installed = parseSemver(current) ?: return false
+        val available = parseSemver(tag) ?: return false
         for (i in 0 until 3) {
-            if (t[i] != c[i]) return t[i] > c[i]
+            if (available[i] != installed[i]) return available[i] > installed[i]
         }
         return false
     }
 
-    /** Parse "v1.2.3" / "1.2.3" → [1,2,3]; missing parts = 0; null if unparseable. */
-    private fun parseSemver(s: String): IntArray? {
-        val core = s.trim().removePrefix("v").substringBefore('-').substringBefore('+')
+    /** Parse `v1.2.3` / `1.2.3`; missing minor or patch components are zero. */
+    private fun parseSemver(value: String): IntArray? {
+        val core = value.trim().removePrefix("v").substringBefore('-').substringBefore('+')
         val parts = core.split('.')
-        if (parts.isEmpty() || parts[0].toIntOrNull() == null) return null
-        return IntArray(3) { i -> parts.getOrNull(i)?.toIntOrNull() ?: 0 }
+        if (parts.size !in 1..3 || parts.any { it.isEmpty() || it.any { c -> !c.isDigit() } }) {
+            return null
+        }
+        return IntArray(3) { index -> parts.getOrNull(index)?.toIntOrNull() ?: 0 }
     }
 }

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Defense in depth for OEM transfer behavior when android:allowBackup="false" is not
+  honored uniformly: only two non-sensitive preferences are eligible, and only under
+  client-side encryption. Once any include is present Android makes every unlisted path
+  ineligible, so redundant excludes would be invalid. Auto Backup itself remains disabled.
+-->
+<full-backup-content>
+    <include
+        domain="sharedpref"
+        path="spectrafilm_settings.xml"
+        requireFlags="clientSideEncryption" />
+    <include
+        domain="file"
+        path="datastore/back_exit_hint.preferences_pb"
+        requireFlags="clientSideEncryption" />
+</full-backup-content>

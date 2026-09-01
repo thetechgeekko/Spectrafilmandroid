@@ -2,8 +2,8 @@
  * Spektrafilm for Android — Diagnostics screen. GPLv3.
  * Film modeling powered by spektrafilm.
  *
- * Shows the last persisted crash (if any) and an on-demand logcat snapshot of this
- * process, with copy + share. No network, no permission; for self-service bug reports.
+ * Shows a bounded, redacted crash record and an on-demand redacted logcat snapshot.
+ * Nothing leaves the device until the user explicitly copies or shares it.
  */
 package com.spectrafilm.app
 
@@ -57,6 +57,13 @@ fun DiagnosticsScreen() {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("App: ${Diagnostics.appVersion(ctx)}", style = MaterialTheme.typography.bodyMedium)
+        Text(
+            "Nothing is uploaded automatically. Reports include app/device version, " +
+                "redact paths, URIs and image metadata, and keep the last crash for at most 7 days. " +
+                "Copy or Share is always an explicit action.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
         // --- last crash ---
         Text("Last crash", style = MaterialTheme.typography.titleMedium)
