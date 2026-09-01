@@ -45,6 +45,7 @@ object Diagnostics {
     internal const val MAX_CRASH_BYTES = 64 * 1024
     internal const val MAX_LOG_BYTES = 128 * 1024
     internal const val MAX_REPORT_BYTES = 192 * 1024
+    internal const val MAX_ENGINE_CACHE_BYTES = 8 * 1024
     internal const val MAX_LOG_LINES = 500
     internal const val MAX_CRASH_AGE_MS = 7L * 24L * 60L * 60L * 1_000L
 
@@ -311,11 +312,25 @@ object Diagnostics {
             "Android ${android.os.Build.VERSION.RELEASE} " +
             "(API ${android.os.Build.VERSION.SDK_INT})\n\n"
         val crash = lastCrash(context)?.let { "--- last crash ---\n$it\n\n" } ?: ""
+        val cache = engineCacheSection(engineCacheSnapshot())
         return sanitizeForExport(
-            header + crash + "--- logcat (recent) ---\n" + captureLogcat(),
+            header + crash + cache + "--- logcat (recent) ---\n" + captureLogcat(),
             MAX_REPORT_BYTES,
         )
     }
+
+    /** Current shipping native readout; failure text is fixed so paths never leak. */
+    fun engineCacheSnapshot(): String = runCatching {
+        EngineHolder.tcLutCacheStatsJson()
+    }.getOrDefault(
+        """{"schema":"spk.tc_lut_cache.v1","status":"unavailable"}""",
+    )
+
+    internal fun engineCacheSection(snapshot: String): String =
+        sanitizeForExport(
+            "--- Filming tc_lut cache ---\n$snapshot\n\n",
+            MAX_ENGINE_CACHE_BYTES,
+        )
 
     fun appVersion(context: Context): String = runCatching {
         val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)

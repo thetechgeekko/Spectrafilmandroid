@@ -32,6 +32,13 @@ object EngineHolder {
     @Volatile private var instance: SpektraEngine? = null
 
     /**
+     * Read the shipping native cache diagnostics without creating a heavy engine
+     * merely because Settings was opened before the editor.
+     */
+    fun tcLutCacheStatsJson(): String = instance?.tcLutCacheStatsJson()
+        ?: """{"schema":"spk.tc_lut_cache.v1","status":"engine_not_initialized"}"""
+
+    /**
      * Return the shared engine, creating it on first use. Heavy on the first call
      * (asset wiring); call off the main thread.
      */

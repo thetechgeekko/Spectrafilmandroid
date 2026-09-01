@@ -37,10 +37,19 @@ target_compile_definitions(spektra_fft_convolve_regression PRIVATE
 target_include_directories(spektra_fft_convolve_regression PRIVATE ..)
 target_link_libraries(spektra_fft_convolve_regression PRIVATE Threads::Threads)
 
+add_executable(spektra_tc_lut_cache_regression
+    test_tc_lut_cache.cpp
+    ../runtime/tc_lut_cache.cpp
+)
+target_compile_features(spektra_tc_lut_cache_regression PRIVATE cxx_std_17)
+target_include_directories(spektra_tc_lut_cache_regression PRIVATE ..)
+target_link_libraries(spektra_tc_lut_cache_regression PRIVATE Threads::Threads)
+
 # These small regression executables use assert as their fail-closed test primitive. CMake's
 # Release flags define NDEBUG; explicitly undo it so CI/release builds execute every assertion
 # instead of compiling the tests into no-ops.
-foreach(target spektra_jni_safety_regression spektra_parallel_exceptions_regression)
+foreach(target spektra_jni_safety_regression spektra_parallel_exceptions_regression
+               spektra_tc_lut_cache_regression)
     if(MSVC)
         target_compile_options(${target} PRIVATE /UNDEBUG)
     else()
@@ -80,6 +89,7 @@ if(SPK_NPY_TEST_SANITIZERS OR SPK_NATIVE_INPUT_TEST_SANITIZERS)
                 spektra_jni_safety_regression
                 spektra_parallel_exceptions_regression
                 spektra_fft_convolve_regression
+                spektra_tc_lut_cache_regression
                 spektra_npy_lut_regression
                 spektra_json_profile_regression)
             target_compile_options(${target} PRIVATE
@@ -104,6 +114,10 @@ set_tests_properties(spektra.parallel.exception-containment PROPERTIES TIMEOUT 1
 add_test(NAME spektra.fft-convolve.denial-and-parity
     COMMAND spektra_fft_convolve_regression)
 set_tests_properties(spektra.fft-convolve.denial-and-parity PROPERTIES TIMEOUT 30)
+
+add_test(NAME spektra.tc-lut-cache.bounded-lru
+    COMMAND spektra_tc_lut_cache_regression)
+set_tests_properties(spektra.tc-lut-cache.bounded-lru PROPERTIES TIMEOUT 30)
 
 add_test(NAME spektra.npy-lut.hostile-inputs
     COMMAND spektra_npy_lut_regression

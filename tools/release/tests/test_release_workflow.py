@@ -10,6 +10,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 CI = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 RELEASE = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+WORKFLOW_README = (ROOT / ".github/workflows/README.md").read_text(encoding="utf-8")
 APP_BUILD = (ROOT / "app/build.gradle.kts").read_text(encoding="utf-8")
 PROGUARD_RULES = (ROOT / "app/proguard-rules.pro").read_text(encoding="utf-8")
 RUNNER = (
@@ -444,6 +445,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety",
                 "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation",
                 "asan-ubsan|engine-parallel-exception-containment|engine-parallel-exceptions",
+                "asan-ubsan|engine-tc-lut-cache-bounded-lru|engine-tc-lut-cache",
                 "asan-ubsan|engine-json-profile-hostile-inputs|engine-json-profile",
                 "asan-ubsan|engine-npy-hostile-inputs|engine-npy",
                 "asan-ubsan|png-writer-hostile-jni-helpers|png-writer",
@@ -451,16 +453,21 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 "tsan|engine-c-cancellation-race|engine-c-cancellation",
                 "tsan|engine-jni-allocation-registry-race|engine-jni-safety",
                 "tsan|engine-parallel-exception-race|engine-parallel-exceptions",
+                "tsan|engine-tc-lut-cache-race|engine-tc-lut-cache",
                 "tsan|png-writer-cancellation-race|png-writer",
                 "tsan|tiff-writer-cancellation-race|tiff-writer",
             ),
             actual,
         )
+        self.assertEqual(8, sum(row.startswith("asan-ubsan|") for row in actual))
+        self.assertEqual(6, sum(row.startswith("tsan|") for row in actual))
         self.assertIn('"$ENGINE_CPP/tests/test_npy_lut.cpp"', runner)
         self.assertIn('"$ENGINE_CPP/io/npy_lut.cpp"', runner)
         self.assertIn('"$ENGINE_CPP/tests/test_json_profile.cpp"', runner)
         self.assertIn('"$ENGINE_CPP/profiles/profile.cpp"', runner)
         self.assertIn('"$ENGINE_CPP/runtime/print_digest.cpp"', runner)
+        self.assertIn('"$ENGINE_CPP/tests/test_tc_lut_cache.cpp"', runner)
+        self.assertIn('"$ENGINE_CPP/runtime/tc_lut_cache.cpp"', runner)
         self.assertIn(
             '"$ENGINE_CPP/../assets/spektra/luts/spectral_upsampling/irradiance_xy_tc.npy"',
             runner,
@@ -477,6 +484,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             "tests/test_jni_safety.cpp",
             "tests/test_cancellation_api.cpp",
             "tests/test_parallel_exceptions.cpp",
+            "tests/test_tc_lut_cache.cpp",
             "tests/test_png_writer.cpp",
             "tests/test_tiff_writer.cpp",
         ):
@@ -484,6 +492,13 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("NATIVE_SAFETY_RUNNER: PASS", runner)
         self.assertNotIn("spektra_jni.cpp", runner)
         self.assertNotIn("|| true", runner)
+        for documented_count in (
+            "exact fourteen-suite host inventory",
+            "locked eight\nASan+UBSan plus six TSan inventory",
+            "same committed fourteen-suite ASan+UBSan/TSan runner",
+        ):
+            self.assertIn(documented_count, WORKFLOW_README)
+        self.assertIn("bounded tc_lut-cache lifetime/concurrency", CI)
 
     def test_engine_rejects_wrong_spectra_lut_shape_before_cache_publication(self) -> None:
         bounded_read = (

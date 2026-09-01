@@ -46,8 +46,12 @@ fun DiagnosticsScreen() {
     val scope = rememberCoroutineScope()
     var crash by remember { mutableStateOf<String?>(null) }
     var log by remember { mutableStateOf<String?>(null) }
+    var engineCache by remember { mutableStateOf<String?>(null) }
     // Read the persisted crash off the main thread (file IO).
-    LaunchedEffect(Unit) { crash = withContext(Dispatchers.IO) { Diagnostics.lastCrash(ctx) } }
+    LaunchedEffect(Unit) {
+        crash = withContext(Dispatchers.IO) { Diagnostics.lastCrash(ctx) }
+        engineCache = withContext(Dispatchers.Default) { Diagnostics.engineCacheSnapshot() }
+    }
 
     Column(
         Modifier
@@ -82,6 +86,27 @@ fun DiagnosticsScreen() {
                 }) { Text("Clear") }
             }
         }
+
+        // --- bounded native cache state ---
+        Text("Filming tc_lut cache", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Pinned defaults and the parameter-keyed LRU. cache_held_bytes excludes " +
+                "evicted LUTs still leased by an active render; those remain in the " +
+                "process memory-budget counter until released.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        engineCache?.let { MonoBlock(it) }
+            ?: Text("Loading cache diagnostics...", style = MaterialTheme.typography.bodySmall)
+        OutlinedButton(
+            onClick = {
+                scope.launch(Dispatchers.Default) {
+                    val snapshot = Diagnostics.engineCacheSnapshot()
+                    withContext(Dispatchers.Main) { engineCache = snapshot }
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Refresh cache stats") }
 
         // --- logcat snapshot ---
         Text("Logcat snapshot", style = MaterialTheme.typography.titleMedium)

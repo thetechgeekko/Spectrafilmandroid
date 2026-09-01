@@ -571,6 +571,10 @@ class SpektraEngine private constructor(
         nativeListProfiles(leasedHandle).split('\n').filter { it.isNotBlank() }
     }
 
+    /** Stable `spk.tc_lut_cache.v1` shipping diagnostics for this engine. */
+    fun tcLutCacheStatsJson(): String =
+        withEngineLease("tcLutCacheStatsJson", ::nativeTcLutCacheStatsJson)
+
     /**
      * Full pipeline: RGB → negative → (print) → scan. Heavy; call off the main
      * thread. On a native failure the underlying [RuntimeException] (with the
@@ -691,6 +695,7 @@ class SpektraEngine private constructor(
     // --- native bridge (see spektra_jni.cpp) ---
     private external fun nativeDestroy(handle: Long)
     private external fun nativeListProfiles(handle: Long): String
+    private external fun nativeTcLutCacheStatsJson(handle: Long): String
     private external fun nativeSimulate(
         handle: Long, inBuf: ByteBuffer, w: Int, h: Int, inCs: String,
         params: SpektraParams, preview: Boolean, renderKind: Int,

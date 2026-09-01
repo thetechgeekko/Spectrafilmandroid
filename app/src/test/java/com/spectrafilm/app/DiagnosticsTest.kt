@@ -15,6 +15,22 @@ import org.junit.Test
 class DiagnosticsTest {
 
     @Test
+    fun engineTcLutCacheSnapshotIsAVisibleBoundedReportSection() {
+        val summary =
+            """{"schema":"spk.tc_lut_cache.v1","hits":9,"misses":3,"evictions":2,"cache_held_bytes":885000}"""
+        val snapshot = summary + "x".repeat(Diagnostics.MAX_ENGINE_CACHE_BYTES * 2)
+
+        val section = Diagnostics.engineCacheSection(snapshot)
+
+        assertTrue(section.contains("Filming tc_lut cache"))
+        assertTrue(section.contains("spk.tc_lut_cache.v1"))
+        assertTrue(section.contains("\"hits\":9"))
+        assertTrue(section.contains("\"evictions\":2"))
+        assertTrue(section.toByteArray(Charsets.UTF_8).size <= Diagnostics.MAX_ENGINE_CACHE_BYTES)
+        assertTrue(section.endsWith("[truncated]\n"))
+    }
+
+    @Test
     fun exportedDiagnosticsRedactUrisPathsImageNamesAndMetadata() {
         val raw = """
             render width=4032 height=3024 elapsed=81ms

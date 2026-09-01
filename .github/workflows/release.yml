@@ -180,8 +180,8 @@ jobs:
 
   # Keep the release gate structurally identical to CI by calling the same
   # committed runner. It covers JNI safety helpers + engine C cancellation ABI,
-  # fork/join exception containment, and writer tests; the actual Android JNI
-  # bridge runs on API 35 before publish.
+  # bounded tc_lut-cache lifetime/admission, fork/join exception containment,
+  # and writer tests; the actual Android JNI bridge runs on API 35 before publish.
   qualify-native-safety:
     name: Qualify engine and PNG/TIFF native safety
     needs: resolve-release

@@ -1093,6 +1093,35 @@ JNI(jstring, nativeListProfiles)(JNIEnv* env, jobject /*thiz*/, jlong handle) tr
     return nullptr;
 }
 
+JNI(jstring, nativeTcLutCacheStatsJson)(JNIEnv* env, jobject /*thiz*/,
+                                        jlong handle) try {
+    spk_engine* eng = reinterpret_cast<spk_engine*>(handle);
+    if (!eng) {
+        throw_runtime(env, "spektra: engine handle is null");
+        return nullptr;
+    }
+    char json[2048]{};
+    if (spk_engine_tc_lut_cache_stats_json(
+            eng, json, static_cast<int>(sizeof(json))) <= 0) {
+        throw_runtime(env, "spektra: failed to format tc_lut cache diagnostics");
+        return nullptr;
+    }
+    jstring result = env->NewStringUTF(json);
+    if (!result && !env->ExceptionCheck()) {
+        throw_runtime(env, "spektra: failed to create tc_lut cache diagnostics");
+    }
+    return result;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return nullptr;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
+}
+
 /*
  * nativeSimulate(handle, inBuf, w, h, inCs, paramsObj, preview, renderKind,
  *                cancellation)

@@ -347,6 +347,7 @@ Owners:
 - [Release full-resolution buffers promptly and enforce one global memory budget](https://github.com/thetechgeekko/Spektrafilm-android/issues/176)
 - [Tile the mask compositor and enforce a full-resolution memory budget](https://github.com/thetechgeekko/Spektrafilm-android/issues/141)
 - [Bound tc_lut_cache with a byte-budgeted LRU](https://github.com/thetechgeekko/Spektrafilm-android/issues/142)
+  ([implementation contract and evidence](research/tc-lut-cache.md))
 - [Stream exact quantization and PNG/TIFF output without full-image staging](https://github.com/thetechgeekko/Spektrafilm-android/issues/175)
 
 Inventory Java/Kotlin, native, GPU and file-writer allocations on one timeline. Define device-tier

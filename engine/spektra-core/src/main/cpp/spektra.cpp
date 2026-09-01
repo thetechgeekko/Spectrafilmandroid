@@ -38,6 +38,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <dirent.h>
@@ -70,6 +71,7 @@
 #include "runtime/params.h"
 #include "runtime/print_digest.h"
 #include "runtime/stage_timer.h"
+#include "runtime/tc_lut_cache.h"
 #include "runtime/stages/autoexposure.h"
 #include "runtime/stages/crop_resize.h"
 #include "runtime/stages/filming.h"
@@ -205,15 +207,14 @@ struct spk_engine {
     // Gaussian blur, the hanatos window/surface toggles, the camera UV/IR
     // band-pass triples, and input_gamut_compress (see engine_tc_lut below; a
     // key that dropped any of these would serve stale tc_luts across a settings
-    // change). Entries are never evicted, so node references stay valid — which
-    // also means non-default continuous params (blur sigma, UV/IR floats) add
-    // one ~885 KB entry PER DISTINCT VALUE for the engine's lifetime; the
-    // default path keeps the bare film-id key (28 bundled profiles, bounded).
-    // Bounding the non-default entries (LRU, like kernels/lut3d_cache) is an
-    // open item tracked in docs/AUDIT.md. Guarded by cache_mutex.
+    // change). The 28 bare/default profile keys are pinned behind their own
+    // count+byte ceilings. Parameterized keys use an 8 MiB byte-budgeted LRU,
+    // so continuous blur / UV / IR slider motion cannot grow native residency.
+    // Shared leases keep an evicted LUT alive only for renders already reading
+    // it. Cache allocations also reserve the process MemoryDomain::Cache budget.
     std::mutex cache_mutex;
     std::map<std::string, spk::Profile> profile_cache;   // id -> parsed Profile
-    std::map<std::string, spk::NdArray> tc_lut_cache;    // film id -> filming tc_lut
+    spk::TcLutCache tc_lut_cache;
 
     // FILM-DENSITY (film_density_cmy) memo, one slot PER ROUTE (PERF). Unlike
     // profile_cache/tc_lut_cache above — which are keyed by an IMMUTABLE
@@ -378,6 +379,21 @@ uint64_t spk_test_lut_cache_hits(spk_engine* eng) {
 }
 uint64_t spk_test_lut_cache_misses(spk_engine* eng) {
     return eng ? eng->lut_cache.misses() : 0;
+}
+uint64_t spk_test_tc_lut_cache_hits(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().hits : 0;
+}
+uint64_t spk_test_tc_lut_cache_misses(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().misses : 0;
+}
+uint64_t spk_test_tc_lut_cache_evictions(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().evictions : 0;
+}
+size_t spk_test_tc_lut_cache_dynamic_bytes(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().dynamic_bytes : 0;
+}
+void spk_test_tc_lut_cache_set_dynamic_budget(spk_engine* eng, size_t bytes) {
+    if (eng) eng->tc_lut_cache.set_dynamic_byte_budget(bytes);
 }
 uint64_t spk_test_pointwise_cache_hits(spk_engine* eng) {
     if (!eng) return 0;
@@ -548,20 +564,17 @@ static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) 
 // live param the build consumes. For the DEFAULT values the key is just the film
 // id and the cached LUT is byte-identical to rebuilding it (build_filming_tc_lut
 // is a pure function of film profile, the immutable spectra LUT, the D55
-// constant, and those inputs). A non-default value gets its own cache slot so
-// distinct adaptations never collide. Returns a reference into the never-evicted
-// cache map (node references stay valid; see the growth note on tc_lut_cache
-// above). Throws on build failure (caller maps to SPK_ERR_ASSET_IO, as the
-// inline build did).
-static const spk::NdArray& engine_tc_lut(spk_engine* eng,
-                                         const std::string& film_id,
-                                         const spk::Profile& film,
-                                         float spectral_gaussian_blur,
-                                         bool apply_window, bool apply_surface,
-                                         const float* filter_uv,
-                                         const float* filter_ir,
-                                         spk::InputGamutCompress input_gamut_compress =
-                                             spk::InputGamutCompress::kOff) {
+// constant, and those inputs). A non-default value gets its own LRU slot so
+// distinct adaptations never collide. The returned shared lease keeps the
+// immutable LUT alive across concurrent eviction. Throws on build failure
+// (caller maps to SPK_ERR_ASSET_IO, as the inline build did).
+static spk::TcLutCache::Lease engine_tc_lut(
+        spk_engine* eng, const std::string& film_id,
+        const spk::Profile& film, float spectral_gaussian_blur,
+        bool apply_window, bool apply_surface, const float* filter_uv,
+        const float* filter_ir,
+        spk::InputGamutCompress input_gamut_compress =
+            spk::InputGamutCompress::kOff) {
     // Compose a key that folds the blur sigma's exact IEEE-754 bytes plus the
     // window/surface toggles and the camera UV/IR band-pass so distinct adaptations
     // (or float jitter) never alias. The DEFAULT (blur==0, window on, surface off,
@@ -572,9 +585,11 @@ static const spk::NdArray& engine_tc_lut(spk_engine* eng,
         (filter_uv[0] > 0.0f || filter_ir[0] > 0.0f);
     const bool gamut_in_on =
         input_gamut_compress != spk::InputGamutCompress::kOff;
+    const bool parameterized =
+        spectral_gaussian_blur > 0.0f || !apply_window || apply_surface ||
+        band_pass_on || gamut_in_on;
     std::string key = film_id;
-    if (spectral_gaussian_blur > 0.0f || !apply_window || apply_surface ||
-        band_pass_on || gamut_in_on) {
+    if (parameterized) {
         key.push_back('|');
         const unsigned char* b =
             reinterpret_cast<const unsigned char*>(&spectral_gaussian_blur);
@@ -607,19 +622,12 @@ static const spk::NdArray& engine_tc_lut(spk_engine* eng,
                 key.push_back(static_cast<char>(gb[i]));
         }
     }
-    {
-        std::lock_guard<std::mutex> g(eng->cache_mutex);
-        auto it = eng->tc_lut_cache.find(key);
-        if (it != eng->tc_lut_cache.end()) return it->second;
-    }
-    spk::NdArray lut = spk::build_filming_tc_lut(film, engine_spectra(eng),
-                                                 kD55Illuminant,
-                                                 spectral_gaussian_blur,
-                                                 apply_window, apply_surface,
-                                                 filter_uv, filter_ir,
-                                                 input_gamut_compress);
-    std::lock_guard<std::mutex> g(eng->cache_mutex);
-    return eng->tc_lut_cache.emplace(key, std::move(lut)).first->second;
+    return eng->tc_lut_cache.get_or_build(key, !parameterized, [&] {
+        return spk::build_filming_tc_lut(
+            film, engine_spectra(eng), kD55Illuminant,
+            spectral_gaussian_blur, apply_window, apply_surface, filter_uv,
+            filter_ir, input_gamut_compress);
+    });
 }
 
 // FNV-1a 64-bit over raw bytes. Used to build the print-route film_density_cmy
@@ -2031,19 +2039,18 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     // 3) Build (or reuse the engine-cached) Hanatos2025 filming tc_lut (D55
     //    reference illuminant). Cached by film id — byte-identical to rebuilding
     //    (see engine_tc_lut / the spk_engine cache note).
-    const spk::NdArray* tc_lut_ptr = nullptr;
+    spk::TcLutCache::Lease tc_lut_lease;
     try {
         spk::ScopedStage _t(spk::STG_TC_LUT);  // cold-start heavy (#152)
-        tc_lut_ptr = &engine_tc_lut(eng, p->film_profile, film, p->spectral_gaussian_blur,
-                                    p->apply_hanatos_window != 0,
-                                    p->apply_hanatos_surface != 0,
-                                    p->camera_filter_uv, p->camera_filter_ir,
-                                    static_cast<spk::InputGamutCompress>(
-                                        p->input_gamut_compress));
+        tc_lut_lease = engine_tc_lut(
+            eng, p->film_profile, film, p->spectral_gaussian_blur,
+            p->apply_hanatos_window != 0, p->apply_hanatos_surface != 0,
+            p->camera_filter_uv, p->camera_filter_ir,
+            static_cast<spk::InputGamutCompress>(p->input_gamut_compress));
     } catch (const std::exception&) {
         return SPK_ERR_ASSET_IO;
     }
-    const spk::NdArray& tc_lut = *tc_lut_ptr;
+    const spk::NdArray& tc_lut = *tc_lut_lease;
     if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 4) expose(): the image runs as float64 (ProPhoto linear). `rgb` was built
@@ -2279,19 +2286,18 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     //    reference illuminant). Needed both by the filming expose and by the
     //    native midgray digest below. Cached by film id — byte-identical to
     //    rebuilding (see engine_tc_lut / the spk_engine cache note).
-    const spk::NdArray* tc_lut_ptr = nullptr;
+    spk::TcLutCache::Lease tc_lut_lease;
     try {
         spk::ScopedStage _t(spk::STG_TC_LUT);  // cold-start heavy (#152)
-        tc_lut_ptr = &engine_tc_lut(eng, p->film_profile, film, p->spectral_gaussian_blur,
-                                    p->apply_hanatos_window != 0,
-                                    p->apply_hanatos_surface != 0,
-                                    p->camera_filter_uv, p->camera_filter_ir,
-                                    static_cast<spk::InputGamutCompress>(
-                                        p->input_gamut_compress));
+        tc_lut_lease = engine_tc_lut(
+            eng, p->film_profile, film, p->spectral_gaussian_blur,
+            p->apply_hanatos_window != 0, p->apply_hanatos_surface != 0,
+            p->camera_filter_uv, p->camera_filter_ir,
+            static_cast<spk::InputGamutCompress>(p->input_gamut_compress));
     } catch (const std::exception&) {
         return SPK_ERR_ASSET_IO;
     }
-    const spk::NdArray& tc_lut = *tc_lut_ptr;
+    const spk::NdArray& tc_lut = *tc_lut_lease;
     if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 3) Native print digest for ANY (film, paper) pair:
@@ -3372,6 +3378,48 @@ spk_status spk_engine_list_profiles(spk_engine* eng, char* buf, size_t buf_len,
     if (buf_len < req) return SPK_ERR_BAD_ARGS;
     std::memcpy(buf, list.c_str(), req);
     return SPK_OK;
+}
+
+int spk_engine_tc_lut_cache_stats_json(spk_engine* eng, char* buf, int cap) {
+    constexpr int kRequiredCapacity = 2048;
+    if (!eng || !buf || cap < kRequiredCapacity) {
+        if (buf && cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    const spk::TcLutCacheStats s = eng->tc_lut_cache.stats();
+    const int written = std::snprintf(
+        buf, static_cast<size_t>(cap),
+        "{\"schema\":\"spk.tc_lut_cache.v1\","
+        "\"memory_boundary\":\"post-build-cache-residency\","
+        "\"hits\":%llu,\"misses\":%llu,\"race_hits\":%llu,"
+        "\"evictions\":%llu,\"oversize_bypasses\":%llu,"
+        "\"entry_limit_bypasses\":%llu,\"budget_bypasses\":%llu,"
+        "\"global_budget_denials\":%llu,\"build_failures\":%llu,"
+        "\"accounting_overflows\":%llu,\"classification_conflicts\":%llu,"
+        "\"cache_held_bytes\":%zu,\"pinned_bytes\":%zu,"
+        "\"dynamic_bytes\":%zu,\"pinned_entries\":%zu,"
+        "\"dynamic_entries\":%zu,\"pinned_byte_budget\":%zu,"
+        "\"dynamic_byte_budget\":%zu,\"max_pinned_entries\":%zu,"
+        "\"max_dynamic_entries\":%zu}",
+        static_cast<unsigned long long>(s.hits),
+        static_cast<unsigned long long>(s.misses),
+        static_cast<unsigned long long>(s.race_hits),
+        static_cast<unsigned long long>(s.evictions),
+        static_cast<unsigned long long>(s.oversize_bypasses),
+        static_cast<unsigned long long>(s.entry_limit_bypasses),
+        static_cast<unsigned long long>(s.budget_bypasses),
+        static_cast<unsigned long long>(s.global_budget_denials),
+        static_cast<unsigned long long>(s.build_failures),
+        static_cast<unsigned long long>(s.accounting_overflows),
+        static_cast<unsigned long long>(s.classification_conflicts),
+        s.cache_held_bytes, s.pinned_bytes, s.dynamic_bytes,
+        s.pinned_entries, s.dynamic_entries, s.pinned_byte_budget,
+        s.dynamic_byte_budget, s.max_pinned_entries, s.max_dynamic_entries);
+    if (written < 0 || written >= cap) {
+        buf[0] = '\0';
+        return 0;
+    }
+    return written;
 }
 
 spk_status spk_simulate(spk_engine* eng, const spk_image* in, const spk_params* p,

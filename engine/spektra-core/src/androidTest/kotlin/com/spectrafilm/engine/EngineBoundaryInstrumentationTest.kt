@@ -27,6 +27,7 @@ class EngineBoundaryInstrumentation : Instrumentation() {
     override fun onStart() {
         val results = Bundle()
         try {
+            TcLutCacheInstrumentationChecks.run(targetContext)
             logicalDirectBufferRangeAndCancellationMapping()
             meterRejectsMismatchedLinearImageColorSpace()
             latestParamsCrossTheActualJniMarshallerAndDefaultsSurviveAbsence()

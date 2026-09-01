@@ -64,6 +64,7 @@ add_library(spektra SHARED
         # Filming stage (rgb -> raw -> negative density), ported in M4:
         model/couplers.cpp                   # DIR couplers (M4)
         runtime/params.cpp                   # minimal digested filming params (M4)
+        runtime/tc_lut_cache.cpp             # byte-budgeted filming tc_lut LRU (#142)
         runtime/stages/filming.cpp           # rgb -> raw -> film density CMY (M4)
         # Printing (enlarger) stage + dichroic filters, ported in M4
         # (negative -> enlarger expose -> print develop -> scan print):

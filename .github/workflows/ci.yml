@@ -5,8 +5,9 @@
 #   • native-safety-writers — ordinary + ASan/UBSan + bounded fuzz gates for native
 #                        JSON/profile/neutral-filter hostile input; ASan/UBSan + TSan
 #                        for JNI safety helpers, fork/join exception containment,
-#                        the engine C cancellation ABI, and PNG/TIFF hostile-input,
-#                        cancellation, and JNI-helper tests
+#                        bounded tc_lut-cache lifetime/concurrency, the engine C
+#                        cancellation ABI, and PNG/TIFF hostile-input/cancellation/
+#                        JNI-helper tests
 #   • engine-parity   — deterministic stage parity tests against committed goldens (bit-exact
 #                        gate: scan_portra, print_portra, print_ektar + spatial/crop/autoexp/
 #                        diffusion; runs on push/PR)
@@ -136,9 +137,10 @@ jobs:
   # Offline native safety gate. These are direct host builds of committed tests:
   # no downloaded fixtures, generated sources, Android device, or network service
   # is involved. ASan+UBSan cover bounds/overflow/exception paths; the separate
-  # TSan builds exercise fork/join containment, the allocation-registry, and
-  # writer cancellation races. This is JNI safety helpers + engine C cancellation ABI
-  # plus fork/join exception containment coverage; the actual
+  # TSan builds exercise fork/join containment, the allocation-registry, bounded
+  # tc_lut-cache lifetime/concurrency, and writer cancellation races. This is
+  # JNI safety helpers + engine C cancellation ABI + tc_lut-cache bounds plus
+  # fork/join exception containment coverage; the actual
   # Android JNI bridge is executed by the required android-emulator job below.
   # ---------------------------------------------------------------------------
   native-safety-writers:

@@ -3,7 +3,8 @@
 # Offline host sanitizer qualification shared by CI and release.
 #
 # This executes JSON/profile/neutral-filter hostile-input regressions, JNI safety
-# helpers, the engine C cancellation ABI, and fork/join exception containment.
+# helpers, the bounded tc_lut cache, the engine C cancellation ABI, and fork/join
+# exception containment.
 # The actual Android JNI bridge is exercised separately by
 # EngineBoundaryInstrumentation; this host runner must never be described as
 # runtime sanitizer coverage of that bridge.
@@ -22,6 +23,7 @@ readonly SUITE_SPECS=(
   "asan-ubsan|engine-jni-safety-helpers|engine-jni-safety"
   "asan-ubsan|engine-c-cancellation-abi|engine-c-cancellation"
   "asan-ubsan|engine-parallel-exception-containment|engine-parallel-exceptions"
+  "asan-ubsan|engine-tc-lut-cache-bounded-lru|engine-tc-lut-cache"
   "asan-ubsan|engine-json-profile-hostile-inputs|engine-json-profile"
   "asan-ubsan|engine-npy-hostile-inputs|engine-npy"
   "asan-ubsan|png-writer-hostile-jni-helpers|png-writer"
@@ -29,6 +31,7 @@ readonly SUITE_SPECS=(
   "tsan|engine-c-cancellation-race|engine-c-cancellation"
   "tsan|engine-jni-allocation-registry-race|engine-jni-safety"
   "tsan|engine-parallel-exception-race|engine-parallel-exceptions"
+  "tsan|engine-tc-lut-cache-race|engine-tc-lut-cache"
   "tsan|png-writer-cancellation-race|png-writer"
   "tsan|tiff-writer-cancellation-race|tiff-writer"
 )
@@ -124,6 +127,13 @@ run_suite() {
         -I "$ENGINE_CPP"
         "$ENGINE_CPP/tests/test_parallel_exceptions.cpp"
         "$ENGINE_CPP/kernels/parallel.cpp"
+      )
+      ;;
+    engine-tc-lut-cache)
+      command+=(
+        -I "$ENGINE_CPP"
+        "$ENGINE_CPP/tests/test_tc_lut_cache.cpp"
+        "$ENGINE_CPP/runtime/tc_lut_cache.cpp"
       )
       ;;
     engine-npy)

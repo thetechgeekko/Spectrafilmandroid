@@ -7,7 +7,7 @@ Runs on every push, PR, and manual dispatch. Eight jobs:
 | Job | What it gates |
 |-----|---------------|
 | **engine-native** | The engine C++ + JNI bridge compile and link into `libspektra.so` on a host g++ toolchain (`-Wall -Wextra`; JDK provides `jni.h`); checks the exported `spk_*` symbols exist. |
-| **native-safety-writers** | One committed runner performs the exact twelve-suite host inventory: seven ASan+UBSan rows for JNI safety helpers, fork/join exception containment, bounded JSON/NPY parsing, an asset-backed engine C render/cancel race, and PNG/TIFF hostile-input/JNI-helper tests; five TSan rows repeat the synchronized engine race and cover fork/join containment, the allocation registry, and writer cancellation races. This does **not** claim sanitizer runtime coverage of the actual engine JNI bridge. |
+| **native-safety-writers** | One committed runner performs the exact fourteen-suite host inventory: eight ASan+UBSan rows for JNI safety helpers, fork/join exception containment, the bounded `tc_lut` cache, bounded JSON/NPY parsing, an asset-backed engine C render/cancel race, and PNG/TIFF hostile-input/JNI-helper tests; six TSan rows cover the synchronized engine race, fork/join containment, the allocation registry, `tc_lut` cache concurrency/lifetime, and writer cancellation races. This does **not** claim sanitizer runtime coverage of the actual engine JNI bridge. |
 | **engine-parity** | The stage-parity gate: **39 `build_run` cases** against bundled assets and committed goldens (e2e goldens pinned to oracle `c1d0e44`), incl. thread-invariance (`SPK_NUM_THREADS` 1 vs 8). The workflow table is authoritative; `tools/parity/run_engine_parity.sh` must fail loudly if its table drifts from that count. |
 | **libraw-hostile** | Fetches the official SHA-pinned LibRaw 0.22.2 archive through the Android resolver, verifies/applies all 23 hashed patches, runs independent shipping-serial and OpenMP-required public-seam ASan/UBSan gates (including dormant X3F model-boundary regressions), a serial TSan first-use gate, and 1,000 iterations on each bounded libFuzzer target. It also builds the LibRaw source/relink ZIP twice, verifies deterministic bytes, and audits the route-neutral bundle; CI permits `UNRESOLVED` so packaging remains testable before human selection. Shipping decode stays serial because the repeated compressed-Fuji corpus rejected OpenMP exactness for the current patched release. |
 | **parity** | The standalone `.spkvec` comparator (`tools/parity`) builds via CMake and its `spkvec_selftest` ctest passes. |
@@ -15,8 +15,8 @@ Runs on every push, PR, and manual dispatch. Eight jobs:
 | **android** | JDK 21. Runs debug JVM unit tests for `:app`, `:lib:libraw`, `:engine:spektra-core`, `:lib:pngwriter`, and `:lib:tiffwriter`, then `:app:lint` (a hard gate — `abortOnError = true`, baseline at `app/lint-baseline.xml`), assembles the debug APK with the NDK-built `.so` for all 3 ABIs, and verifies the bundled app GPL/NOTICE plus the three pinned LibRaw legal assets. It extracts the generated source/relink bundle and performs a real NDK 27 x86_64 recipient build, checking SONAME, JNI/recipient marker exports, and every `PT_LOAD` alignment. Finally it runs the APK **16 KB-page gate** (`zipalign -c -P 16 4` plus `readelf -lW`). It uploads the app APK and standalone engine boundary Android-test APK as separate exact artifacts. |
 | **android-emulator** | Required on every CI run. A single pinned emulator action installs the standalone engine Android-test APK on the same API 35 x86_64 `google_apis` route used by release, runs the actual `EngineBoundaryInstrumentation` JNI bridge suite, and requires both `ENGINE_BOUNDARY_INSTRUMENTATION: PASS` and `INSTRUMENTATION_CODE: -1`. It then installs/launches the app and rejects fatal Java/JNI/native failures. |
 
-`bash tools/release/run_native_safety.sh --list` prints the locked seven
-ASan+UBSan plus five TSan inventory. Running it without arguments compiles and
+`bash tools/release/run_native_safety.sh --list` prints the locked eight
+ASan+UBSan plus six TSan inventory. Running it without arguments compiles and
 executes every row. CI and release both delegate to this one file, so their
 native-safety command bodies cannot drift independently.
 
@@ -31,9 +31,10 @@ the Gradle wrapper/distribution, matches the tag to source `versionName`, builds
 the R8-minified APK, its release-targeted app instrumentation APK, and the
 standalone engine boundary instrumentation APK; it proves the app is unsigned
 and checks its compiled package/version. A separate native-safety
-qualification calls CI's same committed twelve-suite ASan+UBSan/TSan runner for
-JNI safety helpers, fork/join exception containment, bounded JSON/NPY parsing, the synchronized
-asset-backed engine C cancellation race, and PNG/TIFF writer gates on
+qualification calls CI's same committed fourteen-suite ASan+UBSan/TSan runner for
+JNI safety helpers, `tc_lut` cache bounds/lifetime/concurrency, fork/join exception
+containment, bounded JSON/NPY parsing, the synchronized asset-backed engine C
+cancellation race, and PNG/TIFF writer gates on
 the exact tag commit before candidate build/signing. It makes no actual-JNI ASan
 claim.
 That job reruns the exact engine suite at both `-O2` and the shipping flags, release JVM tests for the app and all four native-backed modules, and release lint,

@@ -402,6 +402,15 @@ void       spk_engine_destroy(spk_engine*);
  * film/print profile ids into `buf` (caller-provided). Sets `*needed` to required size. */
 spk_status spk_engine_list_profiles(spk_engine*, char* buf, size_t buf_len, size_t* needed);
 
+/* Stable shipping diagnostics for the bounded filming tc_lut memo. Writes one
+ * NUL-terminated `spk.tc_lut_cache.v1` JSON object and returns bytes excluding
+ * NUL. `cap` must be at least 2048; invalid arguments or insufficient capacity
+ * clear the buffer (when possible) and return 0. `cache_held_bytes` counts nodes
+ * retained by the cache; process MemoryDomain::Cache may be higher while a
+ * render still leases an already-evicted node. Cache admission is post-build
+ * residency accounting, not admission-before-builder-allocation. */
+int spk_engine_tc_lut_cache_stats_json(spk_engine*, char* buf, int cap);
+
 /* Simulation ------------------------------------------------------------------ */
 
 /* Full pipeline: RGB → negative → (print) → scan. `out` is allocated by the engine
