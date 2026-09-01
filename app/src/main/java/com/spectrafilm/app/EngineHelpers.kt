@@ -11,6 +11,7 @@ import com.spectrafilm.app.masks.LocalAdjustment
 import com.spectrafilm.app.masks.MaskCompositor
 import com.spectrafilm.engine.ColorSpace
 import com.spectrafilm.engine.LinearImage
+import com.spectrafilm.engine.RenderCancellation
 import com.spectrafilm.engine.SimResult
 import com.spectrafilm.libraw.LinearResult
 import com.spectrafilm.libraw.DecodeStatus
@@ -875,6 +876,7 @@ fun simResultToBitmapGraded(
     vibrance: Float,
     gamutCompress: Float,
     localAdjustments: List<LocalAdjustment> = emptyList(),
+    cancellation: RenderCancellation? = null,
 ): Bitmap = res.acquireDataLease().use { lease ->
     val data = lease.data
     gradeBufferToBitmap(
@@ -887,13 +889,16 @@ fun simResultToBitmapGraded(
         vibrance,
         gamutCompress,
         localAdjustments,
+        cancellation,
     )
 }
 
 /**
  * The buffer-level core of [simResultToBitmapGraded]: grade [data] IN PLACE and
  * convert to a bitmap. Also the re-grade entry point for [GradeCache] hits —
- * use [GradeCache.Pristine.withScratch], never the retained master.
+ * use [GradeCache.Pristine.withScratch], never the retained master. When [cancellation] is supplied,
+ * the buffer must remain private and unpublished: cancellation during mask work can leave completed
+ * rows modified, so the caller must discard the buffer instead of publishing or reusing it.
  */
 fun gradeBufferToBitmap(
     data: java.nio.ByteBuffer,
@@ -905,8 +910,13 @@ fun gradeBufferToBitmap(
     vibrance: Float,
     gamutCompress: Float,
     localAdjustments: List<LocalAdjustment> = emptyList(),
+    cancellation: RenderCancellation? = null,
 ): Bitmap {
     ColorGrade.applyInPlace(data, width, height, colorSpace, cctfEncoded, saturation, vibrance, gamutCompress)
-    MaskCompositor.applyInPlace(data, width, height, colorSpace, cctfEncoded, localAdjustments)
+    if (cancellation == null) {
+        MaskCompositor.applyInPlace(data, width, height, colorSpace, cctfEncoded, localAdjustments)
+    } else {
+        MaskCompositor.applyInPlace(data, width, height, colorSpace, cctfEncoded, localAdjustments, cancellation)
+    }
     return simResultToBitmap(data, width, height, colorSpace)
 }

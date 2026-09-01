@@ -30,6 +30,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -71,6 +72,17 @@ fun MaskGeometryOverlay(
     // The geometry being edited: the first component's shape (defaulting to a centered radial).
     var shape by remember {
         mutableStateOf(mask.components.firstOrNull()?.shape ?: MaskComponent.Radial(0.5f, 0.5f, 0.3f, 0.3f, 0.5f))
+    }
+    val committedShape = mask.components.firstOrNull()?.shape
+        ?: MaskComponent.Radial(0.5f, 0.5f, 0.3f, 0.3f, 0.5f)
+    // Emitted only for an armed #139 oracle, after this real Composable owns its local draft.
+    LaunchedEffect(Unit) {
+        Ticket139EditorProbe.publishMaskDraftInitialized(
+            bitmapWidth = bitmap.width,
+            bitmapHeight = bitmap.height,
+            committed = committedShape,
+            actual = shape,
+        )
     }
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     val handleRef = remember { mutableStateOf(MaskGesture.Handle.NONE) }

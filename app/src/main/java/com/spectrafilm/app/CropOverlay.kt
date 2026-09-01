@@ -45,6 +45,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -124,6 +125,22 @@ fun CropOverlay(
     }
 
     var aspect by remember { mutableStateOf(CropAspect.FREE) }
+
+    // Fixed #139 evidence is gated inside the bridge and is a no-op for normal app sessions. The
+    // effect runs only after this actual overlay instance has initialized its remembered draft.
+    LaunchedEffect(Unit) {
+        Ticket139EditorProbe.publishCropDraftInitialized(
+            bitmapWidth = bitmap.width,
+            bitmapHeight = bitmap.height,
+            initialCrop = initialCrop,
+            initialCenter = initialCenter,
+            initialSize = initialSize,
+            actualLeft = rect.left,
+            actualTop = rect.top,
+            actualRight = rect.right,
+            actualBottom = rect.bottom,
+        )
+    }
 
     // Pixel size of the laid-out image inside the canvas (set by onSizeChanged on
     // the image Box). Used to convert drag pixels <-> normalized coords.

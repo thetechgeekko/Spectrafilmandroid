@@ -238,7 +238,12 @@ does exposure-only. **The per-pixel math + fold are already correct and parity-f
 5. **Brush** + **Polygon**.
 6. **AI Subject/Sky** (LiteRT + guided filter).
 7. **Class-S** — ✅ **Clarity / Texture / Sharpness / Highlights / Shadows SHIPPED** (PR #103: `MaskSpatial`
-   box-blur USM + regional gain on the output luma; radii scale with the long edge). **Dehaze**
+   box-blur USM + regional gain on the output luma; radii scale with the long edge). Ticket #141 replaces
+   the full-frame alpha/luma/blur scratch with an exact row-streamed, radius-bounded compositor. Its
+   memory/publication contract, current-source device-requalification gate, historical measurements,
+   and still-open performance gap are in [MASK_COMPOSITOR_MEMORY.md](MASK_COMPOSITOR_MEMORY.md). The
+   final preview/export call sites must still pass the live cancellation token before closure.
+   **Dehaze**
    (Dark-Channel-Prior) remains — a separate algorithm.
 
 ## Sources
