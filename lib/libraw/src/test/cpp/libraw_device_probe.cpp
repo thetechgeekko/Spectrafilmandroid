@@ -7,10 +7,13 @@
  */
 #include "raw_decoder.h"
 
+#include <chrono>
 #include <cstdint>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -50,13 +53,28 @@ bool writeResult(const std::string& path,
     return static_cast<bool>(output);
 }
 
+class OwnedFd final {
+ public:
+    explicit OwnedFd(const char* path)
+        : fd_(::open(path, O_RDONLY | O_CLOEXEC)) {}
+    ~OwnedFd() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+    int get() const noexcept { return fd_; }
+
+ private:
+    int fd_;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4 && argc != 7 && argc != 8) {
+    if (argc != 4 && argc != 7 && argc != 8 && argc != 9) {
         std::cerr << "usage: libraw_device_probe INPUT OUTPUT_PREFIX REPEATS "
                      "[as_shot|daylight|tungsten|custom TEMPERATURE_K TINT "
-                     "[MAX_LONG_EDGE]]\n";
+                     "[MAX_LONG_EDGE [buffer|fd]]]\n";
         return 2;
     }
 
@@ -67,12 +85,6 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (repeats < 1 || repeats > 20) return 2;
-
-    std::vector<uint8_t> input;
-    if (!readFile(argv[1], input)) {
-        std::cerr << "failed to read " << argv[1] << "\n";
-        return 3;
-    }
 
     spectrafilm::DecodeOptions options;
     options.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot;
@@ -108,10 +120,42 @@ int main(int argc, char** argv) {
         }
         if (options.maxLongEdge < 0 || options.maxLongEdge > 16384) return 2;
     }
+    if (argc == 9) {
+        try {
+            options.maxLongEdge = std::stoi(argv[7]);
+        } catch (...) {
+            return 2;
+        }
+        if (options.maxLongEdge < 0 || options.maxLongEdge > 16384) return 2;
+    }
+    const std::string inputMode = argc == 9 ? argv[8] : "buffer";
+    if (inputMode != "buffer" && inputMode != "fd") {
+        std::cerr << "unsupported input mode: " << inputMode << "\n";
+        return 2;
+    }
+
+    std::vector<uint8_t> input;
+    if (inputMode == "buffer" && !readFile(argv[1], input)) {
+        std::cerr << "failed to read " << argv[1] << "\n";
+        return 3;
+    }
+    OwnedFd inputFd(argv[1]);
+    if (inputMode == "fd" && inputFd.get() < 0) {
+        std::cerr << "failed to open " << argv[1] << "\n";
+        return 3;
+    }
 
     for (int iteration = 0; iteration < repeats; ++iteration) {
-        const spectrafilm::DecodeResult result =
-            spectrafilm::decodeFromBuffer(input.data(), input.size(), options);
+        if (inputMode == "fd" && ::lseek(inputFd.get(), 0, SEEK_SET) < 0) {
+            std::cerr << "failed to rewind " << argv[1] << "\n";
+            return 3;
+        }
+        const auto decodeAt = std::chrono::steady_clock::now();
+        spectrafilm::DecodeResult result = inputMode == "fd"
+            ? spectrafilm::decodeFromFd(inputFd.get(), options)
+            : spectrafilm::decodeFromBuffer(input.data(), input.size(), options);
+        const double decodeMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - decodeAt).count();
         if (!result.ok) {
             std::cerr << "decode failed: status=" << result.status
                       << " libraw=" << result.librawCode
@@ -120,18 +164,24 @@ int main(int argc, char** argv) {
         }
         const std::string outputPath =
             std::string(argv[2]) + "." + std::to_string(iteration) + ".sfraw-f32";
+        const auto writeAt = std::chrono::steady_clock::now();
         if (!writeResult(outputPath, result)) {
             std::cerr << "failed to write " << outputPath << "\n";
             return 5;
         }
+        const double writeMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - writeAt).count();
         std::cout << "iteration=" << iteration
                   << " wb_mode=" << (argc >= 7 ? argv[4] : "as_shot")
                   << " temperature_k=" << options.temperatureK
                   << " tint=" << options.tint
                   << " max_long_edge=" << options.maxLongEdge
+                  << " input_mode=" << inputMode
                   << " width=" << result.width
                   << " height=" << result.height
                   << " floats=" << result.rgb.size()
+                  << " decode_ms=" << decodeMs
+                  << " write_ms=" << writeMs
                   << " output=" << outputPath << "\n";
     }
     return 0;

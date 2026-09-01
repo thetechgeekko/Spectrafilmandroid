@@ -127,7 +127,8 @@ target_link_libraries(sfraw_ljpeg_concurrency_test
 
 add_executable(sfraw_native_allocation_registry_test
                test_native_allocation_registry.cpp
-               "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp/native_allocation_registry.cpp")
+               "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp/native_allocation_registry.cpp"
+               "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp/raw_result_publication.cpp")
 target_include_directories(sfraw_native_allocation_registry_test PRIVATE
                            "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp")
 target_link_libraries(sfraw_native_allocation_registry_test

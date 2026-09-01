@@ -2367,6 +2367,134 @@ What this does NOT change: the per-pixel loops are 1.4% here and 0.4% there — 
 every measurement — so §23.1's verdict on the GPU kernel holds. And the filter is now **71%
 of the coupler block**, so §24 landed its 36% on the largest part.
 
+## 25. #158 final: remove the duplicate RAW result, keep the decoder exact
+
+The patched LibRaw 0.22.2 release path was re-profiled on the connected SM-S948W
+(API 36, arm64-v8a) with `-O3`, FP contraction disabled for the wrapper, zlib on,
+and shipping OpenMP off. The authoritative thread-policy result did not change:
+compressed Fuji output is scheduling-dependent under OpenMP, so release stays serial.
+`raw_decoder.cpp` still does not set `user_qual`; changing demosaic quality was not
+smuggled into a performance ticket.
+
+The measurable redundant work was ownership. The old successful path held a
+`std::vector<float>`, allocated another equally large `malloc` buffer in JNI, copied
+the complete frame in cancellable 1 MiB chunks, then registered the copy. The new path
+writes every sample once into uninitialized malloc-backed storage and transfers that
+exact base into the existing token/base/capacity registry. This removes one complete
+output allocation and copy: **149,817,600 bytes** for the 3060x4080 Samsung frame and
+**119,771,136 bytes** for the 2736x3648 MotionCam frame. Every JNI failure after transfer
+releases through the registry; failures before transfer remain RAII-owned. The JNI path
+uses the same injectable production publication seam as the ASan/UBSan host test. That
+test covers release-to-adopt, pre/post-adopt cancellation, platform failure/exception,
+post-publication cancellation, normal close, stale-token rejection, and zero outstanding
+entries after every rollback rather than testing a detached copy helper.
+
+The added release telemetry names all boundaries: fd I/O, `open_buffer`, `unpack`,
+`dcraw_process`, `dcraw_make_mem_image`, output allocation, uint16-to-float copy,
+CAT/tint, ACES-to-ProPhoto conversion, and JNI handoff/publication. The device probe
+now selects buffer or fd input, reports decode and output-write wall time separately,
+and emits one payload per repetition for SHA-256 comparison.
+
+### 25.1 Matched native A/B and why there is no inflated speed claim
+
+Three-run medians for the full 3060x4080 Samsung source were:
+
+| arm64 release path | buffer decode | fd decode | output allocation + uint16 copy |
+|---|---:|---:|---:|
+| frozen vector/JNI-copy baseline | 456.274 ms | 449.826 ms | 43.209 ms (buffer), 30.139 ms (fd) |
+| malloc-backed/final core | 438.496 ms | 450.877 ms | 32.031 ms (buffer), 32.975 ms (fd) |
+
+The buffer run improved 17.778 ms, while the fd repeat was 1.051 ms slower. That is the
+same anonymous-page first-touch effect documented in §24.5: removing value-initialisation
+moves page faults from allocation into the first sample writes. It is **not** a stable
+LibRaw throughput win. The stable result is the deleted *second* JNI allocation/copy and
+the corresponding full-frame peak-memory reduction.
+
+### 25.2 Matched minified release/R8 APK evidence
+
+The final release target and separate release AndroidTest APK were built with R8 and
+`lintVitalRelease` enabled. For the baseline arm, only `lib/arm64-v8a/libsfraw.so` was
+replaced by the frozen vector/JNI-copy build; the R8 dex, resources, other ABIs, test APK,
+debug signer, input path and phone were the same. Both fixtures were copied into the
+target app's external-files sandbox and SHA-256 verified before the run. The focused
+probe reopened an fd for every repetition, timed `RawDecoder.decodeToLinear`, and hashed
+the complete public float-buffer lease before closing it.
+
+Qualification is fail-closed: `ticket158_expected_sha256` must name the independently
+pinned 64-hex float-payload digest, and every repetition is compared to it. Omitting that
+argument fails with `TICKET158_RAW_RELEASE_R8: FAIL`. A developer may instead pass
+`ticket158_exploratory=true` to discover a repeatable digest, but the output is deliberately
+labelled `TICKET158_RAW_RELEASE_R8_EXPLORATORY: RESULT (UNQUALIFIED)` and is not
+qualification evidence. The two modes are mutually exclusive. Content-URI probes use only
+`READ_MEDIA_IMAGES` on API 33+, only `READ_EXTERNAL_STORAGE` on API 29-32, and require an
+already-granted manifest/URI read permission below API 29; no unavailable shell identity is
+called on the legacy branch.
+
+| source / release arm | repetitions | decode p50 | JNI publication p50 | float payload SHA-256 |
+|---|---:|---:|---:|---|
+| Samsung 3060x4080 baseline | 5 | 870.807 ms | 34.628 ms | `a78c7e3957c39f55b782ee4af69be937ec8d633fd3e0bb689bdc6f841c51c463` |
+| Samsung 3060x4080 final | 5 | 838.443 ms | 0.040 ms | same, 5/5 |
+| MotionCam 2736x3648 baseline | 3 | 671.795 ms | 25.730 ms | `ecfadb24fefc31d9044830f2a8f65ae9b61eae08fc42befd10fb77aa1ef79fda` |
+| MotionCam 2736x3648 final | 3 | 640.619 ms | 0.032 ms | same, 3/3 |
+
+The 32.364 ms and 31.175 ms decode-p50 reductions are approximately the removed JNI
+publication cost. The internal decode phase did not become consistently faster: its page
+faults moved between allocation and the first sample write, just as the standalone buffer/fd
+A/B showed. Therefore the supported claim is one fewer full-frame allocation, lower peak
+memory, and a removed 25-35 ms JNI copy on these inputs—not a faster demosaic and not a
+1-2 second whole-export result. The final APK also passed the complete release-candidate
+instrumentation smoke, including injected write failures and native-result recreation/lifetime.
+
+### 25.3 Shipping thread and oversubscription verdict
+
+All three release ABI CMake caches record `SFRAW_ENABLE_OPENMP=OFF`; arm64 compile commands
+contain `-O3 -DNDEBUG` and no `-fopenmp`. ELF inspection of the final `libsfraw.so` found no
+`libomp` dependency and no `omp_`, `GOMP_`, or `__kmpc` dynamic reference. During three
+consecutive ten-decode final-APK runs, 29 active `/proc` samples observed at most 15 process
+threads. The sampled names were the main/instrumentation thread plus ART signal, profiler,
+JIT, heap/finalizer, binder and profile-saver threads—no LibRaw/OpenMP worker appeared.
+
+That is the measured reason no new LibRaw/engine thread-budget coordinator was added: the
+shipping decoder contributes one calling thread, and import completes before engine rendering.
+An OpenMP experiment would require a shared bounded budget and a fresh exact corpus gate, but
+the current patched release is not eligible because the compressed-Fuji output changed across
+runs.
+
+### 25.4 `AImageDecoder` is a separately qualified non-RAW route
+
+NDK `AImageDecoder` (API 30+) can decode supported platform formats into caller-provided
+memory, but it publishes platform RGBA/dataspace output—not LibRaw's scene-linear ACES to
+ProPhoto RAW-development contract. The app already has a Java `ImageDecoder`/`BitmapFactory`
+path for non-RAW images and display-referred compressed-DNG fallback. Replacing that path is
+therefore not part of this LibRaw ownership change and must never silently become an
+archival-exact entry point.
+
+The separately routed work should be titled **“Benchmark and qualify NDK AImageDecoder for
+API 30+ non-RAW/fallback imports.”** Its gate is: capability/MIME selection; matched Java-vs-
+native latency and peak-memory A/B; JPEG, PNG, GIF, WebP, BMP/ICO/WBMP, HEIF and fallback-only
+DNG comparisons on API 30, 34 and 36; orientation, ICC/dataspace and decoded-sample evidence;
+caller-memory OOM/cancellation/hostile-input tests; unchanged API 24-29 and LibRaw RAW routes;
+and no archival-exact admission unless the OS-version corpus proves the required samples.
+
+The serialized probe containers did not move. The following values are SHA-256
+digests of the complete `.sfraw-f32` files—a 24-byte container header followed by
+the float payload—not the headerless raw float-buffer digests reported in §25.2:
+
+- Samsung source `58093ddf…`: baseline, malloc intermediate, final buffer, baseline fd,
+  and final fd — 3/3 each, all `.sfraw-f32` file SHA-256
+  `f1c23a56519300b85ec006e08e1c28dc722d4f53015377d2bc0d166a2e928309`.
+- MotionCam source `bb74d328…`: baseline and final — 3/3 each, all
+  `.sfraw-f32` file SHA-256
+  `1f83e610505fbc232f79e4c58cb7eccb4e572c01e340676a22dcb7443d3da14b`.
+
+The six-test shipping-serial host project passed under ASan/UBSan, including hostile
+inputs, exact 56-vector CAT02 bits, in-flight cancellation, dimension/metadata/OOM
+limits, concurrent lossless-JPEG first use, and the production publication seam's
+release/adopt/cancel/failure/exception/success/overflow exact-cleanup checks. The Android
+release module built arm64-v8a, armeabi-v7a, and x86_64. These are
+component facts: a roughly 0.36-0.45 s RAW decode cannot establish a 1-2 s whole export,
+whose dominant engine/effect work is measured elsewhere in this dossier.
+
 ## Running it
 
 ```bash

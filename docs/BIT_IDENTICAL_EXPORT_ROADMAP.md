@@ -234,12 +234,12 @@ large memory improvement and a tail-latency improvement, not the simulation solu
 
 Owner: [Finish RAW decode optimization on patched LibRaw release builds](https://github.com/thetechgeekko/Spektrafilm-android/issues/158)
 
-An OpenMP qualification build exists, but shipping LibRaw remains serial until a fixed RAW corpus
-proves deterministic decoded outputs, memory, and thermal behavior. The historical release path
-spent roughly 546 ms in decode and 325 ms in `dcraw_process`; even an ideal 2x demosaic gain saves
-about 160 ms. Profile copies, allocation and JNI handoff first; enable parallel decode only through
-the qualification gate and a bounded global thread budget. Consider NDK `AImageDecoder` only for
-eligible non-RAW inputs and only after an OS-version corpus comparison.
+An OpenMP qualification build exists, but the repeated compressed-Fuji corpus changed decoded
+bytes, so patched LibRaw 0.22.2 has no shipping OpenMP qualification. Release remains serial and
+adds no worker pool or engine oversubscription. The measured safe win removes the duplicate full-
+frame JNI allocation/copy while preserving Samsung and MotionCam float-buffer digests. NDK
+`AImageDecoder` is a separate API-30+ non-RAW/display-fallback task: compare it across OS codec
+versions and never admit it to archival-exact or replace scene-linear LibRaw without sample proof.
 
 ### Tune diffusion after evidence
 
@@ -318,7 +318,7 @@ license texts, SBOM entry, ABI/16 KiB check, fuzz/update owner and measured rele
 | NDK `AImageDecoder` (API 30+) | narrow spike | Supported non-RAW decode into native memory | OS codec output may vary; keep API 24–29 and RAW fallbacks |
 | Highway 1.4.0 | narrow per-kernel spike | Independent FP32 pointwise/LUT/quantization kernels | Local f64 was slower; FP32 gained 2.1–2.7x but changed last bits. `memcmp` each candidate |
 | VkFFT 1.3.4 (MIT) | Fast GPU Pro-Mist/diffusion spike only | Large-radius R2C/overlap-save after measured crossover | Runtime shader/build/Android integration cost; approximate GPU contract only |
-| NDK LLVM OpenMP | qualification-only until corpus approval | Potential LibRaw demosaic parallelism | Shipping stays serial; require deterministic decode, memory/thermal evidence, capped threads, and no engine-pool oversubscription |
+| NDK LLVM OpenMP | debug qualification only; current corpus rejected shipping | Potential LibRaw demosaic parallelism | Compressed-Fuji runs changed bytes; shipping stays serial. Any future patched release restarts deterministic decode, memory/thermal, capped-thread and oversubscription gates |
 | existing custom CPU R2C FFT | keep | Current CPU diffusion fallback | It beat the tested NumHalide path; do not replace without real A/B |
 | libjpeg-turbo 3.2.0 | optional format-specific spike | JPEG/lossy-DNG only if encoding becomes material | Codestream and possibly decoded samples change; historical Amdahl ceiling is small |
 | Little CMS 2.19.1 | feature-dependent, not speed | Arbitrary external ICC support only | Larger untrusted parser surface; will not reproduce current fixed-transform pixels |

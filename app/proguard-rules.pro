@@ -8,6 +8,11 @@
 -keep class com.spectrafilm.libraw.RawDecoder { *; }
 -keep class com.spectrafilm.libraw.RawDecoder$NativeResult { *; }
 -keep class com.spectrafilm.libraw.RawDecodeException { *; }
+# Ticket #158's separately packaged release probe hashes the production
+# malloc-backed result through this public lease ABI. R8 cannot see that
+# cross-APK call edge, so retain the exact method/class names it invokes.
+-keep class com.spectrafilm.libraw.LinearResult { *; }
+-keep class com.spectrafilm.libraw.LinearResult$DataLease { *; }
 -keep class com.spectrafilm.tiffwriter.TiffWriter { *; }
 -keep class com.spectrafilm.pngwriter.PngWriter { *; }
 -keep class com.spectrafilm.tiffwriter.TiffCancellationToken { *; }

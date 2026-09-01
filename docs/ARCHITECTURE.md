@@ -147,7 +147,8 @@ spatial/stochastic work remain outside the qualified slice, and no functional de
 - Kotlin coroutines keep decode, render and export off the main thread; UI state receives only
   bounded progress and terminal results.
 - The native engine owns its worker scheduler and render-local stage timings. LibRaw shipping builds
-  remain serial until the separate OpenMP corpus qualification succeeds, avoiding silent
+  remain serial because the repeated compressed-Fuji OpenMP corpus changed output bytes;
+  the current patched release has no exact OpenMP qualification, avoiding silent
   oversubscription and decode drift.
 - Native allocations have explicit owner tokens and leases. A direct `ByteBuffer` is a view, never
   release authority. Geometry and logical buffer windows are checked at each JNI boundary.

@@ -23,8 +23,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <new>
 #include <string>
-#include <vector>
+#include <utility>
 
 namespace spectrafilm {
 
@@ -140,8 +143,74 @@ const char* dngCompressionName(int compressionValue);
 // Linear scene-referred result. Pixels are interleaved RGB float32, row-major,
 // normalized 16-bit -> [0,1] (value / 65535), in linear ProPhoto RGB primaries
 // (decoded via ACES2065-1, then converted — see the file header / aces2065ToProPhotoRGB).
+// Move-only malloc-backed output storage. The decoder writes every element before
+// publication, so it deliberately avoids std::vector::resize's full-buffer zero fill.
+// release() transfers the exact malloc-compatible base to the JNI ownership registry;
+// this permits a direct ByteBuffer handoff without a second full-frame copy.
+class DecodedFloatBuffer final {
+ public:
+    DecodedFloatBuffer() noexcept = default;
+    ~DecodedFloatBuffer() { reset(); }
+
+    DecodedFloatBuffer(const DecodedFloatBuffer&) = delete;
+    DecodedFloatBuffer& operator=(const DecodedFloatBuffer&) = delete;
+
+    DecodedFloatBuffer(DecodedFloatBuffer&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)),
+          size_(std::exchange(other.size_, 0U)) {}
+
+    DecodedFloatBuffer& operator=(DecodedFloatBuffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            data_ = std::exchange(other.data_, nullptr);
+            size_ = std::exchange(other.size_, 0U);
+        }
+        return *this;
+    }
+
+    void allocateUninitialized(std::size_t count) {
+        if (count == 0U) {
+            reset();
+            return;
+        }
+        if (count > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+            throw std::bad_alloc();
+        }
+        void* allocation = std::malloc(count * sizeof(float));
+        if (allocation == nullptr) throw std::bad_alloc();
+        reset();
+        data_ = static_cast<float*>(allocation);
+        size_ = count;
+    }
+
+    void reset() noexcept {
+        std::free(data_);
+        data_ = nullptr;
+        size_ = 0U;
+    }
+
+    [[nodiscard]] float* release() noexcept {
+        size_ = 0U;
+        return std::exchange(data_, nullptr);
+    }
+
+    [[nodiscard]] float* data() noexcept { return data_; }
+    [[nodiscard]] const float* data() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0U; }
+
+    float& operator[](std::size_t index) noexcept { return data_[index]; }
+    const float& operator[](std::size_t index) const noexcept {
+        return data_[index];
+    }
+
+ private:
+    float* data_ = nullptr;
+    std::size_t size_ = 0U;
+};
+
 struct DecodeResult {
-    std::vector<float> rgb;       // size == width * height * 3
+    DecodedFloatBuffer rgb;       // size == width * height * 3
     int width = 0;
     int height = 0;
     std::string colorSpace = "ProPhoto RGB";

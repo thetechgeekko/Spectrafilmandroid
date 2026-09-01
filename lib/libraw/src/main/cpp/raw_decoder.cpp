@@ -825,14 +825,16 @@ void applyParityParams(LibRaw& raw, const DecodeOptions& options) {
 // LibRaw opened) so a failed unpack() of a compressed DNG can be classified
 // (deflate vs lossy-JPEG) for a precise, actionable error code.
 DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
-                          const uint8_t* srcData, size_t srcLen) {
+                          const uint8_t* srcData, size_t srcLen,
+                          std::chrono::steady_clock::time_point decodeStartedAt,
+                          double inputIoMs, double openMs) {
     DecodeResult result;
 
     if (cancellationRequested(options)) return cancellationFailure();
 
     // Intra-decode phase timers (#158). `phaseMs()` returns the delta since the last
     // call and re-stamps, so the phases are contiguous by construction and cannot
-    // double-count. Cost is a handful of steady_clock reads against a ~3.5 s decode.
+    // double-count. Cost is a handful of steady_clock reads against a full decode.
     // maybe_unused because the line they feed is Android-only and this file also
     // compiles for the host test.
     using phase_clk = std::chrono::steady_clock;
@@ -844,7 +846,7 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
         return d;
     };
     [[maybe_unused]] double mUnpack = 0, mProcess = 0, mMemImg = 0,
-                            mCopy = 0, mAdapt = 0, mColour = 0;
+                            mAllocate = 0, mCopy = 0, mAdapt = 0, mColour = 0;
 
     int rc = raw.unpack();
     mUnpack = phaseMs();
@@ -959,7 +961,8 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     const int oh = step > 1 ? (fullH + step - 1) / step : fullH;
     result.width = ow;
     result.height = oh;
-    result.rgb.resize(static_cast<size_t>(ow) * oh * 3);
+    result.rgb.allocateUninitialized(static_cast<size_t>(ow) * oh * 3U);
+    mAllocate = phaseMs();
     for (int oy = 0; oy < oh; ++oy) {
         if (cancellationRequested(options)) return cancellationFailure();
         const size_t srow = static_cast<size_t>(oy) * step * fullW;
@@ -999,9 +1002,13 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
         "decoded %dx%d (halfSize=%d) -> %dx%d (maxLongEdge=%d, step=%d)",
         fullW, fullH, options.halfSize ? 1 : 0, ow, oh, options.maxLongEdge, step);
     __android_log_print(ANDROID_LOG_INFO, "sfraw",
-        "decode phases ms: unpack=%.0f process=%.0f memimg=%.0f copy=%.0f "
-        "adapt=%.0f colour=%.0f",
-        mUnpack, mProcess, mMemImg, mCopy, mAdapt, mColour);
+        "decode phases ms: io=%.3f open=%.3f unpack=%.3f process=%.3f "
+        "memimg=%.3f output_alloc=%.3f copy=%.3f adapt=%.3f colour=%.3f "
+        "total=%.3f",
+        inputIoMs, openMs, mUnpack, mProcess, mMemImg, mAllocate, mCopy,
+        mAdapt, mColour,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - decodeStartedAt).count());
 #endif
 
     result.colorSpace = "ProPhoto RGB";
@@ -1014,6 +1021,7 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
 
 DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
                               const DecodeOptions& options) try {
+    const auto decodeStartedAt = std::chrono::steady_clock::now();
     DecodeResult result;
     if (!rawWhiteBalanceOptionsValid(options)) {
         return invalidWhiteBalanceFailure();
@@ -1032,7 +1040,10 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
     LibRaw raw;
     applyInputLimits(raw);
     applyCancellationHandler(raw, options);
+    const auto openAt = std::chrono::steady_clock::now();
     int rc = raw.open_buffer(const_cast<uint8_t*>(data), length);
+    const double openMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - openAt).count();
     if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
     if (cancellationRequested(options)) return cancellationFailure();
     if (rc != LIBRAW_SUCCESS) {
@@ -1049,7 +1060,8 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
     if (declaredDecodeDimensionsExceedLimit(raw, options)) {
         return dimensionLimitFailure(options);
     }
-    return finishDecode(raw, options, data, length);
+    return finishDecode(raw, options, data, length, decodeStartedAt, 0.0,
+                        openMs);
 } catch (const std::bad_alloc&) {
     DecodeResult result;
     result.status = SFRAW_ERR_NO_MEMORY;
@@ -1063,6 +1075,7 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
 }
 
 DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
+    const auto decodeStartedAt = std::chrono::steady_clock::now();
     DecodeResult result;
     if (!rawWhiteBalanceOptionsValid(options)) {
         return invalidWhiteBalanceFailure();
@@ -1095,7 +1108,7 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
     // bounded chunks. This supports descriptors without a trustworthy stat size
     // and rejects over-limit files before growing the vector past the ceiling.
     std::vector<uint8_t> bytes;
-    [[maybe_unused]] auto ioAt = std::chrono::steady_clock::now();
+    const auto ioAt = std::chrono::steady_clock::now();
     std::array<uint8_t, 64U * 1024U> chunk{};
     for (;;) {
         if (cancellationRequested(options)) return cancellationFailure();
@@ -1120,21 +1133,18 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
         }
     }
     fp.reset();  // closes only the duplicate; caller retains ownership
-#ifdef __ANDROID__
-    // Separated from the phases above because it happens before LibRaw sees anything.
-    // Only the fd path is timed: decodeFromBuffer has no file read, and exports take
-    // this one.
-    __android_log_print(ANDROID_LOG_INFO, "sfraw", "decode io ms: fileread=%.0f bytes=%zu",
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - ioAt).count(),
-        bytes.size());
-#endif
+    // Only the fd path has input I/O: decodeFromBuffer receives caller-owned bytes.
+    const double inputIoMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - ioAt).count();
     if (bytes.empty()) {
         result.status = SFRAW_ERR_INPUT;
         result.error = "failed to read RAW from fd";
         return result;
     }
+    const auto openAt = std::chrono::steady_clock::now();
     int rc = raw.open_buffer(bytes.data(), bytes.size());
+    const double openMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - openAt).count();
     if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
     if (cancellationRequested(options)) return cancellationFailure();
     if (rc != LIBRAW_SUCCESS) {
@@ -1152,7 +1162,8 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
     if (declaredDecodeDimensionsExceedLimit(raw, options)) {
         return dimensionLimitFailure(options);
     }
-    return finishDecode(raw, options, bytes.data(), bytes.size());
+    return finishDecode(raw, options, bytes.data(), bytes.size(),
+                        decodeStartedAt, inputIoMs, openMs);
 } catch (const std::bad_alloc&) {
     DecodeResult result;
     result.status = SFRAW_ERR_NO_MEMORY;

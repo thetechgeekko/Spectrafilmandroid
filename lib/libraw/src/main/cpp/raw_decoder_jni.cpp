@@ -6,6 +6,7 @@
  */
 #include <jni.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,11 @@
 #include "native_allocation_registry.h"
 #include "raw_decoder.h"
 #include "raw_decoder_jni_safety.h"
+#include "raw_result_publication.h"
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #define JNI(ret, name) extern "C" JNIEXPORT ret JNICALL \
     Java_com_spectrafilm_libraw_RawDecoder_##name
@@ -118,11 +124,6 @@ bool isCancelled(const CancellationLease& lease) {
     return lease != nullptr && lease->load(std::memory_order_acquire);
 }
 
-bool cancellationLeaseRequested(void* opaque) noexcept {
-    const auto* lease = static_cast<const CancellationLease*>(opaque);
-    return lease != nullptr && isCancelled(*lease);
-}
-
 spectrafilm::DecodeOptions readOptions(
     jint wbMode, jdouble temperatureK, jdouble tint, jboolean halfSize,
     jint maxLongEdge, const CancellationLease& cancellation) {
@@ -157,8 +158,93 @@ bool checkedOutputBytes(const spectrafilm::DecodeResult& result,
     return *byteCount != 0U;
 }
 
-jobject toJavaResult(JNIEnv* env, const spectrafilm::DecodeResult& result,
-                     const CancellationLease& cancellation) {
+enum class JavaPublicationFailure {
+    None,
+    DirectBuffer,
+    ResultAbi,
+    ColorSpace,
+    ResultConstruction,
+};
+
+struct JavaPublicationContext {
+    JNIEnv* env = nullptr;
+    const spectrafilm::DecodeResult* decoded = nullptr;
+    jobject javaResult = nullptr;
+    JavaPublicationFailure failure = JavaPublicationFailure::None;
+    std::chrono::steady_clock::time_point phaseAt;
+    double handoffAdoptMs = 0.0;
+    double wrapMs = 0.0;
+    double constructMs = 0.0;
+
+    double markPhase() {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            now - phaseAt).count();
+        phaseAt = now;
+        return elapsed;
+    }
+};
+
+bool cancellationLeaseRequested(void* opaque) noexcept {
+    const auto* cancellation = static_cast<const CancellationLease*>(opaque);
+    return cancellation != nullptr && isCancelled(*cancellation);
+}
+
+sfraw::jni::PublicationDecision attemptJavaPublication(
+        const sfraw::jni::NativePublication& publication, void* opaque) {
+    auto& context = *static_cast<JavaPublicationContext*>(opaque);
+    context.handoffAdoptMs = context.markPhase();
+
+    jobject owned = context.env->NewDirectByteBuffer(
+        publication.base, static_cast<jlong>(publication.capacity));
+    if (owned == nullptr) {
+        context.failure = JavaPublicationFailure::DirectBuffer;
+        return sfraw::jni::PublicationDecision::Failed;
+    }
+    context.wrapMs = context.markPhase();
+
+    jclass resultClass = context.env->FindClass(
+        "com/spectrafilm/libraw/RawDecoder$NativeResult");
+    jmethodID constructor = resultClass != nullptr
+        ? context.env->GetMethodID(
+              resultClass, "<init>",
+              "(Ljava/nio/ByteBuffer;IILjava/lang/String;J)V")
+        : nullptr;
+    if (constructor == nullptr) {
+        context.failure = JavaPublicationFailure::ResultAbi;
+        return sfraw::jni::PublicationDecision::Failed;
+    }
+
+    jstring colorSpace =
+        context.env->NewStringUTF(context.decoded->colorSpace.c_str());
+    if (colorSpace == nullptr) {
+        context.failure = JavaPublicationFailure::ColorSpace;
+        return sfraw::jni::PublicationDecision::Failed;
+    }
+    context.javaResult = context.env->NewObject(
+        resultClass, constructor, owned,
+        static_cast<jint>(context.decoded->width),
+        static_cast<jint>(context.decoded->height), colorSpace,
+        static_cast<jlong>(publication.token));
+    if (context.javaResult == nullptr) {
+        context.failure = JavaPublicationFailure::ResultConstruction;
+        return sfraw::jni::PublicationDecision::Failed;
+    }
+    context.constructMs = context.markPhase();
+    return sfraw::jni::PublicationDecision::Published;
+}
+
+void abortJavaPublication(void* opaque) noexcept {
+    auto& context = *static_cast<JavaPublicationContext*>(opaque);
+    if (context.javaResult != nullptr) {
+        context.env->DeleteLocalRef(context.javaResult);
+        context.javaResult = nullptr;
+    }
+}
+
+jobject toJavaResult(JNIEnv* env, spectrafilm::DecodeResult& result,
+                     CancellationLease& cancellation) {
+    const auto jniStartedAt = std::chrono::steady_clock::now();
     if (!result.ok) {
         throwDecodeResult(env, result);
         return nullptr;
@@ -171,84 +257,65 @@ jobject toJavaResult(JNIEnv* env, const spectrafilm::DecodeResult& result,
         return nullptr;
     }
 
-    void* nativeBuffer = std::malloc(byteCount);
-    if (nativeBuffer == nullptr) {
-        throwRawDecodeException(env, "failed to allocate native RAW output",
-                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
-        return nullptr;
-    }
-    if (!sfraw::jni::copyBytesCancellable(
-            nativeBuffer, result.rgb.data(), byteCount,
-            cancellationLeaseRequested,
-            const_cast<CancellationLease*>(&cancellation))) {
-        std::free(nativeBuffer);
+    // DecodeResult already owns malloc-compatible storage. Transfer that exact
+    // allocation into the registry: no second full-frame allocation, zero-fill,
+    // or memcpy is needed before NewDirectByteBuffer publishes it to Kotlin.
+    // The production publication seam owns every release/adopt/failure/cancel
+    // transition so no JNI branch can strand or double-free the allocation.
+    JavaPublicationContext publicationContext;
+    publicationContext.env = env;
+    publicationContext.decoded = &result;
+    publicationContext.phaseAt = jniStartedAt;
+    const auto publication = sfraw::jni::publishDecodedAllocation(
+        result.rgb, byteCount, sfraw::nativeAllocationRegistry(),
+        cancellationLeaseRequested, &cancellation,
+        attemptJavaPublication, &publicationContext,
+        abortJavaPublication);
+
+    if (publication.decision == sfraw::jni::PublicationDecision::Cancelled) {
         throwCancelled(env);
         return nullptr;
     }
-
-    std::uint64_t allocationToken = 0U;
-    try {
-        allocationToken =
-            sfraw::nativeAllocationRegistry().adopt(nativeBuffer, byteCount);
-    } catch (...) {
-        std::free(nativeBuffer);
-        throw;
-    }
-
-    auto releaseRegistered = [&] {
-        sfraw::nativeAllocationRegistry().release(
-            allocationToken, nativeBuffer, byteCount);
-    };
-
-    jobject owned = env->NewDirectByteBuffer(
-        nativeBuffer, static_cast<jlong>(byteCount));
-    if (owned == nullptr) {
-        releaseRegistered();
-        throwRawDecodeException(env, "failed to wrap native RAW output",
-                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+    if (publication.decision != sfraw::jni::PublicationDecision::Published) {
+        switch (publicationContext.failure) {
+            case JavaPublicationFailure::DirectBuffer:
+                throwRawDecodeException(env, "failed to wrap native RAW output",
+                                        spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+                break;
+            case JavaPublicationFailure::ResultAbi:
+                throwRawDecodeException(env, "RAW NativeResult ABI mismatch",
+                                        spectrafilm::SFRAW_ERR_FORMAT, 0);
+                break;
+            case JavaPublicationFailure::ColorSpace:
+                throwRawDecodeException(
+                    env, "failed to create RAW color-space metadata",
+                    spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+                break;
+            case JavaPublicationFailure::ResultConstruction:
+                // Replace VM-specific construction failures (most commonly OOM)
+                // with the stable typed contract used by every JNI failure path.
+                throwRawDecodeException(env, "failed to construct RAW result",
+                                        spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+                break;
+            case JavaPublicationFailure::None:
+                throwRawDecodeException(env, "missing native RAW output",
+                                        spectrafilm::SFRAW_ERR_FORMAT, 0);
+                break;
+        }
         return nullptr;
     }
-
-    jclass resultClass =
-        env->FindClass("com/spectrafilm/libraw/RawDecoder$NativeResult");
-    jmethodID constructor = resultClass != nullptr
-        ? env->GetMethodID(
-              resultClass, "<init>",
-              "(Ljava/nio/ByteBuffer;IILjava/lang/String;J)V")
-        : nullptr;
-    if (constructor == nullptr) {
-        releaseRegistered();
-        throwRawDecodeException(env, "RAW NativeResult ABI mismatch",
-                                spectrafilm::SFRAW_ERR_FORMAT, 0);
-        return nullptr;
-    }
-
-    jstring colorSpace = env->NewStringUTF(result.colorSpace.c_str());
-    if (colorSpace == nullptr) {
-        releaseRegistered();
-        throwRawDecodeException(env, "failed to create RAW color-space metadata",
-                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
-        return nullptr;
-    }
-    jobject javaResult = env->NewObject(
-        resultClass, constructor, owned, static_cast<jint>(result.width),
-        static_cast<jint>(result.height), colorSpace,
-        static_cast<jlong>(allocationToken));
-    if (javaResult == nullptr) {
-        releaseRegistered();
-        // Replace VM-specific construction failures (most commonly OOM) with
-        // the stable typed contract exposed by every other JNI failure path.
-        throwRawDecodeException(env, "failed to construct RAW result",
-                                spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
-        return nullptr;
-    }
-    if (isCancelled(cancellation)) {
-        env->DeleteLocalRef(javaResult);
-        releaseRegistered();
-        throwCancelled(env);
-        return nullptr;
-    }
-    return javaResult;
+#ifdef __ANDROID__
+    __android_log_print(
+        ANDROID_LOG_INFO, "sfraw",
+        "jni result ms: handoff_adopt=%.3f wrap=%.3f "
+        "construct=%.3f total=%.3f bytes=%zu",
+        publicationContext.handoffAdoptMs, publicationContext.wrapMs,
+        publicationContext.constructMs,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - jniStartedAt).count(),
+        byteCount);
+#endif
+    return publicationContext.javaResult;
 }
 
 bool validateDirectInput(JNIEnv* env, jobject buffer, jint length,
@@ -398,7 +465,7 @@ JNI(jobject, nativeDecodeBytes)(JNIEnv* env, jobject, jbyteArray bytes,
             throwCancelled(env);
             return nullptr;
         }
-        const spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
+        spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
             reinterpret_cast<const std::uint8_t*>(input.get()),
             static_cast<std::size_t>(length),
             readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge,
@@ -433,7 +500,7 @@ JNI(jobject, nativeDecodeBuffer)(JNIEnv* env, jobject, jobject directBuffer,
             throwCancelled(env);
             return nullptr;
         }
-        const spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
+        spectrafilm::DecodeResult result = spectrafilm::decodeFromBuffer(
             reinterpret_cast<const std::uint8_t*>(address),
             static_cast<std::size_t>(length),
             readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge,
@@ -465,7 +532,7 @@ JNI(jobject, nativeDecodeFd)(JNIEnv* env, jobject, jint fd, jint wbMode,
             throwCancelled(env);
             return nullptr;
         }
-        const spectrafilm::DecodeResult result = spectrafilm::decodeFromFd(
+        spectrafilm::DecodeResult result = spectrafilm::decodeFromFd(
             fd, readOptions(wbMode, temperatureK, tint, halfSize, maxLongEdge,
                             cancellation));
         if (isCancelled(cancellation) && result.ok) {

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Exact RAW decode handoff and release profiling (#158)
+
+- Replaced the decoded `std::vector<float>` plus JNI `malloc`/memcpy pair with one
+  move-only, malloc-backed float buffer that is transferred directly into the
+  native allocation registry. A 3060x4080 decode no longer creates and copies a
+  second 149,817,600-byte output allocation; cancellation, typed OOM handling,
+  token/base/capacity release validation, and the existing LibRaw limits remain.
+- Added release phase telemetry for input I/O, `open_buffer`, unpack, process,
+  processed-image creation, output allocation, uint16-to-float copy, white balance,
+  colour conversion, and JNI publication, plus an fd-capable repeated device probe.
+- Hardened that probe so exact release/R8 qualification requires a pinned expected
+  SHA-256 on every repetition. Explicit self-seeding is labelled exploratory and never
+  emits an exactness PASS; RAW argument failures keep the `TICKET158_RAW_RELEASE_R8`
+  marker, and content-URI shell permissions are selected safely by Android API level.
+- Routed the real JNI release/adopt/publication transition through the injectable
+  production ownership seam. ASan/UBSan now proves exact-once cleanup and zero
+  outstanding registry entries for cancellation, publication failure/exception,
+  post-publication revocation, success, and later close.
+- Patched LibRaw 0.22.2 remains serial in shipping builds. The compressed-Fuji
+  OpenMP corpus is nondeterministic, and the decoder still leaves `user_qual`
+  unchanged; neither exactness contract was traded for a headline speed number.
+- On the connected SM-S948W, repeated baseline/final Samsung and MotionCam outputs
+  kept their exact full-resolution SHA-256 values. In matched minified release/R8
+  runs, JNI publication p50 fell from 34.628 to 0.040 ms (Samsung) and 25.730 to
+  0.032 ms (MotionCam). Core decode remained page-fault-sensitive, so this is a
+  peak-memory/JNI handoff improvement, not a demosaic or 1-2 second export claim.
+- Measured shipping builds add no LibRaw workers: OpenMP is off for all ABIs and
+  the final ELF has no OpenMP dependency/symbol. NDK `AImageDecoder` remains a
+  separately qualified API-30+ non-RAW/fallback experiment, never a silent
+  replacement for scene-linear LibRaw or an archival-exact entry point.
+
 ### Transactional storage and versioned documents (#170)
 
 - MediaStore export now stages bytes behind an app-owned pending row, verifies

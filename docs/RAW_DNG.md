@@ -53,14 +53,21 @@ requested ACES-space white-balance adaptation, and converts ACES2065-1 to linear
 ProPhoto RGB before handing it to the engine. LibRaw's raw-memory budget is set
 to 128 MiB before `open_buffer`; its mobile-unfriendly 2048 MiB default is not used.
 
-The returned native allocation is exposed only through a `LinearResult` data
-lease. `close()` prevents new readers immediately but waits for active leases,
-and the JNI allocation registry requires the exact token, base address, and
-capacity before freeing. Export-scale hand-off transfers a live lease into the
-engine `LinearImage`; proxy/Coil consumers copy while leased and release the
-native result before returning. Cooperative cancellation is installed as a
-LibRaw progress handler for its long decode phases and is also polled around
-each phase and throughout first-party read/copy/colour loops.
+The decoder writes into one uninitialized, malloc-backed float buffer and transfers
+that exact allocation into the JNI registry; it does not zero-fill a vector and then
+allocate/copy a second full-resolution buffer. The allocation is exposed only through
+a `LinearResult` data lease. `close()` prevents new readers immediately but waits for
+active leases, and release requires the exact token, base address, and capacity.
+Export-scale hand-off transfers a live lease into the engine `LinearImage`; proxy/Coil
+consumers copy while leased and release the native result before returning. Cooperative
+cancellation is installed as a LibRaw progress handler for its long decode phases and
+is also polled around each phase and throughout first-party read, uint16-to-float,
+white-balance, and colour loops. A cancellation observed before or after the constant-
+time ownership transfer discards or registry-releases the buffer exactly once.
+The same production ownership-publication seam is exercised on the host under
+ASan/UBSan with injected pre-handoff and post-adopt cancellation, platform
+publication failure/exception, successful publication, and stale-token checks;
+each rollback ends with zero outstanding registry entries.
 
 The cross-module ownership rules and combined host/JVM/Android verification matrix are canonical
 in [JNI_LIFETIME_SAFETY.md](JNI_LIFETIME_SAFETY.md).
@@ -98,6 +105,25 @@ and add LibRaw for the real decode.)
   security maintenance, and license evidence.
 - The exact release path is serial. Debug-only OpenMP reproduced upstream issue
   #845 with five different decoded hashes from five runs on the connected phone.
+- Release telemetry separates fd I/O, `open_buffer`, unpack, `dcraw_process`,
+  `dcraw_make_mem_image`, output allocation, uint16-to-float copy, CAT/tint,
+  ACES-to-ProPhoto conversion, and JNI handoff. The repeat probe can exercise both
+  buffer and fd entry points; output payloads are hash-compared, not visually judged.
+- A release/R8 qualification run must receive a previously pinned 64-hex
+  `ticket158_expected_sha256` and compare every repetition against it. Self-seeding
+  is permitted only with explicit `ticket158_exploratory=true`; that mode emits
+  `TICKET158_RAW_RELEASE_R8_EXPLORATORY: RESULT (UNQUALIFIED)` and can
+  never satisfy the exactness gate. Content-URI probes adopt only the SDK-valid
+  media permission (API 33+) or legacy storage permission (API 29-32); below API
+  29 they require an already-granted manifest or URI read permission.
+- Matched minified release/R8 tests retained the complete Samsung and MotionCam
+  float-buffer SHA-256 values while removing a 34.628 ms / 25.730 ms median JNI
+  publication copy. The final shipping ELF has no OpenMP dependency or symbols,
+  and active device thread inventories showed no LibRaw worker pool.
+- NDK `AImageDecoder` is not a replacement for this scene-linear route. Any API-30+
+  native-decoder experiment is restricted to supported non-RAW/display-referred
+  fallback inputs, requires an OS-version codec corpus, and cannot enter the
+  archival-exact tier without separately proving decoded samples.
 - LibRaw is offered under LGPL-2.1-only or CDDL-1.0. The intended LGPL static
   distribution route still requires the source/relink/notice bundle owned by
   the release-blocking licensing ticket; see `LICENSING.md`.

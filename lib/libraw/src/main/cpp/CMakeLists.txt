@@ -224,7 +224,7 @@ endif ()
 # failing the build.
 # Exact output has priority over speculative decode throughput. LibRaw issue #845
 # reports scheduling-dependent compressed-Fuji output, so shipping configurations
-# remain serial until #158 qualifies OpenMP against the repeated camera corpus.
+# remain serial; the current patched release has no exact OpenMP qualification.
 # Debug builds may opt in to exercise the patched OpenMP code under sanitizers.
 option(SFRAW_ENABLE_OPENMP
         "Experimental: compile LibRaw with OpenMP; not qualified for exact release"
@@ -267,6 +267,7 @@ add_library(sfraw SHARED
         native_allocation_registry.cpp
         raw_decoder.cpp
         raw_decoder_jni.cpp
+        raw_result_publication.cpp
 )
 
 # Clang/GCC may otherwise fuse multiply-add operations at -O3 even without
