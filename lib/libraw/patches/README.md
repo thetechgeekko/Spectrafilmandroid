@@ -117,7 +117,7 @@ Patch order:
     It changes notices only; the preceding aggregate remains a recognized
     migration input so a clean chain can apply this notice patch exactly.
 24. `0024-define-xtrans-negative-index-arithmetic.patch`
-    (`71b8b6810416f407549a52c3b21cb91720d6935dee1da8adfbd1ef50e53e138a`)
+    (`c6dbbe4707503049e601b993c5238b8e90404ff0d442d5c334c98f649f28f5c3`)
     preserves the X-Trans interpolator's intended negative neighbor offsets as
     `-(i << c)`. This removes undefined left shifts of negative integers without
     changing the selected pixels or the exact processed-image digest.

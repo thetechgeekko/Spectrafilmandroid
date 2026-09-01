@@ -315,7 +315,7 @@ function(sfraw_resolve_libraw out_var)
         "local modification-notice patch")
     _sfraw_verify_file_sha256(
         "${_SFRAW_LIBRAW_PATCH_DIR}/0024-define-xtrans-negative-index-arithmetic.patch"
-        "71b8b6810416f407549a52c3b21cb91720d6935dee1da8adfbd1ef50e53e138a"
+        "c6dbbe4707503049e601b993c5238b8e90404ff0d442d5c334c98f649f28f5c3"
         "defined X-Trans negative-index arithmetic patch")
     _sfraw_verify_file_sha256(
         "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch"
