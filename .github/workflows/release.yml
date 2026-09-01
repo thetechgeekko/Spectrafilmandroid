@@ -480,7 +480,7 @@ jobs:
           verify_asset third_party/libraw/LICENSE.LGPL eea173a556abac0370461e57e12aab266894ea6be3874c2be05fd87871f75449
           verify_asset third_party/libraw/LICENSE.CDDL 0e3098d2d54a12434715f6679ea408d57da5e8d613c385c58ecc6fe5d30cc81f
           verify_asset legal/spektrafilm/LICENSE.GPL-3.0 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-          verify_asset legal/spektrafilm/NOTICE.md caf6d6bc4d383450d683493fc3b92cacddc2a2ec0b45c4b8b9abb584e69ee6d4
+          verify_asset legal/spektrafilm/NOTICE.md 9bab38c4b25b361081f0bcfdabe10f7d5dc0d2a50cc7626612b88971bc8081cb
 
       - name: Stage hash-bound candidate and compliance materials
         env:
@@ -995,7 +995,7 @@ jobs:
           verify_asset third_party/libraw/LICENSE.LGPL eea173a556abac0370461e57e12aab266894ea6be3874c2be05fd87871f75449
           verify_asset third_party/libraw/LICENSE.CDDL 0e3098d2d54a12434715f6679ea408d57da5e8d613c385c58ecc6fe5d30cc81f
           verify_asset legal/spektrafilm/LICENSE.GPL-3.0 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-          verify_asset legal/spektrafilm/NOTICE.md caf6d6bc4d383450d683493fc3b92cacddc2a2ec0b45c4b8b9abb584e69ee6d4
+          verify_asset legal/spektrafilm/NOTICE.md 9bab38c4b25b361081f0bcfdabe10f7d5dc0d2a50cc7626612b88971bc8081cb
 
       - name: Run exact signed candidate instrumentation and API smoke
         uses: reactivecircus/android-emulator-runner@4c44018e59b437e86cdfc41da381398f93ed8808 # v2
