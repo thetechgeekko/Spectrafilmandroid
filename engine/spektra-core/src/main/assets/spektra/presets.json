@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "_comment": "Built-in look presets. Authored against the nested SpektraParams schema and mapped by BuiltInPresets.applyParams. Only ENGINE-HONORED fields are set: grain is fully tunable (and per-stock here, since the engine otherwise gives every stock Portra-400 grain); halation uses halationAmount/scatterAmount/boost (halationStrength + halationFirstSigmaUm are baked from each profile's use/antihalation tags and ignored); DIR couplers use amount/inhibition/diffusion (gamma matrices are baked per stock); diffusionFilter geometry is honored but filterFamily is fixed to black_pro_mist by the C API. Grain/halation are um-based and so look stronger at full-res/zoom than in the fit preview.",
+  "_comment": "Built-in look presets are sparse overlays authored against the nested SpektraParams schema and mapped by BuiltInPresets.applyParams; omitted fields retain their current editor values. Only ENGINE-HONORED fields are set: grain is fully tunable (and per-stock here, since the engine otherwise gives every stock Portra-400 grain); halation uses halationAmount/scatterAmount/boost (halationStrength + halationFirstSigmaUm are baked from each profile's use/antihalation tags and ignored); DIR couplers use amount/inhibition/diffusion (gamma matrices are baked per stock); diffusionFilter geometry and filterFamily are honored. Grain/halation are um-based and so look stronger at full-res/zoom than in the fit preview.",
   "presets": [
     {
       "id": "portra160_endura_softlight",
@@ -548,7 +548,7 @@
       "id": "portra400_promist_dreamy",
       "name": "Dreamy Pro-Mist — Portra 400",
       "group": "Creative",
-      "description": "Portra 400 behind a Black Pro-Mist diffusion filter: bloomed highlights and a soft glow, with a touch of spectral haze.",
+      "description": "Portra 400 with an explicitly selected Black Pro-Mist diffusion filter: bloomed highlights and a soft glow, with a touch of spectral haze.",
       "params": {
         "filmProfile": "kodak_portra_400",
         "printProfile": "kodak_portra_endura",
@@ -556,7 +556,8 @@
         "camera": {
           "exposureCompensationEv": 0.3,
           "diffusionFilter": {
-            "active": true, "strength": 0.6, "spatialScale": 1.1, "haloWarmth": 0.3,
+            "active": true, "filterFamily": "black_pro_mist",
+            "strength": 0.6, "spatialScale": 1.1, "haloWarmth": 0.3,
             "coreIntensity": 1.0, "coreSize": 1.1, "haloIntensity": 1.2, "haloSize": 1.3,
             "bloomIntensity": 1.3, "bloomSize": 1.4
           }

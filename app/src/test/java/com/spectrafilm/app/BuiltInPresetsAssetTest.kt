@@ -14,6 +14,7 @@ package com.spectrafilm.app
 
 import org.json.JSONObject
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -63,13 +64,12 @@ class BuiltInPresetsAssetTest {
 
     @Test
     fun presets_doNotSetEngineIgnoredFields() {
-        // Baked per-profile by digest_halation_params / _apply_film_specifics, or not exposed
-        // by the C API (filterFamily) — a preset setting these would silently do nothing.
+        // Baked per-profile by digest_halation_params / _apply_film_specifics. Diffusion
+        // filterFamily is intentionally absent: BuiltInPresets, JNI, and native all honor it.
         val ignored = listOf(
             "halationStrength", "halationFirstSigmaUm",
             "gammaSamelayerRgb", "gammaInterlayerRToGb",
             "gammaInterlayerGToRb", "gammaInterlayerBToRg",
-            "filterFamily",
         )
         val arr = presetsArray()
         for (i in 0 until arr.length()) {
@@ -79,6 +79,47 @@ class BuiltInPresetsAssetTest {
                 assertFalse(
                     "${p.optString("id")} sets engine-ignored field '$k' (no-op)",
                     params.contains("\"$k\""),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun presets_onlyUseEngineHonoredDiffusionFamilies() {
+        validateDiffusionFamilies(presetsArray())
+    }
+
+    @Test
+    fun diffusionFamilyValidationRejectsUnknownFamily() {
+        val arr = presetsArray()
+        val preset = arr.getJSONObject(0)
+        preset.getJSONObject("params")
+            .put("camera", JSONObject().put(
+                "diffusionFilter",
+                JSONObject().put("filterFamily", "unknown_filter"),
+            ))
+
+        val error = assertThrows(AssertionError::class.java) {
+            validateDiffusionFamilies(arr)
+        }
+        assertTrue(error.message.orEmpty().contains("unknown_filter"))
+    }
+
+    private fun validateDiffusionFamilies(presets: org.json.JSONArray) {
+        val known = DIFFUSION_FAMILIES.toSet()
+        for (i in 0 until presets.length()) {
+            val preset = presets.getJSONObject(i)
+            val params = preset.getJSONObject("params")
+            for (stage in listOf("camera", "enlarger")) {
+                val diffusion = params.optJSONObject(stage)
+                    ?.optJSONObject("diffusionFilter")
+                    ?: continue
+                if (!diffusion.has("filterFamily")) continue
+                val family = diffusion.optString("filterFamily")
+                assertTrue(
+                    "${preset.optString("id")} $stage.diffusionFilter.filterFamily=" +
+                        "'$family' is not engine-honored",
+                    family in known,
                 )
             }
         }

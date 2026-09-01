@@ -7,7 +7,8 @@
  * user presets in Presets.kt — which round-trip the *full* SpektraParams tree under a
  * flat schema — these built-ins are authored sparsely: each preset's "params" object
  * mirrors the engine's nested SpektraParams (camelCase) and only lists the fields it
- * deliberately sets. Anything omitted is left at the ParamsState default.
+ * deliberately sets. Anything omitted retains its current editor value (which is the
+ * ParamsState default only on a fresh/reset editor).
  *
  * The nested authored schema differs from Presets' flat schema, so this file owns its
  * own mapping (applyParams). Two unit conventions are handled here: halation

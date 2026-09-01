@@ -33,6 +33,10 @@ Key knobs used here:
   stage. This is the correct path for reversal/slide stocks (they are already positives) and
   for anyone who wants the "raw scan" negative look.
 - **`scanner.unsharpMask`** — capture sharpening; raised for the crispest, finest-grain stocks.
+- **`camera.diffusionFilter.*`** — optical diffusion controls. `filterFamily` is an
+  engine-honored selector (`glimmerglass`, `black_pro_mist`, `pro_mist`, or `cinebloom`). A
+  preset that promises a particular family must author it explicitly; otherwise the sparse
+  overlay preserves the editor's current family.
 - **`enlarger.*`** — untouched unless a preset explicitly authors a filter shift or preflash.
   Several creative/stock-specific looks do so; all other presets preserve the current enlarger
   state.
@@ -237,10 +241,10 @@ Tuning: neutral contrast, `grain.blur 0.65` (finer than the 400s), `halation 0.9
 
 ### Dreamy Pro-Mist — Portra 400  (`portra400_promist_dreamy`)
 **Kodak Portra 400 → Portra Endura.** Activates the camera diffusion stage, spectral blur, soft
-scanner sharpening, and a warm highlight bloom. The current asset does not author
-`filterFamily`: a fresh editor therefore uses its Black Pro-Mist default, but a previously selected
-Glimmerglass/CineBloom family survives the sparse overlay. The state-independent Black Pro-Mist
-promise is tracked by [Make Dreamy Pro-Mist select Black Pro-Mist independently of prior editor state](https://github.com/thetechgeekko/Spektrafilm-android/issues/194).
+scanner sharpening, and a warm highlight bloom. It explicitly authors
+`camera.diffusionFilter.filterFamily: black_pro_mist`, so applying the look always selects Black
+Pro-Mist regardless of the previously selected diffusion family. Controls omitted by this preset
+still retain their current editor values under the normal sparse-overlay contract.
 
 ### Faded Matte — Lifted Blacks  (`portra400_faded_matte`)
 **Kodak Portra 400 → Portra Endura.** A flashed, low-contrast print with an explicit master tone
