@@ -27,6 +27,28 @@ digest passes. The executable calls production `raw_decoder.cpp` math for all
 ProPhoto bits, and covers cast-order/skip diagnostics plus invalid native
 temperature and tint values. No generated header is committed.
 
+`sfraw.raw-precision.contract` drives the production wrapper with deterministic
+project-owned 8/10/12/14/16-bit CFA DNGs in both TIFF byte orders. Sub-16 inputs
+are row-packed MSB-first; 16-bit inputs use ordered TIFF words. Compliant
+three/four-sample LinearRaw fixtures use exact per-channel levels, complete
+Orientation/UniqueCameraModel metadata plus valid paired illuminants and
+correctly-sized ColorMatrices (including ColorMatrix1), and independently
+perturbed adjacent codes. Uniform black/white controls cancel demosaic/color-matrix scale while
+banded controls assert the expected `(code-black)/(white-black)` response,
+monotonicity, exact repeat float32 digests, descriptor provenance/layout/HDR
+fields, CFAPlaneColor/CFALayout defaults and hostile selected-IFD cases, every
+SHORT/LONG/RATIONAL BlackLevel value and bound, patterned BlackLevel,
+default-level absence, preview isolation, actual proxy reduction,
+malformed-level rejection, overflow-before-allocation, and cancellation. Its
+dependency pre-open matrix covers 17 hostile classes in both TIFF byte orders
+through `decodeFromBuffer` and `decodeFromFd` (68 assertions), including reduced
+next/SubIFD BlackLevelDelta, malformed eligibility, negative BlackLevel,
+valid/malformed non-root DNGVersion, backward next links, duplicate/over-capacity
+SubIFD arrays, depth/cycle limits, and wrong TIFF magic with an independent
+zero-open observer. Three-plane LinearRaw also proves that a padded fourth carrier
+slot cannot affect effective precision or published level counts. A valid
+float/deflate control must route before the quantizing dcraw bitmap boundary.
+
 Typical Clang build:
 
 ```sh

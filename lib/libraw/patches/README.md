@@ -16,7 +16,7 @@ Upstream baseline:
 - annotated tag object: `24fa7e5463cbf8b8615dbd2b16c933a294d52400`
 - peeled commit: `b93f6e45c194f5df9b02a43b1af9a54b4f41f33f`
 - tag signature: none; the archive hash is therefore the shipping trust anchor
-- audited patched-tree aggregate: `d1fd81838e54c83a608f91988cb5e00035891aeab1248bd92aa68b2f12007f77`
+- audited patched-tree aggregate: `bc463c30e414781d2455a47b99c30741830798b5941a049782b560fbb3abc74c`
   over the resolver's sorted 100-file source/header manifest
 
 Patch order:
@@ -115,7 +115,17 @@ Patch order:
     records the 2026-08-30 Spektrafilm Android modification date and contributor
     attribution in each of the 17 upstream files changed by patches 0001–0022.
     It changes notices only; the preceding aggregate remains a recognized
-    migration input so a clean chain can apply this final notice patch exactly.
+    migration input so a clean chain can apply this notice patch exactly.
+24. `0024-define-xtrans-negative-index-arithmetic.patch`
+    (`71b8b6810416f407549a52c3b21cb91720d6935dee1da8adfbd1ef50e53e138a`)
+    preserves the X-Trans interpolator's intended negative neighbor offsets as
+    `-(i << c)`. This removes undefined left shifts of negative integers without
+    changing the selected pixels or the exact processed-image digest.
+25. `0025-define-icc-s15fixed16-conversion.patch`
+    (`895b644886247bb3853002c27aa5d56475429c05f62ec556360a036dc8f3a9a4`)
+    rounds generated ICC XYZ matrix entries in the signed domain before their
+    defined modulo encoding as 32-bit s15Fixed16 words. This preserves negative
+    ACES profile coefficients without undefined floating-to-unsigned conversion.
 
 Patch 0021 deliberately preserves ordered first-match decoding rather than
 requiring a prefix-free codebook: Panasonic S5M2 metadata contains an 8-bit

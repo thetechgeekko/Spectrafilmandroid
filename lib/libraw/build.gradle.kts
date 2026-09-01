@@ -37,8 +37,9 @@ android {
                 // Make the shipping policy explicit so a stale external-native
                 // CMake cache cannot retain an earlier experimental OpenMP opt-in.
                 arguments += "-DSFRAW_ENABLE_OPENMP=OFF"
-                // Keep zlib enabled for LibRaw 0.22.2's supported floating-point
-                // deflate subset. Integer/linear deflate remains typed fallback.
+                // Keep the audited LibRaw floating-point deflate parser compiled
+                // for corpus/security coverage. RawDecoder still routes float DNG
+                // before dcraw's quantizing bitmap stage; it is not native parity.
                 arguments += "-DSFRAW_WITH_ZLIB=ON"
             }
         }

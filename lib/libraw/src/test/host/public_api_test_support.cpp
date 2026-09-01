@@ -795,6 +795,672 @@ std::vector<std::uint8_t> makeValidUncompressedDng(
                     false, width, height);
 }
 
+std::vector<std::uint8_t> makePrecisionUncompressedDng(
+    const PrecisionDngOptions& options) {
+  constexpr char kLinearRawUniqueCameraModel[] =
+      "Spektrafilm LinearRaw fixture";
+  const bool supportedBits = options.bitsPerSample == 8U ||
+      options.bitsPerSample == 10U || options.bitsPerSample == 12U ||
+      options.bitsPerSample == 14U || options.bitsPerSample == 16U;
+  if (!supportedBits) {
+    throw std::invalid_argument("precision fixture requires 8/10/12/14/16 bits");
+  }
+  if (options.samplesPerPixel == 0U || options.samplesPerPixel > 4U ||
+      (!options.linearRaw && options.samplesPerPixel != 1U) ||
+      (options.linearRaw && options.samplesPerPixel < 3U)) {
+    throw std::invalid_argument("precision fixture sample layout is unsupported");
+  }
+  if (options.width < 22U || options.height < 22U ||
+      options.width > std::numeric_limits<std::uint16_t>::max() ||
+      options.height > std::numeric_limits<std::uint16_t>::max() ||
+      options.height > kMaxDeclaredPixels / options.width) {
+    throw std::invalid_argument("precision fixture dimensions are out of bounds");
+  }
+  const std::size_t pixelCount =
+      static_cast<std::size_t>(options.width) * options.height;
+  if (pixelCount > std::numeric_limits<std::size_t>::max() /
+                       options.samplesPerPixel) {
+    throw std::invalid_argument("precision fixture sample count overflows");
+  }
+  const std::size_t sampleCount = pixelCount * options.samplesPerPixel;
+  if (!options.samples.empty() && options.samples.size() != sampleCount) {
+    throw std::invalid_argument("precision fixture samples must cover every pixel");
+  }
+  const std::uint32_t maxCode = options.bitsPerSample == 16U
+      ? 65535U
+      : ((1U << options.bitsPerSample) - 1U);
+  std::vector<std::uint32_t> whiteLevels = options.whiteLevels;
+  if (whiteLevels.empty()) {
+    whiteLevels.assign(options.samplesPerPixel, options.whiteLevel);
+  }
+  if (whiteLevels.size() != options.samplesPerPixel ||
+      std::any_of(whiteLevels.begin(), whiteLevels.end(),
+                  [maxCode](std::uint32_t level) {
+                    return level == 0U || level > maxCode;
+                  })) {
+    throw std::invalid_argument(
+        "precision fixture WhiteLevel must cover every sample channel");
+  }
+
+  const std::uint64_t blackPatternCount64 =
+      static_cast<std::uint64_t>(options.blackRepeatWidth) *
+      options.blackRepeatHeight * options.samplesPerPixel;
+  if (options.blackRepeatWidth == 0U || options.blackRepeatHeight == 0U ||
+      blackPatternCount64 > 64U) {
+    throw std::invalid_argument("precision fixture black pattern is out of bounds");
+  }
+  const std::size_t blackPatternCount =
+      static_cast<std::size_t>(blackPatternCount64);
+  std::vector<std::uint32_t> blackPattern = options.blackPattern;
+  if (blackPattern.empty()) {
+    blackPattern.assign(blackPatternCount, options.blackLevel);
+  } else if (blackPattern.size() != blackPatternCount) {
+    throw std::invalid_argument("precision fixture black pattern shape mismatch");
+  }
+  for (std::size_t index = 0U; index < blackPattern.size(); ++index) {
+    if (blackPattern[index] >= whiteLevels[index % options.samplesPerPixel] ||
+        blackPattern[index] > maxCode) {
+      throw std::invalid_argument(
+          "precision fixture BlackLevel reaches its sample WhiteLevel");
+    }
+  }
+  if (options.baselineExposureDenominator == 0 ||
+      options.linearResponseDenominator == 0U) {
+    throw std::invalid_argument("precision fixture rational denominator is zero");
+  }
+  std::vector<std::uint8_t> cfaPattern = options.cfaPattern;
+  if (options.linearRaw) {
+    if (options.cfaPatternRows != 2U || options.cfaPatternColumns != 2U ||
+        !cfaPattern.empty()) {
+      throw std::invalid_argument("LinearRaw fixture cannot carry a CFA pattern");
+    }
+  } else {
+    const std::uint64_t cfaCount64 =
+        static_cast<std::uint64_t>(options.cfaPatternRows) *
+        options.cfaPatternColumns;
+    if (options.cfaPatternRows == 0U || options.cfaPatternColumns == 0U ||
+        cfaCount64 > 36U) {
+      throw std::invalid_argument("precision fixture CFA pattern is out of bounds");
+    }
+    if (cfaPattern.empty()) {
+      if (options.cfaPatternRows != 2U || options.cfaPatternColumns != 2U) {
+        throw std::invalid_argument("custom CFA fixture requires explicit cells");
+      }
+      cfaPattern = {0U, 1U, 1U, 2U};
+    }
+    if (cfaPattern.size() != static_cast<std::size_t>(cfaCount64) ||
+        std::any_of(cfaPattern.begin(), cfaPattern.end(),
+                    [](std::uint8_t value) { return value > 3U; })) {
+      throw std::invalid_argument("precision fixture CFA pattern is invalid");
+    }
+    if (options.cfaPlaneColors.empty() ||
+        options.cfaPlaneColors.size() > 4U) {
+      throw std::invalid_argument(
+          "precision fixture CFA plane mapping is out of bounds");
+    }
+  }
+
+  std::vector<std::uint16_t> samples = options.samples;
+  if (samples.empty()) {
+    samples.resize(sampleCount);
+    for (std::uint32_t row = 0U; row < options.height; ++row) {
+      for (std::uint32_t col = 0U; col < options.width; ++col) {
+        const std::size_t band = std::min<std::size_t>(
+            4U, static_cast<std::size_t>(col) * 5U / options.width);
+        for (std::uint16_t component = 0U;
+             component < options.samplesPerPixel; ++component) {
+          const std::size_t index =
+              (static_cast<std::size_t>(row) * options.width + col) *
+                  options.samplesPerPixel +
+              component;
+          const std::size_t blackCell =
+              ((static_cast<std::size_t>(row) % options.blackRepeatHeight) *
+                   options.blackRepeatWidth +
+               (static_cast<std::size_t>(col) % options.blackRepeatWidth)) *
+                  options.samplesPerPixel +
+              component;
+          const std::uint32_t black = blackPattern[blackCell];
+          const std::uint32_t white = whiteLevels[component];
+          const std::uint32_t span = white - black;
+          const std::uint32_t level = band == 0U
+              ? black
+              : (band == 1U ? black + 1U
+                 : (band == 2U ? black + span / 2U
+                    : (band == 3U ? white - 1U : white)));
+          samples[index] = static_cast<std::uint16_t>(level);
+        }
+      }
+    }
+  }
+  for (const std::uint16_t sample : samples) {
+    if (sample > maxCode) {
+      throw std::invalid_argument("precision fixture sample exceeds declared bits");
+    }
+  }
+
+  const std::uint64_t rowBits =
+      static_cast<std::uint64_t>(options.width) * options.samplesPerPixel *
+      options.bitsPerSample;
+  const std::uint64_t rowBytes64 = (rowBits + 7U) / 8U;
+  if (rowBytes64 > std::numeric_limits<std::uint32_t>::max() ||
+      options.height > std::numeric_limits<std::uint32_t>::max() / rowBytes64) {
+    throw std::invalid_argument("precision fixture packed stride overflows");
+  }
+  const std::size_t rowBytes = static_cast<std::size_t>(rowBytes64);
+  const std::size_t stripSize = rowBytes * options.height;
+  std::vector<std::uint8_t> strip(stripSize, 0U);
+  if (options.bitsPerSample == 16U) {
+    const std::size_t samplesPerRow =
+        static_cast<std::size_t>(options.width) * options.samplesPerPixel;
+    for (std::uint32_t row = 0U; row < options.height; ++row) {
+      for (std::size_t col = 0U; col < samplesPerRow; ++col) {
+        const std::uint16_t sample =
+            samples[static_cast<std::size_t>(row) * samplesPerRow + col];
+        const std::size_t at = static_cast<std::size_t>(row) * rowBytes +
+            col * 2U;
+        if (options.byteOrder == TiffByteOrder::kBigEndian) {
+          strip[at] = static_cast<std::uint8_t>(sample >> 8U);
+          strip[at + 1U] = static_cast<std::uint8_t>(sample & 0xffU);
+        } else {
+          strip[at] = static_cast<std::uint8_t>(sample & 0xffU);
+          strip[at + 1U] = static_cast<std::uint8_t>(sample >> 8U);
+        }
+      }
+    }
+  } else {
+    // TIFF/DNG packed integers are emitted most-significant bit first and each
+    // row starts at a fresh byte boundary, matching LibRaw getbits(tiff_bps).
+    for (std::uint32_t row = 0U; row < options.height; ++row) {
+      std::size_t bitAt = static_cast<std::size_t>(row) * rowBytes * 8U;
+      const std::size_t samplesPerRow =
+          static_cast<std::size_t>(options.width) * options.samplesPerPixel;
+      for (std::size_t col = 0U; col < samplesPerRow; ++col) {
+        const std::uint16_t sample =
+            samples[static_cast<std::size_t>(row) * samplesPerRow + col];
+        for (int bit = static_cast<int>(options.bitsPerSample) - 1;
+             bit >= 0; --bit, ++bitAt) {
+          if ((sample & (1U << bit)) != 0U) {
+            strip[bitAt / 8U] |=
+                static_cast<std::uint8_t>(1U << (7U - bitAt % 8U));
+          }
+        }
+      }
+    }
+  }
+
+  std::vector<TiffEntry> entries{
+      {0x00feU, 4U, 1U, 0U},
+      {0x0100U, 4U, 1U, options.width},
+      {0x0101U, 4U, 1U, options.height},
+      {0x0102U, 3U, options.samplesPerPixel, options.bitsPerSample},
+      {0x0103U, 3U, 1U, 1U},
+      {0x0106U, 3U, 1U, options.linearRaw ? 34892U : 32803U},
+      {0x0111U, 4U, 1U, 0U},
+      {0x0115U, 3U, 1U, options.samplesPerPixel},
+      {0x0116U, 4U, 1U, options.height},
+      {0x0117U, 4U, 1U, static_cast<std::uint32_t>(strip.size())},
+      {0xc612U, 1U, 4U, 0U},
+      {0xc613U, 1U, 4U, 0U},
+  };
+  if (options.includePlanarConfiguration) {
+    entries.push_back({0x011cU, 3U, 1U, options.planarConfiguration});
+  }
+  if (options.includeExtraSamples) {
+    entries.push_back({0x0152U, 3U, 1U, 0U});
+  }
+  if (options.includeCalibrationIlluminant1) {
+    entries.push_back({0xc65aU, 3U, 1U, 21U});
+  }
+  if (options.linearRaw) {
+    // DNG requires a defined orientation and camera calibration identity for a
+    // LinearRaw image. Each ColorMatrix has ColorPlanes x 3 signed rationals:
+    // nine elements for RGB and twelve for the admitted four-plane variant.
+    // Carry a valid two-illuminant pair because LibRaw 0.22.2's post-identify
+    // DNG field promotion is the path that retains the fourth matrix row.
+    entries.push_back({0x0112U, 3U, 1U, 1U});
+    entries.push_back({
+        0xc614U, 2U,
+        static_cast<std::uint32_t>(sizeof(kLinearRawUniqueCameraModel)), 0U});
+    if (options.includeColorMatrix1) {
+      entries.push_back({
+          0xc621U, 10U,
+          static_cast<std::uint32_t>(options.samplesPerPixel) * 3U, 0U});
+    }
+    if (options.includeColorMatrix2) {
+      entries.push_back({
+          0xc622U, 10U,
+          static_cast<std::uint32_t>(options.samplesPerPixel) * 3U, 0U});
+    }
+    if (options.includeCalibrationIlluminant2) {
+      entries.push_back({0xc65bU, 3U, 1U, 17U});
+    }
+  }
+  if (!options.linearRaw) {
+    entries.push_back({0x828dU, 3U, 2U, 0U});
+    entries.push_back({0x828eU, 1U,
+                       static_cast<std::uint32_t>(cfaPattern.size()), 0U});
+    if (options.includeCfaPlaneColor) {
+      entries.push_back({0xc616U, 1U,
+                         static_cast<std::uint32_t>(
+                             options.cfaPlaneColors.size()), 0U});
+      if (options.duplicateCfaPlaneColor) {
+        entries.push_back({0xc616U, 1U,
+                           static_cast<std::uint32_t>(
+                               options.cfaPlaneColors.size()), 0U});
+      }
+    }
+    if (options.includeCfaLayout) {
+      entries.push_back({0xc617U, 3U, 1U, options.cfaLayout});
+      if (options.duplicateCfaLayout) {
+        entries.push_back({0xc617U, 3U, 1U, options.cfaLayout});
+      }
+    }
+  }
+  if (options.includeSampleFormat || options.samplesPerPixel > 1U) {
+    entries.push_back({0x0153U, 3U, options.samplesPerPixel, 1U});
+  }
+  if (options.includeBlackLevel) {
+    entries.push_back({0xc619U, 3U, 2U, 0U});
+    entries.push_back({0xc61aU, 4U,
+                       static_cast<std::uint32_t>(blackPattern.size()), 0U});
+  }
+  if (options.includeWhiteLevel) {
+    entries.push_back({0xc61dU, 4U,
+                       static_cast<std::uint32_t>(whiteLevels.size()), 0U});
+    if (options.duplicateWhiteLevel) {
+      entries.push_back({0xc61dU, 4U,
+                         static_cast<std::uint32_t>(whiteLevels.size()), 0U});
+    }
+  }
+  if (options.includeBlackLevelDeltaH) {
+    entries.push_back({0xc61bU, 10U, 1U, 0U});
+  }
+  if (options.includeBaselineExposure) {
+    entries.push_back({0xc62aU, 10U, 1U, 0U});
+  }
+  if (options.includeLinearResponseLimit) {
+    entries.push_back({0xc62eU, 5U, 1U, 0U});
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const TiffEntry& left, const TiffEntry& right) {
+              return left.tag < right.tag;
+            });
+
+  constexpr std::uint32_t kIfdOffset = 8U;
+  const std::uint64_t ifdBytes64 = 2U + entries.size() * 12U + 4U;
+  if (ifdBytes64 > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("precision fixture IFD is too large");
+  }
+  std::uint32_t payloadAt =
+      kIfdOffset + static_cast<std::uint32_t>(ifdBytes64);
+  const bool externalBits = options.samplesPerPixel > 2U;
+  const std::uint32_t bitsAt = externalBits ? payloadAt : 0U;
+  if (externalBits) payloadAt += options.samplesPerPixel * 2U;
+  const bool externalSampleFormat =
+      (options.includeSampleFormat || options.samplesPerPixel > 1U) &&
+      options.samplesPerPixel > 2U;
+  const std::uint32_t sampleFormatAt = externalSampleFormat ? payloadAt : 0U;
+  if (externalSampleFormat) payloadAt += options.samplesPerPixel * 2U;
+  const bool externalCfa = !options.linearRaw && cfaPattern.size() > 4U;
+  const std::uint32_t cfaAt = externalCfa ? payloadAt : 0U;
+  if (externalCfa) {
+    payloadAt += static_cast<std::uint32_t>(cfaPattern.size());
+  }
+  const bool externalBlack = options.includeBlackLevel && blackPattern.size() > 1U;
+  const std::uint32_t blackAt = externalBlack ? payloadAt : 0U;
+  if (externalBlack) {
+    payloadAt += static_cast<std::uint32_t>(blackPattern.size() * 4U);
+  }
+  const bool externalWhite =
+      options.includeWhiteLevel && whiteLevels.size() > 1U;
+  const std::uint32_t whiteAt = externalWhite ? payloadAt : 0U;
+  if (externalWhite) {
+    payloadAt += static_cast<std::uint32_t>(whiteLevels.size() * 4U);
+  }
+  const std::uint32_t baselineAt = options.includeBaselineExposure ? payloadAt : 0U;
+  if (options.includeBaselineExposure) payloadAt += 8U;
+  const std::uint32_t linearAt = options.includeLinearResponseLimit ? payloadAt : 0U;
+  if (options.includeLinearResponseLimit) payloadAt += 8U;
+  const std::uint32_t blackDeltaAt = options.includeBlackLevelDeltaH ? payloadAt : 0U;
+  if (options.includeBlackLevelDeltaH) payloadAt += 8U;
+  const std::uint32_t uniqueCameraModelAt = options.linearRaw ? payloadAt : 0U;
+  if (options.linearRaw) {
+    payloadAt += static_cast<std::uint32_t>(
+        sizeof(kLinearRawUniqueCameraModel));
+  }
+  const std::uint32_t colorMatrixAt =
+      options.linearRaw && options.includeColorMatrix1 ? payloadAt : 0U;
+  if (options.linearRaw && options.includeColorMatrix1) {
+    payloadAt += static_cast<std::uint32_t>(options.samplesPerPixel) * 3U * 8U;
+  }
+  const std::uint32_t colorMatrix2At =
+      options.linearRaw && options.includeColorMatrix2 ? payloadAt : 0U;
+  if (options.linearRaw && options.includeColorMatrix2) {
+    payloadAt += static_cast<std::uint32_t>(options.samplesPerPixel) * 3U * 8U;
+  }
+  const std::uint32_t stripAt = payloadAt;
+  if (strip.size() > std::numeric_limits<std::uint32_t>::max() - stripAt) {
+    throw std::invalid_argument("precision fixture container size overflows");
+  }
+  std::vector<std::uint8_t> bytes(stripAt + strip.size(), 0U);
+
+  const bool bigEndian = options.byteOrder == TiffByteOrder::kBigEndian;
+  const auto put16Ordered = [&](std::size_t at, std::uint16_t value) {
+    if (bigEndian) {
+      bytes.at(at) = static_cast<std::uint8_t>(value >> 8U);
+      bytes.at(at + 1U) = static_cast<std::uint8_t>(value & 0xffU);
+    } else {
+      bytes.at(at) = static_cast<std::uint8_t>(value & 0xffU);
+      bytes.at(at + 1U) = static_cast<std::uint8_t>(value >> 8U);
+    }
+  };
+  const auto put32Ordered = [&](std::size_t at, std::uint32_t value) {
+    if (bigEndian) {
+      bytes.at(at) = static_cast<std::uint8_t>(value >> 24U);
+      bytes.at(at + 1U) = static_cast<std::uint8_t>(value >> 16U);
+      bytes.at(at + 2U) = static_cast<std::uint8_t>(value >> 8U);
+      bytes.at(at + 3U) = static_cast<std::uint8_t>(value & 0xffU);
+    } else {
+      bytes.at(at) = static_cast<std::uint8_t>(value & 0xffU);
+      bytes.at(at + 1U) = static_cast<std::uint8_t>(value >> 8U);
+      bytes.at(at + 2U) = static_cast<std::uint8_t>(value >> 16U);
+      bytes.at(at + 3U) = static_cast<std::uint8_t>(value >> 24U);
+    }
+  };
+
+  bytes[0] = bigEndian ? 'M' : 'I';
+  bytes[1] = bytes[0];
+  put16Ordered(2U, 42U);
+  put32Ordered(4U, kIfdOffset);
+  put16Ordered(kIfdOffset, static_cast<std::uint16_t>(entries.size()));
+  std::size_t cursor = kIfdOffset + 2U;
+  for (TiffEntry entry : entries) {
+    put16Ordered(cursor, entry.tag);
+    put16Ordered(cursor + 2U, entry.type);
+    put32Ordered(cursor + 4U, entry.count);
+    const std::size_t valueAt = cursor + 8U;
+    if (entry.tag == 0x0102U) {
+      if (externalBits) {
+        put32Ordered(valueAt, bitsAt);
+      } else {
+        for (std::uint16_t sample = 0U; sample < options.samplesPerPixel; ++sample) {
+          put16Ordered(valueAt + sample * 2U, options.bitsPerSample);
+        }
+      }
+    } else if (entry.tag == 0x0153U) {
+      if (externalSampleFormat) {
+        put32Ordered(valueAt, sampleFormatAt);
+      } else {
+        for (std::uint16_t sample = 0U; sample < options.samplesPerPixel; ++sample) {
+          put16Ordered(valueAt + sample * 2U, 1U);
+        }
+      }
+    } else if (entry.tag == 0x828dU) {
+      put16Ordered(valueAt, options.cfaPatternRows);
+      put16Ordered(valueAt + 2U, options.cfaPatternColumns);
+    } else if (entry.tag == 0x828eU) {
+      if (externalCfa) {
+        put32Ordered(valueAt, cfaAt);
+      } else {
+        std::copy(cfaPattern.begin(), cfaPattern.end(), bytes.begin() + valueAt);
+      }
+    } else if (entry.tag == 0xc616U) {
+      std::copy(options.cfaPlaneColors.begin(), options.cfaPlaneColors.end(),
+                bytes.begin() + valueAt);
+    } else if (entry.tag == 0xc617U) {
+      put16Ordered(valueAt, options.cfaLayout);
+    } else if (entry.tag == 0xc612U) {
+      bytes[valueAt] = 1U;
+      bytes[valueAt + 1U] = 4U;
+    } else if (entry.tag == 0xc613U) {
+      bytes[valueAt] = 1U;
+      bytes[valueAt + 1U] = 1U;
+    } else if (entry.tag == 0xc619U) {
+      put16Ordered(valueAt, options.blackRepeatHeight);
+      put16Ordered(valueAt + 2U, options.blackRepeatWidth);
+    } else if (entry.tag == 0xc61aU) {
+      put32Ordered(valueAt, externalBlack ? blackAt : blackPattern.front());
+    } else if (entry.tag == 0xc61dU) {
+      put32Ordered(valueAt, externalWhite ? whiteAt : whiteLevels.front());
+    } else if (entry.tag == 0xc62aU) {
+      put32Ordered(valueAt, baselineAt);
+    } else if (entry.tag == 0xc62eU) {
+      put32Ordered(valueAt, linearAt);
+    } else if (entry.tag == 0xc61bU) {
+      put32Ordered(valueAt, blackDeltaAt);
+    } else if (entry.tag == 0xc614U) {
+      put32Ordered(valueAt, uniqueCameraModelAt);
+    } else if (entry.tag == 0xc621U) {
+      put32Ordered(valueAt, colorMatrixAt);
+    } else if (entry.tag == 0xc622U) {
+      put32Ordered(valueAt, colorMatrix2At);
+    } else if (entry.tag == 0x0111U) {
+      put32Ordered(valueAt, stripAt);
+    } else if (entry.type == 3U && entry.count == 1U) {
+      put16Ordered(valueAt, static_cast<std::uint16_t>(entry.value));
+    } else {
+      put32Ordered(valueAt, entry.value);
+    }
+    cursor += 12U;
+  }
+  put32Ordered(cursor, 0U);
+
+  if (externalBits) {
+    for (std::uint16_t sample = 0U; sample < options.samplesPerPixel; ++sample) {
+      put16Ordered(bitsAt + sample * 2U, options.bitsPerSample);
+    }
+  }
+  if (externalSampleFormat) {
+    for (std::uint16_t sample = 0U; sample < options.samplesPerPixel; ++sample) {
+      put16Ordered(sampleFormatAt + sample * 2U, 1U);
+    }
+  }
+  if (externalCfa) {
+    std::copy(cfaPattern.begin(), cfaPattern.end(), bytes.begin() + cfaAt);
+  }
+  if (externalBlack) {
+    for (std::size_t index = 0U; index < blackPattern.size(); ++index) {
+      put32Ordered(blackAt + index * 4U, blackPattern[index]);
+    }
+  }
+  if (externalWhite) {
+    for (std::size_t index = 0U; index < whiteLevels.size(); ++index) {
+      put32Ordered(whiteAt + index * 4U, whiteLevels[index]);
+    }
+  }
+  if (options.includeBaselineExposure) {
+    put32Ordered(baselineAt,
+                 static_cast<std::uint32_t>(options.baselineExposureNumerator));
+    put32Ordered(baselineAt + 4U,
+                 static_cast<std::uint32_t>(options.baselineExposureDenominator));
+  }
+  if (options.includeLinearResponseLimit) {
+    put32Ordered(linearAt, options.linearResponseNumerator);
+    put32Ordered(linearAt + 4U, options.linearResponseDenominator);
+  }
+  if (options.includeBlackLevelDeltaH) {
+    put32Ordered(blackDeltaAt, 0U);
+    put32Ordered(blackDeltaAt + 4U, 1U);
+  }
+  if (options.linearRaw) {
+    std::copy_n(
+        reinterpret_cast<const std::uint8_t*>(kLinearRawUniqueCameraModel),
+        sizeof(kLinearRawUniqueCameraModel),
+        bytes.begin() + uniqueCameraModelAt);
+    std::vector<std::uint32_t> matrixOffsets;
+    if (options.includeColorMatrix1) matrixOffsets.push_back(colorMatrixAt);
+    if (options.includeColorMatrix2) matrixOffsets.push_back(colorMatrix2At);
+    for (const std::uint32_t matrixAt : matrixOffsets) {
+      for (std::uint16_t plane = 0U; plane < options.samplesPerPixel; ++plane) {
+        for (std::uint16_t xyz = 0U; xyz < 3U; ++xyz) {
+          const std::size_t matrixIndex =
+              static_cast<std::size_t>(plane) * 3U + xyz;
+          // RGB rows form an identity matrix. A possible fourth sensor plane is
+          // a non-degenerate equal-energy row, keeping the 4x3 matrix rank three.
+          const std::int32_t numerator = plane < 3U
+              ? (plane == xyz ? 1 : 0)
+              : 1;
+          const std::int32_t denominator = plane < 3U ? 1 : 3;
+          put32Ordered(
+              matrixAt + matrixIndex * 8U,
+              static_cast<std::uint32_t>(numerator));
+          put32Ordered(
+              matrixAt + matrixIndex * 8U + 4U,
+              static_cast<std::uint32_t>(denominator));
+        }
+      }
+    }
+  }
+  std::copy(strip.begin(), strip.end(), bytes.begin() + stripAt);
+  return bytes;
+}
+
+std::vector<std::uint8_t> makePrecisionSubIfdDngWithPreviewMetadata() {
+  PrecisionDngOptions rawOptions;
+  const std::vector<std::uint8_t> raw =
+      makePrecisionUncompressedDng(rawOptions);
+  constexpr std::uint32_t kRootIfd = 8U;
+  constexpr std::uint32_t kPreviewWidth = 32U;
+  constexpr std::uint32_t kPreviewHeight = 32U;
+  constexpr std::uint32_t kPreviewBytes =
+      kPreviewWidth * kPreviewHeight * 3U;
+  std::vector<TiffEntry> rootEntries{
+      {0x00feU, 4U, 1U, 1U},
+      {0x0100U, 4U, 1U, kPreviewWidth},
+      {0x0101U, 4U, 1U, kPreviewHeight},
+      {0x0102U, 3U, 3U, 0U},
+      {0x0103U, 3U, 1U, 1U},
+      {0x0106U, 3U, 1U, 2U},
+      {0x0111U, 4U, 1U, 0U},
+      {0x0115U, 3U, 1U, 3U},
+      {0x0116U, 4U, 1U, kPreviewHeight},
+      {0x0117U, 4U, 1U, kPreviewBytes},
+      {0x011cU, 3U, 1U, 1U},
+      {0x014aU, 4U, 1U, 0U},
+      {0x0153U, 3U, 3U, 0U},
+      {0xc612U, 1U, 4U, 0x00000401U},
+      // These CFA-only values are intentionally non-qualified on the reduced
+      // RGB preview. Candidate-local parsing must not leak them into the RAW
+      // SubIFD selected by LibRaw geometry.
+      {0xc616U, 1U, 3U, 0x00010200U},
+      {0xc617U, 3U, 1U, 2U},
+      {0xc61aU, 4U, 1U, 1U},
+      {0xc61dU, 4U, 1U, 255U},
+      {0xc62aU, 10U, 1U, 0U},
+      {0xc62eU, 5U, 1U, 0U},
+  };
+  std::sort(rootEntries.begin(), rootEntries.end(),
+            [](const TiffEntry& left, const TiffEntry& right) {
+              return left.tag < right.tag;
+            });
+  const std::uint32_t rootEnd = kRootIfd + 2U +
+      static_cast<std::uint32_t>(rootEntries.size()) * 12U + 4U;
+  const std::uint32_t bitsAt = rootEnd;
+  const std::uint32_t formatAt = bitsAt + 6U;
+  const std::uint32_t baselineAt = formatAt + 6U;
+  const std::uint32_t linearAt = baselineAt + 8U;
+  const std::uint32_t previewAt = linearAt + 8U;
+  const std::uint32_t rawAt = previewAt + kPreviewBytes;
+  const std::uint64_t total = static_cast<std::uint64_t>(rawAt) + raw.size() - 8U;
+  if (total > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("SubIFD precision fixture is too large");
+  }
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(total), 0U);
+  bytes[0] = 'I';
+  bytes[1] = 'I';
+  put16(bytes, 2U, 42U);
+  put32(bytes, 4U, kRootIfd);
+  put16(bytes, kRootIfd, static_cast<std::uint16_t>(rootEntries.size()));
+  std::size_t cursor = kRootIfd + 2U;
+  for (const TiffEntry& entry : rootEntries) {
+    put16(bytes, cursor, entry.tag);
+    put16(bytes, cursor + 2U, entry.type);
+    put32(bytes, cursor + 4U, entry.count);
+    std::uint32_t value = entry.value;
+    if (entry.tag == 0x0102U) value = bitsAt;
+    else if (entry.tag == 0x0111U) value = previewAt;
+    else if (entry.tag == 0x014aU) value = rawAt;
+    else if (entry.tag == 0x0153U) value = formatAt;
+    else if (entry.tag == 0xc62aU) value = baselineAt;
+    else if (entry.tag == 0xc62eU) value = linearAt;
+    if (entry.type == 3U && entry.count == 1U) {
+      put16(bytes, cursor + 8U, static_cast<std::uint16_t>(value));
+    } else {
+      put32(bytes, cursor + 8U, value);
+    }
+    cursor += 12U;
+  }
+  put32(bytes, cursor, 0U);
+  for (std::size_t index = 0U; index < 3U; ++index) {
+    put16(bytes, bitsAt + index * 2U, 8U);
+    put16(bytes, formatAt + index * 2U, 1U);
+  }
+  put32(bytes, baselineAt, 1U);
+  put32(bytes, baselineAt + 4U, 1U);
+  put32(bytes, linearAt, 1U);
+  put32(bytes, linearAt + 4U, 2U);
+  std::fill(bytes.begin() + previewAt, bytes.begin() + rawAt, 127U);
+
+  std::copy(raw.begin() + 8U, raw.end(), bytes.begin() + rawAt);
+  const std::uint32_t delta = rawAt - 8U;
+  const std::uint16_t rawEntries = get16(bytes, rawAt);
+  const auto typeSize = [](std::uint16_t type) -> std::uint32_t {
+    switch (type) {
+      case 1U:
+      case 2U: return 1U;
+      case 3U: return 2U;
+      case 4U: return 4U;
+      case 5U:
+      case 10U: return 8U;
+      default: return 0U;
+    }
+  };
+  for (std::uint16_t index = 0U; index < rawEntries; ++index) {
+    const std::size_t entry = rawAt + 2U + index * 12U;
+    const std::uint16_t tag = get16(bytes, entry);
+    if (tag == 0xc612U) {
+      // DNGVersion is a container/root declaration. Retag the copied child
+      // bytes as bounded inline Software text so the positive SubIFD fixture
+      // remains structurally compliant with the dependency-safety contract.
+      put16(bytes, entry, 0x0131U);
+      put16(bytes, entry + 2U, 2U);
+      put32(bytes, entry + 4U, 4U);
+      continue;
+    }
+    const std::uint16_t type = get16(bytes, entry + 2U);
+    const std::uint32_t count = get32(bytes, entry + 4U);
+    const std::uint32_t elementBytes = typeSize(type);
+    const bool external = elementBytes != 0U &&
+        static_cast<std::uint64_t>(elementBytes) * count > 4U;
+    if (external || tag == 0x0111U || tag == 0x0144U) {
+      put32(bytes, entry + 8U, get32(bytes, entry + 8U) + delta);
+    }
+  }
+  const std::size_t nextAt = rawAt + 2U + rawEntries * 12U;
+  const std::uint32_t next = get32(bytes, nextAt);
+  if (next != 0U) put32(bytes, nextAt, next + delta);
+  return bytes;
+}
+
+std::vector<std::uint8_t> makeMalformedPrecisionLevelsDng() {
+  PrecisionDngOptions options;
+  options.bitsPerSample = 12U;
+  options.blackLevel = 64U;
+  options.whiteLevel = 4095U;
+  std::vector<std::uint8_t> bytes = makePrecisionUncompressedDng(options);
+  const std::uint32_t ifd = get32(bytes, 4U);
+  const std::uint16_t entryCount = get16(bytes, ifd);
+  for (std::uint16_t index = 0U; index < entryCount; ++index) {
+    const std::size_t entry =
+        static_cast<std::size_t>(ifd) + 2U + index * 12U;
+    if (get16(bytes, entry) == 0xc61dU) {
+      put32(bytes, entry + 8U, options.blackLevel);
+      return bytes;
+    }
+  }
+  throw std::logic_error("precision fixture WhiteLevel tag is absent");
+}
+
 std::vector<std::uint8_t> makeDeclaredOversizeUncompressedDng(
     std::uint32_t width, std::uint32_t height) {
   const std::vector<std::uint8_t> tinyStrip{0U, 0U};

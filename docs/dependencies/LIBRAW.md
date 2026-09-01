@@ -10,7 +10,7 @@ Status: implemented for ticket [Patch LibRaw to 0.22.2 and add hostile-RAW regre
 | Official archive | `https://www.libraw.org/data/LibRaw-0.22.2.tar.gz` |
 | Archive size | `1,682,962` bytes |
 | Archive SHA-256 | `de86b035655accff8d4010f1a221fdf50d353cb7b1422ba26f14a0db92612cfa` |
-| Audited patched-tree SHA-256 | `d1fd81838e54c83a608f91988cb5e00035891aeab1248bd92aa68b2f12007f77` over the sorted 100-file source/header manifest |
+| Audited patched-tree SHA-256 | `bc463c30e414781d2455a47b99c30741830798b5941a049782b560fbb3abc74c` over the sorted 100-file source/header manifest |
 | Annotated Git tag object | `24fa7e5463cbf8b8615dbd2b16c933a294d52400` |
 | Peeled release commit | `b93f6e45c194f5df9b02a43b1af9a54b4f41f33f` |
 | Signature | The annotated tag is not signed; the official URL plus archive SHA-256 is the shipping trust anchor. |
@@ -56,7 +56,9 @@ The complete manifest and patch hashes are in
 | `0020-bound-olympus-metadata-and-arithmetic.patch` | Validates Olympus 14-bit metadata, exact refills, unary work, shifts, predictors, and pixel narrowing. |
 | `0021-harden-panasonic-c8-decoder.patch` | Preserves raw C8 metadata counts, validates tables, destination geometry and each in-file source range, enforces bit budgets, and defines predictor arithmetic plus OpenMP error reduction. |
 | `0022-bound-fixed-header-string-reads.patch` | Bounds identify and MakerNote fixed-header comparisons and the dormant X3F model probe. The host gate enables X3FTOOLS to qualify this seam; it does not qualify the full optional parser for Android. |
-| `0023-record-local-modification-notices.patch` | Adds a dated Spektrafilm Android modification notice to every upstream file changed by patches 0001–0022. This is a notice-only patch; aggregate `2fb59481…` is retained only as the exact migration input to the final tree. |
+| `0023-record-local-modification-notices.patch` | Adds a dated Spektrafilm Android modification notice to every upstream file changed by patches 0001–0022. This is a notice-only patch; aggregate `2fb59481…` is retained only as the exact migration input to the 23-patch notice tree. |
+| `0024-define-xtrans-negative-index-arithmetic.patch` | Rewrites X-Trans neighbor offsets from undefined `-i << c` to the intended `-(i << c)`. A valid 520 x 520 public-seam X-Trans DNG keeps the exact pre-fix float digest `5238915555911424415` while ASan/UBSan stays clean. |
+| `0025-define-icc-s15fixed16-conversion.patch` | Rounds generated ICC XYZ coefficients in the signed domain before defined s15Fixed16 word encoding, preserving negative ACES matrix entries without floating-to-unsigned undefined behavior. |
 
 Panasonic C8 codebooks are intentionally decoded in metadata order. Requiring a
 prefix-free table would reject a real S5M2 table whose 8-bit entry shadows two
@@ -165,9 +167,15 @@ pinned/patched source and exercises the public sequence
 
 Local decoder evidence at implementation time used a byte-verified official
 archive plus the 22 behavioral hardening patches. Patch 0023 subsequently added
-notices only; current-tree CI and release gates still rebuild and verify the full
-23-patch aggregate. GCC 13 ASan + UBSan + float-cast-overflow passed 4/4
-CTest targets in both shipping-serial and OpenMP-required builds. The dedicated
+notices only. Patch 0024 then defined X-Trans negative-neighbor index arithmetic
+without changing its exact float output: the independently captured pre-fix and
+patched digest is `5238915555911424415`. Patch 0025 defines signed ICC
+s15Fixed16 conversion while retaining negative ACES profile coefficients. The
+current 25-patch `bc463c30…` aggregate passed all 7/7 shipping-serial host CTests
+under Clang 18.1.3 ASan + UBSan + float-cast-overflow on 2026-09-01, including
+both-endian hostile next/reduced IFDs and the complete RAW precision contract.
+Earlier #165 qualification passed 4/4 CTest
+targets in both shipping-serial and OpenMP-required builds. The dedicated
 first-use concurrency target passed under ThreadSanitizer; WSL required
 `setarch x86_64 -R` only to avoid its known shadow-memory/ASLR collision. Clang
 18 libFuzzer completed 1,000 public-LibRaw and 1,000 bounded-sniffer iterations
@@ -245,12 +253,52 @@ qualification. If any of those are unavailable, keep the release gate closed.
 
 LibRaw Android distribution route: UNRESOLVED.
 
-Native support in this build includes uncompressed RAW/DNG, internal
-lossless-JPEG/LJ92, and the qualified float-DEFLATE DNG path
-(`Compression=8`, `SampleFormat=3`). Integer/linear Compression 8 and Adobe
-0x80B2 deflate are rejected with the dedicated fallback classification. External
-lossy JPEG and JPEG-XL DNG are not enabled; a platform preview fallback is not
-equivalent to a high-bit scene-linear RAW decode.
+Native precision-parity support in this build includes uncompressed RAW/DNG and
+internal lossless-JPEG/LJ92. Floating-point DEFLATE
+(`Compression=8`, `SampleFormat=3`) is parsed only by the audited dependency
+corpus: the wrapper rejects it before LibRaw's quantizing memory-bitmap handoff.
+It, integer/linear Compression 8, and Adobe 0x80B2 deflate use the dedicated
+`DEFLATE_DNG` fallback classification. External lossy JPEG and JPEG-XL DNG are
+not enabled; every platform fallback is display-referred and is not equivalent
+to a high-bit scene-linear RAW decode.
+
+The v1 wrapper binds DNG metadata to the single non-reduced RAW IFD matching
+LibRaw geometry before and after unpack; root `DNGVersion` is the only inherited
+tag. Any valid or malformed non-root `DNGVersion` is hostile and rejects for a
+recognized TIFF even when IFD0 does not establish semantic DNG identity. Its
+bounded pre-open walk also rejects malformed/missing eligibility fields
+for every non-reduced RAW-looking IFD, plus unsafe BlackLevel conversion data in
+every walked IFD, including reduced/non-selected images. Both buffer and fd
+entry points therefore stop before `LibRaw::open_buffer`; a test-only observer
+asserts zero dependency-open attempts. `BlackLevelDeltaH/V` presence is also
+dependency-wide across bounded next/SubIFD paths, reduced images, and malformed
+eligibility. The walker tracks ten distinct IFD offsets, matching LibRaw's
+`LIBRAW_IFD_MAXCOUNT`, follows forward or backward next links, and rejects cycles,
+aliases, malformed/duplicate/over-capacity SubIFD declarations, out-of-bounds
+edges, and any depth/capacity exhaustion as incomplete before dependency open.
+An `II`/`MM` header with wrong or truncated TIFF magic is likewise rejected before
+LibRaw's endian-header dispatch. The review matrix proves 17 hostile classes in
+two byte orders through buffer and fd (68 zero-open assertions). Verified Bayer 2×2 and X-Trans 6×6
+additionally require the RGB-identity
+`CFAPlaneColor` mapping and rectangular `CFALayout` (including their specified
+defaults). Duplicate, malformed, remapped, or staggered selected-IFD tags fail
+before dependency parsing and preview tags cannot provide RAW provenance.
+
+Three/four-sample LinearRaw is qualified only with uniform BitsPerSample and
+SampleFormat arrays, chunky planar configuration, no ExtraSamples, a 1×1 black
+repeat, exact per-sample BlackLevel/WhiteLevel counts, and a complete local
+two-illuminant ColorMatrix1/2 pair. Matrix type, dimension, payload,
+denominators, and every plane row are checked pre-open; promoted matrices and
+LibRaw's output coefficients must keep every plane finite and active after
+identify. Spatial row×column×sample black matrices, custom CFA tables, and
+`BlackLevelDeltaH/V` fail with `PRECISION_METADATA` until a versioned contract
+can carry them. Every SHORT/LONG/RATIONAL BlackLevel element is parsed and bounded
+against the selected declared-bit maximum before `LibRaw::open_buffer`; fractional,
+zero-denominator, and out-of-range rational values cannot enter LibRaw conversion.
+
+LinearRaw level validation and effective-bit derivation use exactly its active
+three or four sample planes, and its public black/white lists have that same
+length. CFA keeps four LibRaw level slots so the second-green plane is preserved.
 
 LibRaw offers a choice of LGPL-2.1-only or CDDL-1.0. The distribution route for
 this static integration remains `UNRESOLVED`; including both upstream license

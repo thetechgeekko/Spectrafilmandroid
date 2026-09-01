@@ -58,12 +58,15 @@ enum class WhiteBalance(val nativeMode: Int) {
  * returns.
  * [colorSpace] is "ProPhoto RGB" — the decode path converts from its ACES2065-1
  * intermediate to the engine's linear ProPhoto input space.
+ * [precisionDescriptor] keeps source precision, effective levels, layout, route,
+ * and HDR-relevant metadata distinct from this float32 interchange buffer.
  */
 class LinearResult private constructor(
     data: ByteBuffer,
     val width: Int,
     val height: Int,
     val colorSpace: String = "ProPhoto RGB",
+    val precisionDescriptor: RawPrecisionDescriptor,
     private val release: (ByteBuffer) -> Unit,
 ) : AutoCloseable {
     // Capture the caller's logical sample window once. Later position/limit changes
@@ -89,7 +92,9 @@ class LinearResult private constructor(
         width: Int,
         height: Int,
         colorSpace: String = "ProPhoto RGB",
-    ) : this(data, width, height, colorSpace, {})
+        precisionDescriptor: RawPrecisionDescriptor =
+            RawPrecisionDescriptor.forManagedLinear(colorSpace),
+    ) : this(data, width, height, colorSpace, precisionDescriptor, {})
 
     /**
      * An explicitly held native-buffer lease. [data] is valid only until [close].
@@ -157,6 +162,7 @@ class LinearResult private constructor(
             data = data,
             width = width,
             height = height,
+            precisionDescriptor = RawPrecisionDescriptor.forManagedLinear("ProPhoto RGB"),
             release = { release() },
         )
 
@@ -165,9 +171,18 @@ class LinearResult private constructor(
             width: Int,
             height: Int,
             colorSpace: String,
+            precisionDescriptor: RawPrecisionDescriptor =
+                RawPrecisionDescriptor.forManagedLinear(colorSpace),
             release: (ByteBuffer) -> Unit,
         ): LinearResult = try {
-            LinearResult(data, width, height, colorSpace, release)
+            LinearResult(
+                data,
+                width,
+                height,
+                colorSpace,
+                precisionDescriptor,
+                release,
+            )
         } catch (constructionFailure: Throwable) {
             try {
                 release(data)
@@ -239,7 +254,16 @@ object RawDecoder {
         @JvmField val height: Int,
         @JvmField val colorSpace: String,
         @JvmField val allocationToken: Long,
-    )
+        descriptorWords: IntArray,
+        descriptorReals: FloatArray,
+    ) {
+        // Construct and validate while JNI still owns the publication attempt. If
+        // the ABI is malformed, NewObject fails and native publication rolls back
+        // the allocation instead of exposing a partially trusted result.
+        @JvmField
+        val precisionDescriptor: RawPrecisionDescriptor =
+            RawPrecisionDescriptor.fromNative(descriptorWords, descriptorReals)
+    }
 
     private val RAW_EXTENSIONS = setOf(
         "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
@@ -339,7 +363,13 @@ object RawDecoder {
         // Native gives little-/native-endian float32; tag the byte order so callers
         // reading as a FloatBuffer get correct values.
         data.order(ByteOrder.nativeOrder())
-        return LinearResult.fromNative(data, width, height, colorSpace) { owned ->
+        return LinearResult.fromNative(
+            data,
+            width,
+            height,
+            colorSpace,
+            precisionDescriptor,
+        ) { owned ->
             check(nativeRelease(allocationToken, owned) == NATIVE_RELEASED) {
                 "native RAW allocation ownership mismatch"
             }
@@ -355,14 +385,16 @@ object RawDecoder {
      *  * **Lossless-JPEG / LJ92** (Compression 7) — the common Pixel encoding;
      *    decoded natively by LibRaw's own internal lossless-JPEG code (no
      *    libjpeg needed).
-     *  * **Floating-point DEFLATE/ZIP** (Compression 8, SampleFormat 3) —
-     *    decoded natively with zlib from the NDK.
-     *
-     * Variants that still need a platform fallback (no libjpeg/libjxl vendored):
+     * Variants that need a typed, explicitly display-referred platform/next-codec
+     * fallback (no precision-preserving float/libjpeg/libjxl route is qualified):
      *
      *  * **Integer/linear DEFLATE** (Compression 8), and Adobe-deflate tag
      *    **0x80B2** — pinned LibRaw 0.22.2 does not decode these through the
      *    qualified path; surfaces as [DecodeStatus.DEFLATE_DNG].
+     *  * **Floating-point DEFLATE/ZIP** (Compression 8, SampleFormat 3) — LibRaw's
+     *    memory-bitmap route would quantize the float source before this module's
+     *    float32 boundary. It therefore fails closed as [DecodeStatus.DEFLATE_DNG]
+     *    instead of claiming native precision parity.
      *  * **Lossy-baseline-JPEG DNG** (DNG 1.4 lossy, Compression 0x884C; or
      *    old-style JPEG, Compression 6) — common in Samsung Expert RAW. LibRaw
      *    `unpack()` fails; the native layer throws [RawDecodeException] with
@@ -392,8 +424,10 @@ object RawDecoder {
      *         DecodeStatus.FILE_UNSUPPORTED -> {
      *             val src = ImageDecoder.createSource(resolver, uri) // API 28+
      *             val bmp = ImageDecoder.decodeBitmap(src)
-     *             // NOTE: bmp is display-referred sRGB, not linear ProPhoto, so this
-     *             // bypasses the spectral pipeline (preview / import only).
+     *             val source = RawPrecisionDescriptor
+     *                 .forPlatformDisplayReferredFallback("sRGB")
+     *             // `source` can only be PLATFORM_DISPLAY_REFERRED: this bitmap is
+     *             // not native RAW parity and bypasses the scene-linear pipeline.
      *         }
      *         else -> throw e
      *     }
@@ -445,7 +479,6 @@ object RawDecoder {
  *  - Lossless-JPEG / LJ92 DNG (Compression 7) — common Google Pixel and other
  *    computational-RAW DNGs; LibRaw decodes these with its own internal
  *    lossless-JPEG code (no libjpeg required).
- *  - Floating-point DEFLATE / ZIP DNG (Compression 8, SampleFormat 3) — via zlib.
  *  - Mainstream camera RAW (CR2/CR3/NEF/ARW/RAF/ORF/RW2/...).
  */
 enum class DecodeStatus(val code: Int) {
@@ -460,7 +493,7 @@ enum class DecodeStatus(val code: Int) {
     FORMAT(8),
     CANCELLED(9),
 
-    /** Integer/linear or 0x80B2 DEFLATE unsupported here, or zlib is absent. */
+    /** Unsupported DEFLATE layout, or a float DNG with no precision-safe RGB route. */
     DEFLATE_DNG(10),
 
     /**
@@ -476,6 +509,9 @@ enum class DecodeStatus(val code: Int) {
      * decodes JXL). See [RawDecoder].
      */
     JPEGXL_DNG(12),
+
+    /** Contradictory/unbounded precision, black/white, or CFA metadata. */
+    PRECISION_METADATA(13),
     ;
 
     companion object {

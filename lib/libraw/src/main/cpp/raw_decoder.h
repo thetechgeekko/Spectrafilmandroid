@@ -21,6 +21,7 @@
 #define SPECTRAFILM_RAW_DECODER_H
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -103,9 +104,10 @@ struct DecodeOptions {
 //       src/decoders/decoders_dcraw.cpp), which is compiled unconditionally and
 //       does NOT require USE_JPEG/libjpeg. (USE_JPEG only adds *lossy* baseline
 //       JPEG, below.)
-//   * Floating-point DEFLATE/ZIP DNG (Compression 8,
-//       SampleFormat=3) via USE_ZLIB (NDK libz linked). Integer/linear deflate
-//       remains a typed platform/next-codec fallback in pinned LibRaw 0.22.2.
+//   * Floating-point DEFLATE/ZIP parsing exists in LibRaw via USE_ZLIB, but its
+//       dcraw memory-bitmap route quantizes before this module's float boundary.
+//       The wrapper therefore routes SampleFormat=3 to a typed display-referred /
+//       next-codec fallback rather than labelling it native precision parity.
 //   * Mainstream camera RAW (CR2/CR3/NEF/ARW/RAF/ORF/RW2/...).
 enum DecodeStatus {
     SFRAW_OK = 0,
@@ -120,8 +122,9 @@ enum DecodeStatus {
     SFRAW_ERR_CANCELLED = 9,      // cooperative caller cancellation
 
     // ---- DNG compressions that need a platform-decoder fallback ----
-    // Integer/linear DEFLATE DNG unsupported by pinned LibRaw 0.22.2, or a
-    // floating-point DEFLATE DNG in a build without USE_ZLIB.
+    // Integer/linear DEFLATE DNG unsupported by pinned LibRaw 0.22.2, or any
+    // floating-point DNG for which no precision-preserving RGB route is
+    // qualified (including DEFLATE regardless of the zlib parser being built).
     SFRAW_ERR_DEFLATE_DNG = 10,
 
     // Lossy-baseline-JPEG-compressed DNG (DNG 1.4 lossy, Compression 0x884C, and
@@ -134,14 +137,130 @@ enum DecodeStatus {
     // libjxl / the Adobe DNG SDK, neither of which is vendored. App should fall
     // back to the platform ImageDecoder (Android 14+ decodes JXL).
     SFRAW_ERR_JPEGXL_DNG = 12,
+
+    // Source precision/level/layout metadata was contradictory, unbounded, or
+    // insufficient to describe the admitted decode without guessing.
+    SFRAW_ERR_PRECISION_METADATA = 13,
 };
 
 // Human-readable name for a DNG Compression tag value (for diagnostics / logs).
 // Handles values outside the sniffer's enum too.
 const char* dngCompressionName(int compressionValue);
 
+enum class RawSampleFormat : int {
+    Unknown = 0,
+    UnsignedInteger = 1,
+    FloatingPoint = 2,
+};
+
+enum class RawByteOrder : int {
+    Unknown = 0,
+    LittleEndian = 1,
+    BigEndian = 2,
+    NotApplicable = 3,
+};
+
+enum class RawPacking : int {
+    Unknown = 0,
+    TiffPackedBits = 1,
+    TiffWord16 = 2,
+    TiffFloat = 3,
+    LosslessCompressed = 4,
+    VendorDefined = 5,
+};
+
+enum class RawPixelLayout : int {
+    Unknown = 0,
+    Bayer2x2 = 1,
+    XTrans6x6 = 2,
+    Linear = 3,
+    Layered = 4,
+    CustomCfa = 5,
+};
+
+enum class RawDecoderRoute : int {
+    LibRawNative = 1,
+};
+
+enum class RawPostprocessRoute : int {
+    LibRawAcesToFloat32ProPhoto = 1,
+};
+
+enum class RawLinearSpace : int {
+    LinearProPhotoRgb = 1,
+};
+
+enum class RawLevelProvenance : int {
+    Unknown = 0,
+    DngMetadata = 1,
+    DeclaredBitsDefault = 2,
+    DecoderMetadata = 3,
+};
+
+// Versioned, bounded source contract published with every successful native
+// decode. Black semantics are lossless: effective code black at CFA position
+// (row,col,channel) is common + channel[channel] + repeatingPattern[row,col].
+// DNG LinearRaw v1 is consequently admitted only as a 1x1 repeat with one
+// BlackLevel/WhiteLevel per three/four-sample channel; a spatial
+// row-column-sample matrix requires a versioned representation.
+// White levels are per LibRaw channel after source selection and unpack, but
+// before dcraw_process mutates level state. A zero declared/effective bit count means
+// unknown/not-applicable, never an inferred zero-bit sensor.
+struct RawPrecisionDescriptor {
+    static constexpr int kVersion = 1;
+    static constexpr std::size_t kMaxBlackPatternEntries = 64U;
+    static constexpr std::size_t kMaxCfaPatternEntries = 36U;
+    // JNI carrier ABI v1. Kotlin validates these exact sizes before reading any
+    // index; changing either requires a descriptor version bump and both-side tests.
+    static constexpr std::size_t kJniWordCount = 136U;
+    static constexpr std::size_t kJniRealCount = 2U;
+
+    int version = kVersion;
+    RawSampleFormat sampleFormat = RawSampleFormat::Unknown;
+    int declaredBitsPerSample = 0;
+    int effectiveBitsPerSample = 0;
+    int processedBitsPerSample = 0;
+    RawByteOrder byteOrder = RawByteOrder::Unknown;
+    RawPacking packing = RawPacking::Unknown;
+    int containerCompression = -1;
+    RawPixelLayout pixelLayout = RawPixelLayout::Unknown;
+    int colorChannels = 0;
+    std::uint32_t cfaFilterCode = 0U;
+    int cfaPatternRows = 0;
+    int cfaPatternColumns = 0;
+    std::array<std::uint8_t, kMaxCfaPatternEntries> cfaPattern{};
+    std::size_t cfaPatternCount = 0U;
+    RawDecoderRoute decoderRoute = RawDecoderRoute::LibRawNative;
+    RawPostprocessRoute postprocessRoute =
+        RawPostprocessRoute::LibRawAcesToFloat32ProPhoto;
+    RawLinearSpace linearSpace = RawLinearSpace::LinearProPhotoRgb;
+    RawLevelProvenance whiteLevelProvenance = RawLevelProvenance::Unknown;
+    RawLevelProvenance blackLevelProvenance = RawLevelProvenance::Unknown;
+    bool halfSizeRequested = false;
+
+    std::uint32_t blackLevelCommon = 0U;
+    std::array<std::uint32_t, 4> blackLevelChannels{};
+    int blackPatternRows = 0;
+    int blackPatternColumns = 0;
+    std::array<std::uint32_t, kMaxBlackPatternEntries> blackPattern{};
+    std::size_t blackPatternCount = 0U;
+    std::array<std::uint32_t, 4> whiteLevels{};
+
+    bool baselineExposurePresent = false;
+    float baselineExposure = 0.0f;
+    bool linearResponseLimitPresent = false;
+    float linearResponseLimit = 0.0f;
+
+    // Proxy state is explicit and reports both independent reduction routes.
+    // `requestedMaxLongEdge == 0` means no post-bitmap cap was requested;
+    // `outputSubsampleStep == 1` means that route did not reduce this result.
+    int requestedMaxLongEdge = 0;
+    int outputSubsampleStep = 1;
+};
+
 // Linear scene-referred result. Pixels are interleaved RGB float32, row-major,
-// normalized 16-bit -> [0,1] (value / 65535), in linear ProPhoto RGB primaries
+// normalized from LibRaw's requested high-precision processed bitmap into
+// [0,1], in linear ProPhoto RGB primaries
 // (decoded via ACES2065-1, then converted — see the file header / aces2065ToProPhotoRGB).
 // Move-only malloc-backed output storage. The decoder writes every element before
 // publication, so it deliberately avoids std::vector::resize's full-buffer zero fill.
@@ -220,6 +339,7 @@ struct DecodeResult {
     int status = SFRAW_ERR_UNKNOWN;
     // Underlying LibRaw error code (LIBRAW_*), for diagnostics. 0 if N/A.
     int librawCode = 0;
+    RawPrecisionDescriptor descriptor;
 };
 
 // Decode from an in-memory RAW/DNG buffer (e.g. a SAF InputStream read fully).

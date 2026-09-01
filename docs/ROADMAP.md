@@ -51,8 +51,9 @@ Milestones are vertical slices. Each ends with something demonstrable and a pari
 > Ektar baked-only; `print_ektar` golden proves the second pair). App features: 16-bit TIFF
 > export (live), Lightroom-style Auto-exposure UI, profile-curve browser, non-destructive
 > recipe/sidecar layer, engine/render status pill, full source EXIF copy on export, Google Ultra
-> HDR export, the qualified floating-point Compression-8 DNG subset (integer/0x80B2 remains
-> typed fallback), and a **major Lightroom-style UI redesign** (edge-to-edge,
+> HDR export, typed display-referred fallback for every Compression-8 DNG
+> (including float sources whose LibRaw bitmap route would quantize), and a
+> **major Lightroom-style UI redesign** (edge-to-edge,
 > pinned preview + 90° rotate, horizontal scrollable category bar, inline panel, back navigation).
 > Issue #6 is essentially resolved: lens blur (camera+scanner) and scanner LUT acceleration are
 > now wired too (the latter opt-in/default-off, default path byte-identical). Glare-on-print is

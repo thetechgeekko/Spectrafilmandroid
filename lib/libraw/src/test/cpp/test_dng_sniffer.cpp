@@ -231,8 +231,8 @@ int main() {
       check("classify/integer deflate -> DEFLATE_DNG",
             classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }
     { auto b = buildPixel(7, 8, 4080, 4080, 3);
-      check("classify/float deflate -> UNPACK",
-            classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_UNPACK); }
+      check("classify/float deflate -> DEFLATE_DNG",
+            classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }
     { auto b = buildPixel(7, 0x80B2, 4080, 4080, 1);
       check("classify/integer 0x80B2 -> DEFLATE_DNG",
             classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }

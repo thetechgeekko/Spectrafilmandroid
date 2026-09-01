@@ -1,0 +1,29 @@
+diff --git a/src/demosaic/xtrans_demosaic.cpp b/src/demosaic/xtrans_demosaic.cpp
+--- a/src/demosaic/xtrans_demosaic.cpp
++++ b/src/demosaic/xtrans_demosaic.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-09-01; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+@@ -275,10 +277,12 @@ void LibRaw::xtrans_interpolate(int passes)
+                     {
+                         for (c = 0; c < 2; c++, h ^= 2)
+                         {
+-                            int g = 2 * rix[0][1] - rix[i << c][1] - rix[-i << c][1];
+-                            color[h][d] = g + rix[i << c][h] + rix[-i << c][h];
++                            int g = 2 * rix[0][1] - rix[i << c][1] -
++                                rix[-(i << c)][1];
++                            color[h][d] = g + rix[i << c][h] + rix[-(i << c)][h];
+                             if (d > 1)
+-                                diff[d] += SQR((float)rix[i << c][1] - (float)rix[-i << c][1] -
+-                                    (float)rix[i << c][h] + (float)rix[-i << c][h]) + SQR((float)g);
++                                diff[d] += SQR((float)rix[i << c][1] -
++                                    (float)rix[-(i << c)][1] - (float)rix[i << c][h] +
++                                    (float)rix[-(i << c)][h]) + SQR((float)g);
+                         }
+                         if (d > 1 && (d & 1))
+                             if (diff[d - 1] < diff[d])

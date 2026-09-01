@@ -99,14 +99,15 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     # LibRaw build knobs.
     # ----------------------------------------------------------------------
     # We disable the heavy optional deps we do not need (jasper/lcms). Keep
-    # zlib enabled for the compressed-DNG subset that pinned LibRaw 0.22.2
-    # actually implements:
+    # zlib enabled for the compressed-DNG parser subset that pinned LibRaw 0.22.2
+    # implements and that the hostile-input corpus audits:
     #
     #   * DEFLATE/ZIP DNG (Compression 8) with SampleFormat=3
     #     floating-point samples. USE_ZLIB gates this path and the Android NDK
-    #     supplies libz. Integer/linear deflate is not implemented safely by
-    #     this pinned decoder and surfaces as SFRAW_ERR_DEFLATE_DNG so the app
-    #     can choose a platform/next-codec fallback.
+    #     supplies libz. The wrapper deliberately routes these float samples
+    #     before LibRaw's quantizing dcraw bitmap output, so this compile-time
+    #     parser capability is not advertised as native precision parity.
+    #     Integer/linear deflate also surfaces as SFRAW_ERR_DEFLATE_DNG.
     #
     #   * Lossy-JPEG-compressed DNG (DNG 1.4 lossy, Compression 0x884C; legacy 6).
     #     LibRaw decodes these via libjpeg; guarded by USE_JPEG. The NDK does
@@ -134,14 +135,14 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
             # Deterministic zero-filled backing storage for truncated inputs.
             LIBRAW_CALLOC_RAWSTORE)
 
-    # zlib / floating-point deflate DNG: ON by default (NDK provides libz).
+    # zlib / floating-point deflate parser: ON by default (NDK provides libz).
     option(SFRAW_WITH_ZLIB
-            "Build LibRaw with floating-point deflate-DNG (zlib) support" ON)
+            "Build LibRaw's audited floating-point deflate-DNG parser" ON)
     sfraw_is_shipping_config(_sfraw_shipping_config)
     if (_sfraw_shipping_config AND NOT SFRAW_WITH_ZLIB)
         message(FATAL_ERROR
                 "sfraw: shipping builds require SFRAW_WITH_ZLIB=ON for "
-                "floating-point deflate DNG support")
+                "the audited floating-point deflate DNG parser")
     endif ()
     # libjpeg / lossy-DNG: OFF by default (NDK has no libjpeg). Point
     # SFRAW_LIBRAW_JPEG_TARGET at a CMake target that provides libjpeg
@@ -152,11 +153,11 @@ if (EXISTS "${LIBRAW_DIR}/libraw/libraw.h")
     if (SFRAW_WITH_ZLIB)
         list(APPEND SFRAW_LIBRAW_DEFS USE_ZLIB)
         message(STATUS
-                "sfraw: floating-point deflate DNG support ENABLED (zlib)")
+                "sfraw: floating-point deflate DNG parser ENABLED (wrapper routes before quantizing bitmap)")
     else ()
         list(APPEND SFRAW_LIBRAW_DEFS NO_ZLIB)
         message(WARNING
-                "sfraw: floating-point deflate DNG support DISABLED; "
+                "sfraw: floating-point deflate DNG parser DISABLED; "
                 "Compression 8 inputs will use typed fallback.")
     endif ()
 

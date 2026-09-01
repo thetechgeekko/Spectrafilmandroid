@@ -213,6 +213,76 @@ std::vector<std::uint8_t> makeOverlappingPanasonicC8Tiff();
 std::vector<std::uint8_t> makeValidUncompressedDng(
     std::uint32_t width = 256U, std::uint32_t height = 256U);
 
+// Project-owned, deterministic precision fixture for the production wrapper.
+// Integer samples are TIFF/DNG row-packed MSB-first for 8/10/12/14-bit input;
+// 16-bit samples are native TIFF SHORT words in the selected byte order. Empty
+// `samples` creates five vertical monotonic bands spanning black..white. The
+// builder rejects impossible sizes and out-of-range code values before allocating.
+enum class TiffByteOrder {
+  kLittleEndian,
+  kBigEndian,
+};
+
+struct PrecisionDngOptions {
+  std::uint32_t width = 64U;
+  std::uint32_t height = 64U;
+  std::uint16_t bitsPerSample = 12U;
+  // LinearRaw uses chunky, uniform multi-sample TIFF arrays. CFA remains one
+  // sample per pixel. The production metadata seam must bind each array to this
+  // count and reject mixed element values instead of reading only element zero.
+  std::uint16_t samplesPerPixel = 1U;
+  bool linearRaw = false;
+  bool includeSampleFormat = false;
+  bool includePlanarConfiguration = true;
+  std::uint16_t planarConfiguration = 1U;
+  bool includeExtraSamples = false;
+  TiffByteOrder byteOrder = TiffByteOrder::kLittleEndian;
+  std::uint32_t blackLevel = 64U;
+  std::uint32_t whiteLevel = 4095U;
+  std::uint16_t blackRepeatWidth = 1U;
+  std::uint16_t blackRepeatHeight = 1U;
+  // DNG scan order is row-column-sample. For CFA SamplesPerPixel is one; for
+  // the qualified LinearRaw v1 subset this is exactly one value per channel.
+  std::vector<std::uint32_t> blackPattern;
+  std::vector<std::uint32_t> whiteLevels;
+  std::vector<std::uint16_t> samples;
+  bool includeWhiteLevel = true;
+  bool includeBlackLevel = true;
+  bool includeBaselineExposure = true;
+  bool includeLinearResponseLimit = true;
+  bool includeBlackLevelDeltaH = false;
+  bool duplicateWhiteLevel = false;
+  bool includeCfaPlaneColor = true;
+  bool includeCfaLayout = true;
+  bool duplicateCfaPlaneColor = false;
+  bool duplicateCfaLayout = false;
+  bool includeColorMatrix1 = true;
+  bool includeColorMatrix2 = true;
+  bool includeCalibrationIlluminant1 = true;
+  bool includeCalibrationIlluminant2 = true;
+  std::vector<std::uint8_t> cfaPlaneColors{0U, 1U, 2U};
+  std::uint16_t cfaLayout = 1U;
+  std::uint16_t cfaPatternRows = 2U;
+  std::uint16_t cfaPatternColumns = 2U;
+  std::vector<std::uint8_t> cfaPattern;
+  std::int32_t baselineExposureNumerator = -1;
+  std::int32_t baselineExposureDenominator = 2;
+  std::uint32_t linearResponseNumerator = 3U;
+  std::uint32_t linearResponseDenominator = 4U;
+};
+
+std::vector<std::uint8_t> makePrecisionUncompressedDng(
+    const PrecisionDngOptions& options);
+
+// Reduced RGB IFD0 with conflicting precision/HDR tags plus the exact RAW IFD
+// as a SubIFD. Only the selected RAW IFD may contribute descriptor metadata.
+std::vector<std::uint8_t> makePrecisionSubIfdDngWithPreviewMetadata();
+
+// Structurally valid 12-bit DNG whose WhiteLevel equals its BlackLevel. LibRaw
+// may identify the container, but the production descriptor gate must reject it
+// before unpack/processing because normalization would be undefined.
+std::vector<std::uint8_t> makeMalformedPrecisionLevelsDng();
+
 // A structurally valid uncompressed DNG whose declared raw plane exceeds the
 // production decoder's immediate in-memory pixel budget. The strip itself is
 // intentionally tiny: decodeFromBuffer() must reject from metadata immediately

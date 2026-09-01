@@ -1,0 +1,26 @@
+diff --git a/src/postprocessing/postprocessing_utils_dcrdefs.cpp b/src/postprocessing/postprocessing_utils_dcrdefs.cpp
+--- a/src/postprocessing/postprocessing_utils_dcrdefs.cpp
++++ b/src/postprocessing/postprocessing_utils_dcrdefs.cpp
+@@ -1,5 +1,7 @@
+ /* -*- C++ -*-
+  * Copyright 2019-2025 LibRaw LLC (info@libraw.org)
++ * Modified by Spektrafilm Android contributors, 2026-09-01; see the
++ * corresponding source distribution's bundled patch manifest.
+  *
+  LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
+  dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
+@@ -88,7 +90,13 @@ void LibRaw::convert_to_rgb()
+       {
+         for (num = k = 0; k < 3; k++)
+           num += LibRaw_constants::xyzd50_srgb[i][k] * inverse[j][k];
+-        oprof[pbody[j * 3 + 23] / 4 + i + 2] = unsigned(num * 0x10000 + 0.5);
++        // ICC XYZType stores signed s15Fixed16 values. Converting a negative
++        // floating-point value directly to unsigned is undefined; round in the
++        // signed domain first, then use the defined modulo conversion to encode
++        // its 32-bit two's-complement representation in the profile buffer.
++        const int signed_fixed = static_cast<int>(
++            num * 0x10000 + (num < 0.0 ? -0.5 : 0.5));
++        oprof[pbody[j * 3 + 23] / 4 + i + 2] = static_cast<unsigned>(signed_fixed);
+       }
+     for (i = 0; i < (int)phead[0] / 4; i++)
+       oprof[i] = htonl(oprof[i]);

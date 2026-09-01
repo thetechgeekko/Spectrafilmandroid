@@ -31,6 +31,28 @@ Output is interleaved RGB **float32**, row-major, normalized from LibRaw's
 16-bit linear ACES intermediate and converted to **linear ProPhoto RGB** before
 it crosses JNI. It is delivered as a direct `ByteBuffer` with no 8-bit round-trip.
 
+Every successful native result also carries `RawPrecisionDescriptor` v1. It keeps
+these contracts separate instead of collapsing them into one “bit depth”:
+
+- **Declared source storage:** integer `BitsPerSample` (or bounded decoder metadata),
+  sample format, TIFF byte order/packing/compression, and CFA/layout.
+- **Effective sensor/code range:** exact common + per-channel + repeating-cell
+  BlackLevel model, per-channel WhiteLevel, provenance, and the distinct-value
+  precision between them. Zero is a real code value; absence is represented separately.
+- **Interchange/compute:** one float32 RGB ownership boundary. Integer samples up
+  to 16 bits are exactly representable before adopted LibRaw/CPU mixed-precision
+  demosaic and colour arithmetic. This is not a claim that the whole CPU stack is f64.
+- **Downstream/output:** the engine's f32/Vulkan working precision, PNG/TIFF/JPEG
+  output depth, and HDR transfer/gain-map metadata are independent contracts; none
+  can be inferred from sensor bits or the descriptor's linear float32 buffer.
+
+The JNI carrier is fixed-size and versioned (136 bounded integer words + two
+floats), validated during `NativeResult` construction before publication commits.
+Contradictory levels, unsupported CFA shapes, or ambiguous precision fail with
+`PRECISION_METADATA`. Platform codec fallback uses
+`RawPrecisionDescriptor.forPlatformDisplayReferredFallback(...)`; that factory
+cannot label its output `LIBRAW_NATIVE` or scene-linear parity.
+
 ### Native ownership and cancellation
 
 Each native decode returns an owning `LinearResult`. Call `close()` (normally
@@ -123,7 +145,7 @@ selected full-resolution raw plane, not from the file extension or preview:
 |------------------------|---------------|-------------------------------------------------------|
 | 1 — uncompressed       | ✅ native     | plain unpack                                          |
 | 7 — lossless JPEG/LJ92 | ✅ native     | LibRaw **internal** lossless-JPEG (`lossless_jpeg_load_raw` / `ljpeg_start` / `ljpeg_row`, `src/decoders/decoders_dcraw.cpp`) — **no libjpeg required** |
-| 8 — DEFLATE, float (`SampleFormat=3`) | ✅ native | qualified LibRaw 0.22.2 float path + NDK zlib |
+| 8 — DEFLATE, float (`SampleFormat=3`) | ❌ precision fallback | LibRaw's bitmap handoff would quantize float input before f32; fails closed as `DEFLATE_DNG` |
 | 8 — DEFLATE, integer/linear | ❌ fallback | pinned decoder rejects safely → `DEFLATE_DNG` |
 | 0x80B2 — Adobe deflate | ❌ fallback | no qualified 0.22.2 route → `DEFLATE_DNG` |
 | 6 — old-style JPEG     | ❌ fallback   | needs libjpeg → `LOSSY_JPEG_DNG`                      |
@@ -137,13 +159,71 @@ unconditionally. A Pixel/Samsung/other mobile DNG must still be classified from
 its actual raw IFD; model-level blanket support is not claimed.
 
 > Mobile DNGs commonly embed a large JPEG **preview** in IFD0 with the real
-> Bayer/linear raw in a **SubIFD**. The `dngsniff` sniffer walks IFD0 + SubIFDs
-> + the next-IFD chain and picks the largest **non-reduced** (`NewSubFileType`
-> bit 0 clear) image, so a JPEG preview is never mistaken for the raw
-> compression. The unpack-failure classifier only flags genuinely-unsupported
-> codecs (integer/linear Compression 8 or 0x80B2 → `DEFLATE_DNG`, 6 / 0x884C →
-> `LOSSY_JPEG_DNG`, 0xCD42 → `JPEGXL_DNG`). A failed native float-deflate,
-> uncompressed, or LJ92 decode stays a genuine data error (`UNPACK`).
+> Bayer/linear raw in a **SubIFD**. The `dngsniff` precision path walks IFD0,
+> bounded SubIFDs, and the next-IFD chain, keeps metadata candidate-local, and
+> requires exactly one non-reduced RAW IFD whose width/height match LibRaw's
+> identified and finalized raw geometry. Zero or multiple matches fail with
+> `PRECISION_METADATA`; the largest-plane heuristic remains diagnostic-only.
+> Only root `DNGVersion` is container-inherited; any valid or malformed child
+> declaration rejects before dependency open, including when IFD0 is ordinary
+> TIFF. Bits/sample format, CFA,
+> BlackLevel/WhiteLevel, BaselineExposure, and LinearResponseLimit never inherit
+> from a preview, sibling, or parent IFD. The unpack-failure classifier only flags genuinely-unsupported
+> codecs/precision routes (all Compression 8 or 0x80B2 → `DEFLATE_DNG`, 6 / 0x884C →
+> `LOSSY_JPEG_DNG`, 0xCD42 → `JPEGXL_DNG`). A failed native uncompressed or
+> LJ92 decode stays a genuine data error (`UNPACK`). Float
+> deflate is parsed by the audited LibRaw build for security coverage but is
+> deliberately stopped before its quantizing memory-bitmap output.
+
+The same bounded TIFF walk runs before `LibRaw::open_buffer`. Malformed external
+precision payloads (including BlackLevel offsets/counts) are therefore rejected
+as `PRECISION_METADATA` before they can reach dependency metadata arithmetic.
+This gate covers every viable non-reduced CFA/LinearRaw candidate, including a
+smaller plane LibRaw might inspect but not finally select; final geometry binding
+is a separate post-open decision. BlackLevel conversion safety and
+`BlackLevelDeltaH/V` presence are dependency-wide across every bounded next-IFD
+and SubIFD, including reduced and malformed-eligibility children, on both buffer
+and fd routes. The walk tracks ten distinct IFD offsets (LibRaw's own IFD storage
+cap), follows next links in either direction, and fails closed on repeated,
+malformed, over-capacity, out-of-bounds, or otherwise incomplete SubIFD graphs.
+Even an `II`/`MM` header with wrong TIFF magic is stopped before dependency parser
+dispatch. Declared integer precision is admitted only in
+the 8-through-16-bit range.
+
+Every successful native result also carries a bounded v1 precision descriptor:
+declared/effective/processed precision, integer sample format, byte order and
+packing, compression, explicit CFA rows/columns/pattern, exact
+common/channel/repeating black levels,
+per-channel white levels and provenance, BaselineExposure/LinearResponseLimit
+presence, postprocess/linear-space route, and both requested and actually-applied
+proxy reduction. A public fallback factory can create only a display-referred
+descriptor; it cannot label platform pixels as native RAW parity.
+
+For v1, CFA admission is deliberately narrow: LibRaw's filter state must prove a
+true repeating Bayer 2×2 or X-Trans 6×6 pattern, `CFAPlaneColor` must be the RGB
+identity mapping (its specified default), and `CFALayout` must be rectangular
+(its specified default). Duplicate, malformed, remapped, or staggered selected-IFD
+CFA tags fail before dependency parsing. The `filters == 1` custom table and any
+non-repeating encoded filter period also fail closed.
+
+LinearRaw accepts only a losslessly representable v1 subset: three or four
+samples, uniform `BitsPerSample`/`SampleFormat` arrays whose count equals
+`SamplesPerPixel`, a 1×1 `BlackLevelRepeatDim`, exactly one BlackLevel and one
+WhiteLevel per sample channel when those tags are present, and no CFA tags.
+Spatial row×column×sample black matrices require a later descriptor version.
+Inline and offset arrays in both TIFF byte orders are covered. Every admitted
+SHORT, LONG, or RATIONAL BlackLevel value is parsed before `LibRaw::open_buffer`
+and bounded by the selected IFD's declared `BitsPerSample` maximum. Fractional,
+zero-denominator, or out-of-declared-range rationals fail rather than being
+rounded. `BlackLevelDeltaH/V` remains a typed unsupported spatial transform.
+The project-owned LinearRaw fixtures include required Orientation and
+UniqueCameraModel identity plus a valid paired-illuminant set of
+ColorPlanes-by-3 SRATIONAL matrices (including ColorMatrix1). That pairing drives
+LibRaw's post-identify field promotion instead of silently zeroing the fourth
+matrix row, and the host gate perturbs each of three/four planes independently.
+LinearRaw validation, effective precision, and public level lists use exactly its
+active three or four sample planes. CFA retains four LibRaw level slots, including
+the second-green slot when the mosaic has three colours.
 
 A lightweight host unit test (`src/test/cpp/test_dng_sniffer.cpp`) compiles `raw_decoder.cpp`
 with `-include` (no LibRaw needed — the decoder guards its LibRaw include) and
@@ -161,6 +241,20 @@ The security gate is the separate `src/test/host` CMake project. It builds the
 exact patched LibRaw source with Clang ASan/UBSan and exercises hostile TIFF and
 lossless-JPEG inputs through `open_buffer -> unpack -> dcraw_process`; its
 libFuzzer entry follows the official OSS-Fuzz public-seam strategy.
+
+The physical-device JNI boundary gate is:
+
+```powershell
+.\gradlew.bat :lib:libraw:connectedDebugAndroidTest
+```
+
+This module deliberately uses `RawDecoderBoundaryInstrumentation`, a small custom
+instrumentation runner, instead of exposing JUnit test cases. Android Gradle Plugin's
+UTP summary therefore reports `0 tests`; that count is not the acceptance marker.
+The generated `testlog/test-results.log` must contain both
+`INSTRUMENTATION_RESULT: stream=OK (8 tests)` and `INSTRUMENTATION_CODE: -1`.
+Any other stream, code, missing log, install failure, or zero-test summary without
+those two exact instrumentation markers is a failed gate.
 
 ## Half-size (proxy) decode — memory and performance option
 

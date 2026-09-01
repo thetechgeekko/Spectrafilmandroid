@@ -18,6 +18,14 @@ set(SFRAW_LIBRAW_SOURCE_DIR "" CACHE PATH
 
 set(_SFRAW_LIBRAW_PATCH_DIR "${CMAKE_CURRENT_LIST_DIR}/../patches")
 set(_SFRAW_LIBRAW_PATCHED_TREE_SHA256
+    "bc463c30e414781d2455a47b99c30741830798b5941a049782b560fbb3abc74c")
+# Exact aggregate shipped by the immediately preceding 24-patch resolver.
+# It is accepted only as a migration source for the ICC conversion patch.
+set(_SFRAW_LIBRAW_PATCHED_TREE_SHA256_24
+    "bf5e58dc1c950f19110311b319a967f819930e656b0e8802ed4a4a133ae818d4")
+# Exact aggregate shipped by the immediately preceding 23-patch resolver.
+# It is accepted only as a migration source for the X-Trans arithmetic patch.
+set(_SFRAW_LIBRAW_PATCHED_TREE_SHA256_23
     "d1fd81838e54c83a608f91988cb5e00035891aeab1248bd92aa68b2f12007f77")
 # Exact aggregate shipped by the immediately preceding 22-patch resolver.
 # It is accepted only as a migration source for the modification-notice patch.
@@ -51,7 +59,9 @@ set(_SFRAW_LIBRAW_PATCHES
     "${_SFRAW_LIBRAW_PATCH_DIR}/0020-bound-olympus-metadata-and-arithmetic.patch"
     "${_SFRAW_LIBRAW_PATCH_DIR}/0021-harden-panasonic-c8-decoder.patch"
     "${_SFRAW_LIBRAW_PATCH_DIR}/0022-bound-fixed-header-string-reads.patch"
-    "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch")
+    "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch"
+    "${_SFRAW_LIBRAW_PATCH_DIR}/0024-define-xtrans-negative-index-arithmetic.patch"
+    "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch")
 
 # Multi-config generators can emit a shipping configuration even though
 # CMAKE_BUILD_TYPE is empty. Treat them as shipping-capable and normalize the
@@ -303,6 +313,14 @@ function(sfraw_resolve_libraw out_var)
         "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch"
         "3d8d2eef4f59ef665d58fede9ae780d523deb5a119c6c67ed6844ad4812edc38"
         "local modification-notice patch")
+    _sfraw_verify_file_sha256(
+        "${_SFRAW_LIBRAW_PATCH_DIR}/0024-define-xtrans-negative-index-arithmetic.patch"
+        "71b8b6810416f407549a52c3b21cb91720d6935dee1da8adfbd1ef50e53e138a"
+        "defined X-Trans negative-index arithmetic patch")
+    _sfraw_verify_file_sha256(
+        "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch"
+        "895b644886247bb3853002c27aa5d56475429c05f62ec556360a036dc8f3a9a4"
+        "defined ICC s15Fixed16 conversion patch")
 
     sfraw_is_shipping_config(_shipping_config)
     if (_shipping_config)
@@ -364,36 +382,73 @@ function(sfraw_resolve_libraw out_var)
         message(STATUS "sfraw: existing LibRaw tree matches the audited aggregate")
     else ()
         _sfraw_tree_has_expected_aggregate(
-            "${_source_dir}" "${_SFRAW_LIBRAW_PATCHED_TREE_SHA256_22}"
-            _is_exact_22_patch_tree)
-        if (_is_exact_22_patch_tree)
+            "${_source_dir}" "${_SFRAW_LIBRAW_PATCHED_TREE_SHA256_24}"
+            _is_exact_24_patch_tree)
+        if (_is_exact_24_patch_tree)
             message(STATUS
-                "sfraw: migrating exact audited 22-patch tree to patch 23")
+                "sfraw: migrating exact audited 24-patch tree to patch 25")
             _sfraw_apply_patch(
                 "${_source_dir}"
-                "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch")
+                "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch")
         else ()
             _sfraw_tree_has_expected_aggregate(
-                "${_source_dir}" "${_SFRAW_LIBRAW_PATCHED_TREE_SHA256_21}"
-                _is_exact_21_patch_tree)
-        endif ()
-        if (_is_exact_21_patch_tree)
-            message(STATUS
-                "sfraw: migrating exact audited 21-patch tree to patches 22-23")
-            _sfraw_apply_patch(
-                "${_source_dir}"
-                "${_SFRAW_LIBRAW_PATCH_DIR}/0022-bound-fixed-header-string-reads.patch")
-            _sfraw_apply_patch(
-                "${_source_dir}"
-                "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch")
-        elseif (NOT _is_exact_22_patch_tree)
-            foreach (_patch IN LISTS _SFRAW_LIBRAW_PATCHES)
-                if (NOT EXISTS "${_patch}")
-                    message(FATAL_ERROR
-                        "sfraw: required local patch is missing: ${_patch}")
+                "${_source_dir}" "${_SFRAW_LIBRAW_PATCHED_TREE_SHA256_23}"
+                _is_exact_23_patch_tree)
+            if (_is_exact_23_patch_tree)
+                message(STATUS
+                    "sfraw: migrating exact audited 23-patch tree to patches 24-25")
+                _sfraw_apply_patch(
+                    "${_source_dir}"
+                    "${_SFRAW_LIBRAW_PATCH_DIR}/0024-define-xtrans-negative-index-arithmetic.patch")
+                _sfraw_apply_patch(
+                    "${_source_dir}"
+                    "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch")
+            else ()
+                _sfraw_tree_has_expected_aggregate(
+                    "${_source_dir}" "${_SFRAW_LIBRAW_PATCHED_TREE_SHA256_22}"
+                    _is_exact_22_patch_tree)
+                if (_is_exact_22_patch_tree)
+                    message(STATUS
+                        "sfraw: migrating exact audited 22-patch tree to patches 23-25")
+                    _sfraw_apply_patch(
+                        "${_source_dir}"
+                        "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch")
+                    _sfraw_apply_patch(
+                        "${_source_dir}"
+                        "${_SFRAW_LIBRAW_PATCH_DIR}/0024-define-xtrans-negative-index-arithmetic.patch")
+                    _sfraw_apply_patch(
+                        "${_source_dir}"
+                        "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch")
+                else ()
+                    _sfraw_tree_has_expected_aggregate(
+                        "${_source_dir}" "${_SFRAW_LIBRAW_PATCHED_TREE_SHA256_21}"
+                        _is_exact_21_patch_tree)
+                    if (_is_exact_21_patch_tree)
+                        message(STATUS
+                            "sfraw: migrating exact audited 21-patch tree to patches 22-25")
+                        _sfraw_apply_patch(
+                            "${_source_dir}"
+                            "${_SFRAW_LIBRAW_PATCH_DIR}/0022-bound-fixed-header-string-reads.patch")
+                        _sfraw_apply_patch(
+                            "${_source_dir}"
+                            "${_SFRAW_LIBRAW_PATCH_DIR}/0023-record-local-modification-notices.patch")
+                        _sfraw_apply_patch(
+                            "${_source_dir}"
+                            "${_SFRAW_LIBRAW_PATCH_DIR}/0024-define-xtrans-negative-index-arithmetic.patch")
+                        _sfraw_apply_patch(
+                            "${_source_dir}"
+                            "${_SFRAW_LIBRAW_PATCH_DIR}/0025-define-icc-s15fixed16-conversion.patch")
+                    else ()
+                        foreach (_patch IN LISTS _SFRAW_LIBRAW_PATCHES)
+                            if (NOT EXISTS "${_patch}")
+                                message(FATAL_ERROR
+                                    "sfraw: required local patch is missing: ${_patch}")
+                            endif ()
+                            _sfraw_apply_patch("${_source_dir}" "${_patch}")
+                        endforeach ()
+                    endif ()
                 endif ()
-                _sfraw_apply_patch("${_source_dir}" "${_patch}")
-            endforeach ()
+            endif ()
         endif ()
     endif ()
 
@@ -660,6 +715,14 @@ function(sfraw_resolve_libraw out_var)
         "${_source_dir}/src/metadata/tiff.cpp"
         "if \\(rawopcode.data\\)"
         "duplicate DNG opcode rejection")
+    _sfraw_assert_contains(
+        "${_source_dir}/src/demosaic/xtrans_demosaic.cpp"
+        "rix\\[-\\(i << c\\)\\]"
+        "defined X-Trans negative index arithmetic")
+    _sfraw_assert_contains(
+        "${_source_dir}/src/postprocessing/postprocessing_utils_dcrdefs.cpp"
+        "static_cast<unsigned>\\(signed_fixed\\)"
+        "defined ICC s15Fixed16 signed conversion")
 
     set(_sfraw_locally_modified_files
         "internal/var_defines.h"
@@ -685,6 +748,14 @@ function(sfraw_resolve_libraw out_var)
             "Modified by Spektrafilm Android contributors, 2026-08-30"
             "dated local modification notice")
     endforeach ()
+    _sfraw_assert_contains(
+        "${_source_dir}/src/demosaic/xtrans_demosaic.cpp"
+        "Modified by Spektrafilm Android contributors, 2026-09-01"
+        "dated X-Trans local modification notice")
+    _sfraw_assert_contains(
+        "${_source_dir}/src/postprocessing/postprocessing_utils_dcrdefs.cpp"
+        "Modified by Spektrafilm Android contributors, 2026-09-01"
+        "dated ICC conversion local modification notice")
 
     file(READ "${_source_dir}/src/postprocessing/postprocessing_aux.cpp" _wavelet)
     # Do not include the trailing semicolon in the match: CMake treats it as a

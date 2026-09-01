@@ -7,6 +7,7 @@
 #include <jni.h>
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -163,7 +164,9 @@ enum class JavaPublicationFailure {
     DirectBuffer,
     ResultAbi,
     ColorSpace,
-    ResultConstruction,
+    Descriptor,
+    DescriptorValidation,
+    ResultConstructionNoMemory,
 };
 
 struct JavaPublicationContext {
@@ -190,6 +193,158 @@ bool cancellationLeaseRequested(void* opaque) noexcept {
     return cancellation != nullptr && isCancelled(*cancellation);
 }
 
+enum class DescriptorArrayResult {
+    Success,
+    Invalid,
+    AllocationFailure,
+};
+
+DescriptorArrayResult createDescriptorArrays(
+        JNIEnv* env, const spectrafilm::RawPrecisionDescriptor& source,
+        jintArray* javaWords, jfloatArray* javaReals) {
+    constexpr std::size_t kWordCount =
+        spectrafilm::RawPrecisionDescriptor::kJniWordCount;
+    constexpr std::size_t kRealCount =
+        spectrafilm::RawPrecisionDescriptor::kJniRealCount;
+    constexpr std::size_t kBlackPatternAt = 24U;
+    constexpr std::size_t kWhiteLevelsAt = 88U;
+    constexpr std::size_t kCfaPatternCountAt = 92U;
+    constexpr std::size_t kCfaPatternAt = 93U;
+    constexpr std::size_t kBaselinePresentAt = 129U;
+    constexpr std::size_t kLinearResponsePresentAt = 130U;
+    constexpr std::size_t kCompressionAt = 131U;
+    constexpr std::size_t kRequestedMaxLongEdgeAt = 132U;
+    constexpr std::size_t kOutputSubsampleStepAt = 133U;
+    constexpr std::size_t kCfaPatternRowsAt = 134U;
+    constexpr std::size_t kCfaPatternColumnsAt = 135U;
+    static_assert(spectrafilm::RawPrecisionDescriptor::kMaxBlackPatternEntries == 64U);
+    static_assert(spectrafilm::RawPrecisionDescriptor::kMaxCfaPatternEntries == 36U);
+    static_assert(kBlackPatternAt +
+                      spectrafilm::RawPrecisionDescriptor::kMaxBlackPatternEntries ==
+                  kWhiteLevelsAt);
+    static_assert(kCfaPatternAt +
+                      spectrafilm::RawPrecisionDescriptor::kMaxCfaPatternEntries ==
+                  kBaselinePresentAt);
+    static_assert(kCfaPatternColumnsAt + 1U == kWordCount);
+    const bool blackShapeValid =
+        source.blackPatternRows >= 0 && source.blackPatternRows <= 8 &&
+        source.blackPatternColumns >= 0 && source.blackPatternColumns <= 8 &&
+        ((source.blackPatternCount == 0U && source.blackPatternRows == 0 &&
+          source.blackPatternColumns == 0) ||
+         (source.blackPatternRows > 0 && source.blackPatternColumns > 0 &&
+          static_cast<std::size_t>(source.blackPatternRows) *
+                  static_cast<std::size_t>(source.blackPatternColumns) ==
+              source.blackPatternCount));
+    const bool cfaShapeValid =
+        source.cfaPatternRows >= 0 && source.cfaPatternRows <= 6 &&
+        source.cfaPatternColumns >= 0 && source.cfaPatternColumns <= 6 &&
+        ((source.cfaPatternCount == 0U && source.cfaPatternRows == 0 &&
+          source.cfaPatternColumns == 0) ||
+         (source.cfaPatternRows > 0 && source.cfaPatternColumns > 0 &&
+          static_cast<std::size_t>(source.cfaPatternRows) *
+                  static_cast<std::size_t>(source.cfaPatternColumns) ==
+              source.cfaPatternCount));
+    if (!blackShapeValid || !cfaShapeValid ||
+        source.blackPatternCount >
+            spectrafilm::RawPrecisionDescriptor::kMaxBlackPatternEntries ||
+        source.cfaPatternCount >
+            spectrafilm::RawPrecisionDescriptor::kMaxCfaPatternEntries ||
+        source.requestedMaxLongEdge < 0 || source.outputSubsampleStep < 1) {
+        return DescriptorArrayResult::Invalid;
+    }
+
+    std::array<jint, kWordCount> words{};
+    words[0] = source.version;
+    words[1] = static_cast<jint>(source.sampleFormat);
+    words[2] = source.declaredBitsPerSample;
+    words[3] = source.effectiveBitsPerSample;
+    words[4] = source.processedBitsPerSample;
+    words[5] = static_cast<jint>(source.byteOrder);
+    words[6] = static_cast<jint>(source.packing);
+    words[7] = static_cast<jint>(source.pixelLayout);
+    words[8] = source.colorChannels;
+    static_assert(sizeof(words[9]) == sizeof(source.cfaFilterCode));
+    std::memcpy(&words[9], &source.cfaFilterCode, sizeof(words[9]));
+    words[10] = static_cast<jint>(source.decoderRoute);
+    words[11] = static_cast<jint>(source.postprocessRoute);
+    words[12] = static_cast<jint>(source.linearSpace);
+    words[13] = static_cast<jint>(source.whiteLevelProvenance);
+    words[14] = static_cast<jint>(source.blackLevelProvenance);
+    words[15] = source.halfSizeRequested ? 1 : 0;
+    words[16] = static_cast<jint>(source.blackLevelCommon);
+    for (std::size_t index = 0U; index < 4U; ++index) {
+        words[17U + index] =
+            static_cast<jint>(source.blackLevelChannels[index]);
+    }
+    words[21] = source.blackPatternRows;
+    words[22] = source.blackPatternColumns;
+    words[23] = static_cast<jint>(source.blackPatternCount);
+    for (std::size_t index = 0U; index < source.blackPatternCount; ++index) {
+        words[kBlackPatternAt + index] =
+            static_cast<jint>(source.blackPattern[index]);
+    }
+    for (std::size_t index = 0U; index < 4U; ++index) {
+        words[kWhiteLevelsAt + index] =
+            static_cast<jint>(source.whiteLevels[index]);
+    }
+    words[kCfaPatternCountAt] = static_cast<jint>(source.cfaPatternCount);
+    for (std::size_t index = 0U; index < source.cfaPatternCount; ++index) {
+        words[kCfaPatternAt + index] = source.cfaPattern[index];
+    }
+    words[kBaselinePresentAt] = source.baselineExposurePresent ? 1 : 0;
+    words[kLinearResponsePresentAt] =
+        source.linearResponseLimitPresent ? 1 : 0;
+    words[kCompressionAt] = source.containerCompression;
+    words[kRequestedMaxLongEdgeAt] = source.requestedMaxLongEdge;
+    words[kOutputSubsampleStepAt] = source.outputSubsampleStep;
+    words[kCfaPatternRowsAt] = source.cfaPatternRows;
+    words[kCfaPatternColumnsAt] = source.cfaPatternColumns;
+    const std::array<jfloat, kRealCount> reals{{
+        source.baselineExposure,
+        source.linearResponseLimit,
+    }};
+
+    jintArray wordArray = env->NewIntArray(static_cast<jsize>(words.size()));
+    if (wordArray == nullptr) return DescriptorArrayResult::AllocationFailure;
+    env->SetIntArrayRegion(wordArray, 0, static_cast<jsize>(words.size()),
+                           words.data());
+    if (env->ExceptionCheck()) {
+        env->DeleteLocalRef(wordArray);
+        return DescriptorArrayResult::AllocationFailure;
+    }
+    jfloatArray realArray = env->NewFloatArray(static_cast<jsize>(reals.size()));
+    if (realArray == nullptr) {
+        env->DeleteLocalRef(wordArray);
+        return DescriptorArrayResult::AllocationFailure;
+    }
+    env->SetFloatArrayRegion(realArray, 0, static_cast<jsize>(reals.size()),
+                             reals.data());
+    if (env->ExceptionCheck()) {
+        env->DeleteLocalRef(realArray);
+        env->DeleteLocalRef(wordArray);
+        return DescriptorArrayResult::AllocationFailure;
+    }
+    *javaWords = wordArray;
+    *javaReals = realArray;
+    return DescriptorArrayResult::Success;
+}
+
+bool consumePendingOutOfMemory(JNIEnv* env) {
+    if (!env->ExceptionCheck()) return false;
+    jthrowable pending = env->ExceptionOccurred();
+    env->ExceptionClear();
+    jclass oomClass = env->FindClass("java/lang/OutOfMemoryError");
+    if (oomClass == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (pending != nullptr) env->DeleteLocalRef(pending);
+        return true;
+    }
+    const bool isOom = pending != nullptr && env->IsInstanceOf(pending, oomClass);
+    env->DeleteLocalRef(oomClass);
+    if (pending != nullptr) env->DeleteLocalRef(pending);
+    return isOom;
+}
+
 sfraw::jni::PublicationDecision attemptJavaPublication(
         const sfraw::jni::NativePublication& publication, void* opaque) {
     auto& context = *static_cast<JavaPublicationContext*>(opaque);
@@ -208,7 +363,7 @@ sfraw::jni::PublicationDecision attemptJavaPublication(
     jmethodID constructor = resultClass != nullptr
         ? context.env->GetMethodID(
               resultClass, "<init>",
-              "(Ljava/nio/ByteBuffer;IILjava/lang/String;J)V")
+              "(Ljava/nio/ByteBuffer;IILjava/lang/String;J[I[F)V")
         : nullptr;
     if (constructor == nullptr) {
         context.failure = JavaPublicationFailure::ResultAbi;
@@ -221,13 +376,28 @@ sfraw::jni::PublicationDecision attemptJavaPublication(
         context.failure = JavaPublicationFailure::ColorSpace;
         return sfraw::jni::PublicationDecision::Failed;
     }
+    jintArray descriptorWords = nullptr;
+    jfloatArray descriptorReals = nullptr;
+    const DescriptorArrayResult descriptorResult = createDescriptorArrays(
+        context.env, context.decoded->descriptor, &descriptorWords,
+        &descriptorReals);
+    if (descriptorResult != DescriptorArrayResult::Success) {
+        context.failure = descriptorResult == DescriptorArrayResult::Invalid
+            ? JavaPublicationFailure::DescriptorValidation
+            : JavaPublicationFailure::Descriptor;
+        return sfraw::jni::PublicationDecision::Failed;
+    }
     context.javaResult = context.env->NewObject(
         resultClass, constructor, owned,
         static_cast<jint>(context.decoded->width),
         static_cast<jint>(context.decoded->height), colorSpace,
-        static_cast<jlong>(publication.token));
+        static_cast<jlong>(publication.token), descriptorWords, descriptorReals);
+    context.env->DeleteLocalRef(descriptorReals);
+    context.env->DeleteLocalRef(descriptorWords);
     if (context.javaResult == nullptr) {
-        context.failure = JavaPublicationFailure::ResultConstruction;
+        context.failure = consumePendingOutOfMemory(context.env)
+            ? JavaPublicationFailure::ResultConstructionNoMemory
+            : JavaPublicationFailure::DescriptorValidation;
         return sfraw::jni::PublicationDecision::Failed;
     }
     context.constructMs = context.markPhase();
@@ -291,7 +461,17 @@ jobject toJavaResult(JNIEnv* env, spectrafilm::DecodeResult& result,
                     env, "failed to create RAW color-space metadata",
                     spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
                 break;
-            case JavaPublicationFailure::ResultConstruction:
+            case JavaPublicationFailure::Descriptor:
+                throwRawDecodeException(
+                    env, "failed to publish bounded RAW precision descriptor",
+                    spectrafilm::SFRAW_ERR_NO_MEMORY, 0);
+                break;
+            case JavaPublicationFailure::DescriptorValidation:
+                throwRawDecodeException(
+                    env, "invalid native RAW precision descriptor",
+                    spectrafilm::SFRAW_ERR_PRECISION_METADATA, 0);
+                break;
+            case JavaPublicationFailure::ResultConstructionNoMemory:
                 // Replace VM-specific construction failures (most commonly OOM)
                 // with the stable typed contract used by every JNI failure path.
                 throwRawDecodeException(env, "failed to construct RAW result",

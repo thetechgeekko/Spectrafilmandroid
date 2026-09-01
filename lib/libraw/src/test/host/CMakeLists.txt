@@ -147,6 +147,17 @@ target_compile_definitions(sfraw_decoder_resource_limits_test PRIVATE
 target_link_libraries(sfraw_decoder_resource_limits_test
                       PRIVATE sfraw_public_api_test_support)
 
+add_executable(sfraw_raw_precision_contract_test
+               test_raw_precision_contract.cpp
+               "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp/raw_decoder.cpp")
+target_include_directories(sfraw_raw_precision_contract_test PRIVATE
+                           "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp")
+target_compile_definitions(sfraw_raw_precision_contract_test PRIVATE
+                           SFRAW_TESTING=1
+                           USE_ZLIB=1)
+target_link_libraries(sfraw_raw_precision_contract_test
+                      PRIVATE sfraw_public_api_test_support)
+
 # First-party bounded TIFF/DNG diagnostic parser. Force the lightweight
 # no-LibRaw branch even on developer hosts that happen to install system LibRaw;
 # this keeps the test independent from the pinned dependency target above.
@@ -234,6 +245,14 @@ if(BUILD_TESTING)
     sfraw.decoder.resource-limits
     PROPERTIES
       TIMEOUT 10
+      ENVIRONMENT
+        "ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:strict_string_checks=1;UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+  add_test(NAME sfraw.raw-precision.contract
+           COMMAND sfraw_raw_precision_contract_test)
+  set_tests_properties(
+    sfraw.raw-precision.contract
+    PROPERTIES
+      TIMEOUT 30
       ENVIRONMENT
         "ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:strict_string_checks=1;UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
   add_test(NAME sfraw.ljpeg.concurrent-first-use
