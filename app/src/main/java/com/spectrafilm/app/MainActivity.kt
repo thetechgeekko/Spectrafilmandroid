@@ -946,12 +946,12 @@ class MainActivity : ComponentActivity() {
         var status by remember { mutableStateOf(initialEditorStatus) }
         var exportPhase by remember { mutableStateOf(initialExportState.phase) }
         var exportRuntimeRunId by remember { mutableStateOf(initialExportState.runtimeRunId) }
-        var exporting by remember {
-            mutableStateOf(exportPhase == EditorExportPhase.RUNNING || exportPhase == EditorExportPhase.SUCCESS)
-        }
-        var exportDone by remember {
-            mutableStateOf(exportPhase == EditorExportPhase.SUCCESS)
-        }
+        // #161: busy/done are DERIVED from the one export state machine, never parallel
+        // flags — the pill can no longer claim "Exporting…" over a finished export, and no
+        // path can forget to clear a boolean the phase transition already implies.
+        val exportInFlight = exportPhase == EditorExportPhase.RUNNING
+        val exportDone = exportPhase == EditorExportPhase.SUCCESS
+        val exportMaskVisible = exportInFlight || exportDone
         // Lightroom-style export sheet: per-export format / quality / size / colour / name, instead
         // of the global Settings defaults. Seeded from Settings and remembered back on export.
         var showExportSheet by remember {
@@ -1198,8 +1198,6 @@ class MainActivity : ComponentActivity() {
             when (val runtime = exportRuntimeState) {
                 ExportRuntimeState.Idle -> {
                     if (exportPhase == EditorExportPhase.RECONCILING) {
-                        exporting = false
-                        exportDone = false
                         exportRuntimeRunId = null
                         status = "previous export interrupted · storage reconciliation is running"
                     }
@@ -1213,8 +1211,6 @@ class MainActivity : ComponentActivity() {
                         if (exportRuntimeRunId == runtime.runId) {
                             exportPhase = EditorExportPhase.RECONCILING
                             exportRuntimeRunId = null
-                            exporting = false
-                            exportDone = false
                         }
                         return@LaunchedEffect
                     }
@@ -1229,8 +1225,6 @@ class MainActivity : ComponentActivity() {
                     }
                     exportPhase = EditorExportPhase.RUNNING
                     exportRuntimeRunId = runtime.runId
-                    exporting = true
-                    exportDone = false
                     status = "rendering full resolution…"
                     sessionCheckpointAction[0]?.invoke()
                 }
@@ -1244,8 +1238,6 @@ class MainActivity : ComponentActivity() {
                         if (exportRuntimeRunId == runtime.runId) {
                             exportRuntimeRunId = null
                             exportPhase = EditorExportPhase.RECONCILING
-                            exporting = false
-                            exportDone = false
                         }
                         return@LaunchedEffect
                     }
@@ -1259,8 +1251,6 @@ class MainActivity : ComponentActivity() {
                     when (val pending = runtime.outcome) {
                         is ExportTerminalOutcome.Success -> {
                             exportPhase = EditorExportPhase.SUCCESS
-                            exporting = true
-                            exportDone = true
                             status = "saved to Pictures/Spektrafilm"
                         }
                         is ExportTerminalOutcome.Failure -> {
@@ -1269,13 +1259,9 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 EditorExportPhase.FAILURE
                             }
-                            exporting = false
-                            exportDone = false
                         }
                         is ExportTerminalOutcome.Cancelled -> {
                             exportPhase = EditorExportPhase.CANCELLED
-                            exporting = false
-                            exportDone = false
                         }
                     }
                     val durableTerminal = awaitDurableEditorSessionCheckpoint(
@@ -1332,8 +1318,6 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             if (!identityAuthorized) {
-                                exporting = false
-                                exportDone = false
                                 exportPhase = EditorExportPhase.RECONCILING
                                 status = "export completed for a previous or unauthorized source"
                                 sessionCheckpointAction[0]?.invoke()
@@ -1349,8 +1333,6 @@ class MainActivity : ComponentActivity() {
                                     "residual=${outcome.totalMs - accounted} total=${outcome.totalMs}",
                             )
                             Diag.i("export format=${outcome.format.name} ok in ${outcome.totalMs}ms")
-                            exporting = true
-                            exportDone = true
                             exportPhase = EditorExportPhase.SUCCESS
                             status = "saved to Pictures/Spektrafilm"
                         }
@@ -1359,7 +1341,6 @@ class MainActivity : ComponentActivity() {
                                 "export format=${outcome.format.name} failed after " +
                                     "${outcome.elapsedMs}ms: ${outcome.cause.message}",
                             )
-                            exporting = false
                             if (outcome.cause is ExportReconciliationPendingException) {
                                 exportPhase = EditorExportPhase.RECONCILING
                                 status = "export outcome pending reconciliation · restart before retry"
@@ -1383,8 +1364,6 @@ class MainActivity : ComponentActivity() {
                                 "export format=${outcome.format.name} cancelled after " +
                                     "${outcome.elapsedMs}ms",
                             )
-                            exporting = false
-                            exportDone = false
                             exportPhase = EditorExportPhase.CANCELLED
                             status = "export cancelled"
                         }
@@ -3024,7 +3003,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(filmGroups, printGroups) { onProfileGroups(filmGroups, printGroups) }
 
         fun openExportSheetIfAllowed() {
-            if (engine != null && sourceRenderAllowed && !previewBusy && !exporting) {
+            if (engine != null && sourceRenderAllowed && !previewBusy && !exportInFlight) {
                 showExportSheet = true
             }
         }
@@ -3073,8 +3052,8 @@ class MainActivity : ComponentActivity() {
             Column(Modifier.fillMaxSize()) {
                 // --- TOP BAR ---
                 EditorTopBar(
-                    canExport = engine != null && sourceRenderAllowed && !previewBusy && !exporting,
-                    exporting = exporting,
+                    canExport = engine != null && sourceRenderAllowed && !previewBusy && !exportInFlight,
+                    exporting = exportInFlight,
                     canUndo = editHistory.canUndo,
                     canRedo = editHistory.canRedo,
                     onUndo = { doUndo() },
@@ -3108,7 +3087,7 @@ class MainActivity : ComponentActivity() {
                         before = beforePreview,
                         busy = previewBusy,
                         decoding = decoding,
-                        exporting = exporting,
+                        exporting = exportInFlight,
                         lastRenderMs = lastRenderMs,
                         renderErr = renderErr,
                         compareMode = compareMode,
@@ -3625,12 +3604,10 @@ class MainActivity : ComponentActivity() {
             }
 
             // --- full-screen export mask ---
-            if (exporting) {
+            if (exportMaskVisible) {
                 ExportMask(
                     done = exportDone,
                     onDismiss = {
-                        exporting = false
-                        exportDone = false
                         exportPhase = EditorExportPhase.IDLE
                         exportRuntimeRunId = null
                         checkpointEditorSession()
@@ -3731,7 +3708,7 @@ class MainActivity : ComponentActivity() {
                             // (issue #119): logcat-visible start marker + duration on ok/fail.
                             val exportStartMs = System.currentTimeMillis()
                             Diag.i("export start format=${exportFmt.name} contract=${outputDescriptor.existingExportClass.id}")
-                            exporting = true; exportDone = false; status = "rendering full resolution…"
+                            status = "rendering full resolution…"
                             val exportContext = ctx.applicationContext
                             val exportParams = if (outputDescriptor.engineColorSpace == null) {
                                 state.toParams()
