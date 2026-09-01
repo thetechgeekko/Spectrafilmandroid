@@ -116,9 +116,14 @@ HUMAN_ROUTE_ASSERTION = re.compile(
 )
 REQUIRED_NATIVE_FILES = (
     "CMakeLists.txt",
+    "native_allocation_registry.cpp",
+    "native_allocation_registry.h",
     "raw_decoder.cpp",
     "raw_decoder.h",
     "raw_decoder_jni.cpp",
+    "raw_decoder_jni_safety.h",
+    "raw_result_publication.cpp",
+    "raw_result_publication.h",
 )
 REQUIRED_RELINK_FILES = (
     "CMakeLists.txt",

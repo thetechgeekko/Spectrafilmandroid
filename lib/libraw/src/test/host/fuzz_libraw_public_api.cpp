@@ -88,6 +88,20 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data,
   if (exceedsDecodeCap(raw.imgdata.sizes)) {
     return 0;
   }
+  // Wavelet denoise is O(pixels) work per level and legitimately runs for tens
+  // of seconds on multi-megapixel mutants under ASan + coverage + OpenMP, which
+  // the 10 s libFuzzer alarm then misreports as a hang (observed in
+  // LibRaw::wavelet_denoise from a 12 MP-capped mutant). Keep the denoise path
+  // exercised on small images so the alarm keeps measuring hangs, not honest
+  // postprocessing throughput. Production never reaches it (threshold is
+  // pinned to 0.0f in raw_decoder.cpp).
+  constexpr std::uint64_t kMaxDenoisePixels = 1ULL << 20;
+  if (raw.imgdata.params.threshold > 0.0F &&
+      static_cast<std::uint64_t>(raw.imgdata.sizes.width) *
+              static_cast<std::uint64_t>(raw.imgdata.sizes.height) >
+          kMaxDenoisePixels) {
+    raw.imgdata.params.threshold = 0.0F;
+  }
   if (raw.dcraw_process() != LIBRAW_SUCCESS) return 0;
   int status = LIBRAW_SUCCESS;
   libraw_processed_image_t* image = raw.dcraw_make_mem_image(&status);

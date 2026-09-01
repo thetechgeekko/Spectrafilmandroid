@@ -316,12 +316,7 @@ endfunction()
 
         native_dir = root / "lib/libraw/src/main/cpp"
         native_dir.mkdir(parents=True)
-        for name in (
-            "CMakeLists.txt",
-            "raw_decoder.cpp",
-            "raw_decoder.h",
-            "raw_decoder_jni.cpp",
-        ):
+        for name in BUNDLE_TOOL.REQUIRED_NATIVE_FILES:
             (native_dir / name).write_text(f"fixture {name}\n", encoding="utf-8")
 
         (root / "NOTICE.md").write_text(
@@ -1059,7 +1054,7 @@ class LibRawBundleCliTest(unittest.TestCase):
                 sbom["documentNamespace"], r"/UNRESOLVED/[0-9a-f]{64}$"
             )
             self.assertTrue(wrapper["filesAnalyzed"])
-            self.assertEqual(7, len(wrapper["hasFiles"]))
+            self.assertEqual(3 + len(BUNDLE_TOOL.REQUIRED_NATIVE_FILES), len(wrapper["hasFiles"]))
             self.assertRegex(
                 wrapper["packageVerificationCode"]["packageVerificationCodeValue"],
                 r"^[0-9a-f]{40}$",
