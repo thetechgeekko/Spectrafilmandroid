@@ -241,9 +241,11 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             "'getOutcome' '()Lcom/spectrafilm/app/ExportTerminalOutcome;'",
             "check_member 'Lcom/spectrafilm/app/ExportRuntimeState$Running;' method "
             "'getRunId' '()J'",
+            # #162 added publishedUri + publishedMimeType, so the constructor the
+            # release AndroidTest dex resolves now carries two trailing Strings.
             "check_member 'Lcom/spectrafilm/app/ExportTerminalOutcome$Success;' method "
             "'<init>' '(Lcom/spectrafilm/app/ExportFormat;JLandroid/graphics/Bitmap;J"
-            "Lcom/spectrafilm/app/ExportPhaseSnapshot;)V'",
+            "Lcom/spectrafilm/app/ExportPhaseSnapshot;Ljava/lang/String;Ljava/lang/String;)V'",
             "check_member 'Lcom/spectrafilm/app/ExportPhaseSnapshot;' method '<init>' "
             "'(JJJJJJ)V'",
             "check_member 'Lcom/spectrafilm/app/ExportFormat;' field 'PNG16' "
