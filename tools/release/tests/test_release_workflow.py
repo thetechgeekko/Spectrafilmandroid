@@ -27,6 +27,12 @@ ENGINE_BOUNDARY_RUNNER = (
     / "engine/spektra-core/src/androidTest/kotlin/com/spectrafilm/engine/EngineBoundaryInstrumentationTest.kt"
 ).read_text(encoding="utf-8")
 RELEASE_DEVICE_GATE = ROOT / "tools/android/run_release_device_gate.ps1"
+# The emulator action runs each `script:` line in its own `sh -c`, so the
+# smoke bodies live in files; the contract below inspects job + script.
+EMULATOR_SMOKE = (ROOT / "tools/ci/emulator_smoke.sh").read_text(encoding="utf-8")
+RELEASE_DEVICE_SMOKE = (ROOT / "tools/ci/release_device_smoke.sh").read_text(
+    encoding="utf-8"
+)
 SPEKTRA_CPP = (ROOT / "engine/spektra-core/src/main/cpp/spektra.cpp").read_text(
     encoding="utf-8"
 )
@@ -553,6 +559,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
         emulator = workflow_job_block(CI, "android-emulator")
         self.assertNotRegex(emulator, r"(?m)^    if:")
+        self.assertIn("script: bash tools/ci/emulator_smoke.sh", emulator)
+        self.assertIn("set -euo pipefail", EMULATOR_SMOKE)
+        emulator += EMULATOR_SMOKE
         self.assertNotIn("github.event_name == 'workflow_dispatch'", emulator)
         self.assertNotIn("continue-on-error: true", emulator)
         self.assertEqual(
@@ -597,6 +606,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             protected,
             "Run exact signed candidate instrumentation and API smoke",
         )
+        self.assertIn("script: bash tools/ci/release_device_smoke.sh", device)
+        self.assertIn("set -euo pipefail", RELEASE_DEVICE_SMOKE)
+        device += RELEASE_DEVICE_SMOKE
         self.assertIn("adb install --no-streaming -r candidate/engine-boundary-debug-androidTest.apk", device)
         self.assertIn(
             "com.spectrafilm.engine.test/com.spectrafilm.engine.EngineBoundaryInstrumentation",
@@ -677,6 +689,8 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         )
         for left, right in zip(protected_steps, protected_steps[1:]):
             self.assertLess(protected.index(f"- name: {left}"), protected.index(f"- name: {right}"))
+        self.assertIn("script: bash tools/ci/release_device_smoke.sh", protected)
+        protected += RELEASE_DEVICE_SMOKE
         for marker in (
             "am instrument -w",
             "INSTRUMENTATION_CODE: -1",
