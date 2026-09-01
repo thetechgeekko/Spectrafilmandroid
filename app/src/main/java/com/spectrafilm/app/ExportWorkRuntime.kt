@@ -176,7 +176,7 @@ internal object ExportWorkRuntime {
         val runId = ids.incrementAndGet()
         val appContext = context.applicationContext
         mutableState.value = ExportRuntimeState.Running(runId, format, sourceIdentity)
-        ExportForegroundService.start(appContext, runId)
+        ExportForegroundService.start(appContext, runId, startedAtMillis)
         val job = scope.launch {
             val outcome = try {
                 work()
@@ -209,7 +209,8 @@ internal object ExportWorkRuntime {
                     ),
                 )
             }
-            ExportForegroundService.stop(appContext, runId)
+            // No external stop command: the service observes this runtime's state and stops
+            // itself on the terminal transition (#153), which cannot race startForeground.
             synchronized(lock) {
                 if (activeJob === job) activeJob = null
             }

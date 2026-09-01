@@ -38,4 +38,58 @@ class ExportForegroundServiceGenerationGateTest {
 
         assertTrue(gate.mayStop(7L))
     }
+
+    // --- service-owned stop decision (#153): the service observes the runtime state and
+    // stops itself; these pin the pure decision against every runtime state shape. ---
+
+    @Test
+    fun serviceKeepsRunningWhileItsTrackedExportIsStillRunning() {
+        val gate = ExportForegroundServiceGenerationGate()
+        gate.recordStart(7L)
+
+        assertFalse(
+            exportForegroundStopDecision(
+                ExportRuntimeState.Running(7L, ExportFormat.PNG16),
+                gate,
+            ),
+        )
+    }
+
+    @Test
+    fun serviceStopsOnceTheTrackedExportReachesItsRetainedTerminal() {
+        val gate = ExportForegroundServiceGenerationGate()
+        gate.recordStart(7L)
+
+        val finished = ExportRuntimeState.Finished(
+            7L,
+            ExportTerminalOutcome.Cancelled(ExportFormat.PNG16, 0L, 1L),
+        )
+        assertTrue(exportForegroundStopDecision(finished, gate))
+        assertTrue(exportForegroundStopDecision(ExportRuntimeState.Idle, gate))
+    }
+
+    @Test
+    fun terminalOfOlderExportCannotStopServiceProtectingNewerExport() {
+        val gate = ExportForegroundServiceGenerationGate()
+        gate.recordStart(7L)
+        gate.recordStart(8L)
+
+        // Newer export still running: its own Running state keeps the service alive,
+        // and the older generation's retained terminal must not stop it either.
+        assertFalse(
+            exportForegroundStopDecision(
+                ExportRuntimeState.Running(8L, ExportFormat.PNG16),
+                gate,
+            ),
+        )
+        assertFalse(
+            exportForegroundStopDecision(
+                ExportRuntimeState.Finished(
+                    7L,
+                    ExportTerminalOutcome.Cancelled(ExportFormat.PNG16, 0L, 1L),
+                ),
+                gate,
+            ),
+        )
+    }
 }

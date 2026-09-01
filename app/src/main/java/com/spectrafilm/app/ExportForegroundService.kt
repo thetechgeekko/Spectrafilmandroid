@@ -6,6 +6,7 @@ package com.spectrafilm.app
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -15,6 +16,12 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * Prevents a delayed completion command for export N from stopping the service after export N+1
@@ -28,6 +35,22 @@ internal class ExportForegroundServiceGenerationGate {
     }
 
     fun mayStop(runId: Long): Boolean = runId >= newestStartedRunId
+}
+
+/**
+ * The service-owned stop decision (#153): the service watches [ExportWorkRuntime.state] and
+ * stops itself, so no external completion command can race the 5-second startForeground window.
+ * Foreground priority is held exactly while work runs — a retained terminal result does not
+ * need it — and a stale terminal from an older generation never stops the service protecting
+ * a newer export.
+ */
+internal fun exportForegroundStopDecision(
+    state: ExportRuntimeState,
+    gate: ExportForegroundServiceGenerationGate,
+): Boolean = when (state) {
+    ExportRuntimeState.Idle -> true
+    is ExportRuntimeState.Running -> false
+    is ExportRuntimeState.Finished -> gate.mayStop(state.runId)
 }
 
 /**
@@ -86,17 +109,26 @@ internal class ExportForegroundServiceGenerationGate {
  */
 class ExportForegroundService : Service() {
     private val generationGate = ExportForegroundServiceGenerationGate()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var observer: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val runId = intent?.getLongExtra(EXTRA_RUN_ID, INVALID_RUN_ID) ?: INVALID_RUN_ID
+        val startedAt = intent?.getLongExtra(EXTRA_STARTED_AT, 0L) ?: 0L
         // Must reach startForeground within ~5 s of startForegroundService or the
         // system throws; doing it first thing in onStartCommand is well inside that.
         try {
             ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
-                buildNotification(),
+                buildNotification(runId, startedAt),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                 } else {
@@ -111,53 +143,87 @@ class ExportForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        val runId = intent?.getLongExtra(EXTRA_RUN_ID, INVALID_RUN_ID) ?: INVALID_RUN_ID
         when (intent?.action) {
             ACTION_START -> {
                 if (runId > INVALID_RUN_ID) generationGate.recordStart(runId)
+                ensureRuntimeObserver()
             }
-            ACTION_STOP -> {
-                // Never call stopService() from the worker completion path. A tiny or
-                // pre-cancelled export can finish before Android dispatches the original
-                // start command; stopping it externally in that gap triggers
-                // ForegroundServiceDidNotStartInTimeException. This queued command reaches
-                // startForeground above first, then lets the service stop itself. The
-                // startId and run generation both prevent an old completion from stopping
-                // a newer export.
-                if (runId > INVALID_RUN_ID && generationGate.mayStop(runId)) {
-                    stopSelfResult(startId)
+            ACTION_CANCEL -> {
+                // The notification's Cancel is service-owned: it asks the process runtime to
+                // cancel; the observer below sees the terminal transition and stops the
+                // service. Never stop directly here — the work must reach its terminal state
+                // and durable checkpoint first.
+                if (runId > INVALID_RUN_ID && !ExportWorkRuntime.cancel(runId)) {
+                    Diag.w("export cancel ignored: run $runId is no longer running")
                 }
+                ensureRuntimeObserver()
             }
             else -> {
                 Diag.w("export foreground service received an invalid command")
                 stopSelfResult(startId)
             }
         }
-        // Not sticky: if the process dies the export died with it, and restarting a
-        // service with no work to do would only show a notification for nothing.
+        // Not sticky: if the process dies the export died with it. The durable editor
+        // cursor (#139) and the journaled MediaStore transaction reconcile the loss on
+        // the next launch; restarting a service with no work would only show a
+        // notification for nothing.
         return START_NOT_STICKY
     }
 
-    private fun buildNotification(): Notification {
+    /**
+     * The service owns its lifetime by observing the process runtime (#153): it stays
+     * foreground exactly while the tracked export runs and stops itself on the export's
+     * terminal transition. Self-stopping after startForeground cannot race the 5-second
+     * window, which is what the old externally-queued stop command existed to dodge.
+     */
+    private fun ensureRuntimeObserver() {
+        if (observer?.isActive == true) return
+        observer = scope.launch {
+            ExportWorkRuntime.state.collect { state ->
+                if (exportForegroundStopDecision(state, generationGate)) {
+                    stopSelf()
+                }
+            }
+        }
+    }
+
+    private fun buildNotification(runId: Long, startedAtMillis: Long): Notification {
         ensureChannel(this)
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText("Exporting photo…")
             .setSmallIcon(R.drawable.ic_launcher_monochrome)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             // Indeterminate: the engine reports stage timings, not a monotonic
-            // fraction, so a percentage here would be invented.
+            // fraction, so a percentage here would be invented. The chronometer shows
+            // honest elapsed time instead.
             .setProgress(0, 0, true)
-            .build()
+        if (startedAtMillis > 0L) {
+            builder.setWhen(startedAtMillis).setShowWhen(false).setUsesChronometer(true)
+        }
+        if (runId > INVALID_RUN_ID) {
+            builder.addAction(
+                0,
+                "Cancel",
+                PendingIntent.getService(
+                    this,
+                    runId.toInt(),
+                    commandIntent(this, ACTION_CANCEL, runId),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
+        }
+        return builder.build()
     }
 
     companion object {
         private const val CHANNEL_ID = "export"
         private const val NOTIFICATION_ID = 1001
         private const val ACTION_START = "com.spectrafilm.app.action.START_EXPORT_FOREGROUND"
-        private const val ACTION_STOP = "com.spectrafilm.app.action.STOP_EXPORT_FOREGROUND"
+        private const val ACTION_CANCEL = "com.spectrafilm.app.action.CANCEL_EXPORT"
         private const val EXTRA_RUN_ID = "com.spectrafilm.app.extra.EXPORT_RUN_ID"
+        private const val EXTRA_STARTED_AT = "com.spectrafilm.app.extra.EXPORT_STARTED_AT"
         private const val INVALID_RUN_ID = 0L
 
         private fun ensureChannel(ctx: Context) {
@@ -174,33 +240,21 @@ class ExportForegroundService : Service() {
 
         /**
          * Enter the foreground scheduling group. Safe to call when already running.
+         * There is deliberately no external stop command: the service observes
+         * [ExportWorkRuntime.state] and stops itself on the export's terminal transition.
          *
          * Never throws: if the service cannot start, the export proceeds at whatever
          * priority the scheduler gives it, which is the pre-existing behaviour.
          */
-        fun start(ctx: Context, runId: Long) {
+        fun start(ctx: Context, runId: Long, startedAtMillis: Long) {
             try {
                 ContextCompat.startForegroundService(
                     ctx.applicationContext,
-                    commandIntent(ctx, ACTION_START, runId),
+                    commandIntent(ctx, ACTION_START, runId)
+                        .putExtra(EXTRA_STARTED_AT, startedAtMillis),
                 )
             } catch (t: Throwable) {
                 Diag.w("export foreground service start refused: ${t.message}")
-            }
-        }
-
-        /**
-         * Queue service-owned shutdown after foreground promotion. Safe when the original start
-         * command is still pending and safe against a later export generation.
-         */
-        fun stop(ctx: Context, runId: Long) {
-            try {
-                ContextCompat.startForegroundService(
-                    ctx.applicationContext,
-                    commandIntent(ctx, ACTION_STOP, runId),
-                )
-            } catch (t: Throwable) {
-                Diag.w("export foreground service stop command refused: ${t.message}")
             }
         }
 
