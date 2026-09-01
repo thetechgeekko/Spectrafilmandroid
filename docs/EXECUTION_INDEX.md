@@ -1,6 +1,6 @@
 # Spektrafilm execution index
 
-Status: **canonical navigation and execution protocol**. Last reconciled 2026-08-31.
+Status: **canonical navigation and execution protocol**. Last reconciled 2026-09-01.
 
 This page answers one question: *where is the current truth?* It deliberately does not copy the
 open-work queue. GitHub's native issue state, dependencies, labels, and assignees are the live
@@ -78,9 +78,13 @@ executable source for direct review:
 | Engine gate | 39 cases at O2 and shipping `-O3 -ffast-math -fno-finite-math-only` | `.github/workflows/ci.yml` |
 | Public release | `v0.9.0`; current tree remains under release hold | release checklist + live production map |
 
-Target/compile SDK 34 is current-tree truth, not release approval. Store/API-36 policy remains a
-live ticket. Likewise, a locally device-qualified debug-key candidate is not production-signing
-evidence.
+Target/compile SDK 34 is current-tree truth, not release approval. The owner has selected a free
+GitHub release followed by a paid Google Play supporter channel that unlocks nothing. API-36 and
+Android behavior qualification remain live in [#171](https://github.com/thetechgeekko/Spektrafilm-android/issues/171),
+and the final Play publication contract lives in [#200](https://github.com/thetechgeekko/Spektrafilm-android/issues/200).
+The two channels must represent the same logical release; APK/AAB signing, ZIP layout, and
+device-split bytes are reported separately. Likewise, a locally device-qualified debug-key
+candidate is not production-signing evidence.
 
 ## Product and numeric contracts
 
@@ -106,6 +110,12 @@ evidence.
   DNG SDK, vkdt, Halide, or another library without the per-stage benchmark, format coverage,
   licensing, memory, APK-size, and numeric gates in the performance plan. Reuse proven techniques
   where they win; do not replace the app architecture by name.
+- [#199](https://github.com/thetechgeekko/Spektrafilm-android/issues/199) owns the final spectral
+  documentation product: an HonKit-style GitHub Pages portal for Spektrafilm Android and explicitly
+  allowlisted public LATENT material, plus an offline Android viewer and one canonical user-facing
+  License & Attribution document. LATENT stays private-by-default and is never bulk-published.
+- [#200](https://github.com/thetechgeekko/Spektrafilm-android/issues/200) is the post-GitHub-release
+  distribution tail. The paid Play listing is a supporter contribution, not a feature entitlement.
 
 ## Documentation classes
 

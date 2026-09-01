@@ -7,8 +7,12 @@
 > The release pipeline now builds without secrets, transfers a hash-bound unsigned candidate, and
 > signs only inside the protected Environment. Every open release-blocking child on the live map,
 > including human legal/product decisions, must close before tagging.
-> If the artifact is a Google Play update, target SDK 36 must replace target SDK 34; a GitHub-only
-> route must be an explicit owner decision and still pass the Android 16 behavior matrix.
+> The owner-selected GitHub release remains free. After that immutable release and its documentation
+> portal are verified, [#200](https://github.com/thetechgeekko/Spektrafilm-android/issues/200)
+> publishes the same logical release as an upfront-paid Google Play supporter edition that unlocks
+> nothing. Play publication requires target SDK 36 and the Android 16 behavior matrix from
+> [#171](https://github.com/thetechgeekko/Spektrafilm-android/issues/171). APK/AAB signatures, ZIP
+> layout, and device splits can differ and must never be described as byte-identical containers.
 
 Releases are **automated**. Pushing a stable `vMAJOR.MINOR.PATCH` tag (no
 prerelease/build suffixes or leading-zero components) triggers
