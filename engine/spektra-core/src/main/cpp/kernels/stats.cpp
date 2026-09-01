@@ -14,13 +14,32 @@
 #include "kernels/stats.h"
 
 #include <cmath>
+#include <limits>
 
 namespace spk {
+
+namespace {
+
+// 2^63 is exactly representable as double, unlike INT64_MAX. Guarding against
+// this exclusive upper bound before llround avoids a range-error/unspecified
+// conversion result while leaving every representable finite sample unchanged.
+constexpr double kInt64UpperExclusive = 0x1p63;
+
+int64_t round_nonnegative_i64(double sample) {
+    if (!(sample > 0.0)) return 0;  // non-positive and NaN
+    if (!std::isfinite(sample) || sample >= kInt64UpperExclusive)
+        return std::numeric_limits<int64_t>::max();
+    return static_cast<int64_t>(std::llround(sample));
+}
+
+}  // namespace
 
 int64_t fast_poisson_one(double lam, StatsRng& rng) {
     // fast_poisson: lam <= 0 -> 0; lam < 30 -> Knuth; else Normal approx.
     const double lam_threshold = 30.0;
-    if (lam <= 0.0) return 0;
+    if (!(lam > 0.0)) return 0;  // non-positive and NaN
+    if (!std::isfinite(lam) || lam >= kInt64UpperExclusive)
+        return std::numeric_limits<int64_t>::max();
     if (lam < lam_threshold) {
         // Knuth: multiply uniforms until the product drops below exp(-lam).
         double L = std::exp(-lam);
@@ -35,9 +54,7 @@ int64_t fast_poisson_one(double lam, StatsRng& rng) {
     // Normal approximation N(lam, sqrt(lam)), rounded, clamped >= 0.
     double z = rng.normal();
     double sample = lam + std::sqrt(lam) * z;
-    int64_t s = static_cast<int64_t>(std::llround(sample));
-    if (s < 0) s = 0;
-    return s;
+    return round_nonnegative_i64(sample);
 }
 
 int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
@@ -57,8 +74,7 @@ int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
     if (var > 10.0) {
         double z = rng.normal();
         double approx = mean + std::sqrt(var) * z;
-        int64_t a = static_cast<int64_t>(std::llround(approx));
-        if (a < 0) a = 0;
+        int64_t a = round_nonnegative_i64(approx);
         if (a > n) a = n;
         return a;
     }
@@ -66,31 +82,29 @@ int64_t fast_binomial_one(int64_t n, double p, StatsRng& rng) {
     double u = rng.uniform();
     double cdf = 0.0;
     double prob = std::pow(1.0 - p, static_cast<double>(n));
-
-    // DEGENERATE WALK, SHORT-CIRCUITED. `prob` is pow(1-p, n), and this branch is
-    // only reached when var = n*p*(1-p) <= 10 with n >= 25 — i.e. p is pinned to one
-    // end of [0,1]. At the p->1 end (a pixel at maximum density, where saturation
-    // collapses to ~1-uniformity and the Poisson rate explodes) that pow underflows
-    // to exactly 0. Then `cdf += prob` can never advance, so the loop below is
-    // GUARANTEED to run to k = n+1 and return n — after up to n useless iterations.
+    // DEGENERATE WALK, SHORT-CIRCUITED. If P(X=0) underflowed to exactly 0 the
+    // recurrence stays 0 for every k, so `cdf += prob` can never advance and the
+    // loop below is GUARANTEED to run to k = n+1 and return n — after up to n
+    // iterations that compute nothing. The uniform above is already drawn, so
+    // returning n here leaves both the variate and the RNG stream unchanged.
     //
-    // That is not a corner case, it is the whole cost of the grain stage. Census at
-    // 12.58 MP export geometry (pixel_size_um 8.545): 55.47% of the calls reaching
-    // here have prob == 0, and they account for 40,767,030,234 iterations — 99.62%
-    // of every iteration this branch runs, averaging 1892 each. The other 0.38%
-    // averages 8.9. The sampler is 94.6% of the sublayer grain stage, and grain is
-    // the largest item in an export (perf-lab.md §22: 4340-4540 ms of ~10 s).
-    // Coarser pixels make it worse, not better — n scales with pixel area, so at
-    // 35 um/px the same census reads 100% of calls, avg 30877 iterations, max n
-    // 41643. Removing them measured 8.4x on the stage at export geometry (§25).
+    // Not a corner case: at 12.58 MP export geometry (pixel_size_um 8.545) 55.47%
+    // of the calls reaching here have prob == 0, and they account for
+    // 40,767,030,234 iterations — 99.62% of every iteration this branch runs,
+    // averaging 1892 each (the other 0.38% averages 8.9). The sampler is 94.6% of
+    // the sublayer grain stage, and grain is the largest item in an export
+    // (perf-lab.md §22: 4340-4540 ms of ~10 s). Coarser pixels are worse, not
+    // better — n scales with pixel area, so at 35 um/px the census reads 100% of
+    // calls, avg 30877 iterations, max n 41643. Measured 8.4x on the stage (§25).
     //
-    // Returning n directly is BYTE-IDENTICAL, not an approximation: the loop draws
-    // no randomness (u is already drawn above), so both the result and the RNG
-    // stream are unchanged. The u > 0.0 guard preserves the one case where the loop
-    // does something else — uniform() can return exactly 0.0, and then `cdf < u` is
-    // false at k = 0, so the original returns k-1 = -1. That path is left intact.
+    // The `u > 0.0` half of the guard is load-bearing and must not be dropped:
+    // uniform() can return exactly 0.0, and then `cdf < u` is false at k = 0 so
+    // the original returns k-1 = -1. Without the guard this returns n instead —
+    // a behaviour change. tests/test_binomial_shortcircuit.cpp gates the rest of
+    // this equivalence element-wise, and its mutation check records that this
+    // particular half is not reachable by any sweep (~2^-53 per draw), which is
+    // exactly why it is written down rather than trusted to a test.
     if (prob == 0.0 && u > 0.0) return n;
-
     int64_t k = 0;
     while (cdf < u && k <= n) {
         cdf += prob;
