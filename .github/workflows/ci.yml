@@ -909,6 +909,17 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      # Emulator 37.1.11.0 (2026-09) refuses the runner's preinstalled adb:
+      # "Unable to connect to adb daemon on port: 5037" followed by a "device
+      # offline" loop killed two otherwise-green runs. Match platform-tools to
+      # the emulator the action is about to install, and warm the daemon so the
+      # emulator never races adb server startup.
+      - name: Update platform-tools and warm the adb server
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" > /dev/null
+          "$ANDROID_HOME/platform-tools/adb" start-server
+          "$ANDROID_HOME/platform-tools/adb" version
+
       # Grant the runner's user access to /dev/kvm (standard udev rule from the
       # reactivecircus/android-emulator-runner action README).
       - name: Enable KVM group permissions
