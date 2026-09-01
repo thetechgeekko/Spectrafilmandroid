@@ -45,18 +45,31 @@ class OwnedContextHandoffTest {
         val caller = QueuedDispatcher()
         val scopeJob = Job()
         val scope = CoroutineScope(scopeJob + caller)
+        val parked = CountDownLatch(1)
         val produced = CountDownLatch(1)
         val closes = AtomicInteger()
         val received = AtomicReference<Resource?>()
         val job = scope.launch {
             received.set(
                 withOwnedContext(Dispatchers.Default, Resource::close) {
+                    // Hold the producer until the caller has actually parked at the dispatcher
+                    // switch. `withContext` only routes its result back through a dispatch when
+                    // it decided to suspend; that decision is a CAS the producing thread can win
+                    // by finishing first, in which case the value is returned inline and NO
+                    // continuation is ever enqueued on `caller`. The scenario under test — a
+                    // resource unclaimed in the dispatcher-return window — does not exist on that
+                    // path, so without this gate the test does not merely go slow, it waits for a
+                    // task that will never arrive and fails the awaitTask() budget below.
+                    check(parked.await(10, TimeUnit.SECONDS)) { "caller never reached the switch" }
                     Resource(closes).also { produced.countDown() }
                 },
             )
         }
 
+        // run() returning while the producer is still gated proves the caller suspended: the
+        // producer cannot have completed, so the decision CAS can only have gone to SUSPENDED.
         caller.awaitTask().run()
+        parked.countDown()
         check(produced.await(10, TimeUnit.SECONDS)) { "resource producer did not finish" }
         val returnContinuation = caller.awaitTask()
 
