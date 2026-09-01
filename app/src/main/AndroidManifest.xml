@@ -17,11 +17,6 @@
          raised for it — the speed-up does not depend on the user granting this. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- #196 in-app capture. Optional hardware: the Camera action is capability-gated at
-         runtime and simply absent on devices without a usable back camera. -->
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
-
     <!-- Legacy gallery export (API <= 28) writes to public Pictures storage.
          On API 29+ scoped storage is used via MediaStore and needs no permission. -->
     <uses-permission
