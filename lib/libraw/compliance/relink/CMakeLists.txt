@@ -32,7 +32,15 @@ set(SFRAW_WRAPPER_SOURCE_DIR
     "Spektrafilm JNI wrapper source directory")
 get_filename_component(SFRAW_WRAPPER_SOURCE_DIR
     "${SFRAW_WRAPPER_SOURCE_DIR}" ABSOLUTE)
-foreach (_wrapper_file IN ITEMS raw_decoder.cpp raw_decoder.h raw_decoder_jni.cpp)
+foreach (_wrapper_file IN ITEMS
+        native_allocation_registry.cpp
+        native_allocation_registry.h
+        raw_decoder.cpp
+        raw_decoder.h
+        raw_decoder_jni.cpp
+        raw_decoder_jni_safety.h
+        raw_result_publication.cpp
+        raw_result_publication.h)
     if (NOT EXISTS "${SFRAW_WRAPPER_SOURCE_DIR}/${_wrapper_file}")
         message(FATAL_ERROR "missing recipient relink wrapper source: ${_wrapper_file}")
     endif ()
@@ -79,8 +87,10 @@ find_library(SFRAW_ZLIB z REQUIRED)
 target_link_libraries(raw PUBLIC "${SFRAW_ZLIB}")
 
 add_library(sfraw SHARED
+    "${SFRAW_WRAPPER_SOURCE_DIR}/native_allocation_registry.cpp"
     "${SFRAW_WRAPPER_SOURCE_DIR}/raw_decoder.cpp"
     "${SFRAW_WRAPPER_SOURCE_DIR}/raw_decoder_jni.cpp"
+    "${SFRAW_WRAPPER_SOURCE_DIR}/raw_result_publication.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/unofficial_relink_marker.cpp")
 set_target_properties(sfraw PROPERTIES OUTPUT_NAME sfraw)
 target_include_directories(sfraw PRIVATE

@@ -297,7 +297,8 @@ endfunction()
         (relink_dir / "CMakeLists.txt").write_text(
             "set(LIBRAW_SOURCE_DIR required)\n"
             "add_library(raw STATIC)\n"
-            "add_library(sfraw SHARED raw_decoder.cpp raw_decoder_jni.cpp "
+            "add_library(sfraw SHARED native_allocation_registry.cpp "
+            "raw_decoder.cpp raw_decoder_jni.cpp raw_result_publication.cpp "
             "unofficial_relink_marker.cpp)\n"
             "set_target_properties(sfraw PROPERTIES OUTPUT_NAME sfraw)\n"
             "target_compile_definitions(raw PRIVATE NO_JPEG USE_ZLIB LIBRAW_NODLL)\n"
@@ -727,7 +728,8 @@ class LibRawBundleCliTest(unittest.TestCase):
             (relink_dir / "CMakeLists.txt").write_text(
                 "set(LIBRAW_SOURCE_DIR required)\n"
                 "add_library(raw STATIC)\n"
-                "add_library(sfraw SHARED raw_decoder.cpp raw_decoder_jni.cpp "
+                "add_library(sfraw SHARED native_allocation_registry.cpp "
+                "raw_decoder.cpp raw_decoder_jni.cpp raw_result_publication.cpp "
                 "unofficial_relink_marker.cpp)\n"
                 "set_target_properties(sfraw PROPERTIES OUTPUT_NAME sfraw)\n"
                 "target_compile_definitions(raw PRIVATE NO_JPEG USE_ZLIB LIBRAW_NODLL)\n"
