@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import re
+import string
 import sys
+import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -29,6 +31,8 @@ CURRENT_DOCS = (
     ROOT / "engine" / "spektra-core" / "README.md",
     ROOT / "lib" / "libraw" / "README.md",
 )
+
+_COMMONMARK_ESCAPABLE = frozenset(string.punctuation)
 
 
 def _extract(pattern: str, text: str, source: Path) -> str:
@@ -101,6 +105,54 @@ def _markdown_link_targets(text: str) -> list[str]:
     return targets
 
 
+def _unescape_markdown_destination(target: str) -> str:
+    """Apply CommonMark backslash escapes used inside link destinations."""
+    output: list[str] = []
+    index = 0
+    while index < len(target):
+        if (
+            target[index] == "\\"
+            and index + 1 < len(target)
+            and target[index + 1] in _COMMONMARK_ESCAPABLE
+        ):
+            output.append(target[index + 1])
+            index += 2
+        else:
+            output.append(target[index])
+            index += 1
+    return "".join(output)
+
+
+def _exact_local_path_error(base: Path, portable_path: str) -> str | None:
+    """Return an error when a local path component is absent or mis-cased."""
+    current = base
+    for component in portable_path.split("/"):
+        if not component or component == ".":
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        try:
+            children = tuple(current.iterdir())
+        except OSError:
+            return "missing local link target"
+        exact = next((child for child in children if child.name == component), None)
+        if exact is not None:
+            current = exact
+            continue
+        folded = next(
+            (child for child in children if child.name.casefold() == component.casefold()),
+            None,
+        )
+        if folded is not None:
+            return (
+                "on-disk spelling mismatch for component "
+                f"{component!r}; found {folded.name!r}"
+            )
+        return "missing local link target"
+    return None
+
+
 def _check_local_links(path: Path, text: str) -> list[str]:
     errors: list[str] = []
     for raw_target in _markdown_link_targets(text):
@@ -111,16 +163,24 @@ def _check_local_links(path: Path, text: str) -> list[str]:
             target = stripped.split(maxsplit=1)[0]
         if not target or target.startswith("#"):
             continue
+        target = _unescape_markdown_destination(target)
         parsed = urlsplit(target)
         scheme = parsed.scheme.lower()
-        if parsed.netloc or scheme in {"http", "https", "mailto"}:
+        if scheme in {"http", "https", "mailto"}:
             continue
         if scheme:
             errors.append(
                 f"{path.relative_to(ROOT)}: unsupported link scheme {scheme!r}: {target}"
             )
             continue
+        if parsed.netloc:
+            continue
         decoded_path = unquote(parsed.path)
+        if any(unicodedata.category(char) == "Cc" for char in decoded_path):
+            errors.append(
+                f"{path.relative_to(ROOT)}: decoded link target contains a control character: {target}"
+            )
+            continue
         decoded = urlsplit(decoded_path)
         decoded_scheme = decoded.scheme.lower()
         if decoded.netloc or decoded_scheme in {"http", "https", "mailto"}:
@@ -133,18 +193,30 @@ def _check_local_links(path: Path, text: str) -> list[str]:
                 f"{path.relative_to(ROOT)}: encoded link scheme {decoded_scheme!r}: {target}"
             )
             continue
-        if len(decoded_path) >= 2 and all(char in "/\\" for char in decoded_path[:2]):
+        portable_path = decoded_path.replace("\\", "/")
+        if portable_path.startswith("//"):
             errors.append(f"{path.relative_to(ROOT)}: unsafe network link target: {target}")
             continue
-        relative = decoded_path
-        resolved = (path.parent / relative).resolve()
+        components = portable_path.split("/")
+        if any(
+            component not in {"", ".", ".."}
+            and component.endswith((".", " "))
+            for component in components
+        ):
+            errors.append(
+                f"{path.relative_to(ROOT)}: link target has a trailing dot or space: {target}"
+            )
+            continue
+        resolved = (path.parent / portable_path).resolve()
+        root_resolved = ROOT.resolve()
         try:
-            resolved.relative_to(ROOT)
+            resolved.relative_to(root_resolved)
         except ValueError:
             errors.append(f"{path.relative_to(ROOT)}: link escapes repository: {target}")
             continue
-        if not resolved.exists():
-            errors.append(f"{path.relative_to(ROOT)}: missing local link target: {target}")
+        local_error = _exact_local_path_error(path.parent, portable_path)
+        if local_error:
+            errors.append(f"{path.relative_to(ROOT)}: {local_error}: {target}")
     return errors
 
 

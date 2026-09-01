@@ -5,7 +5,7 @@ import io
 import json
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +25,8 @@ def ticket(
     state: str = "open",
     assignees: tuple[str, ...] = (),
     blocked_by: int = 0,
+    fallback_blockers: tuple[int, ...] = (),
+    open_fallback_blockers: tuple[int, ...] = (),
     title: str = "ticket",
     parent: int = 164,
 ):
@@ -36,6 +38,8 @@ def ticket(
         assignees=assignees,
         blocked_by=blocked_by,
         parent=parent,
+        fallback_blockers=fallback_blockers,
+        open_fallback_blockers=open_fallback_blockers,
     )
 
 
@@ -70,6 +74,24 @@ class FrontierTest(unittest.TestCase):
     def test_gh_json_reports_bounded_timeout(self, run: mock.Mock) -> None:
         run.side_effect = frontier.subprocess.TimeoutExpired("gh", 3)
         with self.assertRaisesRegex(RuntimeError, "timed out after 3 seconds"):
+            frontier._gh_json("o/r", "issues/1/sub_issues", 1, 3)
+
+    @mock.patch.object(frontier.subprocess, "run")
+    def test_gh_json_wraps_permission_error_with_endpoint_context(self, run: mock.Mock) -> None:
+        run.side_effect = PermissionError("execution denied")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"could not execute gh while reading issues/1/sub_issues: execution denied",
+        ):
+            frontier._gh_json("o/r", "issues/1/sub_issues", 1, 3)
+
+    @mock.patch.object(frontier.subprocess, "run")
+    def test_gh_json_wraps_other_spawn_os_errors_with_endpoint_context(self, run: mock.Mock) -> None:
+        run.side_effect = OSError("spawn failed")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"could not execute gh while reading issues/1/sub_issues: spawn failed",
+        ):
             frontier._gh_json("o/r", "issues/1/sub_issues", 1, 3)
 
     @mock.patch.object(frontier.subprocess, "run")
@@ -119,6 +141,113 @@ class FrontierTest(unittest.TestCase):
         ), mock.patch.object(frontier, "_validate_root_map"):
             result = frontier.load_tree("o/r", 164)
         self.assertEqual([item.number for item in result], [10, 117, 11])
+
+    def test_fallback_parser_reads_only_the_first_content_line_and_deduplicates(self) -> None:
+        body = "\n  Blocked by: #201, #202, #201\n\n## Question\nWhat now?"
+        self.assertEqual(frontier._fallback_blockers(body), (201, 202))
+        self.assertEqual(
+            frontier._fallback_blockers("## Question\n\nBlocked by: #203"),
+            (),
+        )
+
+    def test_fallback_parser_rejects_marker_without_an_issue_reference(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "expected at least one #issue"):
+            frontier._fallback_blockers("Blocked by: none")
+
+    def test_ticket_treats_null_native_dependency_summary_as_absent(self) -> None:
+        parsed = frontier._ticket(
+            {
+                "number": 10,
+                "title": "fallback only",
+                "body": "Blocked by: #201",
+                "state": "open",
+                "labels": [{"name": "wayfinder:task"}, {"name": "ready-for-agent"}],
+                "assignees": [],
+                "issue_dependencies_summary": None,
+            },
+            164,
+        )
+        self.assertEqual(parsed.blocked_by, 0)
+        self.assertEqual(parsed.fallback_blockers, (201,))
+
+    def test_load_tree_resolves_and_caches_open_and_closed_fallback_blockers(self) -> None:
+        children = [
+            {
+                "number": 10,
+                "title": "first",
+                "body": "Blocked by: #201, #202, #201\n\n## Question",
+                "repository_url": "https://api.github.com/repos/o/r",
+                "state": "open",
+                "labels": [{"name": "wayfinder:task"}, {"name": "ready-for-agent"}],
+                "assignees": [],
+                "issue_dependencies_summary": {"blocked_by": 0},
+            },
+            {
+                "number": 11,
+                "title": "second",
+                "body": "Blocked by: #201",
+                "repository_url": "https://api.github.com/repos/o/r",
+                "state": "open",
+                "labels": [{"name": "wayfinder:task"}, {"name": "ready-for-agent"}],
+                "assignees": [],
+            },
+        ]
+
+        def issue_payload(_repo: str, endpoint: str, _timeout: float):
+            number = int(endpoint.rsplit("/", 1)[1])
+            return {
+                "number": number,
+                "repository_url": "https://api.github.com/repos/o/r",
+                "state": "open" if number == 201 else "closed",
+            }
+
+        with mock.patch.object(frontier, "_validate_root_map"), mock.patch.object(
+            frontier, "_children", return_value=children
+        ), mock.patch.object(frontier, "_gh_payload", side_effect=issue_payload) as payload:
+            rows = frontier.load_tree("o/r", 164, 3)
+
+        self.assertEqual(rows[0].fallback_blockers, (201, 202))
+        self.assertEqual(rows[0].open_fallback_blockers, (201,))
+        self.assertEqual(rows[1].open_fallback_blockers, (201,))
+        self.assertEqual(
+            [call.args[1] for call in payload.call_args_list],
+            ["issues/201", "issues/202"],
+        )
+
+    def test_load_tree_fails_closed_when_fallback_blocker_lookup_fails(self) -> None:
+        child = {
+            "number": 10,
+            "title": "blocked",
+            "body": "Blocked by: #201",
+            "repository_url": "https://api.github.com/repos/o/r",
+            "state": "open",
+            "labels": [{"name": "wayfinder:task"}, {"name": "ready-for-agent"}],
+            "assignees": [],
+            "issue_dependencies_summary": {"blocked_by": 0},
+        }
+        with mock.patch.object(frontier, "_validate_root_map"), mock.patch.object(
+            frontier, "_children", return_value=[child]
+        ), mock.patch.object(frontier, "_gh_payload", side_effect=RuntimeError("API unavailable")):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"could not resolve fallback blocker #201: API unavailable",
+            ):
+                frontier.load_tree("o/r", 164, 3)
+
+    def test_main_emits_no_frontier_when_fallback_lookup_fails(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            frontier,
+            "load_tree",
+            side_effect=RuntimeError(
+                "could not resolve fallback blocker #201: API unavailable"
+            ),
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = frontier.main([])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("fallback blocker #201", stderr.getvalue())
 
     def test_closed_nested_map_is_traversed_and_open_child_is_reported(self) -> None:
         closed_map = {
@@ -237,6 +366,38 @@ class FrontierTest(unittest.TestCase):
                 code = frontier.main([])
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue().count("#7 ticket"), 1)
+
+    def test_open_fallback_blocker_excludes_ticket_from_takeable_frontier(self) -> None:
+        body_blocked = ticket(
+            16,
+            labels={"wayfinder:task", "ready-for-agent"},
+            fallback_blockers=(201,),
+            open_fallback_blockers=(201,),
+        )
+        with mock.patch.object(frontier, "load_tree", return_value=[body_blocked]):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = frontier.main([])
+        self.assertEqual(code, 0)
+        rendered = output.getvalue()
+        self.assertIn("AGENT FRONTIER (0)", rendered)
+        self.assertIn("BLOCKED (1)", rendered)
+        self.assertEqual(rendered.count("#16 ticket"), 1)
+
+    def test_closed_fallback_blocker_leaves_ticket_takeable(self) -> None:
+        body_unblocked = ticket(
+            17,
+            labels={"wayfinder:task", "ready-for-agent"},
+            fallback_blockers=(202,),
+        )
+        with mock.patch.object(frontier, "load_tree", return_value=[body_unblocked]):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = frontier.main([])
+        self.assertEqual(code, 0)
+        rendered = output.getvalue()
+        self.assertIn("AGENT FRONTIER (1)", rendered)
+        self.assertIn("BLOCKED (0)", rendered)
 
     def test_strict_returns_two_for_hygiene_errors(self) -> None:
         wrong = ticket(8, labels={"wayfinder:grilling", "ready-for-agent"})

@@ -53,6 +53,63 @@ class DocsConsistencyTest(unittest.TestCase):
                 errors = checker._check_local_links(page, text)
         self.assertEqual(errors, [])
 
+    def test_commonmark_destination_escapes_are_unescaped_before_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = root / "docs"
+            nested = docs / "nested"
+            nested.mkdir(parents=True)
+            page = docs / "page.md"
+            (nested / "file_(v2).md").write_text("ok", encoding="utf-8")
+            text = (
+                r"[parentheses](nested/file_\(v2\).md) "
+                r"[backslash](nested\\file_\(v2\).md) "
+                r"[external](HTTPS\://example.invalid/path)"
+            )
+            with mock.patch.object(checker, "ROOT", root):
+                errors = checker._check_local_links(page, text)
+        self.assertEqual(errors, [])
+
+    def test_local_link_checker_enforces_exact_nested_component_spelling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = root / "docs"
+            nested = docs / "Parent" / "Child"
+            nested.mkdir(parents=True)
+            page = docs / "page.md"
+            (nested / "Target.md").write_text("ok", encoding="utf-8")
+            text = (
+                "[exact](Parent/Child/Target.md) "
+                "[parent](parent/Child/Target.md) "
+                "[child](Parent/child/Target.md) "
+                "[file](Parent/Child/target.md)"
+            )
+            with mock.patch.object(checker, "ROOT", root):
+                errors = checker._check_local_links(page, text)
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(all("on-disk spelling mismatch" in error for error in errors))
+
+    def test_local_link_checker_rejects_trailing_dot_or_space_in_any_component(self) -> None:
+        page = checker.ROOT / "docs" / "page.md"
+        text = (
+            "[dot](existing.md.) "
+            "[space](<existing.md >) "
+            "[nested-dot](folder./file.md) "
+            "[nested-space](folder%20/file.md)"
+        )
+        with mock.patch.object(Path, "resolve", side_effect=AssertionError("must not resolve")):
+            errors = checker._check_local_links(page, text)
+        self.assertEqual(len(errors), 4)
+        self.assertTrue(all("trailing dot or space" in error for error in errors))
+
+    def test_local_link_checker_rejects_percent_decoded_control_characters(self) -> None:
+        page = checker.ROOT / "docs" / "page.md"
+        text = "[nul](exists%00.md) [tab](exists%09.md) [del](exists%7F.md)"
+        with mock.patch.object(Path, "resolve", side_effect=AssertionError("must not resolve")):
+            errors = checker._check_local_links(page, text)
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(all("control character" in error for error in errors))
+
     def test_reference_links_and_images_are_checked_but_fenced_examples_are_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -84,6 +141,15 @@ class DocsConsistencyTest(unittest.TestCase):
             errors = checker._check_local_links(page, "[local](file:///etc/passwd)")
         self.assertEqual(len(errors), 1)
         self.assertIn("unsupported link scheme 'file'", errors[0])
+
+    def test_unsupported_authority_schemes_are_rejected_after_unescaping(self) -> None:
+        page = checker.ROOT / "docs" / "page.md"
+        text = r"[file](FILE\://server/share) [ssh](SSH\://host/path)"
+        with mock.patch.object(Path, "resolve", side_effect=AssertionError("must not resolve")):
+            errors = checker._check_local_links(page, text)
+        self.assertEqual(len(errors), 2)
+        self.assertIn("unsupported link scheme 'file'", errors[0])
+        self.assertIn("unsupported link scheme 'ssh'", errors[1])
 
     def test_percent_encoded_network_paths_never_reach_pathlib(self) -> None:
         page = checker.ROOT / "docs" / "page.md"
