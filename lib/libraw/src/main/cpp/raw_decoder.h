@@ -11,8 +11,8 @@
  *   no_auto_bright = 1
  *   gamm[0] = gamm[1] = 1.0   (linear)
  * White balance mirrors raw_file_processor.py: as-shot (camera WB), daylight
- * (LibRaw daylight base), tungsten / custom (temperature+tint -> Von-Kries
- * chromatic adaptation in linear ACES + green/magenta tint multiplier).
+ * (LibRaw daylight base), tungsten / custom (temperature+tint -> CAT02
+ * Von-Kries chromatic adaptation in linear ACES + a separate float32 tint step).
  * The result is then converted ACES2065-1 -> linear ProPhoto RGB (the spektrafilm
  * engine's input space), mirroring load_and_process_raw_file's output_colorspace
  * step, so DecodeResult.colorSpace is "ProPhoto RGB" — ACES is only intermediate.
@@ -38,8 +38,11 @@ enum class WhiteBalanceMode {
 
 struct DecodeOptions {
     WhiteBalanceMode whiteBalance = WhiteBalanceMode::AsShot;
-    // Custom mode only. temperatureK in kelvin; tint multiplies both green
-    // channels (1.0 = neutral). Mirrors raw_file_processor.py.
+    // temperatureK in kelvin; tint multiplies green (1.0 = neutral). Native
+    // entry points reject values outside the product contract before touching
+    // LibRaw or colour math: temperatureK [1000, 12000], tint [0.2, 1.8], both
+    // finite. The values are colour-active only in Custom mode, but validating
+    // every request keeps NaN/Inf out of render and cache identities too.
     double temperatureK = 6504.0;
     double tint = 1.0;
 
@@ -164,11 +167,25 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options);
 // for >= 4000 K, Kang 2002 Planckian approximation below.
 void whitepointXyzFromTemperature(double temperatureK, double outXyz[3]);
 
-// Build a per-channel linear-RGB multiplier that reproduces the Von-Kries
-// chromatic adaptation (source white -> 6504 K reference) plus the green tint,
-// applied in ACES2065-1 RGB. Result mirrors the colour-science path in
-// raw_file_processor.py for daylight-base WB modes.
-void buildAcesWbMultiplier(const DecodeOptions& options, float outMul[3]);
+// True only when the full native WB option contract is valid. Validation is
+// deliberately independent of LibRaw so host and Android entry points share it.
+bool rawWhiteBalanceOptionsValid(const DecodeOptions& options) noexcept;
+
+// Apply the oracle-locked RAW white balance in place at the float32 ACES2065-1
+// boundary. Tungsten/custom receive exactly one CAT02 scene-white adaptation;
+// as-shot/daylight are byte-preserving no-ops. CAT output is rounded to float32
+// before a separate float32 tint multiply, matching colour-science/NumPy cast
+// order. Invalid options and a cancellation already set at entry leave pixels
+// untouched; a cancellation observed during a large buffer may leave a partial
+// internal result, which the decode owner discards.
+bool applyAcesWhiteBalance(float* rgb, size_t pixelCount,
+                           const DecodeOptions& options);
+
+// Build the transformed unit-neutral ACES value. This compatibility helper is
+// retained for small math probes; non-neutral pixels must use the full CAT02
+// matrix through applyAcesWhiteBalance(), not a per-channel multiplier. Returns
+// false and leaves the identity value in `outMul` for invalid/cancelled input.
+bool buildAcesWbMultiplier(const DecodeOptions& options, float outMul[3]);
 
 // Convert an interleaved RGB float32 buffer (pixelCount pixels) from linear
 // ACES2065-1 to linear ProPhoto RGB in place, mirroring raw_file_processor.py's

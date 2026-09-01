@@ -55,6 +55,21 @@
   dirty checkouts fail closed, and manifests record the verified commit/state.
   Profile-load allocation failures are contained as `SPK_ERR_OOM` at the C ABI.
 
+### Oracle-locked CAT02 RAW white balance (#192)
+
+- Replaced the tungsten/custom direct-XYZ approximation with colour-science
+  0.4.7's full CAT02 Von Kries transform in linear ACES2065-1. As-shot and
+  daylight remain byte-preserving after LibRaw; CAT output is rounded to
+  float32 before the separate float32 tint operation.
+- Added NumPy-compatible near-reference `allclose` and near-unity-tint
+  `isclose` skips, disabled FP contraction for the decoder translation unit,
+  and fail closed on non-finite or out-of-product-range temperature/tint while
+  preserving the upstream-compatible 1000 K endpoint.
+- Added a digest-generated C++ gate for all 56 locked ACES/ProPhoto vectors,
+  including HDR/wide-gamut and wrong-cast diagnostic cases. Optimized host and
+  Android arm64 runs match bit-for-bit, and fresh production-decoder runs are
+  repeat-exact for the recorded Samsung, MotionCam, and third local DNG cohorts.
+
 ### RAW white-balance CAT research (#167)
 
 - Pinned the upstream RAW processor/test blobs and the exact Python, NumPy, and

@@ -151,6 +151,44 @@ target_link_libraries(sfraw_decoder_resource_limits_test
 # this keeps the test independent from the pinned dependency target above.
 set(SFRAW_RAW_DECODER_SOURCE
     "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp/raw_decoder.cpp")
+
+# Generate the C++ table directly from the immutable research JSON after its
+# canonical digest and independently captured colour-reference bits pass. The
+# native test therefore consumes all 8 x 7 vectors without a shipping JSON
+# parser or a second hand-maintained baseline.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(SFRAW_RAW_WB_RESEARCH_SCRIPT
+    "${CMAKE_CURRENT_LIST_DIR}/../../../../../tools/parity/raw_wb_cat_research.py")
+set(SFRAW_RAW_WB_FIXTURE
+    "${CMAKE_CURRENT_LIST_DIR}/../../../../../tools/parity/fixtures/raw_wb_cat_vectors.json")
+set(SFRAW_RAW_WB_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(SFRAW_RAW_WB_GENERATED_HEADER
+    "${SFRAW_RAW_WB_GENERATED_DIR}/raw_wb_cat_fixture.h")
+add_custom_command(
+  OUTPUT "${SFRAW_RAW_WB_GENERATED_HEADER}"
+  COMMAND "${Python3_EXECUTABLE}" "${SFRAW_RAW_WB_RESEARCH_SCRIPT}"
+          --fixture "${SFRAW_RAW_WB_FIXTURE}"
+          --check
+          --emit-cpp-header "${SFRAW_RAW_WB_GENERATED_HEADER}"
+  DEPENDS "${SFRAW_RAW_WB_RESEARCH_SCRIPT}" "${SFRAW_RAW_WB_FIXTURE}"
+  COMMENT "Generating digest-locked RAW-WB CAT02 fixture"
+  VERBATIM)
+add_executable(sfraw_raw_wb_cat_test
+               "${CMAKE_CURRENT_LIST_DIR}/../cpp/test_raw_wb_cat.cpp"
+               "${SFRAW_RAW_DECODER_SOURCE}"
+               "${SFRAW_RAW_WB_GENERATED_HEADER}")
+target_include_directories(sfraw_raw_wb_cat_test PRIVATE
+                           "${CMAKE_CURRENT_LIST_DIR}/../../main/cpp"
+                           "${SFRAW_RAW_WB_GENERATED_DIR}")
+target_compile_definitions(sfraw_raw_wb_cat_test PRIVATE
+                           SFRAW_FORCE_NO_LIBRAW=1)
+if(MSVC)
+  target_compile_options(sfraw_raw_wb_cat_test PRIVATE /O2 /fp:strict)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(sfraw_raw_wb_cat_test PRIVATE -O2 -ffp-contract=off)
+endif()
+target_link_libraries(sfraw_raw_wb_cat_test PRIVATE sfraw_host_sanitizers)
+
 add_executable(sfraw_dng_sniffer_test
                "${CMAKE_CURRENT_LIST_DIR}/../cpp/test_dng_sniffer.cpp")
 target_include_directories(sfraw_dng_sniffer_test PRIVATE
@@ -177,6 +215,14 @@ if(BUILD_TESTING)
            COMMAND sfraw_dng_sniffer_test)
   set_tests_properties(
     sfraw.dng-sniffer.hostile-ifd
+    PROPERTIES
+      TIMEOUT 10
+      ENVIRONMENT
+        "ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:strict_string_checks=1;UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+  add_test(NAME sfraw.raw-wb.cat02-exact-bits
+           COMMAND sfraw_raw_wb_cat_test)
+  set_tests_properties(
+    sfraw.raw-wb.cat02-exact-bits
     PROPERTIES
       TIMEOUT 10
       ENVIRONMENT

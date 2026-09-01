@@ -224,23 +224,24 @@ full-resolution output subject to the same safety limits.
 | `use_camera_wb` (as-shot)    | `True`                 | `use_camera_wb = 1`              |
 | normalization                | `/ 65535.0` → float32  | done in `raw_decoder.cpp`        |
 
-### White balance (current compatibility state)
+### White balance (oracle-locked compatibility state)
 
 | Mode       | Behavior                                                                  |
 |------------|---------------------------------------------------------------------------|
 | `AS_SHOT`  | LibRaw camera WB (`use_camera_wb`) during demosaic.                        |
 | `DAYLIGHT` | LibRaw daylight-balanced base output; no adaptation.                       |
-| `TUNGSTEN` | Current direct-XYZ **2850 K → 6504 K** approximation in linear ACES.       |
-| `CUSTOM`   | Current direct-XYZ **`temperature` K → 6504 K** approximation plus `tint`. |
+| `TUNGSTEN` | One CAT02 **2850 K → 6504 K** adaptation in linear ACES; tint is neutral.   |
+| `CUSTOM`   | One CAT02 **`temperature` K → 6504 K** adaptation, then float32 tint.      |
 
 Whitepoints come from CCT: **CIE daylight locus** for ≥ 4000 K, **Kang 2002**
-Planckian approximation below. Upstream's generic Von-Kries call resolves to CAT02, but the
-shipping native implementation still applies direct XYZ scaling, combines the green-channel tint
-multiply into the final float32 cast, and therefore does not reproduce upstream's separate
-float32 CAT/tint rounding boundary. Tungsten/custom are not yet upstream-exact; the accepted
-CAT02 decision and implementation gate are tracked by
+Planckian approximation below. Upstream's generic Von-Kries call resolves to CAT02. Production
+uses its full cone-response matrix, preserves NumPy's `allclose`/`isclose` skips, and rounds CAT
+output to float32 before the separate float32 green-channel tint multiply. The digest-generated
+C++ gate reproduces all 56 research vectors at both declared bit boundaries; connected Samsung,
+MotionCam, and third-cohort DNG repeat digests are recorded in
 [`docs/research/raw-wb-chromatic-adaptation.md`](../../docs/research/raw-wb-chromatic-adaptation.md)
-and [Implement oracle-locked CAT02 RAW white balance and exact cast-order goldens](https://github.com/thetechgeekko/Spektrafilm-android/issues/192).
+and [Implement oracle-locked CAT02 RAW white balance and exact cast-order goldens](https://github.com/thetechgeekko/Spektrafilm-android/issues/192). Native entry points reject non-finite
+or out-of-range `[1000,12000] K` / `[0.2,1.8]` settings before decode or colour math.
 
 ## Integration points (docs/RAW_DNG.md)
 

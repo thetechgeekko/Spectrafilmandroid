@@ -1,6 +1,6 @@
 # RAW white-balance chromatic-adaptation decision
 
-Status: **research resolved; production pixels intentionally unchanged**
+Status: **research resolved; CAT02 implementation and device goldens verified**
 
 Date: 2026-08-30
 Wayfinder ticket: [Research and lock RAW white-balance chromatic adaptation against the upstream oracle](https://github.com/thetechgeekko/Spektrafilm-android/issues/167)
@@ -33,8 +33,52 @@ Keep the following ownership and ordering explicit:
    engine boundary is explicitly the float32 result of that conversion; the
    desktop function itself returns a float64 array for this call.
 
-No native decoder arithmetic changed in this research ticket. The implementation
-must land in a separate task with RAW-specific host and device goldens.
+No native decoder arithmetic changed in the original research ticket. The
+separate implementation ticket now applies this contract in production and
+keeps the research fixture as its immutable external baseline.
+
+## Implementation evidence (2026-08-31)
+
+`raw_decoder.cpp` now constructs colour-science 0.4.7's CAT02 matrix in the
+oracle's exact float64 operation order, disables floating-point contraction for
+that production translation unit, rounds CAT output to float32, and only then
+performs the float32 tint multiply. `as_shot` and daylight return without any
+pixel arithmetic. Native requests fail closed before LibRaw/math unless
+temperature and tint are finite and inside the product ranges `[1000,12000] K`
+and `[0.2,1.8]`; the deterministic 1000 K compatibility endpoint remains accepted.
+
+The host CMake test generates a build-only C++ table directly from this JSON
+after `--check` verifies the canonical digest. It passes all 56 combinations
+(8 scenarios x 7 patches) bit-for-bit at both the ACES-after-WB and float32
+ProPhoto boundaries. It also proves that the fixture still distinguishes the
+wrong one-cast tint, missing `allclose`, and missing `isclose` implementations.
+An optimized Windows `/O2 /fp:strict` run and an Android arm64 NDK r27 Clang
+18.0.1 `-O3 -ffp-contract=off` run produced the same canonical evidence file:
+
+`1ada31ace191d8d7bfffb7bb3cf1e96ae17bc78cd660cb380d743b3241d87d1a`
+
+The final arm64 math-probe executable SHA-256 was
+`c4d716e5973fcf826e2737996d9d11f5d3e1d8e85dad4b4e79b82bbcf4742120`.
+
+The Android run was on a Samsung SM-S948W, API 36, Android 16, arm64-v8a,
+fingerprint
+`samsung/m3qcsx/m3q:16/BP4A.251205.006/S948WVLS4AZG3_OYV4AZG3:user/release-keys`.
+The freshly built debug variant of the production decoder `libsfraw.so` was then
+exercised twice per source with custom 4100 K / 0.85 tint and a deterministic
+512-pixel longest-edge copy bound. Private RAW bytes stayed on-device; only
+source and derived-output SHA-256 values are recorded.
+
+| Device cohort | Source bytes / SHA-256 | Derived shape | Exact repeat output |
+|---|---|---:|---|
+| Samsung SM-S948W native DNG (the exact committed camera-seed source) | `24,999,540` / `58093ddfb0bba8fa6be32ae038b1323584e30902b20fb7c338eab4d6e16e444a` | `383x510x3` float32 | 2/2 `b3ab6024dd8545f4cd4666e33a888ba3f779749fd3ac9f2dcbd113f56e582375` |
+| MotionCam DNG (the exact committed camera-seed source) | `20,333,486` / `bb74d3285ccb32cb775aaac029471cf6ed23ce4ec66e9e370ada1b2b2010b314` | `342x456x3` float32 | 2/2 `ba3dae0cdfb31adcc17c67bf3766acb433b4a5b3c963afe926c76d37468663d4` |
+| User-authorized local VWFNDR Mobile DNG (third deterministic device cohort; never redistributed) | `25,014,193` / `f5a8e51c2ffc30a5f18a8388c26bf9ced6e6674631db6e64ec81224e64f4c0ea` | `383x510x3` float32 | 2/2 `f70c30c10bb0ccc47c88bb9247deb6ba6dbbe678886de2a506099f5c05a2f630` |
+
+The exact debug device library used for this capture was
+`e63e7c13ccd606206c3d06ae0ed7fc932a38d0b5e4d1e1d469a6ae8c273996e2`.
+The linked device-probe executable SHA-256 was
+`8f58144226daaa7af2a90a3d1c4e007bd13e60f1cda496e013898bf246aec6e5`.
+This is numeric/device evidence, not a release-signing attestation.
 
 ## Oracle and environment pin
 
@@ -147,13 +191,12 @@ Selected CAT02 example vectors:
   of 1667 K. To preserve upstream parity, the fixture locks the deterministic
   1000 K extrapolation, but the UI must not present it as physically validated.
   Changing the range or model is a new colour decision and requires a rebaseline.
-- The current JNI path accepts non-finite/out-of-product-range temperature and
-  tint values. The implementation task must reject them before native math; it
-  must not allow NaN/Inf into a render or cache key.
-- The current native path also lacks the oracle's near-reference `allclose`
-  skip; the fixture measures up to `2.62260437e-6` at that scenario even before
-  any visible model error. It also lacks the near-unity `isclose` tint skip.
-  The implementation must preserve both skips exactly.
+- Native validation rejects non-finite or out-of-product-range temperature/tint
+  before LibRaw and colour math. Host regressions cover NaN, both infinities,
+  non-positive temperature, both range boundaries, and out-of-range values.
+- Production now preserves the oracle's near-reference `allclose` CAT skip and
+  near-unity `isclose` tint skip. Diagnostic candidates remain in the fixture so
+  removing either skip fails by up to `2.62260437e-6` / `2.38418579e-6`.
 - `as_shot` relies on LibRaw metadata and fallback policy. Missing camera WB is a
   decode-policy issue, not a reason to add this CAT a second time.
 
@@ -162,9 +205,10 @@ Selected CAT02 example vectors:
 1. The committed JSON's source/test blobs, environment, seven independently
    captured colour-reference bit vectors, and canonical report digest are the
    immutable research baseline.
-2. Production implementation must consume the same constants and reproduce all
-   fixture ACES/ProPhoto float32 bits, including the separate CAT and tint casts.
-   Add real C++ host coverage plus an exact connected-device RAW digest gate.
+2. Production consumes the same constants and reproduces all fixture
+   ACES/ProPhoto float32 bits, including the separate CAT and tint casts. The
+   C++ host gate and connected-device digests above are the implementation
+   evidence; a changed output requires the rebaseline process below.
 3. Existing engine stage goldens must not be rewritten: they begin after a
    caller supplies linear ProPhoto. Add RAW-import goldens alongside them.
 4. A rebaseline is allowed only when the upstream SHA or a pinned numeric

@@ -53,8 +53,10 @@ bool writeResult(const std::string& path,
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "usage: libraw_device_probe INPUT OUTPUT_PREFIX REPEATS\n";
+    if (argc != 4 && argc != 7 && argc != 8) {
+        std::cerr << "usage: libraw_device_probe INPUT OUTPUT_PREFIX REPEATS "
+                     "[as_shot|daylight|tungsten|custom TEMPERATURE_K TINT "
+                     "[MAX_LONG_EDGE]]\n";
         return 2;
     }
 
@@ -74,8 +76,38 @@ int main(int argc, char** argv) {
 
     spectrafilm::DecodeOptions options;
     options.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot;
+    if (argc >= 7) {
+        const std::string mode = argv[4];
+        if (mode == "as_shot") {
+            options.whiteBalance = spectrafilm::WhiteBalanceMode::AsShot;
+        } else if (mode == "daylight") {
+            options.whiteBalance = spectrafilm::WhiteBalanceMode::Daylight;
+        } else if (mode == "tungsten") {
+            options.whiteBalance = spectrafilm::WhiteBalanceMode::Tungsten;
+        } else if (mode == "custom") {
+            options.whiteBalance = spectrafilm::WhiteBalanceMode::Custom;
+        } else {
+            std::cerr << "unsupported white-balance mode: " << mode << "\n";
+            return 2;
+        }
+        try {
+            options.temperatureK = std::stod(argv[5]);
+            options.tint = std::stod(argv[6]);
+        } catch (...) {
+            std::cerr << "invalid temperature/tint\n";
+            return 2;
+        }
+    }
     options.halfSize = false;
     options.maxLongEdge = 0;
+    if (argc == 8) {
+        try {
+            options.maxLongEdge = std::stoi(argv[7]);
+        } catch (...) {
+            return 2;
+        }
+        if (options.maxLongEdge < 0 || options.maxLongEdge > 16384) return 2;
+    }
 
     for (int iteration = 0; iteration < repeats; ++iteration) {
         const spectrafilm::DecodeResult result =
@@ -93,6 +125,10 @@ int main(int argc, char** argv) {
             return 5;
         }
         std::cout << "iteration=" << iteration
+                  << " wb_mode=" << (argc >= 7 ? argv[4] : "as_shot")
+                  << " temperature_k=" << options.temperatureK
+                  << " tint=" << options.tint
+                  << " max_long_edge=" << options.maxLongEdge
                   << " width=" << result.width
                   << " height=" << result.height
                   << " floats=" << result.rgb.size()

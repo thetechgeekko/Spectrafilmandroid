@@ -41,7 +41,7 @@ simulate(image, params)   ── DebugParams ──►      ▼
 | `spkvec_io.h`        | Header-only C++ reader/writer for `.spkvec`, byte-compatible with `spkvec.py`. |
 | `gen_goldens.py`     | Runs `spektrafilm` with each DebugParams tap on a fixed synthetic image; writes `goldens/<case>/<tap>.spkvec` + `manifest.json`. **Requires a spektrafilm env.** |
 | `gen_viewing_illuminant_visuals.py` | Re-scans the two committed cinema-print density taps under K75P (plus a deliberately wrong D50 counterfactual), writes six output-space references, two review PNGs, hashes, and numeric deltas. **Requires the pinned oracle + colour 0.4.7.** |
-| `raw_wb_cat_research.py` | Dependency-free lock for the RAW-WB CAT02 decision; compares current XYZ scaling, Bradford, no adaptation, cast order, and oracle tolerance skips against pinned float32 bits in `fixtures/raw_wb_cat_vectors.json`. |
+| `raw_wb_cat_research.py` | Dependency-free lock for the RAW-WB CAT02 decision; compares rejected transforms, cast order, and oracle tolerance skips against pinned float32 bits in `fixtures/raw_wb_cat_vectors.json`, and emits the digest-checked build-only header consumed by the production C++ golden. |
 | `compare_main.cpp`   | Standalone comparator: reads a golden `.spkvec` and an engine `.spkvec`, reports max-abs / RMS vs tolerance. Seed of the CI parity test. |
 | `CMakeLists.txt`     | Host build for `spkvec_compare` (independent of the Android/NDK engine module). |
 | `cases.md`           | The parity case matrix (profile pairs, scan_film on/off, taps) gating M3/M4. |

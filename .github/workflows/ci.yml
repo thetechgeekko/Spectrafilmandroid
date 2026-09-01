@@ -11,7 +11,8 @@
 #                        gate: scan_portra, print_portra, print_ektar + spatial/crop/autoexp/
 #                        diffusion; runs on push/PR)
 #   • libraw-hostile  — pinned/patched LibRaw 0.22.2 public-seam ASan/UBSan/TSan
-#                        regressions, bounded hostile RAW/TIFF libFuzzer smoke,
+#                        regressions, bit-exact CAT02 RAW-WB goldens, bounded
+#                        hostile RAW/TIFF libFuzzer smoke,
 #                        and deterministic route-neutral compliance-bundle audit
 #   • parity          — standalone .spkvec comparator (CMake + ctest self-test)
 #   • python-lint     — byte-compiles the Python parity harness
@@ -198,8 +199,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # LibRaw hostile-input gate. This builds the exact official 0.22.2 archive
   # selected by the Android resolver, applies/verifies the hashed local patchset,
-  # and drives bytes through open_buffer -> unpack -> dcraw_process. Sanitizers
-  # instrument LibRaw itself, not just the tiny fixture wrapper. OpenMP is enabled
+  # and drives bytes through open_buffer -> unpack -> dcraw_process. The same
+  # project consumes every digest-locked RAW-WB fixture vector through production
+  # CAT02 math. Sanitizers instrument LibRaw itself. OpenMP is enabled
   # here only to compile/exercise the patched branch; shipping Android builds are
   # serial until the compressed-Fuji determinism ticket qualifies a replacement.
   # ---------------------------------------------------------------------------
@@ -663,8 +665,10 @@ jobs:
       - name: Test LibRaw compliance bundle tooling
         run: python -m unittest discover -s tools/compliance/tests -p 'test_*.py'
 
-      - name: Lock RAW white-balance CAT research decision
-        run: python tools/parity/raw_wb_cat_research.py --check
+      - name: Lock and generate RAW white-balance CAT02 fixture
+        run: >-
+          python tools/parity/raw_wb_cat_research.py --check
+          --emit-cpp-header "${RUNNER_TEMP}/raw_wb_cat_fixture.h"
 
       - name: Test fail-closed release tooling and workflow policy
         run: python -m unittest discover -s tools/release/tests -p 'test_*.py'

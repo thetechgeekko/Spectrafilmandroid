@@ -68,10 +68,12 @@ in [JNI_LIFETIME_SAFETY.md](JNI_LIFETIME_SAFETY.md).
 White-balance modes mirror upstream: **as-shot** (`use_camera_wb`), **daylight**/**tungsten**
 (LibRaw daylight base), and **custom** (temperature + tint). Research has pinned upstream's
 generic `method='Von Kries'` call to its actual colour-science 0.4.7 default, **CAT02**, with
-tint as a separate float32 step. The currently shipped native path still uses a direct-XYZ
-scaling approximation and therefore is not exact for tungsten/custom modes; see
+tint as a separate float32 step. The native path now reproduces that full CAT02 matrix and
+cast order bit-for-bit for every locked host/device vector; as-shot/daylight remain arithmetic
+no-ops after LibRaw. Native requests reject non-finite or out-of-product-range temperature/tint
+before decoding. See
 [`research/raw-wb-chromatic-adaptation.md`](research/raw-wb-chromatic-adaptation.md) for the
-reproducible decision and follow-up contract. As-shot and daylight receive no extra CAT.
+reproducible decision, exact goldens, and connected-device evidence.
 
 ## Why not Android's built-in DNG API?
 

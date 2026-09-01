@@ -32,7 +32,6 @@
 #include <limits>
 #include <memory>
 #include <new>
-#include <unistd.h>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -48,6 +47,10 @@
 
 #ifndef SFRAW_HAVE_LIBRAW
 #  define SFRAW_HAVE_LIBRAW 0
+#endif
+
+#if SFRAW_HAVE_LIBRAW
+#  include <unistd.h>
 #endif
 
 #if defined(SFRAW_TESTING)
@@ -322,6 +325,11 @@ constexpr uint64_t kMaxFullDecodePixels =
     sizeof(void*) >= 8 ? 12ULL * 1024ULL * 1024ULL
                        : 8ULL * 1024ULL * 1024ULL;
 
+bool cancellationRequested(const DecodeOptions& options) {
+    return options.cancelFlag != nullptr &&
+           options.cancelFlag->load(std::memory_order_acquire);
+}
+
 #if SFRAW_HAVE_LIBRAW
 void applyInputLimits(LibRaw& raw) {
     raw.imgdata.rawparams.max_raw_memory_mb = kMaxRawMemoryMb;
@@ -330,11 +338,6 @@ void applyInputLimits(LibRaw& raw) {
 bool isMemoryLimitFailure(int code) {
     return code == LIBRAW_UNSUFFICIENT_MEMORY || code == LIBRAW_TOO_BIG ||
            code == ENOMEM;
-}
-
-bool cancellationRequested(const DecodeOptions& options) {
-    return options.cancelFlag != nullptr &&
-           options.cancelFlag->load(std::memory_order_acquire);
 }
 
 int cancelLibRawProgress(void* context, LibRaw_progress, int, int) {
@@ -360,6 +363,15 @@ DecodeResult cancellationFailure(int librawCode = 0) {
     result.librawCode = librawCode;
     result.status = SFRAW_ERR_CANCELLED;
     result.error = "RAW decode cancelled";
+    return result;
+}
+
+DecodeResult invalidWhiteBalanceFailure() {
+    DecodeResult result;
+    result.status = SFRAW_ERR_INPUT;
+    result.error =
+        "invalid RAW white balance: temperature must be finite and in "
+        "[1000,12000] K; tint must be finite and in [0.2,1.8]";
     return result;
 }
 
@@ -433,6 +445,13 @@ DecodeResult dimensionLimitFailure(const DecodeOptions&) {
 constexpr double kDaylightReferenceTemperature = 6504.0;
 // raw_file_processor.py: _TUNGSTEN_TEMPERATURE = 2850.0
 constexpr double kTungstenTemperature = 2850.0;
+// Public product bounds. 1000 K is intentionally retained for upstream/UI
+// compatibility even though it extrapolates below Kang 2002's documented
+// physical domain; changing that policy requires a new colour decision.
+constexpr double kMinTemperature = 1000.0;
+constexpr double kMaxTemperature = 12000.0;
+constexpr double kMinTint = 0.2;
+constexpr double kMaxTint = 1.8;
 
 // ACES2065-1 (AP0) <-> CIE XYZ (D60-adapted, the colour-science default for this
 // colourspace). These are the standard AP0 RGB->XYZ and XYZ->RGB matrices used by
@@ -449,6 +468,15 @@ constexpr double kAcesXyzToRgb[9] = {
      1.0498110175, 0.0000000000, -0.0000974845,
     -0.4959030231, 1.3733130458,  0.0982400361,
      0.0000000000, 0.0000000000,  0.9912520182,
+};
+
+// colour-science 0.4.7's default Von-Kries cone transform. The upstream call
+// specifies method="Von Kries" without a transform, which resolves to CAT02.
+// Row-major 3x3; these constants are locked by raw_wb_cat_vectors.json.
+constexpr double kCat02[9] = {
+     0.7328, 0.4296, -0.1624,
+    -0.7036, 1.6975,  0.0061,
+     0.0030, 0.0136,  0.9834,
 };
 
 // Linear ACES2065-1 -> linear ProPhoto RGB, the final colourspace step of
@@ -471,7 +499,85 @@ constexpr double kAcesToProPhoto[9] = {
     -0.00205967931567552,  -0.0022515883414713734, 1.0045855773288515,
 };
 
-void mat3MulVec(const double m[9], const double v[3], double out[3]);
+// Keep every accumulation step explicit. The production target and the host
+// golden target also compile this translation unit with FP contraction disabled;
+// together those choices preserve the Python/NumPy double-operation order before
+// the declared float32 cast boundaries.
+double dot3(const double* lhs, const double* rhs, size_t rhsStride) {
+    double sum = 0.0;
+    sum += lhs[0] * rhs[0 * rhsStride];
+    sum += lhs[1] * rhs[1 * rhsStride];
+    sum += lhs[2] * rhs[2 * rhsStride];
+    return sum;
+}
+
+void mat3MulVec(const double m[9], const double v[3], double out[3]) {
+    out[0] = dot3(m + 0, v, 1);
+    out[1] = dot3(m + 3, v, 1);
+    out[2] = dot3(m + 6, v, 1);
+}
+
+void mat3Mul(const double lhs[9], const double rhs[9], double out[9]) {
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            out[row * 3 + column] =
+                dot3(lhs + row * 3, rhs + column, 3);
+        }
+    }
+}
+
+void mat3Inverse(const double m[9], double out[9]) {
+    const double a = m[0], b = m[1], c = m[2];
+    const double d = m[3], e = m[4], f = m[5];
+    const double g = m[6], h = m[7], i = m[8];
+    const double determinant =
+        a * (e * i - f * h) - b * (d * i - f * g) +
+        c * (d * h - e * g);
+    const double inverseDeterminant = 1.0 / determinant;
+    out[0] = (e * i - f * h) * inverseDeterminant;
+    out[1] = (c * h - b * i) * inverseDeterminant;
+    out[2] = (b * f - c * e) * inverseDeterminant;
+    out[3] = (f * g - d * i) * inverseDeterminant;
+    out[4] = (a * i - c * g) * inverseDeterminant;
+    out[5] = (c * d - a * f) * inverseDeterminant;
+    out[6] = (d * h - e * g) * inverseDeterminant;
+    out[7] = (b * g - a * h) * inverseDeterminant;
+    out[8] = (a * e - b * d) * inverseDeterminant;
+}
+
+bool numpyAllclose(const double lhs[3], const double rhs[3]) {
+    for (size_t i = 0; i < 3; ++i) {
+        // NumPy defaults: atol=1e-8, rtol=1e-5. rtol is applied to the
+        // second operand, so the argument order is part of the oracle contract.
+        if (std::fabs(lhs[i] - rhs[i]) >
+            1.0e-8 + 1.0e-5 * std::fabs(rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool numpyIsclose(double lhs, double rhs) {
+    return std::fabs(lhs - rhs) <=
+           1.0e-8 + 1.0e-5 * std::fabs(rhs);
+}
+
+void buildCat02Matrix(const double sourceWhite[3],
+                      const double targetWhite[3], double out[9]) {
+    double sourceCone[3], targetCone[3];
+    mat3MulVec(kCat02, sourceWhite, sourceCone);
+    mat3MulVec(kCat02, targetWhite, targetCone);
+
+    const double diagonal[9] = {
+        targetCone[0] / sourceCone[0], 0.0, 0.0,
+        0.0, targetCone[1] / sourceCone[1], 0.0,
+        0.0, 0.0, targetCone[2] / sourceCone[2],
+    };
+    double inverse[9], inverseTimesDiagonal[9];
+    mat3Inverse(kCat02, inverse);
+    mat3Mul(inverse, diagonal, inverseTimesDiagonal);
+    mat3Mul(inverseTimesDiagonal, kCat02, out);
+}
 
 bool aces2065ToProPhotoRGBImpl(float* rgb, size_t pixelCount,
                                const std::atomic<bool>* cancelFlag) {
@@ -494,24 +600,26 @@ bool aces2065ToProPhotoRGBImpl(float* rgb, size_t pixelCount,
            !cancelFlag->load(std::memory_order_acquire);
 }
 
-void mat3MulVec(const double m[9], const double v[3], double out[3]) {
-    out[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
-    out[1] = m[3] * v[0] + m[4] * v[1] + m[5] * v[2];
-    out[2] = m[6] * v[0] + m[7] * v[1] + m[8] * v[2];
-}
-
 // CIE daylight locus chromaticity for T >= 4000 K (matches colour's
 // 'CIE Illuminant D Series' path used by _whitepoint_xyz_from_temperature).
 void daylightXy(double t, double& x, double& y) {
-    const double t1 = 1.0e3 / t;
-    const double t2 = 1.0e6 / (t * t);
-    const double t3 = 1.0e9 / (t * t * t);
+    const double t2 = t * t;
+    const double t3 = t2 * t;
     if (t <= 7000.0) {
-        x = 0.244063 + 0.09911 * t1 + 2.9678 * t2 - 4.6070 * t3;
+        x = -4.607e9 / t3;
+        x += 2.9678e6 / t2;
+        x += 0.09911e3 / t;
+        x += 0.244063;
     } else {
-        x = 0.237040 + 0.24748 * t1 + 1.9018 * t2 - 2.0064 * t3;
+        x = -2.0064e9 / t3;
+        x += 1.9018e6 / t2;
+        x += 0.24748e3 / t;
+        x += 0.237040;
     }
-    y = -3.000 * x * x + 2.870 * x - 0.275;
+    const double x2 = x * x;
+    y = -3.0 * x2;
+    y += 2.87 * x;
+    y -= 0.275;
 }
 
 // Kang 2002 Planckian approximation for T < 4000 K (matches colour's 'Kang 2002').
@@ -519,18 +627,33 @@ void kang2002Xy(double t, double& x, double& y) {
     const double t2 = t * t;
     const double t3 = t2 * t;
     if (t <= 4000.0) {
-        x = -0.2661239e9 / t3 - 0.2343589e6 / t2 + 0.8776956e3 / t + 0.179910;
+        x = -0.2661239e9 / t3;
+        x -= 0.2343589e6 / t2;
+        x += 0.8776956e3 / t;
+        x += 0.179910;
     } else {
-        x = -3.0258469e9 / t3 + 2.1070379e6 / t2 + 0.2226347e3 / t + 0.240390;
+        x = -3.0258469e9 / t3;
+        x += 2.1070379e6 / t2;
+        x += 0.2226347e3 / t;
+        x += 0.240390;
     }
     const double x2 = x * x;
     const double x3 = x2 * x;
     if (t <= 2222.0) {
-        y = -1.1063814 * x3 - 1.34811020 * x2 + 2.18555832 * x - 0.20219683;
+        y = -1.1063814 * x3;
+        y -= 1.34811020 * x2;
+        y += 2.18555832 * x;
+        y -= 0.20219683;
     } else if (t <= 4000.0) {
-        y = -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * x - 0.16748867;
+        y = -0.9549476 * x3;
+        y -= 1.37418593 * x2;
+        y += 2.09137015 * x;
+        y -= 0.16748867;
     } else {
-        y = 3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483;
+        y = 3.0817580 * x3;
+        y -= 5.87338670 * x2;
+        y += 3.75112997 * x;
+        y -= 0.37001483;
     }
 }
 
@@ -550,50 +673,93 @@ void whitepointXyzFromTemperature(double temperatureK, double outXyz[3]) {
     outXyz[2] = (1.0 - x - y) / y;
 }
 
-void buildAcesWbMultiplier(const DecodeOptions& options, float outMul[3]) {
-    outMul[0] = outMul[1] = outMul[2] = 1.0f;
+bool rawWhiteBalanceOptionsValid(const DecodeOptions& options) noexcept {
+    switch (options.whiteBalance) {
+        case WhiteBalanceMode::AsShot:
+        case WhiteBalanceMode::Daylight:
+        case WhiteBalanceMode::Tungsten:
+        case WhiteBalanceMode::Custom:
+            break;
+        default:
+            return false;
+    }
+    return std::isfinite(options.temperatureK) &&
+           options.temperatureK >= kMinTemperature &&
+           options.temperatureK <= kMaxTemperature &&
+           std::isfinite(options.tint) &&
+           options.tint >= kMinTint && options.tint <= kMaxTint;
+}
 
-    // as-shot / daylight: no colour-science adaptation in raw_file_processor.py.
+bool applyAcesWhiteBalance(float* rgb, size_t pixelCount,
+                           const DecodeOptions& options) {
+    if (!rawWhiteBalanceOptionsValid(options) ||
+        (rgb == nullptr && pixelCount != 0U)) {
+        return false;
+    }
+    if (cancellationRequested(options)) return false;
+
+    // As-shot/daylight ownership stays entirely with LibRaw. Do not even run an
+    // identity matrix: these modes must remain byte-for-byte unchanged.
     if (options.whiteBalance == WhiteBalanceMode::AsShot ||
         options.whiteBalance == WhiteBalanceMode::Daylight) {
-        return;
+        return true;
     }
 
-    double targetTemp = options.temperatureK;
+    double temperatureK = options.temperatureK;
     double tint = options.tint;
     if (options.whiteBalance == WhiteBalanceMode::Tungsten) {
-        targetTemp = kTungstenTemperature;  // adapt 2850 K -> reference
+        temperatureK = kTungstenTemperature;
         tint = 1.0;
     }
 
-    // Source/target whites, normalized so Y == 1 (raw_file_processor.py divides by [1]).
-    double scene[3], reference[3];
-    whitepointXyzFromTemperature(targetTemp, scene);
-    whitepointXyzFromTemperature(kDaylightReferenceTemperature, reference);
+    double sourceWhite[3], targetWhite[3];
+    whitepointXyzFromTemperature(temperatureK, sourceWhite);
+    whitepointXyzFromTemperature(kDaylightReferenceTemperature, targetWhite);
 
-    // Von-Kries adaptation collapses, for a neutral (R=G=B) pixel, to a per-channel
-    // scale in ACES RGB. We derive that scale by adapting a unit-white ACES pixel:
-    //   rgb=(1,1,1) -> XYZ -> (diag von-Kries scene->reference) -> XYZ -> rgb.
-    // For non-neutral pixels the JNI/native path applies the full matrix per pixel;
-    // exposing the multiplier here covers the common neutral case + unit tests.
-    //
-    // Von-Kries here uses XYZ directly (colour 'Von Kries' method with no cone
-    // transform == identity sharpening), matching method='Von Kries' in the Python.
-    double whiteXyz[3];
-    const double unit[3] = {1.0, 1.0, 1.0};
-    mat3MulVec(kAcesRgbToXyz, unit, whiteXyz);
+    // Match np.allclose(target_white, source_white) exactly, including operand
+    // order. A near-reference source skips the CAT but can still receive tint.
+    const bool skipCat = numpyAllclose(targetWhite, sourceWhite);
+    const bool skipTint = numpyIsclose(tint, 1.0);
+    double cat02[9]{};
+    if (!skipCat) buildCat02Matrix(sourceWhite, targetWhite, cat02);
+    const float tint32 = static_cast<float>(tint);
 
-    double adapted[3] = {
-        whiteXyz[0] * (reference[0] / scene[0]),
-        whiteXyz[1] * (reference[1] / scene[1]),
-        whiteXyz[2] * (reference[2] / scene[2]),
-    };
-    double adaptedRgb[3];
-    mat3MulVec(kAcesXyzToRgb, adapted, adaptedRgb);
+    for (size_t i = 0; i < pixelCount; ++i) {
+        if ((i & 4095U) == 0U && cancellationRequested(options)) return false;
+        float adapted[3] = {
+            rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2],
+        };
+        if (!skipCat) {
+            const double in[3] = {
+                static_cast<double>(adapted[0]),
+                static_cast<double>(adapted[1]),
+                static_cast<double>(adapted[2]),
+            };
+            double xyz[3], adaptedXyz[3], out[3];
+            mat3MulVec(kAcesRgbToXyz, in, xyz);
+            mat3MulVec(cat02, xyz, adaptedXyz);
+            mat3MulVec(kAcesXyzToRgb, adaptedXyz, out);
 
-    outMul[0] = static_cast<float>(adaptedRgb[0]);
-    outMul[1] = static_cast<float>(adaptedRgb[1] * tint);  // green tint multiplier
-    outMul[2] = static_cast<float>(adaptedRgb[2]);
+            // First declared oracle boundary: CAT output is float32.
+            adapted[0] = static_cast<float>(out[0]);
+            adapted[1] = static_cast<float>(out[1]);
+            adapted[2] = static_cast<float>(out[2]);
+        }
+        if (!skipTint) {
+            // Second declared oracle boundary: multiply float32 CAT output by a
+            // float32 tint vector, then round the product back to float32.
+            adapted[1] = static_cast<float>(adapted[1] * tint32);
+        }
+        rgb[i * 3 + 0] = adapted[0];
+        rgb[i * 3 + 1] = adapted[1];
+        rgb[i * 3 + 2] = adapted[2];
+    }
+    return !cancellationRequested(options);
+}
+
+bool buildAcesWbMultiplier(const DecodeOptions& options, float outMul[3]) {
+    outMul[0] = outMul[1] = outMul[2] = 1.0f;
+    return applyAcesWhiteBalance(outMul, 1U, options);
 }
 
 void aces2065ToProPhotoRGB(float* rgb, size_t pixelCount) {
@@ -649,44 +815,6 @@ void applyParityParams(LibRaw& raw, const DecodeOptions& options) {
         // daylight multipliers explicitly via p.user_mul / raw.imgdata.color.pre_mul
         // so the base matches rawpy's daylight default exactly.
     }
-}
-
-// Full per-pixel Von-Kries adaptation in ACES RGB (the non-neutral-accurate path),
-// mirroring _apply_white_balance_adaptation + _apply_tint_adjustment.
-bool applyAcesAdaptation(float* rgb, size_t pixelCount,
-                         const DecodeOptions& options) {
-    if (options.whiteBalance == WhiteBalanceMode::AsShot ||
-        options.whiteBalance == WhiteBalanceMode::Daylight) {
-        return !cancellationRequested(options);
-    }
-
-    double targetTemp = options.temperatureK;
-    double tint = options.tint;
-    if (options.whiteBalance == WhiteBalanceMode::Tungsten) {
-        targetTemp = kTungstenTemperature;
-        tint = 1.0;
-    }
-
-    double scene[3], reference[3];
-    whitepointXyzFromTemperature(targetTemp, scene);
-    whitepointXyzFromTemperature(kDaylightReferenceTemperature, reference);
-    const double sx = reference[0] / scene[0];
-    const double sy = reference[1] / scene[1];
-    const double sz = reference[2] / scene[2];
-
-    for (size_t i = 0; i < pixelCount; ++i) {
-        if ((i & 4095U) == 0U && cancellationRequested(options)) return false;
-        double in[3] = {rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2]};
-        double xyz[3];
-        mat3MulVec(kAcesRgbToXyz, in, xyz);
-        xyz[0] *= sx; xyz[1] *= sy; xyz[2] *= sz;     // diagonal Von-Kries
-        double out[3];
-        mat3MulVec(kAcesXyzToRgb, xyz, out);
-        rgb[i * 3 + 0] = static_cast<float>(out[0]);
-        rgb[i * 3 + 1] = static_cast<float>(out[1] * tint);  // green tint
-        rgb[i * 3 + 2] = static_cast<float>(out[2]);
-    }
-    return !cancellationRequested(options);
 }
 
 // Run unpack + dcraw_process + dcraw_make_mem_image and copy the 16-bit linear RGB
@@ -846,8 +974,8 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     mCopy = phaseMs();
     image.reset();
 
-    if (!applyAcesAdaptation(result.rgb.data(), static_cast<size_t>(ow) * oh,
-                             options)) {
+    if (!applyAcesWhiteBalance(result.rgb.data(), static_cast<size_t>(ow) * oh,
+                               options)) {
         return cancellationFailure();
     }
     mAdapt = phaseMs();
@@ -887,6 +1015,9 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
 DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
                               const DecodeOptions& options) try {
     DecodeResult result;
+    if (!rawWhiteBalanceOptionsValid(options)) {
+        return invalidWhiteBalanceFailure();
+    }
     if (cancellationRequested(options)) return cancellationFailure();
     if (data == nullptr || length == 0) {
         result.status = SFRAW_ERR_INPUT;
@@ -933,6 +1064,9 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
 
 DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
     DecodeResult result;
+    if (!rawWhiteBalanceOptionsValid(options)) {
+        return invalidWhiteBalanceFailure();
+    }
     if (cancellationRequested(options)) return cancellationFailure();
     if (fd < 0) {
         result.status = SFRAW_ERR_INPUT;
@@ -1037,15 +1171,30 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
 // intentionally compile this file without the native dependency. Production
 // CMake fails during configure before a libsfraw.so can take this branch.
 
-DecodeResult decodeFromBuffer(const uint8_t*, size_t, const DecodeOptions&) {
+DecodeResult decodeFromBuffer(const uint8_t*, size_t,
+                              const DecodeOptions& options) {
     DecodeResult result;
+    if (!rawWhiteBalanceOptionsValid(options)) {
+        result.status = SFRAW_ERR_INPUT;
+        result.error =
+            "invalid RAW white balance: temperature must be finite and in "
+            "[1000,12000] K; tint must be finite and in [0.2,1.8]";
+        return result;
+    }
     result.status = SFRAW_ERR_UNKNOWN;
     result.error = "LibRaw unavailable in this non-production test build";
     return result;
 }
 
-DecodeResult decodeFromFd(int, const DecodeOptions&) {
+DecodeResult decodeFromFd(int, const DecodeOptions& options) {
     DecodeResult result;
+    if (!rawWhiteBalanceOptionsValid(options)) {
+        result.status = SFRAW_ERR_INPUT;
+        result.error =
+            "invalid RAW white balance: temperature must be finite and in "
+            "[1000,12000] K; tint must be finite and in [0.2,1.8]";
+        return result;
+    }
     result.status = SFRAW_ERR_UNKNOWN;
     result.error = "LibRaw unavailable in this non-production test build";
     return result;

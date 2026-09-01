@@ -23,8 +23,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Release: the demosaic/colour loops are the hot path. -O3 is safe; we keep IEEE
-# semantics here because the Von-Kries / white-balance multipliers must match the
-# desktop rawpy output to within golden-vector tolerance.
+# semantics here because the CAT02 RAW white-balance path is locked to exact
+# float32 oracle bits at its two declared cast boundaries.
 if (NOT CMAKE_CXX_FLAGS_RELEASE)
     set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 endif ()
@@ -268,6 +268,13 @@ add_library(sfraw SHARED
         raw_decoder.cpp
         raw_decoder_jni.cpp
 )
+
+# Clang/GCC may otherwise fuse multiply-add operations at -O3 even without
+# -ffast-math. The oracle accumulates each float64 matrix product in a fixed
+# order, so contraction must be disabled for exact ACES/ProPhoto float32 bits.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(sfraw PRIVATE -ffp-contract=off)
+endif ()
 
 target_include_directories(sfraw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -19,6 +19,14 @@ the test. The production-wrapper CTest also exercises the 64 MiB encoded-input,
 128 MiB raw-store, 12/8 MiPixel, ActiveArea, DefaultScale, ICC, and cumulative
 metadata guards with positive controls.
 
+The same CTest project runs `sfraw.raw-wb.cat02-exact-bits`. Its fixture header
+is generated in the build directory from
+`tools/parity/fixtures/raw_wb_cat_vectors.json` only after the canonical research
+digest passes. The executable calls production `raw_decoder.cpp` math for all
+56 scenario/patch combinations, compares exact ACES-after-WB and float32
+ProPhoto bits, and covers cast-order/skip diagnostics plus invalid native
+temperature and tint values. No generated header is committed.
+
 Typical Clang build:
 
 ```sh
