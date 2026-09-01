@@ -27,6 +27,8 @@ internal data class PersistedSourceRef(
 
 internal sealed interface SourceRestoreResult {
     data object None : SourceRestoreResult
+    /** Explicit durable selection; unlike an absent record it cannot resurrect an older URI. */
+    data object Demo : SourceRestoreResult
     data class Ready(val ref: PersistedSourceRef) : SourceRestoreResult
     data class NeedsAuthorization(val ref: PersistedSourceRef) : SourceRestoreResult
     data class Invalid(val reason: String) : SourceRestoreResult
@@ -128,6 +130,10 @@ internal class SourceAccessCoordinator(
             runCatching { reconcilePersistedGrantsLocked(expectedUri = null) }
             return@synchronized SourceRestoreResult.None
         }
+        if (ref == DEMO_TOMBSTONE) {
+            runCatching { reconcilePersistedGrantsLocked(expectedUri = null) }
+            return@synchronized SourceRestoreResult.Demo
+        }
         try {
             validateUri(ref.uri)
             require(ref.kind == "PHOTO" || ref.kind == "RAW") { "unsupported stored source kind" }
@@ -171,6 +177,21 @@ internal class SourceAccessCoordinator(
         Unit
     }
 
+    /**
+     * Commits the demo selection before releasing the old grant. The tombstone and the old editor
+     * checkpoint may temporarily disagree after a process kill; restoration treats the tombstone
+     * as authoritative and therefore never resurrects the URI.
+     */
+    fun selectDemo() = synchronized(mutationLock) {
+        val previous = store.load()
+        store.save(DEMO_TOMBSTONE)
+        if (previous?.accessMode == SourceAccessMode.PERSISTED && previous != DEMO_TOMBSTONE) {
+            runCatching { backend.releasePersistableRead(previous.uri) }
+        }
+        runCatching { reconcilePersistedGrantsLocked(expectedUri = null) }
+        Unit
+    }
+
     /** Releases grants left by either crash window around source-reference replacement. */
     fun reconcilePersistedGrants(): Int = synchronized(mutationLock) {
         val expected = store.load()
@@ -191,6 +212,12 @@ internal class SourceAccessCoordinator(
 
     companion object {
         private const val MAX_DISPLAY_NAME_CHARS = 512
+        internal val DEMO_TOMBSTONE = PersistedSourceRef(
+            uri = "demo://selected",
+            kind = "DEMO",
+            displayName = "synthetic demo image",
+            accessMode = SourceAccessMode.TRANSIENT,
+        )
 
         private fun validateUri(raw: String) {
             require(raw.isNotBlank() && raw == raw.trim()) { "source URI is blank or padded" }

@@ -210,6 +210,34 @@ class SourceAccessTest {
     }
 
     @Test
+    fun selectDemo_killAfterTombstoneBeforeSessionCommit_neverRestoresOldUri() {
+        val uri = "content://photos/old-before-demo"
+        val old = PersistedSourceRef(uri, "PHOTO", "old.jpg", SourceAccessMode.PERSISTED)
+        val backend = FakeUriGrantBackend(
+            persistedUris = mutableSetOf(uri),
+            readableUris = mutableSetOf(uri),
+        )
+        val store = FakeSourceRefStore(old)
+
+        // Crash point: the source transaction committed, while the editor-session file can still
+        // contain `old`. A brand-new coordinator models process death before session checkpoint.
+        SourceAccessCoordinator(backend, store).selectDemo()
+        val afterKill = SourceAccessCoordinator(backend, FakeSourceRefStore(store.stored)).restore()
+
+        assertEquals(SourceRestoreResult.Demo, afterKill)
+        assertEquals(SourceAccessCoordinator.DEMO_TOMBSTONE, store.stored)
+        assertTrue(backend.persistedReads().isEmpty())
+        val reconciled = reconcileEditorRestoration(
+            session = richSessionForSource(old),
+            sourceRestore = afterKill,
+            savedFallback = EditorSavedFallback.Empty,
+        )
+        assertEquals(SourceKind.DEMO, reconciled.source.kind)
+        assertNull(reconciled.source.uri)
+        assertNull(reconciled.document)
+    }
+
+    @Test
     fun acquire_replacingPersistedSource_releasesPreviousGrantAfterDurableSave() {
         val oldUri = "content://photos/old"
         val newUri = "content://photos/new"
@@ -361,17 +389,18 @@ class SourceAccessTest {
         assertTrue(acquireEntered.await(5, TimeUnit.SECONDS))
 
         // The user chooses demo while acquire is in flight, then Activity recreation queues
-        // restore. FIFO requires clear to run before restore, even though both share the latest
+        // restore. FIFO requires the demo tombstone to commit before restore, even though both
+        // share the latest
         // generation token and coordinator locking alone provides no fairness guarantee.
         val demoToken = gate.begin()
-        val clear = runtime.submit(demoToken) { coordinator.clear() }
+        val demo = runtime.submit(demoToken) { coordinator.selectDemo() }
         val recreatedRestore = runtime.submit(demoToken) { coordinator.restore() }
         releaseAcquire.countDown()
 
         withTimeout(5_000) { acquire.await() }
-        withTimeout(5_000) { clear.await() }
-        assertEquals(SourceRestoreResult.None, withTimeout(5_000) { recreatedRestore.await() })
-        assertNull(store.stored)
+        withTimeout(5_000) { demo.await() }
+        assertEquals(SourceRestoreResult.Demo, withTimeout(5_000) { recreatedRestore.await() })
+        assertEquals(SourceAccessCoordinator.DEMO_TOMBSTONE, store.stored)
         assertTrue(backend.persistedReads().isEmpty())
     }
 
@@ -403,7 +432,7 @@ class SourceAccessTest {
     }
 
     @Test
-    fun failedDemoClear_reportsStillDurableSourceForUiReconciliation() = runBlocking {
+    fun failedLegacyClear_reportsStillDurableSourceForUiReconciliation() = runBlocking {
         val uri = "content://photos/clear-commit-failed"
         val ref = PersistedSourceRef(uri, "PHOTO", "kept.jpg", SourceAccessMode.PERSISTED)
         val backend = FakeUriGrantBackend(
@@ -436,6 +465,30 @@ class SourceAccessTest {
         assertEquals(0, store.saveCalls)
         assertEquals(0, store.clearCalls)
         assertEquals(0, backend.calls)
+    }
+
+    private fun richSessionForSource(ref: PersistedSourceRef): EditorSessionDocument {
+        val snapshot = EditSnapshot("{}", 0)
+        return EditorSessionDocument(
+            source = EditorSourceState(
+                uri = ref.uri,
+                kind = SourceKind.valueOf(ref.kind),
+                displayName = ref.displayName,
+                authorizationRequired = false,
+            ),
+            current = snapshot,
+            committed = snapshot,
+            history = EditHistoryState(emptyList(), emptyList()),
+            tool = EditorToolState(null, EditorOverlayTool.NONE, 0),
+            preset = EditorPresetState(null, null, 1f, null, "", ""),
+            export = EditorExportState(
+                false,
+                ExportOptions(ExportFormat.JPEG, 90, ExportSize.FULL, 2048, ""),
+                false,
+                EditorExportPhase.IDLE,
+                null,
+            ),
+        )
     }
 
     private class FakeUriGrantBackend(

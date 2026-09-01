@@ -17,5 +17,15 @@
                 android:pathPrefix="/source/"
                 android:readPermission="com.spectrafilm.app.test.ticket170.READ_PROBE" />
         </provider>
+
+        <provider
+            android:name="com.spectrafilm.app.Ticket139SourceProvider"
+            android:authorities="com.spectrafilm.app.test.ticket139.sources"
+            android:exported="true"
+            android:grantUriPermissions="true">
+            <path-permission
+                android:pathPrefix="/source/"
+                android:readPermission="com.spectrafilm.app.test.ticket170.READ_PROBE" />
+        </provider>
     </application>
 </manifest>

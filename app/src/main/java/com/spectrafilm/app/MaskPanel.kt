@@ -24,7 +24,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -41,12 +40,13 @@ import com.spectrafilm.app.masks.TierADelta
 @Composable
 fun MasksSection(
     s: ParamsState,
+    selectedIndex: Int,
+    onSelectedIndexChange: (Int) -> Unit,
     onEditOnPhoto: (Int) -> Unit = {},
     onSampleColor: (Int) -> Unit = {},
     onSampleLuminance: (Int) -> Unit = {},
 ) {
     var expanded by remember { mutableStateOf(true) }
-    var selected by remember { mutableIntStateOf(0) }
     val masks = s.localAdjustments
 
     SectionCard("Masks", expanded, { expanded = it }) {
@@ -61,19 +61,19 @@ fun MasksSection(
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = {
                 s.localAdjustments = masks + defaultRadialAdjustment()
-                selected = masks.size
+                onSelectedIndexChange(masks.size)
             }) { Text("+ Radial mask") }
             TextButton(onClick = {
                 s.localAdjustments = masks + defaultLinearAdjustment()
-                selected = masks.size
+                onSelectedIndexChange(masks.size)
             }) { Text("+ Gradient mask") }
         }
 
         if (masks.isEmpty()) return@SectionCard
 
-        val idx = selected.coerceIn(0, masks.lastIndex)
+        val idx = clampSelectedMaskIndex(selectedIndex, masks.size)
         if (masks.size > 1) {
-            SubTabRow(List(masks.size) { "Mask ${it + 1}" }, idx, { selected = it })
+            SubTabRow(List(masks.size) { "Mask ${it + 1}" }, idx, onSelectedIndexChange)
         }
         val adj = masks[idx]
         fun set(updated: LocalAdjustment) {
@@ -226,8 +226,9 @@ fun MasksSection(
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = {
-                s.localAdjustments = masks.toMutableList().also { it.removeAt(idx) }
-                selected = 0
+                val remaining = masks.toMutableList().also { it.removeAt(idx) }
+                s.localAdjustments = remaining
+                onSelectedIndexChange(clampSelectedMaskIndex(idx, remaining.size))
             }) { Text("Delete mask") }
         }
     }

@@ -87,6 +87,42 @@ class AtomicJsonStoreTest {
     }
 
     @Test
+    fun malformedUtf16_isRejectedByLengthWriteAndJsonBoundaries() {
+        val loneHigh = "bad\uD83Dvalue"
+        val loneLow = "bad\uDE42value"
+        val target = temporary.newFolder("malformed-utf16").resolve("document.json")
+
+        listOf(loneHigh, loneLow).forEach { malformed ->
+            expectThrows<CharacterCodingException> { AtomicJsonStore.utf8Length(malformed) }
+            expectThrows<CharacterCodingException> {
+                AtomicJsonStore.writeUtf8(target, malformed, 1024)
+            }
+            expectThrows<IllegalArgumentException> {
+                AtomicJsonStore.parseObject("{\"value\":\"$malformed\"}")
+            }
+        }
+        expectThrows<IllegalArgumentException> {
+            AtomicJsonStore.parseObject("""{"value":"\uD83D"}""")
+        }
+        expectThrows<IllegalArgumentException> {
+            AtomicJsonStore.parseObject("""{"value":"\uDE42"}""")
+        }
+        assertFalse(target.exists())
+    }
+
+    @Test
+    fun supplementaryCodePoint_roundTripsAndTruncatesOnlyAtWholeBoundary() {
+        val emoji = "\uD83D\uDE42"
+        val value = "abc${emoji}def"
+        val escaped = AtomicJsonStore.parseObject("""{"value":"\uD83D\uDE42"}""")
+
+        assertEquals(emoji, escaped.getString("value"))
+        assertEquals("abc", AtomicJsonStore.truncateUtf16Safely(value, 4))
+        assertEquals("abc$emoji", AtomicJsonStore.truncateUtf16Safely(value, 5))
+        assertEquals(value.toByteArray(Charsets.UTF_8).size, AtomicJsonStore.utf8Length(value))
+    }
+
+    @Test
     fun corruptDocument_isQuarantinedUnderDeterministicSiblingName() {
         val target = temporary.newFolder("recipes").resolve("recipe.json")
         target.writeText("not json")
@@ -163,6 +199,42 @@ class AtomicJsonStoreTest {
         )
 
         assertEquals("ab\n", root.getString("value"))
+    }
+
+    @Test
+    fun lexicalMeasurementReportsExactShapeAndUtf8BytesWithoutChangingAdmission() {
+        val unicode = "\u20ac\uD83D\uDE42"
+        val text = " {\"ascii\":[1,{\"unicode\":\"$unicode\"}],\"empty\":null} "
+
+        val measured = AtomicJsonStore.measureText(text)
+        val parsed = AtomicJsonStore.parseMeasuredObject(text)
+
+        assertEquals(6, measured.nodeCount)
+        assertEquals(4, measured.maxDepth)
+        assertEquals(text.toByteArray(Charsets.UTF_8).size, measured.utf8Bytes)
+        assertEquals(measured, parsed.measurement)
+        assertEquals(unicode, parsed.value.getJSONArray("ascii").getJSONObject(1).getString("unicode"))
+    }
+
+    @Test
+    fun utf8LengthMatchesStrictPlatformEncodingAndRejectsEveryLoneSurrogateCase() {
+        val valid = listOf(
+            "ascii",
+            "\u00e9",
+            "\uD83D\uDE42",
+        )
+        val malformed = listOf(
+            "\uD800",
+            "\uDC00",
+            "x\uD800y\uDC00z",
+        )
+
+        valid.forEach { value ->
+            assertEquals(value.toByteArray(Charsets.UTF_8).size, AtomicJsonStore.utf8Length(value))
+        }
+        malformed.forEach { value ->
+            expectThrows<CharacterCodingException> { AtomicJsonStore.utf8Length(value) }
+        }
     }
 
     @Test

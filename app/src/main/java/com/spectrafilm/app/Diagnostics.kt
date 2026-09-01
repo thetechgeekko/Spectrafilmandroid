@@ -231,18 +231,40 @@ object Diagnostics {
                     pid = pid,
                     requestedMaxLines = boundedLines,
                     timeoutMs = LOGCAT_EXIT_TIMEOUT_MS,
-                    onTimeout = { process.destroyForcibly() },
+                    onTimeout = { destroyLogcatProcess(process) },
                 )
-                if (!process.waitFor(100L, TimeUnit.MILLISECONDS)) {
-                    process.destroyForcibly()
+                if (!waitForLogcatExit(process)) {
+                    destroyLogcatProcess(process)
                 }
                 captured?.ifBlank { "(no logcat lines for this process)" }
                     ?: "logcat capture failed"
             } finally {
-                if (process.isAlive) process.destroyForcibly()
+                destroyLogcatProcess(process)
             }
         } catch (_: Exception) {
             "logcat capture failed"
+        }
+    }
+
+    /** API 26 gate: [java.lang.Process.waitFor] with a timeout does not exist below O. */
+    private fun waitForLogcatExit(process: java.lang.Process): Boolean =
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            process.waitFor(100L, TimeUnit.MILLISECONDS)
+        } else {
+            try {
+                process.exitValue()
+                true
+            } catch (_: IllegalThreadStateException) {
+                false
+            }
+        }
+
+    /** API 26 gate: [java.lang.Process.destroyForcibly] does not exist below O. Safe on a dead process. */
+    private fun destroyLogcatProcess(process: java.lang.Process) {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            process.destroyForcibly()
+        } else {
+            process.destroy()
         }
     }
 

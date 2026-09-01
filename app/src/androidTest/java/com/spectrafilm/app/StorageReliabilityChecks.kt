@@ -309,11 +309,20 @@ object StorageReliabilityChecks {
         val release = CompletableDeferred<Unit>()
         val completions = AtomicInteger(0)
         val retainedEngine = AtomicReference<Any?>(null)
+        // This is a legitimate export owned by the Activity's already-authorized demo source.
+        // The legacy four-argument launch ABI is intentionally UNBOUND and therefore must never
+        // be publishable by a source-fenced UI; bind this probe to the exact current generation.
+        val sourceIdentity = ExportSourceIdentityAuthority.bind(
+            uri = null,
+            kind = SourceKind.DEMO,
+            authorizationRequired = false,
+        )
         val runId = requireNotNull(
             ExportWorkRuntime.launch(
                 context = context,
                 format = ExportFormat.PNG16,
                 startedAtMillis = System.currentTimeMillis(),
+                sourceIdentity = sourceIdentity,
             ) {
                 try {
                     val startedAt = System.nanoTime()

@@ -108,6 +108,48 @@ class EditHistoryTest {
     }
 
     @Test
+    fun snapshotAndRestore_preserveBothBranchesAndCursorOrder() {
+        val original = EditHistory()
+        original.push(snap("s1"))
+        original.push(snap("s2"))
+        assertEquals(snap("s2"), original.undo(snap("s3")))
+
+        val restored = EditHistory()
+        restored.restoreState(original.snapshotState())
+
+        assertEquals(snap("s1"), restored.undo(snap("s2")))
+        assertEquals(snap("s2"), restored.redo(snap("s1")))
+        assertEquals(snap("s3"), restored.redo(snap("s2")))
+    }
+
+    @Test
+    fun rejectedRestore_isTransactionalAndLeavesPriorHistoryUntouched() {
+        val history = EditHistory(cap = 2, byteCap = 64)
+        history.push(snap("kept"))
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            history.restoreState(
+                EditHistoryState(
+                    undo = listOf(snap("a"), snap("b"), snap("c")),
+                    redo = emptyList(),
+                ),
+            )
+        }
+
+        assertEquals(snap("kept"), history.undo(snap("live")))
+    }
+
+    @Test
+    fun byteCapDropsOldestSnapshotInsteadOfGrowingWithoutBound() {
+        val history = EditHistory(cap = 50, byteCap = 14)
+        history.push(snap("123456")) // 6 UTF-8 bytes + 4 rotation bytes
+        history.push(snap("abcdef"))
+
+        assertEquals(snap("abcdef"), history.undo(snap("live")))
+        assertFalse("the oldest entry was evicted by the byte cap", history.canUndo)
+    }
+
+    @Test
     fun snapshot_carriesRotation() {
         val h = EditHistory()
         h.push(snap("a", rot = 90))

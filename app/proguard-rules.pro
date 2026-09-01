@@ -60,6 +60,20 @@
 -keep class com.spectrafilm.app.ExportFormat { *; }
 -keep class com.spectrafilm.app.PendingExportBackend$DefaultImpls { *; }
 
+# Ticket #139 deliberately exposes one narrow, fixed-fixture bridge instead of making the entire
+# editor-session/store/source implementation a cross-APK ABI. The release test APK calls only these
+# public methods; their bodies keep the app-internal implementation edges visible to target R8.
+-keep class com.spectrafilm.app.Ticket139EditorTestBridge { public *; }
+
+# The #139 Activity-recreation probe binds its export's source identity from the release test APK
+# (StorageReliabilityChecks), so the authority and the value types that cross with it are cross-APK
+# ABI exactly like ExportWorkRuntime above. Without these, R8 class-inlines the singleton (its only
+# in-app callers are direct) and the test APK dies with NoSuchFieldError: INSTANCE at runtime.
+-keep class com.spectrafilm.app.ExportSourceIdentityAuthority { *; }
+-keep class com.spectrafilm.app.ExportSourceIdentity { *; }
+-keep class com.spectrafilm.app.ExportSourceIdentity$* { *; }
+-keep class com.spectrafilm.app.SourceKind { *; }
+
 # Ticket #174's separate release test APK calls the production descriptor/color contract and the
 # production float-to-tagged-Bitmap bridge, then parses the encoded files on a physical device.
 -keep class com.spectrafilm.app.OutputDescriptor { *; }

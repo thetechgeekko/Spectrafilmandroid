@@ -16,6 +16,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
+import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.math.BigDecimal
 import java.math.BigInteger
@@ -45,11 +46,24 @@ internal data class JsonStructureLimits(
     }
 }
 
+/** Result of the bounded lexical pass; computing it does not materialize a JSON tree or byte array. */
+internal data class JsonTextMeasurement(
+    val nodeCount: Int,
+    val maxDepth: Int,
+    val utf8Bytes: Int,
+)
+
+internal data class MeasuredJsonObject(
+    val value: JSONObject,
+    val measurement: JsonTextMeasurement,
+)
+
 internal object AtomicJsonStore {
     const val MAX_PRESET_BYTES: Int = 4 * 1024 * 1024
     const val MAX_RECIPE_BYTES: Int = 4 * 1024 * 1024
 
     private val fileLocks = ConcurrentHashMap<String, Any>()
+    private data class JsonShapeMeasurement(val nodeCount: Int, val maxDepth: Int)
 
     /**
      * Holds the same reentrant per-path lock used by read/write/delete/quarantine across a
@@ -62,7 +76,11 @@ internal object AtomicJsonStore {
     }
 
     fun writeUtf8(file: File, text: String, maxBytes: Int) {
-        val bytes = text.toByteArray(Charsets.UTF_8)
+        val encoded = Charsets.UTF_8.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .encode(CharBuffer.wrap(text))
+        val bytes = ByteArray(encoded.remaining()).also(encoded::get)
         if (bytes.size > maxBytes) {
             throw DocumentLimitException("document is ${bytes.size} bytes; limit is $maxBytes")
         }
@@ -131,18 +149,84 @@ internal object AtomicJsonStore {
     fun parseObject(
         text: String,
         limits: JsonStructureLimits = JsonStructureLimits(),
-    ): JSONObject {
-        validateText(text, limits)
+    ): JSONObject = parseMeasuredObject(text, limits).value
+
+    /**
+     * Parse one already-bounded object and return the non-allocating preflight measurement that
+     * admitted it. Callers may inspect the object and then discard it; no parsed-tree cache is held.
+     */
+    fun parseMeasuredObject(
+        text: String,
+        limits: JsonStructureLimits = JsonStructureLimits(),
+    ): MeasuredJsonObject {
+        val measurement = measureText(text, limits)
         // Android's platform JSONTokener narrows every non-Long number to Double. That can
         // round a token such as 2.0000000000000001 to exactly 2.0 before schema/version
         // validation sees it. Reparse the already bounded text while retaining integer and
         // decimal tokens as BigInteger/BigDecimal so device and JVM validation are identical.
-        return ExactJsonParser(text).parseDocumentObject().also { validate(it, limits) }
+        val value = ExactJsonParser(text).parseDocumentObject().also { validate(it, limits) }
+        return MeasuredJsonObject(value, measurement)
     }
 
     /** Validate a complete RFC-8259 JSON value without constructing its object tree. */
     fun validateText(text: String, limits: JsonStructureLimits = JsonStructureLimits()) {
-        JsonTextPreflight(text, limits).validateDocument()
+        measureText(text, limits)
+    }
+
+    /** Validate and measure a complete JSON value without constructing its object tree. */
+    fun measureText(
+        text: String,
+        limits: JsonStructureLimits = JsonStructureLimits(),
+    ): JsonTextMeasurement {
+        val shape = JsonTextPreflight(text, limits).validateDocument()
+        return JsonTextMeasurement(shape.nodeCount, shape.maxDepth, utf8Length(text))
+    }
+
+    /** Exact strict UTF-8 length without allocating the encoded byte array. */
+    fun utf8Length(text: String): Int {
+        var bytes = 0L
+        var index = 0
+        while (index < text.length) {
+            val char = text[index]
+            bytes += when {
+                char.code <= 0x7f -> 1L
+                char.code <= 0x7ff -> 2L
+                Character.isHighSurrogate(char) &&
+                    index + 1 < text.length &&
+                    Character.isLowSurrogate(text[index + 1]) -> {
+                    index++
+                    4L
+                }
+                Character.isSurrogate(char) -> throw CharacterCodingException()
+                else -> 3L
+            }
+            if (bytes > Int.MAX_VALUE) throw DocumentLimitException("UTF-8 length exceeds Int range")
+            index++
+        }
+        return bytes.toInt()
+    }
+
+    /**
+     * Truncate a well-formed UTF-16 string without splitting a supplementary code point. The
+     * persisted contracts express limits in UTF-16 code units, so this preserves that limit while
+     * refusing the replacement-character behavior of String.take()/the default UTF-8 encoder.
+     */
+    fun truncateUtf16Safely(text: String, maxChars: Int): String {
+        require(maxChars >= 0) { "maxChars must be non-negative" }
+        // Validate the complete producer value first; truncation must not hide malformed input in
+        // the discarded suffix.
+        utf8Length(text)
+        if (text.length <= maxChars) return text
+        val end = if (
+            maxChars > 0 &&
+            Character.isHighSurrogate(text[maxChars - 1]) &&
+            Character.isLowSurrogate(text[maxChars])
+        ) {
+            maxChars - 1
+        } else {
+            maxChars
+        }
+        return text.substring(0, end)
     }
 
     /**
@@ -221,7 +305,7 @@ internal object AtomicJsonStore {
                 is Number -> Unit
                 is String -> if (value.length > limits.maxStringChars) {
                     throw DocumentLimitException("JSON string exceeds ${limits.maxStringChars} characters")
-                }
+                } else utf8Length(value)
                 is JSONArray -> {
                     if (value.length() > limits.maxArrayLength) {
                         throw DocumentLimitException("JSON array length exceeds ${limits.maxArrayLength}")
@@ -238,6 +322,7 @@ internal object AtomicJsonStore {
                         if (key.length > limits.maxStringChars) {
                             throw DocumentLimitException("JSON key exceeds ${limits.maxStringChars} characters")
                         }
+                        utf8Length(key)
                         visit(value.opt(key), depth + 1)
                     }
                 }
@@ -385,8 +470,9 @@ internal object AtomicJsonStore {
     ) {
         private var position = 0
         private var nodes = 0
+        private var maximumDepth = 0
 
-        fun validateDocument() {
+        fun validateDocument(): JsonShapeMeasurement {
             limit(
                 text.length <= limits.maxInputChars,
                 "JSON input exceeds ${limits.maxInputChars} characters",
@@ -395,10 +481,12 @@ internal object AtomicJsonStore {
             parseValue(depth = 1)
             skipWhitespace()
             syntax(position == text.length, "trailing content")
+            return JsonShapeMeasurement(nodes, maximumDepth)
         }
 
         private fun parseValue(depth: Int) {
             limit(depth <= limits.maxDepth, "JSON depth exceeds ${limits.maxDepth}")
+            maximumDepth = maxOf(maximumDepth, depth)
             nodes++
             limit(nodes <= limits.maxNodes, "JSON node count exceeds ${limits.maxNodes}")
             syntax(position < text.length, "expected a JSON value")
@@ -454,18 +542,41 @@ internal object AtomicJsonStore {
         private fun parseString() {
             syntax(consume('"'), "expected a string")
             var decodedChars = 0
+            var pendingHighSurrogate = false
             while (position < text.length) {
                 val value = text[position++]
                 when {
-                    value == '"' -> return
+                    value == '"' -> {
+                        syntax(!pendingHighSurrogate, "unpaired high surrogate in string")
+                        return
+                    }
                     value == '\\' -> {
                         syntax(position < text.length, "unterminated string escape")
                         when (text[position++]) {
-                            '"', '\\', '/', 'b', 'f', 'n', 'r', 't' -> Unit
+                            '"', '\\', '/', 'b', 'f', 'n', 'r', 't' ->
+                                syntax(!pendingHighSurrogate, "unpaired high surrogate in string")
                             'u' -> {
                                 syntax(position + 4 <= text.length, "truncated unicode escape")
+                                var codeUnit = 0
                                 repeat(4) {
-                                    syntax(text[position++].digitToIntOrNull(16) != null, "invalid unicode escape")
+                                    val digit = text[position++].digitToIntOrNull(16)
+                                    syntax(digit != null, "invalid unicode escape")
+                                    codeUnit = (codeUnit shl 4) or requireNotNull(digit)
+                                }
+                                val escaped = codeUnit.toChar()
+                                when {
+                                    Character.isHighSurrogate(escaped) -> {
+                                        syntax(!pendingHighSurrogate, "unpaired high surrogate in string")
+                                        pendingHighSurrogate = true
+                                    }
+                                    Character.isLowSurrogate(escaped) -> {
+                                        syntax(pendingHighSurrogate, "unpaired low surrogate in string")
+                                        pendingHighSurrogate = false
+                                    }
+                                    else -> syntax(
+                                        !pendingHighSurrogate,
+                                        "unpaired high surrogate in string",
+                                    )
                                 }
                             }
                             else -> syntax(false, "invalid string escape")
@@ -473,7 +584,20 @@ internal object AtomicJsonStore {
                         decodedChars++
                     }
                     value.code < 0x20 -> syntax(false, "unescaped control character in string")
-                    else -> decodedChars++
+                    Character.isHighSurrogate(value) -> {
+                        syntax(!pendingHighSurrogate, "unpaired high surrogate in string")
+                        pendingHighSurrogate = true
+                        decodedChars++
+                    }
+                    Character.isLowSurrogate(value) -> {
+                        syntax(pendingHighSurrogate, "unpaired low surrogate in string")
+                        pendingHighSurrogate = false
+                        decodedChars++
+                    }
+                    else -> {
+                        syntax(!pendingHighSurrogate, "unpaired high surrogate in string")
+                        decodedChars++
+                    }
                 }
                 limit(
                     decodedChars <= limits.maxStringChars,

@@ -54,6 +54,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
@@ -99,7 +100,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Which kind of source image is loaded. */
-private enum class SourceKind { DEMO, PHOTO, RAW }
+internal enum class SourceKind { DEMO, PHOTO, RAW }
 
 private fun Throwable.isSourceAuthorizationFailure(): Boolean =
     generateSequence(this) { it.cause }
@@ -254,10 +255,84 @@ private suspend fun decodeSourceRequest(
 }
 
 /** Top-level navigation destinations. */
-private enum class Screen { EDITOR, SETTINGS, ABOUT, CURVES_FILM, CURVES_PRINT, DIAGNOSTICS }
+internal enum class Screen { EDITOR, SETTINGS, ABOUT, CURVES_FILM, CURVES_PRINT, DIAGNOSTICS }
+
+private data class EditorStartupRead(
+    val session: EditorSessionReadResult,
+    val source: SourceRestoreResult,
+)
+
+/** Waits behind any process-owned grant mutation and returns only its newest durable identity. */
+private suspend fun restoreLatestSourceAccess(context: Context): SourceRestoreResult {
+    val runtime = sourceAccessRuntime(context.applicationContext)
+    while (currentCoroutineContext().isActive) {
+        val generation = runtime.mutations.snapshot()
+        val restored = try {
+            runtime.submit(generation) {
+                runtime.coordinator.restore().also { source ->
+                    if (source is SourceRestoreResult.Invalid) {
+                        runCatching { runtime.coordinator.clear() }
+                    }
+                }
+            }.await()?.takeIf { runtime.mutations.isCurrent(generation) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            SourceRestoreResult.Invalid("source access unavailable")
+        }
+        if (restored != null) return restored
+    }
+    throw CancellationException("source restoration cancelled")
+}
+
+private val EditorSavedFallbackSaver = listSaver<EditorSavedFallback, Any>(
+    save = { fallback ->
+        val source = fallback.source
+        if (source == null) {
+            emptyList()
+        } else {
+            listOf(
+                source.uri.orEmpty(),
+                source.kind.name,
+                source.displayName,
+                source.authorizationRequired,
+                fallback.rotationDegrees,
+            )
+        }
+    },
+    restore = { values ->
+        if (values.size != 5) {
+            EditorSavedFallback.Empty
+        } else {
+            try {
+                val uri = (values[0] as String).ifEmpty { null }
+                val kind = SourceKind.valueOf(values[1] as String)
+                val displayName = values[2] as String
+                val authorizationRequired = values[3] as Boolean
+                val rotationDegrees = values[4] as Int
+                require(uri == null || uri.length <= 16 * 1024)
+                require(displayName.isNotBlank() && displayName.length <= 512)
+                require(rotationDegrees in setOf(0, 90, 180, 270))
+                if (kind == SourceKind.DEMO) {
+                    require(uri == null && !authorizationRequired)
+                } else {
+                    val parsed = Uri.parse(requireNotNull(uri))
+                    require(parsed.scheme.equals("content", ignoreCase = true))
+                    require(!parsed.authority.isNullOrBlank())
+                }
+                EditorSavedFallback(
+                    source = EditorSourceState(uri, kind, displayName, authorizationRequired),
+                    rotationDegrees = rotationDegrees,
+                )
+            } catch (_: Exception) {
+                EditorSavedFallback.Empty
+            }
+        }
+    },
+)
 
 /** Adjustment categories shown in the bottom bar; each maps to an existing section. */
-private enum class Category(val label: String) {
+internal enum class Category(val label: String) {
     SOURCE("Source"),
     PRESETS("Presets"),
     SIMULATION("Simulation"),
@@ -337,15 +412,254 @@ class MainActivity : ComponentActivity() {
     /** Hosts onboarding + top-level navigation around the editor. */
     @Composable
     private fun AppRoot(settings: AppSettings, onThemeChanged: (ThemeMode) -> Unit) {
+        val ctx = LocalContext.current
+        val appContext = ctx.applicationContext
+        // Acquire before startup read: once this host exists, callbacks from an overlapping
+        // outgoing Activity may no longer publish a logically older cursor after restoration.
+        val sessionCheckpointOwner = remember(appContext) {
+            EditorSessionCheckpointRuntime.acquireOwner()
+        }
+        var startupRead by remember { mutableStateOf<EditorStartupRead?>(null) }
+        var savedFallback by rememberSaveable(stateSaver = EditorSavedFallbackSaver) {
+            mutableStateOf(EditorSavedFallback.Empty)
+        }
+        LaunchedEffect(appContext) {
+            val sessionRead = withContext(Dispatchers.IO) {
+                EditorSessionCheckpointRuntime.read(appContext)
+            }
+            startupRead = EditorStartupRead(sessionRead, restoreLatestSourceAccess(appContext))
+        }
+
+        // A session document can contain several megabytes of bounded undo state. Read it from
+        // no-backup storage off-main before constructing the editor; rendering defaults and then
+        // replaying the restored cursor would publish a wrong-source/default frame in between.
+        val startup = startupRead
+        if (startup == null) {
+            Box(
+                Modifier.fillMaxSize().background(SpectraIcons.nearBlackCanvas),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Color.White)
+            }
+            return
+        }
+        val sessionReadResult = startup.session
+        val loadedSession = (sessionReadResult as? EditorSessionReadResult.Loaded)?.document
+        val initialRestoration = remember(loadedSession, startup.source, savedFallback) {
+            reconcileEditorRestoration(
+                session = loadedSession,
+                sourceRestore = startup.source,
+                savedFallback = savedFallback,
+            )
+        }
+        // Unsupported is a durable downgrade guard. Unavailable starts read-only until a real
+        // AtomicFile read proves that transient storage IO recovered.
+        var sessionWriteAccess by remember(sessionReadResult) {
+            mutableStateOf(editorSessionWriteAccess(sessionReadResult))
+        }
+        val sessionRestoreNotice = when {
+            loadedSession != null && !initialRestoration.retainedSessionCursor ->
+                "The durable source changed; its saved recipe will be restored"
+            initialRestoration.source.authorizationRequired ->
+                "Source access expired; choose the same file to continue this edit"
+            sessionReadResult is EditorSessionReadResult.CorruptQuarantined ->
+                "Damaged editor session was quarantined; source and saved recipe will be restored"
+            sessionReadResult is EditorSessionReadResult.Unsupported ->
+                "Editor session is from a newer app version and was left untouched"
+            sessionReadResult is EditorSessionReadResult.Unavailable ->
+                "Editor session is unavailable; source and saved recipe will be restored"
+            else -> null
+        }
+        var pendingSessionRestoreNotice by remember { mutableStateOf(sessionRestoreNotice) }
+        var editorRestoration by remember { mutableStateOf(initialRestoration) }
+        var latestEditorSession by remember { mutableStateOf(initialRestoration.document) }
+        var liveSessionMutatedDuringRecovery by remember { mutableStateOf(false) }
+        var editorAuthorityReady by remember { mutableStateOf(true) }
+        var editorEntryGeneration by remember { mutableLongStateOf(0L) }
+        var editorCompositionGeneration by remember { mutableLongStateOf(0L) }
+        var editorCallbackGeneration by remember { mutableLongStateOf(0L) }
+        LaunchedEffect(appContext, sessionReadResult) {
+            if (sessionWriteAccess != EditorSessionWriteAccess.RECOVERING) return@LaunchedEffect
+            val recovered = awaitEditorSessionWriteRecovery(
+                read = {
+                    withContext(Dispatchers.IO) {
+                        EditorSessionCheckpointRuntime.read(appContext)
+                    }
+                },
+                onUnavailable = { delay(500) },
+            )
+            val recoveredAccess = editorSessionWriteAccess(recovered)
+            when (recoveredAccess) {
+                EditorSessionWriteAccess.WRITABLE -> {
+                    // Fence every callback owned by the outgoing composition before adopting the
+                    // recovery decision. Its lifecycle onDispose must not overwrite that decision.
+                    editorCallbackGeneration++
+                    editorAuthorityReady = false
+                    val source = restoreLatestSourceAccess(appContext)
+                    val resolution = (recovered as? EditorSessionReadResult.Loaded)?.let { loaded ->
+                        resolveLoadedEditorSessionRecovery(
+                            recovered = loaded.document,
+                            sourceRestore = source,
+                            savedFallback = savedFallback,
+                            liveDocument = latestEditorSession,
+                            liveMutated = liveSessionMutatedDuringRecovery,
+                        )
+                    }
+                    val reconciled = resolution?.restoration ?: reconcileEditorRestoration(
+                        session = latestEditorSession,
+                        sourceRestore = source,
+                        savedFallback = savedFallback,
+                    )
+                    editorRestoration = reconciled
+                    latestEditorSession = reconciled.document
+                    savedFallback = EditorSavedFallback(
+                        source = reconciled.source,
+                        rotationDegrees = reconciled.rotationDegrees,
+                    )
+                    // If the explicit live-mutation policy won (or recovery found no document),
+                    // enqueue that exact reconciled cursor before exposing WRITABLE to callbacks.
+                    if (
+                        resolution?.policy == EditorRecoveryConflictPolicy.LIVE_MUTATION ||
+                        recovered !is EditorSessionReadResult.Loaded
+                    ) reconciled.document?.let { document ->
+                        EditorSessionCheckpointRuntime.checkpoint(
+                            appContext,
+                            document,
+                            sessionCheckpointOwner,
+                        )
+                    }
+                    editorCompositionGeneration++
+                    liveSessionMutatedDuringRecovery = false
+                    sessionWriteAccess = EditorSessionWriteAccess.WRITABLE
+                    editorAuthorityReady = true
+                    pendingSessionRestoreNotice =
+                        "Editor session storage recovered; new edits will now be saved"
+                }
+                EditorSessionWriteAccess.PROTECTED -> {
+                    sessionWriteAccess = EditorSessionWriteAccess.PROTECTED
+                    pendingSessionRestoreNotice =
+                        "Editor session is from a newer app version and was left untouched"
+                }
+                EditorSessionWriteAccess.RECOVERING -> error("recovery returned unavailable")
+            }
+        }
+        val activeRestoration = latestEditorSession?.let { document ->
+            EditorRestoration(
+                document = document,
+                source = document.source,
+                rotationDegrees = document.current.rotationDegrees,
+                retainedSessionCursor = true,
+                usedSavedFallback = false,
+            )
+        } ?: editorRestoration
+        SideEffect {
+            if (editorAuthorityReady) {
+                val fallback = EditorSavedFallback(
+                    source = activeRestoration.source,
+                    rotationDegrees = activeRestoration.rotationDegrees,
+                )
+                if (savedFallback != fallback) savedFallback = fallback
+            }
+        }
+        val acceptEditorSession: (EditorSessionDocument, Boolean) -> Boolean = remember(
+            appContext,
+            sessionWriteAccess,
+            sessionCheckpointOwner,
+            editorCallbackGeneration,
+        ) {
+            val acceptedCallbackGeneration = editorCallbackGeneration
+            checkpoint@{ document, liveMutation ->
+                if (acceptedCallbackGeneration != editorCallbackGeneration) {
+                    return@checkpoint false
+                }
+                latestEditorSession = document
+                if (
+                    sessionWriteAccess == EditorSessionWriteAccess.RECOVERING &&
+                    liveMutation
+                ) liveSessionMutatedDuringRecovery = true
+                Ticket139EditorProbe.publishCheckpoint()
+                savedFallback = EditorSavedFallback(
+                    source = document.source,
+                    rotationDegrees = document.current.rotationDegrees,
+                )
+                if (sessionWriteAccess == EditorSessionWriteAccess.WRITABLE) {
+                    EditorSessionCheckpointRuntime.checkpoint(
+                        appContext,
+                        document,
+                        sessionCheckpointOwner,
+                    )
+                } else {
+                    false
+                }
+            }
+        }
         var showOnboarding by remember { mutableStateOf(!settings.seenOnboarding) }
         // One-time editor coach marks, shown once onboarding is out of the way.
         var showEditorCoach by remember { mutableStateOf(!settings.seenEditorCoach) }
         var screen by remember { mutableStateOf(Screen.EDITOR) }
+
+        fun navigateTo(destination: Screen) {
+            if (destination == Screen.EDITOR && screen != Screen.EDITOR) {
+                // Do not compose the editor with its last in-memory identity. A source acquire or
+                // clear may have completed while the editor destination was disposed; the FIFO
+                // restore below waits behind it and reconciles the latest session first.
+                editorAuthorityReady = false
+                editorEntryGeneration++
+            }
+            screen = destination
+        }
+
+        LaunchedEffect(editorEntryGeneration) {
+            if (editorEntryGeneration == 0L) return@LaunchedEffect
+            val source = restoreLatestSourceAccess(appContext)
+            val reconciled = reconcileEditorRestoration(
+                session = latestEditorSession,
+                sourceRestore = source,
+                savedFallback = savedFallback,
+            )
+            editorRestoration = reconciled
+            latestEditorSession = reconciled.document
+            pendingSessionRestoreNotice = when {
+                !reconciled.retainedSessionCursor ->
+                    "The durable source changed; its saved recipe will be restored"
+                reconciled.source.authorizationRequired ->
+                    "Source access expired; choose the same file to continue this edit"
+                else -> pendingSessionRestoreNotice
+            }
+            editorAuthorityReady = true
+        }
+        DisposableEffect(Unit) {
+            Ticket139EditorProbe.onHostCreated()
+            onDispose { }
+        }
+        LaunchedEffect(Unit) {
+            if (!Ticket139EditorProbe.isArmed()) return@LaunchedEffect
+            Ticket139EditorProbe.navigationRequests.collect { request ->
+                if (request.destination.isEmpty()) return@collect
+                val destination = try {
+                    Screen.valueOf(request.destination)
+                } catch (_: IllegalArgumentException) {
+                    return@collect
+                }
+                navigateTo(destination)
+            }
+        }
+        SideEffect {
+            if (screen != Screen.EDITOR || editorAuthorityReady) {
+                Ticket139EditorProbe.publishDestination(screen)
+            }
+        }
         // Hoisted here (not inside EditorScreen) so the open adjustment category survives a
         // round-trip to Settings/About and back — you return to where you were editing,
         // Lightroom-style, instead of a collapsed panel.
-        val editorCategory = remember { mutableStateOf<Category?>(null) }
-        val ctx = LocalContext.current
+        val editorCategory = remember {
+            mutableStateOf(activeRestoration.document?.tool?.category)
+        }
+        LaunchedEffect(editorEntryGeneration, editorAuthorityReady) {
+            if (editorAuthorityReady) {
+                editorCategory.value = activeRestoration.document?.tool?.category
+            }
+        }
 
         // Catalog-grouped profile options for the Settings default-profile pickers.
         var settingsFilmGroups by remember { mutableStateOf<List<DropdownGroup>>(emptyList()) }
@@ -358,7 +672,7 @@ class MainActivity : ComponentActivity() {
         var curvesPrintName by remember { mutableStateOf("") }
 
         // Back from a pushed sub-screen returns to the editor (root).
-        BackHandler(enabled = screen != Screen.EDITOR) { screen = Screen.EDITOR }
+        BackHandler(enabled = screen != Screen.EDITOR) { navigateTo(Screen.EDITOR) }
 
         val screenState = rememberSaveableStateHolder()
 
@@ -375,46 +689,56 @@ class MainActivity : ComponentActivity() {
             // declared rememberSaveable precisely so source identity is durable; the nav
             // swap was defeating that, and it also made any in-app A/B of a render
             // setting impossible, since reaching the toggle destroyed the subject.
-            screenState.SaveableStateProvider(screen) {
+            if (screen == Screen.EDITOR && !editorAuthorityReady) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = Color.White)
+                }
+            } else screenState.SaveableStateProvider(screen) {
                 when (screen) {
-                    Screen.EDITOR -> EditorScreen(
-                        settings = settings,
-                        activeCategoryState = editorCategory,
-                        onOpenSettings = { screen = Screen.SETTINGS },
-                        onOpenAbout = { screen = Screen.ABOUT },
-                        onProfileGroups = { f, p -> settingsFilmGroups = f; settingsPrintGroups = p },
-                        onOpenFilmCurves = { id, name ->
-                            curvesFilmId = id; curvesFilmName = name; screen = Screen.CURVES_FILM
-                        },
-                        onOpenPrintCurves = { id, name ->
-                            curvesPrintId = id; curvesPrintName = name; screen = Screen.CURVES_PRINT
-                        },
-                    )
-                    Screen.SETTINGS -> NavScaffold("Settings", onBack = { screen = Screen.EDITOR }) {
+                    Screen.EDITOR -> key(editorCompositionGeneration) {
+                        EditorScreen(
+                            settings = settings,
+                            restoration = activeRestoration,
+                            sessionRestoreNotice = pendingSessionRestoreNotice,
+                            onSessionRestoreNoticeConsumed = { pendingSessionRestoreNotice = null },
+                            onSessionCheckpoint = acceptEditorSession,
+                            activeCategoryState = editorCategory,
+                            onOpenSettings = { navigateTo(Screen.SETTINGS) },
+                            onOpenAbout = { navigateTo(Screen.ABOUT) },
+                            onProfileGroups = { f, p -> settingsFilmGroups = f; settingsPrintGroups = p },
+                            onOpenFilmCurves = { id, name ->
+                                curvesFilmId = id; curvesFilmName = name; navigateTo(Screen.CURVES_FILM)
+                            },
+                            onOpenPrintCurves = { id, name ->
+                                curvesPrintId = id; curvesPrintName = name; navigateTo(Screen.CURVES_PRINT)
+                            },
+                        )
+                    }
+                    Screen.SETTINGS -> NavScaffold("Settings", onBack = { navigateTo(Screen.EDITOR) }) {
                         SettingsScreen(
                             settings = settings,
                             filmGroups = settingsFilmGroups,
                             printGroups = settingsPrintGroups,
                             onThemeChanged = onThemeChanged,
-                            onShowOnboarding = { showOnboarding = true; screen = Screen.EDITOR },
-                            onOpenDiagnostics = { screen = Screen.DIAGNOSTICS },
+                            onShowOnboarding = { showOnboarding = true; navigateTo(Screen.EDITOR) },
+                            onOpenDiagnostics = { navigateTo(Screen.DIAGNOSTICS) },
                         )
                     }
-                    Screen.DIAGNOSTICS -> NavScaffold("Diagnostics", onBack = { screen = Screen.SETTINGS }) {
+                    Screen.DIAGNOSTICS -> NavScaffold("Diagnostics", onBack = { navigateTo(Screen.SETTINGS) }) {
                         DiagnosticsScreen()
                     }
-                    Screen.ABOUT -> NavScaffold("About", onBack = { screen = Screen.EDITOR }) {
+                    Screen.ABOUT -> NavScaffold("About", onBack = { navigateTo(Screen.EDITOR) }) {
                         AboutScreen()
                     }
                     Screen.CURVES_FILM -> ProfileCurvesScreen(
                         profileId = curvesFilmId,
                         displayName = curvesFilmName,
-                        onBack = { screen = Screen.EDITOR },
+                        onBack = { navigateTo(Screen.EDITOR) },
                     )
                     Screen.CURVES_PRINT -> ProfileCurvesScreen(
                         profileId = curvesPrintId,
                         displayName = curvesPrintName,
-                        onBack = { screen = Screen.EDITOR },
+                        onBack = { navigateTo(Screen.EDITOR) },
                     )
                 }
             }
@@ -459,9 +783,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Deliberately non-composed one-shot read: the durable restore adopts an already-running
+     * export only when its bound source identity is owned by the editor's exact current
+     * binding (ownership, not publication — a revoked source still tracks its own run).
+     * Called once from a keyless remember at EditorScreen entry.
+     */
+    private fun authorizedRunningExportId(editorIdentity: ExportSourceIdentity): Long? =
+        (ExportWorkRuntime.state.value as? ExportRuntimeState.Running)
+            ?.takeIf { running ->
+                exportRunOwnedByEditor(running.sourceIdentity, editorIdentity)
+            }
+            ?.runId
+
     @Composable
     private fun EditorScreen(
         settings: AppSettings,
+        restoration: EditorRestoration,
+        sessionRestoreNotice: String?,
+        onSessionRestoreNoticeConsumed: () -> Unit,
+        onSessionCheckpoint: (EditorSessionDocument, liveMutation: Boolean) -> Boolean,
         activeCategoryState: MutableState<Category?>,
         onOpenSettings: () -> Unit,
         onOpenAbout: () -> Unit,
@@ -470,7 +811,20 @@ class MainActivity : ComponentActivity() {
         onOpenPrintCurves: (id: String, name: String) -> Unit,
     ) {
         val ctx = LocalContext.current.applicationContext
-        val scope = lifecycleScope
+        // Editor-local UI waiters are cancelled when this destination leaves composition. Durable
+        // source/recipe/export work is submitted to its process owner first; AppRoot reconciles
+        // SourceAccess again before a later editor composition, so disposed state is never mutated.
+        val scope = rememberCoroutineScope()
+        val editorInstance = remember { Ticket139EditorProbe.beginLiveEditorInstance() }
+        // Parent checkpoints update while this composition is alive. Restoration is intentionally
+        // one-shot; the newest checkpoint becomes the initializer only after navigation creates a
+        // fresh EditorScreen composition.
+        val initialRestoration = remember { restoration }
+        val initialRestoredSession = initialRestoration.document
+        val initialSessionRestoreNotice = remember { sessionRestoreNotice }
+        SideEffect {
+            if (sessionRestoreNotice != null) onSessionRestoreNoticeConsumed()
+        }
 
         var engine by remember { mutableStateOf<SpektraEngine?>(null) }
         var profiles by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -519,20 +873,31 @@ class MainActivity : ComponentActivity() {
         var builtInGroups by remember { mutableStateOf<Map<String, List<BuiltInPreset>>>(emptyMap()) }
         var catalogReady by remember { mutableStateOf(false) }
 
-        // image / result state. The source identity (uri/kind/name) and the manual
-        // rotation survive process death via rememberSaveable so a recreated Activity
-        // restores the loaded image instead of silently dropping the user back on the
-        // demo image. Uri is Parcelable and the enums are Serializable, so the default
-        // autoSaver stores them. The decode + recipe-restore re-run off the restored
-        // source via the post-init render (previewTick) and the recipe-open effect.
-        var sourceUri by rememberSaveable { mutableStateOf<Uri?>(null) }
-        var sourceKind by rememberSaveable { mutableStateOf(SourceKind.DEMO) }
-        var sourceName by rememberSaveable { mutableStateOf("synthetic demo image") }
+        // SourceAccess and the complete session are reconciled before this Composable exists.
+        // Keep the resulting identity as ordinary live state: destination SavedState is never a
+        // second restoration authority and therefore cannot resurrect an older subject.
+        val restoredSource = initialRestoration.source
+        var sourceUri by remember { mutableStateOf(restoredSource.uri?.let(Uri::parse)) }
+        var sourceKind by remember { mutableStateOf(restoredSource.kind) }
+        var sourceName by remember { mutableStateOf(restoredSource.displayName) }
         val sourceRuntime = remember(ctx.applicationContext) { sourceAccessRuntime(ctx) }
         val sourceAccess = sourceRuntime.coordinator
         val sourceMutationGate = sourceRuntime.mutations
-        var sourceAuthorizationRequired by rememberSaveable { mutableStateOf(false) }
-        var sourceRestoreChecked by remember { mutableStateOf(false) }
+        var sourceAuthorizationRequired by remember {
+            mutableStateOf(restoredSource.authorizationRequired)
+        }
+        val sourceRenderAllowed = !sourceAuthorizationRequired
+        val exportSourceIdentity = remember(
+            sourceUri,
+            sourceKind,
+            sourceAuthorizationRequired,
+        ) {
+            ExportSourceIdentityAuthority.bind(
+                uri = sourceUri?.toString(),
+                kind = sourceKind,
+                authorizationRequired = sourceAuthorizationRequired,
+            )
+        }
         var preview by remember { mutableStateOf<Bitmap?>(null) }
         var beforePreview by remember { mutableStateOf<Bitmap?>(null) }
         // The histogram captures its pixels during composition and never retains either Bitmap.
@@ -546,22 +911,60 @@ class MainActivity : ComponentActivity() {
             val owned = beforePreview
             onDispose { owned?.let(::retirePreviewBitmap) }
         }
-        var status by remember { mutableStateOf("initializing…") }
         var previewBusy by remember { mutableStateOf(false) }
         var decoding by remember { mutableStateOf(false) }
         var lastRenderMs by remember { mutableStateOf<Long?>(null) }
         var renderErr by remember { mutableStateOf<String?>(null) }
-        var exporting by remember { mutableStateOf(false) }
-        var exportDone by remember { mutableStateOf(false) }
+        // One-shot at-restore snapshot (remember, no keys): later runtime transitions reach the
+        // UI through its Compose observer, never through this initializer.
+        val activeExportRunAtRestore = remember { authorizedRunningExportId(exportSourceIdentity) }
+        val initialExportState = reconcileRestoredExport(
+            initialRestoredSession?.export ?: EditorExportState(
+                sheetOpen = false,
+                options = ExportOptions(
+                    settings.exportFormat,
+                    settings.exportQuality,
+                    ExportSize.FULL,
+                    2048,
+                    "",
+                ),
+                keepGps = settings.exportKeepGps,
+                phase = EditorExportPhase.IDLE,
+                runtimeRunId = null,
+            ),
+            activeExportRunAtRestore,
+        )
+        val initialEditorStatus = initialSessionRestoreNotice ?: when (initialExportState.phase) {
+            EditorExportPhase.IDLE -> "initializing…"
+            EditorExportPhase.RUNNING -> "resuming export…"
+            EditorExportPhase.SUCCESS -> "previous export saved to Pictures/Spektrafilm"
+            EditorExportPhase.FAILURE -> "previous export failed"
+            EditorExportPhase.CANCELLED -> "previous export cancelled"
+            EditorExportPhase.RECONCILING ->
+                "previous export interrupted · storage reconciliation is running"
+        }
+        var status by remember { mutableStateOf(initialEditorStatus) }
+        var exportPhase by remember { mutableStateOf(initialExportState.phase) }
+        var exportRuntimeRunId by remember { mutableStateOf(initialExportState.runtimeRunId) }
+        var exporting by remember {
+            mutableStateOf(exportPhase == EditorExportPhase.RUNNING || exportPhase == EditorExportPhase.SUCCESS)
+        }
+        var exportDone by remember {
+            mutableStateOf(exportPhase == EditorExportPhase.SUCCESS)
+        }
         // Lightroom-style export sheet: per-export format / quality / size / colour / name, instead
         // of the global Settings defaults. Seeded from Settings and remembered back on export.
-        var showExportSheet by remember { mutableStateOf(false) }
+        var showExportSheet by remember {
+            mutableStateOf(initialExportState.sheetOpen)
+        }
         var exportOptions by remember {
             mutableStateOf(
-                ExportOptions(settings.exportFormat, settings.exportQuality, ExportSize.FULL, 2048, ""),
+                initialExportState.options,
             )
         }
-        var exportKeepGps by remember { mutableStateOf(settings.exportKeepGps) }
+        var exportKeepGps by remember {
+            mutableStateOf(initialExportState.keepGps)
+        }
         var previewTick by remember { mutableIntStateOf(0) }
         val publicationGate = remember { RenderPublicationGate() }
         val previewRevision = remember(previewTick) { publicationGate.nextRevision() }
@@ -581,7 +984,9 @@ class MainActivity : ComponentActivity() {
         // source rotation (applied to the decoded LinearImage -> preview AND export).
         // This is the user's MANUAL step only; the EXIF baseline is derived fresh per load
         // (see loadSource) and is NOT persisted in the recipe.
-        var rotation by rememberSaveable { mutableStateOf(SourceRotation.NONE) }
+        var rotation by remember {
+            mutableStateOf(SourceRotation.fromDegrees(initialRestoration.rotationDegrees))
+        }
 
         // Set by loadSource when a compressed (lossy/JPEG-XL) DNG fell back to the platform
         // ImageDecoder. Drives a one-shot snackbar (a render path can't show UI directly).
@@ -611,15 +1016,32 @@ class MainActivity : ComponentActivity() {
         }
 
         // interactive crop overlay (Lightroom-style); hosts on top of everything.
-        var cropOverlayOpen by remember { mutableStateOf(false) }
+        val restoredTool = initialRestoredSession?.tool
+        val restoredOverlay = restorableEditorOverlay(
+            restoredTool?.overlay ?: EditorOverlayTool.NONE,
+        )
+        var cropOverlayOpen by remember {
+            mutableStateOf(restoredOverlay == EditorOverlayTool.CROP)
+        }
         // draw-on-the-preview mask geometry editor (positions the selected mask on the photo).
-        var maskOverlayOpen by remember { mutableStateOf(false) }
-        var maskEditIndex by remember { mutableStateOf(0) }
+        var maskOverlayOpen by remember {
+            mutableStateOf(restoredOverlay == EditorOverlayTool.MASK_GEOMETRY)
+        }
+        var selectedMaskIndex by remember { mutableIntStateOf(restoredTool?.maskIndex ?: 0) }
         // eyedropper: sample a color- or luminance-range mask's target by tapping the photo.
-        var sampleOverlayOpen by remember { mutableStateOf(false) }
-        var sampleMaskIndex by remember { mutableStateOf(0) }
-        var sampleLuminanceMode by remember { mutableStateOf(false) }
-        var sampleWbMode by remember { mutableStateOf(false) }  // gray-point WB eyedropper (no mask)
+        var sampleOverlayOpen by remember {
+            mutableStateOf(
+                restoredOverlay == EditorOverlayTool.MASK_SAMPLE_COLOR ||
+                    restoredOverlay == EditorOverlayTool.MASK_SAMPLE_LUMINANCE ||
+                    restoredOverlay == EditorOverlayTool.WHITE_BALANCE_SAMPLE,
+            )
+        }
+        var sampleLuminanceMode by remember {
+            mutableStateOf(restoredOverlay == EditorOverlayTool.MASK_SAMPLE_LUMINANCE)
+        }
+        var sampleWbMode by remember {
+            mutableStateOf(restoredOverlay == EditorOverlayTool.WHITE_BALANCE_SAMPLE)
+        }  // gray-point WB eyedropper (no mask)
 
         // 100% grain magnifier
         var magnifierOpen by remember { mutableStateOf(false) }
@@ -667,6 +1089,16 @@ class MainActivity : ComponentActivity() {
             magnifierJobRef.value?.cancel()
             magnifierBitmap = null
             magnifierRendering = false
+            // Evidence is published only after every production gate/cache/lease owner has been
+            // invalidated or retired; callers never observe a start-of-cleanup false positive.
+            Ticket139EditorProbe.publishSourceRetirement()
+        }
+
+        // Authorization is part of the render identity. Revocation of the same URI must retire
+        // cached/native work just as aggressively as replacing the URI, and no render effect is
+        // allowed to restart until a successful SourceAccess mutation clears this gate.
+        LaunchedEffect(sourceRenderAllowed) {
+            if (!sourceRenderAllowed) retireSourceResources()
         }
 
         // Invalidate an old edit generation before its next main-thread publication, cancel its
@@ -698,23 +1130,24 @@ class MainActivity : ComponentActivity() {
         }
 
         // presets
+        val restoredPreset = initialRestoredSession?.preset
         var presetList by remember { mutableStateOf<List<String>>(emptyList()) }
-        var presetName by remember { mutableStateOf("") }
-        var selectedPreset by remember { mutableStateOf("") }
+        var presetName by remember { mutableStateOf(restoredPreset?.presetName ?: "") }
+        var selectedPreset by remember { mutableStateOf(restoredPreset?.selectedPreset ?: "") }
 
         // Preset "amount" (Lightroom-style): the look active just before a preset was
         // applied (base) and the full applied preset, kept as flat-schema JSON so the
         // amount slider can cross-fade between them. presetAmount is the live mix; null
         // base/full means no preset has been applied since load (slider hidden).
-        var presetBaseJson by remember { mutableStateOf<String?>(null) }
-        var presetFullJson by remember { mutableStateOf<String?>(null) }
-        var presetAmount by remember { mutableFloatStateOf(1f) }
+        var presetBaseJson by remember { mutableStateOf(restoredPreset?.baseJson) }
+        var presetFullJson by remember { mutableStateOf(restoredPreset?.fullJson) }
+        var presetAmount by remember { mutableFloatStateOf(restoredPreset?.amount ?: 1f) }
 
         // Copy/paste settings (Lightroom-style, backlog #10): a session clipboard holding
         // a full params snapshot, so a look dialed on one image can be pasted onto another.
-        // Lives in EditorScreen scope: it survives switching the source, but NOT a round-trip
-        // to Settings/About (EditorScreen leaves composition there and the remember is dropped).
-        var settingsClipboard by remember { mutableStateOf<String?>(null) }
+        // It is part of the bounded editor-session document, so navigation/recreation does not
+        // silently erase a deliberate Copy action; no pixels or source metadata are included.
+        var settingsClipboard by remember { mutableStateOf(restoredPreset?.clipboardJson) }
 
         // Capture the pre-apply look, run [apply], then snapshot the full preset and arm
         // the amount slider at 100%. Used by both built-in and saved-preset apply paths.
@@ -737,6 +1170,14 @@ class MainActivity : ComponentActivity() {
         var recipeReady by remember { mutableStateOf(false) }
         var hasRecipe by remember { mutableStateOf(false) }
         var defaultsJson by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(recipeReady, state.localAdjustments.size) {
+            if (recipeReady) {
+                selectedMaskIndex = clampSelectedMaskIndex(
+                    selectedMaskIndex,
+                    state.localAdjustments.size,
+                )
+            }
+        }
         val snackbarHost = remember { SnackbarHostState() }
         val recipeKey = remember(sourceUri) { Recipes.keyFor(sourceUri) }
         val exportRuntimeState by ExportWorkRuntime.state.collectAsState()
@@ -744,26 +1185,124 @@ class MainActivity : ComponentActivity() {
         var exportPublication by remember {
             mutableStateOf<Pair<Long, RenderPublicationTicket>?>(null)
         }
+        val sessionCheckpointAction = remember { arrayOfNulls<() -> Boolean>(1) }
 
         // The process-owned export survives this Activity. A recreated UI observes exactly one
         // retained terminal outcome instead of turning a committed MediaStore row into CANCELLED.
-        LaunchedEffect(exportRuntimeState) {
+        LaunchedEffect(
+            exportRuntimeState,
+            exportSourceIdentity,
+            recipeReady,
+            onSessionCheckpoint,
+        ) {
             when (val runtime = exportRuntimeState) {
-                ExportRuntimeState.Idle -> Unit
+                ExportRuntimeState.Idle -> {
+                    if (exportPhase == EditorExportPhase.RECONCILING) {
+                        exporting = false
+                        exportDone = false
+                        exportRuntimeRunId = null
+                        status = "previous export interrupted · storage reconciliation is running"
+                    }
+                }
                 is ExportRuntimeState.Running -> {
-                    if (exportPublication?.first != runtime.runId) {
+                    // Ownership (exact current source binding) tracks the durable cursor; full
+                    // publication authorization additionally requires an authorization-free
+                    // source and gates only the pixels. A revoked source still remembers its own
+                    // in-flight run so process-death recovery can reconcile it (ticket #139).
+                    if (!exportRunOwnedByEditor(runtime.sourceIdentity, exportSourceIdentity)) {
+                        if (exportRuntimeRunId == runtime.runId) {
+                            exportPhase = EditorExportPhase.RECONCILING
+                            exportRuntimeRunId = null
+                            exporting = false
+                            exportDone = false
+                        }
+                        return@LaunchedEffect
+                    }
+                    if (
+                        exportPublication?.first != runtime.runId &&
+                        exportPublicationAuthorized(runtime.sourceIdentity, exportSourceIdentity)
+                    ) {
                         exportPublication = runtime.runId to publicationGate.begin(
                             publicationGate.nextRevision(),
                             RenderPublicationPriority.EXPORT,
                         )
                     }
+                    exportPhase = EditorExportPhase.RUNNING
+                    exportRuntimeRunId = runtime.runId
                     exporting = true
                     exportDone = false
                     status = "rendering full resolution…"
+                    sessionCheckpointAction[0]?.invoke()
                 }
                 is ExportRuntimeState.Finished -> {
+                    if (!exportPublicationAuthorized(runtime.sourceIdentity, exportSourceIdentity)) {
+                        val discarded = ExportWorkRuntime.claimFinished(runtime.runId)
+                            ?: return@LaunchedEffect
+                        recycleUnpublishedExport(discarded)
+                        lastHandledExportRun = runtime.runId
+                        exportPublication = null
+                        if (exportRuntimeRunId == runtime.runId) {
+                            exportRuntimeRunId = null
+                            exportPhase = EditorExportPhase.RECONCILING
+                            exporting = false
+                            exportDone = false
+                        }
+                        return@LaunchedEffect
+                    }
+                    if (!recipeReady || sessionCheckpointAction[0] == null) return@LaunchedEffect
                     if (runtime.runId == lastHandledExportRun) return@LaunchedEffect
-                    lastHandledExportRun = runtime.runId
+                    // Persist a sanitized terminal marker before atomically claiming the process
+                    // result. If recreation cancels this coroutine before/during the IO flush, the
+                    // process runtime still owns the unclaimed result; if it cancels after the
+                    // flush, the replacement UI can restore the terminal marker exactly once.
+                    exportRuntimeRunId = null
+                    when (val pending = runtime.outcome) {
+                        is ExportTerminalOutcome.Success -> {
+                            exportPhase = EditorExportPhase.SUCCESS
+                            exporting = true
+                            exportDone = true
+                            status = "saved to Pictures/Spektrafilm"
+                        }
+                        is ExportTerminalOutcome.Failure -> {
+                            exportPhase = if (pending.cause is ExportReconciliationPendingException) {
+                                EditorExportPhase.RECONCILING
+                            } else {
+                                EditorExportPhase.FAILURE
+                            }
+                            exporting = false
+                            exportDone = false
+                        }
+                        is ExportTerminalOutcome.Cancelled -> {
+                            exportPhase = EditorExportPhase.CANCELLED
+                            exporting = false
+                            exportDone = false
+                        }
+                    }
+                    val durableTerminal = awaitDurableEditorSessionCheckpoint(
+                        checkpoint = { sessionCheckpointAction[0]?.invoke() == true },
+                        flush = {
+                            withContext(Dispatchers.IO) {
+                                EditorSessionCheckpointRuntime.flush()
+                            }
+                        },
+                        onRetryableFailure = { failure ->
+                            // The process runtime keeps the terminal result unclaimed while the
+                            // latest checkpoint remains pending. Retry without exposing session
+                            // contents or allowing an older disk generation to count as success.
+                            Diag.w(
+                                "terminal editor session save retrying " +
+                                    "(${failure.javaClass.simpleName})",
+                            )
+                            status = "export complete · retrying editor session save"
+                            delay(500)
+                        },
+                    )
+                    if (!durableTerminal) {
+                        // Startup storage may still be recovering, or a future-version session may
+                        // be protected. In both cases the process outcome remains retained.
+                        status = "export complete · editor session save is waiting"
+                        return@LaunchedEffect
+                    }
                     val publicationTicket = exportPublication
                         ?.takeIf { it.first == runtime.runId }
                         ?.second
@@ -771,9 +1310,17 @@ class MainActivity : ComponentActivity() {
                             publicationGate.nextRevision(),
                             RenderPublicationPriority.EXPORT,
                         )
-                    val publicationAllowed = publicationGate.tryClaim(publicationTicket)
+                    // Identity decides the durable outcome; the render gate only decides whether
+                    // this export's pixels may replace the preview. A newer interactive render
+                    // outranking the export ticket must suppress stale pixels, never rewrite a
+                    // committed MediaStore success into RECONCILING (ticket #139).
+                    val identityAuthorized =
+                        exportPublicationAuthorized(runtime.sourceIdentity, exportSourceIdentity)
+                    val publicationAllowed =
+                        identityAuthorized && publicationGate.tryClaim(publicationTicket)
                     val claimedOutcome = ExportWorkRuntime.claimFinished(runtime.runId)
                         ?: return@LaunchedEffect
+                    lastHandledExportRun = runtime.runId
                     exportPublication = null
                     when (val outcome = claimedOutcome) {
                         is ExportTerminalOutcome.Success -> {
@@ -783,6 +1330,14 @@ class MainActivity : ComponentActivity() {
                                 } else if (!bitmap.isRecycled) {
                                     bitmap.recycle()
                                 }
+                            }
+                            if (!identityAuthorized) {
+                                exporting = false
+                                exportDone = false
+                                exportPhase = EditorExportPhase.RECONCILING
+                                status = "export completed for a previous or unauthorized source"
+                                sessionCheckpointAction[0]?.invoke()
+                                return@LaunchedEffect
                             }
                             val phases = outcome.phases
                             val accounted = phases.setupMs + phases.decodeMs + phases.exifMs +
@@ -796,6 +1351,7 @@ class MainActivity : ComponentActivity() {
                             Diag.i("export format=${outcome.format.name} ok in ${outcome.totalMs}ms")
                             exporting = true
                             exportDone = true
+                            exportPhase = EditorExportPhase.SUCCESS
                             status = "saved to Pictures/Spektrafilm"
                         }
                         is ExportTerminalOutcome.Failure -> {
@@ -805,6 +1361,7 @@ class MainActivity : ComponentActivity() {
                             )
                             exporting = false
                             if (outcome.cause is ExportReconciliationPendingException) {
+                                exportPhase = EditorExportPhase.RECONCILING
                                 status = "export outcome pending reconciliation · restart before retry"
                                 Toast.makeText(
                                     ctx,
@@ -812,6 +1369,7 @@ class MainActivity : ComponentActivity() {
                                     Toast.LENGTH_LONG,
                                 ).show()
                             } else {
+                                exportPhase = EditorExportPhase.FAILURE
                                 status = "export failed: ${outcome.cause.message}"
                                 Toast.makeText(
                                     ctx,
@@ -827,9 +1385,11 @@ class MainActivity : ComponentActivity() {
                             )
                             exporting = false
                             exportDone = false
+                            exportPhase = EditorExportPhase.CANCELLED
                             status = "export cancelled"
                         }
                     }
+                    sessionCheckpointAction[0]?.invoke()
                 }
             }
         }
@@ -840,19 +1400,31 @@ class MainActivity : ComponentActivity() {
         // --- in-session undo / redo edit history ---
         // A snapshot = the full preset/recipe JSON (Presets.toJsonString — covers every
         // ParamsState field incl. raw WB/temp/tint) PLUS the editor-local manual rotation.
-        val editHistory = remember { EditHistory() }
+        val editHistory = remember {
+            EditHistory().also { history ->
+                initialRestoredSession?.history?.let(history::restoreState)
+            }
+        }
         // The last SETTLED snapshot we committed. Capture coalescing pushes THIS (the
         // pre-edit state) onto undo when a newer settled state differs (see the capture
         // effect below), so one slider drag (which settles once) == one undo step.
-        var committedSnapshot by remember { mutableStateOf<EditSnapshot?>(null) }
+        var committedSnapshot by remember {
+            mutableStateOf(initialRestoredSession?.committed)
+        }
         // Set true while we are programmatically restoring a snapshot (undo/redo). The
         // capture effect skips one settle cycle so the restore is NOT recorded as a new
         // edit — without this the restored state would push itself and we'd never escape.
         var restoring by remember { mutableStateOf(false) }
+        // Explicit conflict marker used only while AppRoot is recovering transient session IO.
+        // Programmatic restore/default application keeps it false; a settled user edit sets it.
+        var liveCursorMutated by remember { mutableStateOf(false) }
 
         // Build a snapshot of the CURRENT live editing state (+ manual rotation).
         fun snapshotNow(): EditSnapshot =
-            EditSnapshot(Presets.toJsonString(state), rotation.degrees)
+            // Session decode canonicalizes embedded Params JSON. Keep the live cursor in the same
+            // compact canonical representation; comparing a pretty producer string with a compact
+            // restored string would manufacture an undo entry during the first restore settle.
+            EditSnapshot(Presets.encode(state).toString(), rotation.degrees)
 
         // Restore a snapshot into the live state: decode params (shared preset schema),
         // re-apply rotation, then bump previewTick — mirrors the recipe restore-on-open
@@ -867,14 +1439,138 @@ class MainActivity : ComponentActivity() {
 
         fun doUndo() {
             val target = editHistory.undo(snapshotNow()) ?: return
+            liveCursorMutated = true
             applySnapshot(target)
             status = "undo"
         }
 
         fun doRedo() {
             val target = editHistory.redo(snapshotNow()) ?: return
+            liveCursorMutated = true
             applySnapshot(target)
             status = "redo"
+        }
+
+        fun captureEditorSessionDocument(): EditorSessionDocument? {
+            if (!recipeReady) return null
+            val overlay = when {
+                cropOverlayOpen -> EditorOverlayTool.CROP
+                maskOverlayOpen -> EditorOverlayTool.MASK_GEOMETRY
+                sampleOverlayOpen && sampleWbMode -> EditorOverlayTool.WHITE_BALANCE_SAMPLE
+                sampleOverlayOpen && sampleLuminanceMode -> EditorOverlayTool.MASK_SAMPLE_LUMINANCE
+                sampleOverlayOpen -> EditorOverlayTool.MASK_SAMPLE_COLOR
+                else -> EditorOverlayTool.NONE
+            }
+            val selectedMask = clampSelectedMaskIndex(
+                selectedMaskIndex,
+                state.localAdjustments.size,
+            )
+            // Crop/mask-geometry gesture drafts live only inside their overlay Composable. Persist
+            // the selected tool; a recreated overlay seeds a fresh, no-op draft from the committed
+            // crop/mask geometry passed below, never from the disposed in-progress gesture.
+            val committedOverlay = restorableEditorOverlay(overlay)
+            val safeOverlay = if (
+                committedOverlay == EditorOverlayTool.MASK_SAMPLE_COLOR ||
+                committedOverlay == EditorOverlayTool.MASK_SAMPLE_LUMINANCE
+            ) {
+                committedOverlay.takeIf { selectedMask in state.localAdjustments.indices }
+                    ?: EditorOverlayTool.NONE
+            } else {
+                committedOverlay
+            }
+            return EditorSessionDocument(
+                source = EditorSourceState(
+                        uri = sourceUri?.toString(),
+                        kind = sourceKind,
+                        displayName = AtomicJsonStore.truncateUtf16Safely(sourceName, 512),
+                        authorizationRequired = sourceAuthorizationRequired,
+                    ),
+                    current = snapshotNow(),
+                    committed = committedSnapshot,
+                    history = editHistory.snapshotState(),
+                    tool = EditorToolState(
+                        category = activeCategory,
+                        overlay = safeOverlay,
+                        maskIndex = selectedMask,
+                    ),
+                    preset = EditorPresetState(
+                        baseJson = presetBaseJson,
+                        fullJson = presetFullJson,
+                        amount = presetAmount,
+                        clipboardJson = settingsClipboard,
+                        selectedPreset = AtomicJsonStore.truncateUtf16Safely(selectedPreset, 96),
+                        presetName = AtomicJsonStore.truncateUtf16Safely(presetName, 96),
+                    ),
+                    export = EditorExportState(
+                        sheetOpen = showExportSheet,
+                        options = exportOptions,
+                        keepGps = exportKeepGps,
+                        phase = exportPhase,
+                        runtimeRunId = exportRuntimeRunId,
+                ),
+            )
+        }
+
+        fun checkpointEditorSession(): Boolean = runCatching {
+            captureEditorSessionDocument()?.let { document ->
+                Ticket139EditorProbe.publishLiveEditorSnapshot(editorInstance, document)
+                onSessionCheckpoint(document, liveCursorMutated)
+            } ?: false
+        }.getOrElse {
+            // Never echo session/source values into diagnostics; the exception class is enough
+            // to distinguish schema/limit/programming failures for this app-generated file.
+            Diag.w("editor session checkpoint rejected (${it.javaClass.simpleName})")
+            false
+        }
+        sessionCheckpointAction[0] = ::checkpointEditorSession
+
+        LaunchedEffect(recipeReady) {
+            if (!recipeReady) return@LaunchedEffect
+            runCatching { captureEditorSessionDocument() }
+                .onSuccess { document ->
+                    if (document != null) {
+                        Ticket139EditorProbe.publishLiveEditorSnapshot(editorInstance, document)
+                        onSessionCheckpoint(document, liveCursorMutated)
+                        Ticket139EditorProbe.publishLiveEditorReady(editorInstance, document)
+                    }
+                }
+                .onFailure {
+                    Diag.w("live editor readiness rejected (${it.javaClass.simpleName})")
+                }
+        }
+
+        // Lifecycle recreation is the only time a non-navigation teardown can happen after the
+        // last debounced settle. Capture synchronously on the main thread; the latest-only runtime
+        // owns the bounded IO after this Activity is gone.
+        val currentSessionCheckpoint by rememberUpdatedState<() -> Boolean>(
+            newValue = { checkpointEditorSession() },
+        )
+        DisposableEffect(lifecycle) {
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) currentSessionCheckpoint()
+            }
+            lifecycle.addObserver(observer)
+            onDispose {
+                currentSessionCheckpoint()
+                lifecycle.removeObserver(observer)
+            }
+        }
+
+        fun resetEditorCursorForSourceChange() {
+            editHistory.clear()
+            committedSnapshot = null
+            restoring = true
+            presetBaseJson = null
+            presetFullJson = null
+            presetAmount = 1f
+            cropOverlayOpen = false
+            maskOverlayOpen = false
+            sampleOverlayOpen = false
+            sampleWbMode = false
+            selectedMaskIndex = 0
+            if (recipeReady) {
+                Recipes.resetToDefaults(state, settings, profiles)
+            }
         }
 
         // One-time engine init. The engine is a process-scoped singleton (see
@@ -896,11 +1592,51 @@ class MainActivity : ComponentActivity() {
                         if (state.filmProfile !in list) state.filmProfile = list.first()
                         if (state.printProfile !in list) state.printProfile = list.first()
                     }
+                    val freshDefaults = Presets.toJsonString(state)
+                    initialRestoredSession?.takeIf { restored ->
+                        sourceUri?.toString() == restored.source.uri &&
+                            sourceKind == restored.source.kind
+                    }?.current?.let { restored ->
+                        val removedProfileReference = initialRestoredSession
+                            ?.referencesUnavailableProfiles(list.toSet()) == true
+                        Presets.decode(AtomicJsonStore.parseObject(restored.paramsJson), state)
+                        // A catalog update can remove a profile named by an older session. Keep the
+                        // source and valid edits, but use a real installed profile and re-baseline
+                        // history instead of leaving an undo branch that cannot render.
+                        var migratedProfile = false
+                        if (list.isNotEmpty() && state.filmProfile !in list) {
+                            state.filmProfile = list.first()
+                            migratedProfile = true
+                        }
+                        if (list.isNotEmpty() && state.printProfile !in list) {
+                            state.printProfile = list.first()
+                            migratedProfile = true
+                        }
+                        selectedMaskIndex = clampSelectedMaskIndex(
+                            selectedMaskIndex,
+                            state.localAdjustments.size,
+                        )
+                        if (migratedProfile || removedProfileReference) {
+                            editHistory.clear()
+                            committedSnapshot = null
+                            presetBaseJson = null
+                            presetFullJson = null
+                            presetAmount = 1f
+                            settingsClipboard = null
+                            status = "restored session migrated to available profiles"
+                        }
+                    }
                     builtInGroups = presetGroups
                     catalogReady = true
                     refreshPresets()
-                    status = "ready · ${list.size} profiles"
-                    defaultsJson = Presets.toJsonString(state)
+                    if (initialSessionRestoreNotice == null && status.startsWith("initializing")) {
+                        status = if (initialRestoredSession == null) {
+                            "ready · ${list.size} profiles"
+                        } else {
+                            "editor session restored · ${list.size} profiles"
+                        }
+                    }
+                    defaultsJson = freshDefaults
                     recipeReady = true
                     previewTick++
                 }
@@ -908,18 +1644,24 @@ class MainActivity : ComponentActivity() {
         }
 
         // --- Non-destructive recipe: restore-on-open ---
-        var lastRestoredKey by remember { mutableStateOf<String?>(null) }
-        var recipeWriteBlockedKey by remember { mutableStateOf<String?>(null) }
-        // A key becomes writable only after its read/classification has completed. Starting at
-        // null closes the launch-order race between this restore effect and the autosave effect.
-        var recipeWritableKey by remember { mutableStateOf<String?>(null) }
+        val restoredRecipeKey = initialRestoredSession?.source?.uri
+            ?.let(Uri::parse)
+            ?.let(Recipes::keyFor)
+        var lastRestoredKey by remember { mutableStateOf(restoredRecipeKey) }
+        // A restored source identity proves nothing about its sidecar contents. Every composition
+        // starts PENDING and only the exact generation classified by readResult may become writable.
+        var recipeAccess by remember(recipeKey) {
+            mutableStateOf<EditorRecipeAccess>(
+                recipeKey?.let { EditorRecipeAccess.Pending(it, Recipes.generation(it)) }
+                    ?: EditorRecipeAccess.None,
+            )
+        }
         val recipeEditEpoch = remember { RecipeEditEpoch() }
         LaunchedEffect(recipeKey, recipeReady) {
             if (!recipeReady) return@LaunchedEffect
             if (recipeKey == null) {
                 hasRecipe = false
-                recipeWritableKey = null
-                recipeWriteBlockedKey = null
+                recipeAccess = EditorRecipeAccess.None
                 // Switched to a keyless source (the demo image): still drop cross-image
                 // history and re-baseline once for the demo's current state.
                 if (lastRestoredKey != null) {
@@ -930,48 +1672,55 @@ class MainActivity : ComponentActivity() {
                 }
                 return@LaunchedEffect
             }
-            if (recipeKey == lastRestoredKey) return@LaunchedEffect
+            val preserveSessionCursor = recipeKey == restoredRecipeKey
+            val sourceChanged = recipeKey != lastRestoredKey
             lastRestoredKey = recipeKey
-            recipeWritableKey = null
             // New source: undo must never cross images. Drop the history and re-baseline so
             // the just-restored/default state for THIS image is the empty-history baseline
             // (canUndo=false). `restoring` makes the next capture settle adopt the new
             // baseline without recording it as an edit.
-            editHistory.clear()
-            committedSnapshot = null
-            restoring = true
+            if (sourceChanged) {
+                editHistory.clear()
+                committedSnapshot = null
+                restoring = true
+            }
             // Submission itself happens on Main and is process-owned. If an old Activity already
             // submitted an autosave, FIFO guarantees this recreated restore reads after its commit.
-            val pendingRestore = RecipeWorkRuntime.submit {
-                val before = Recipes.generation(recipeKey)
-                val result = Recipes.readResult(ctx, recipeKey)
-                Triple(before, result, Recipes.generation(recipeKey))
+            var restored: RecipeReadResult
+            while (true) {
+                val pendingRestore = RecipeWorkRuntime.submit {
+                    val before = Recipes.generation(recipeKey)
+                    val result = Recipes.readResult(ctx, recipeKey)
+                    Triple(before, result, Recipes.generation(recipeKey))
+                }
+                val (before, result, after) = pendingRestore.await()
+                val classified = classifyEditorRecipeAccess(recipeKey, before, after, result)
+                recipeAccess = classified
+                if (classified is EditorRecipeAccess.Pending) continue
+                restored = result
+                break
             }
-            val (restoreGeneration, restored, generationAfterRead) = pendingRestore.await()
-            // Reset increments the per-recipe generation before deleting. If it overlapped this
-            // read, the reset owns the final state and a late read must not resurrect old edits.
-            if (restoreGeneration != generationAfterRead) return@LaunchedEffect
             when (restored) {
                 is RecipeReadResult.Loaded -> {
-                    recipeWriteBlockedKey = null
-                    recipeWritableKey = recipeKey
-                    Presets.decode(restored.document.params, state)
                     hasRecipe = true
-                    rotation = SourceRotation.fromDegrees(restored.document.manualRotationDeg)
-                    previewTick++
-                    snackbarHost.currentSnackbarData?.dismiss()
-                    snackbarHost.showSnackbar(
-                        message = "Restored saved edit for this image",
-                        withDismissAction = true,
-                    )
+                    if (!preserveSessionCursor) {
+                        Presets.decode(restored.document.params, state)
+                        rotation = SourceRotation.fromDegrees(restored.document.manualRotationDeg)
+                        previewTick++
+                        snackbarHost.currentSnackbarData?.dismiss()
+                        snackbarHost.showSnackbar(
+                            message = "Restored saved edit for this image",
+                            withDismissAction = true,
+                        )
+                    }
                 }
                 is RecipeReadResult.CorruptQuarantined -> {
-                    recipeWriteBlockedKey = null
-                    recipeWritableKey = recipeKey
                     hasRecipe = false
-                    Recipes.resetToDefaults(state, settings, profiles)
-                    rotation = SourceRotation.NONE
-                    previewTick++
+                    if (!preserveSessionCursor) {
+                        Recipes.resetToDefaults(state, settings, profiles)
+                        rotation = SourceRotation.NONE
+                        previewTick++
+                    }
                     Diag.w("recipe quarantined: ${restored.reason}")
                     snackbarHost.currentSnackbarData?.dismiss()
                     snackbarHost.showSnackbar(
@@ -980,20 +1729,20 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 RecipeReadResult.Missing -> {
-                    recipeWriteBlockedKey = null
-                    recipeWritableKey = recipeKey
                     hasRecipe = false
-                    Recipes.resetToDefaults(state, settings, profiles)
-                    rotation = SourceRotation.NONE
-                    previewTick++
+                    if (!preserveSessionCursor) {
+                        Recipes.resetToDefaults(state, settings, profiles)
+                        rotation = SourceRotation.NONE
+                        previewTick++
+                    }
                 }
                 is RecipeReadResult.Unsupported -> {
                     hasRecipe = true
-                    recipeWriteBlockedKey = recipeKey
-                    recipeWritableKey = null
-                    Recipes.resetToDefaults(state, settings, profiles)
-                    rotation = SourceRotation.NONE
-                    previewTick++
+                    if (!preserveSessionCursor) {
+                        Recipes.resetToDefaults(state, settings, profiles)
+                        rotation = SourceRotation.NONE
+                        previewTick++
+                    }
                     status = "saved edit uses newer recipe version ${restored.version}"
                     snackbarHost.currentSnackbarData?.dismiss()
                     snackbarHost.showSnackbar(
@@ -1004,11 +1753,11 @@ class MainActivity : ComponentActivity() {
                 is RecipeReadResult.CorruptQuarantineFailed,
                 is RecipeReadResult.IoFailure -> {
                     hasRecipe = true
-                    recipeWriteBlockedKey = recipeKey
-                    recipeWritableKey = null
-                    Recipes.resetToDefaults(state, settings, profiles)
-                    rotation = SourceRotation.NONE
-                    previewTick++
+                    if (!preserveSessionCursor) {
+                        Recipes.resetToDefaults(state, settings, profiles)
+                        rotation = SourceRotation.NONE
+                        previewTick++
+                    }
                     val reason = when (restored) {
                         is RecipeReadResult.CorruptQuarantineFailed -> restored.reason
                         is RecipeReadResult.IoFailure -> restored.reason
@@ -1060,12 +1809,33 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        fun visibleSourceState() = EditorSourceState(
+            uri = sourceUri?.toString(),
+            kind = sourceKind,
+            displayName = sourceName,
+            authorizationRequired = sourceAuthorizationRequired,
+        )
+
         fun reconcileVisibleSourceAfterFailure(durable: SourceRestoreResult?) {
             when (durable) {
+                SourceRestoreResult.Demo -> {
+                    if (sourceUri != null || sourceKind != SourceKind.DEMO) {
+                        retireSourceResources()
+                        resetEditorCursorForSourceChange()
+                    }
+                    sourceUri = null
+                    sourceKind = SourceKind.DEMO
+                    sourceName = "synthetic demo image"
+                    sourceAuthorizationRequired = false
+                    rotation = SourceRotation.NONE
+                    status = "demo image"
+                }
                 is SourceRestoreResult.Ready -> {
-                    val switched = sourceUri?.toString() != durable.ref.uri ||
-                        sourceKind.name != durable.ref.kind
-                    if (switched) retireSourceResources()
+                    val switched = !shouldRetainEditorCursor(visibleSourceState(), durable)
+                    if (switched) {
+                        retireSourceResources()
+                        resetEditorCursorForSourceChange()
+                    }
                     sourceUri = Uri.parse(durable.ref.uri)
                     sourceKind = SourceKind.valueOf(durable.ref.kind)
                     sourceName = durable.ref.displayName
@@ -1074,9 +1844,11 @@ class MainActivity : ComponentActivity() {
                     status = "selection failed · previous source restored"
                 }
                 is SourceRestoreResult.NeedsAuthorization -> {
-                    val switched = sourceUri?.toString() != durable.ref.uri ||
-                        sourceKind.name != durable.ref.kind
-                    if (switched) retireSourceResources()
+                    val switched = !shouldRetainEditorCursor(visibleSourceState(), durable)
+                    retireSourceResources()
+                    if (switched) {
+                        resetEditorCursorForSourceChange()
+                    }
                     sourceUri = Uri.parse(durable.ref.uri)
                     sourceKind = SourceKind.valueOf(durable.ref.kind)
                     sourceName = durable.ref.displayName
@@ -1085,30 +1857,44 @@ class MainActivity : ComponentActivity() {
                     status = "selection failed · previous source needs authorization"
                 }
                 SourceRestoreResult.None -> {
-                    if (sourceUri != null || sourceKind != SourceKind.DEMO) {
+                    if (sourceUri != null && sourceKind != SourceKind.DEMO) {
                         retireSourceResources()
+                        sourceAuthorizationRequired = true
+                        status = "selection failed · previous source needs authorization"
+                    } else {
+                        sourceUri = null
+                        sourceKind = SourceKind.DEMO
+                        sourceName = "synthetic demo image"
+                        sourceAuthorizationRequired = false
+                        rotation = SourceRotation.NONE
+                        status = "source unavailable · using demo image"
                     }
-                    sourceUri = null
-                    sourceKind = SourceKind.DEMO
-                    sourceName = "synthetic demo image"
-                    sourceAuthorizationRequired = false
-                    rotation = SourceRotation.NONE
-                    status = "source unavailable · using demo image"
                 }
                 is SourceRestoreResult.Invalid, null -> {
                     sourceAuthorizationRequired = sourceUri != null && sourceKind != SourceKind.DEMO
+                    if (sourceAuthorizationRequired) retireSourceResources()
                     status = "source state unavailable · choose the file again"
                 }
             }
             previewTick++
         }
 
-        fun adoptSource(uri: Uri, kind: SourceKind, displayName: String, readyStatus: String) {
+        fun adoptSource(
+            uri: Uri,
+            kind: SourceKind,
+            displayName: String,
+            readyStatus: String,
+            probeLabel: String? = null,
+        ) {
             val selectionGeneration = sourceMutationGate.begin()
             // The mutation starts in the process-owned runtime before this Activity awaits it.
             // Activity recreation may cancel the waiter, but it cannot drop the grant/store write.
             val pendingAcquire = sourceRuntime.submitReconciled(selectionGeneration) {
-                sourceAccess.acquire(uri.toString(), kind.name, displayName.take(512))
+                sourceAccess.acquire(
+                    uri.toString(),
+                    kind.name,
+                    AtomicJsonStore.truncateUtf16Safely(displayName, 512),
+                )
             }
             scope.launch {
                 val outcome = pendingAcquire.await() ?: return@launch
@@ -1116,20 +1902,23 @@ class MainActivity : ComponentActivity() {
                 when (outcome) {
                     is ReconciledSourceMutation.Applied -> {
                         val ref = outcome.value
-                        if (sourceUri?.toString() != uri.toString() || sourceKind != kind) {
+                        val switched = sourceUri?.toString() != uri.toString() || sourceKind != kind
+                        if (switched) {
                             retireSourceResources()
+                            resetEditorCursorForSourceChange()
                         }
                         sourceUri = uri
                         sourceKind = kind
                         sourceName = displayName
                         sourceAuthorizationRequired = false
-                        rotation = SourceRotation.NONE
+                        if (switched) rotation = SourceRotation.NONE
                         status = if (ref.accessMode == SourceAccessMode.PERSISTED) {
                             readyStatus
                         } else {
                             "$readyStatus · access is temporary"
                         }
                         previewTick++
+                        probeLabel?.let(Ticket139EditorProbe::publishProbeSource)
                     }
                     is ReconciledSourceMutation.Rejected -> {
                         Diag.w("source adoption failed: ${outcome.failure.message}")
@@ -1140,6 +1929,35 @@ class MainActivity : ComponentActivity() {
                             withDismissAction = true,
                         )
                     }
+                }
+                checkpointEditorSession()
+            }
+        }
+
+        LaunchedEffect(Unit) {
+            if (!Ticket139EditorProbe.isArmed()) return@LaunchedEffect
+            Ticket139EditorProbe.sourceProbeRequests.collect { request ->
+                adoptSource(
+                    uri = Uri.parse(Ticket139EditorProbe.sourceProbeUri(request.label)),
+                    kind = SourceKind.PHOTO,
+                    displayName = "ticket139-source-${request.label.lowercase()}.png",
+                    readyStatus = "source probe ${request.label} selected",
+                    probeLabel = request.label,
+                )
+            }
+        }
+
+        LaunchedEffect(Unit) {
+            if (!Ticket139EditorProbe.isArmed()) return@LaunchedEffect
+            Ticket139EditorProbe.previewCompletionRequests.collect {
+                if (
+                    Ticket139EditorProbe.sourceProbeLabel(sourceUri?.toString()) == "A" &&
+                    sourceRenderAllowed
+                ) {
+                    // A published frame normally makes this a grade-cache hit. Clearing only the
+                    // optional retained result forces the next settle through the real native path.
+                    gradeCache.clear()
+                    previewTick++
                 }
             }
         }
@@ -1240,73 +2058,9 @@ class MainActivity : ComponentActivity() {
             pendingLutText = null
         }
 
-        // Restore the last durable source reference on a cold process start. A saved-state URI
-        // is trusted only when it matches a still-readable persisted grant; moved/revoked and
-        // temporary-picker sources enter an explicit reauthorization state instead of failing
-        // later inside a native decoder with a generic render error.
-        LaunchedEffect(Unit) {
-            if (sourceRestoreChecked) return@LaunchedEffect
-            val restoreGeneration = sourceMutationGate.snapshot()
-            val restored = sourceRuntime.submit(restoreGeneration) { sourceAccess.restore() }
-                .await()
-                ?: run {
-                    sourceRestoreChecked = true
-                    return@LaunchedEffect
-                }
-            if (!sourceMutationGate.isCurrent(restoreGeneration)) {
-                sourceRestoreChecked = true
-                return@LaunchedEffect
-            }
-            when (restored) {
-                is SourceRestoreResult.Ready -> {
-                    // The FIFO restore and generation post-check make this durable result
-                    // authoritative. A recreated SavedState may still name source A when a
-                    // process-owned acquisition of B committed after the old Activity died.
-                    val switched = sourceUri?.toString() != restored.ref.uri ||
-                        sourceKind.name != restored.ref.kind
-                    if (switched) retireSourceResources()
-                    sourceUri = Uri.parse(restored.ref.uri)
-                    sourceKind = SourceKind.valueOf(restored.ref.kind)
-                    sourceName = restored.ref.displayName
-                    sourceAuthorizationRequired = false
-                    if (switched) rotation = SourceRotation.NONE
-                    status = "source access restored"
-                    previewTick++
-                }
-                is SourceRestoreResult.NeedsAuthorization -> {
-                    if (sourceUri?.toString() != restored.ref.uri ||
-                        sourceKind.name != restored.ref.kind
-                    ) {
-                        retireSourceResources()
-                    }
-                    sourceUri = Uri.parse(restored.ref.uri)
-                    sourceKind = SourceKind.valueOf(restored.ref.kind)
-                    sourceName = restored.ref.displayName
-                    sourceAuthorizationRequired = true
-                    status = "source access expired or file moved · choose it again"
-                }
-                is SourceRestoreResult.Invalid -> {
-                    // Clear in the process-owned scope as well: recreation must not cancel the
-                    // cleanup and leave the next Activity repeatedly restoring a poisoned record.
-                    sourceRuntime.submit(restoreGeneration) {
-                        runCatching { sourceAccess.clear() }
-                    }
-                        .await()
-                    if (sourceUri != null) sourceAuthorizationRequired = true
-                    status = "stored source was invalid · choose a file again"
-                }
-                SourceRestoreResult.None -> {
-                    if (sourceUri != null && sourceKind != SourceKind.DEMO) {
-                        sourceAuthorizationRequired = true
-                        status = "source access expired · choose the file again"
-                    }
-                }
-            }
-            sourceRestoreChecked = true
-        }
-
         LaunchedEffect(sourceAuthorizationRequired, sourceKind) {
             if (!sourceAuthorizationRequired) return@LaunchedEffect
+            showExportSheet = false
             snackbarHost.currentSnackbarData?.dismiss()
             val result = snackbarHost.showSnackbar(
                 message = "Source access expired or the file moved",
@@ -1333,20 +2087,23 @@ class MainActivity : ComponentActivity() {
         // LibRaw throw RawDecodeException; we fall back to the platform ImageDecoder
         // (display-referred) and flag a one-shot snackbar. EXIF is then applied to the
         // fallback bitmap too.
-        fun currentSourceDecodeRequest(): SourceDecodeRequest = SourceDecodeRequest(
-            context = ctx.applicationContext,
-            uri = sourceUri,
-            kind = sourceKind,
-            authorizationRequired = sourceAuthorizationRequired,
-            rawWhiteBalance = state.rawWhiteBalance,
-            rawTemperature = state.rawTemperature,
-            rawTint = state.rawTint,
-            rotation = rotation,
-            creativeTemp = state.creativeWbTemp,
-            creativeTint = state.creativeWbTint,
-            balanceToFilmStock = state.balanceToFilmStock,
-            filmProfile = state.filmProfile,
-        )
+        fun currentSourceDecodeRequest(): SourceDecodeRequest {
+            check(sourceRenderAllowed) { "Source authorization required" }
+            return SourceDecodeRequest(
+                context = ctx.applicationContext,
+                uri = sourceUri,
+                kind = sourceKind,
+                authorizationRequired = false,
+                rawWhiteBalance = state.rawWhiteBalance,
+                rawTemperature = state.rawTemperature,
+                rawTint = state.rawTint,
+                rotation = rotation,
+                creativeTemp = state.creativeWbTemp,
+                creativeTint = state.creativeWbTint,
+                balanceToFilmStock = state.balanceToFilmStock,
+                filmProfile = state.filmProfile,
+            )
+        }
 
         suspend fun cachedSourceDecodeRequest(
             cache: DecodedSourceCache,
@@ -1456,6 +2213,7 @@ class MainActivity : ComponentActivity() {
         // the coroutine is still active — a cancelled run recycles its own bitmap instead
         // of writing it, so a superseded render can never leak or land on screen.
         fun openMagnifier(nx: Float, ny: Float) {
+            if (!sourceRenderAllowed) return
             val e = engine ?: return
             magnifierJobRef.value?.cancel()
             val renderSnapshot = state.captureInteractiveRenderSnapshot(previewTick)
@@ -1542,6 +2300,7 @@ class MainActivity : ComponentActivity() {
         // Lightroom "smart preview" strategy, so it sidesteps the full-res OOM entirely. Suppressed
         // while cropping or comparing (those branches own the gestures / have no zoom).
         fun renderRoi(roi: RoiRect) {
+            if (!sourceRenderAllowed) return
             val e = engine ?: return
             if (cropOverlayOpen || maskOverlayOpen || sampleOverlayOpen || compareMode) return
             roiJobRef.value?.cancel()
@@ -1679,7 +2438,8 @@ class MainActivity : ComponentActivity() {
         // cache peek — never decodes here, so it cannot race the settle pass's first decode) and
         // just asks the engine for a smaller DRAFT_RENDER_MAX_PX pass. Quiet: it touches only
         // `preview`, never status/previewBusy; the crisp full pass still lands on settle below.
-        LaunchedEffect(previewTick) {
+        LaunchedEffect(previewTick, sourceRenderAllowed) {
+                if (!sourceRenderAllowed) return@LaunchedEffect
                 val publicationTicket = publicationGate.begin(
                     previewRevision,
                     RenderPublicationPriority.DRAFT,
@@ -1793,8 +2553,10 @@ class MainActivity : ComponentActivity() {
         // change, after a debounce so it lands once the user pauses. The live DRAFT effect above
         // keeps the image moving during the edit (Lightroom's loupe), so this pass goes straight
         // to the full-resolution result instead of a separate coarse pass.
-        LaunchedEffect(previewTick) {
+        LaunchedEffect(previewTick, sourceRenderAllowed) {
+            if (!sourceRenderAllowed) return@LaunchedEffect
             val e = engine ?: return@LaunchedEffect
+            val previewProbeLabel = Ticket139EditorProbe.sourceProbeLabel(sourceUri?.toString())
             // Settle debounce, raised from 350ms. Each preview render maxes all CPU cores for
             // ~1s, so waiting a bit longer for the user to pause means fewer renders that start
             // then get cancelled mid-flight on the next edit ("coroutine scope left the
@@ -1816,6 +2578,7 @@ class MainActivity : ComponentActivity() {
             val cached = gradeCache.lookup(cacheKey)
             val prevBefore = beforePreview
             var renderId = 0L
+            var completionProbeHandled = false
             val result = try {
                 runCatching {
                     withOwnedContext(
@@ -1857,6 +2620,7 @@ class MainActivity : ComponentActivity() {
                             var before: Bitmap? = null
                             var after: Bitmap? = null
                             var transferred = false
+                            var completionProbeHeld = false
                             try {
                                 val submission = loadSourceCachedForPreview(fullEdge).use { lease ->
                                     decoding = false
@@ -1894,16 +2658,39 @@ class MainActivity : ComponentActivity() {
                                                 Diag.w("grade cache skipped: memory admission denied")
                                             }
                                         }
-                                        simResultToBitmapGraded(
+                                        val rendered = simResultToBitmapGraded(
                                             res,
                                             state.savingCctfEncoding,
                                             state.saturation,
                                             state.vibrance,
                                             state.gamutCompress,
                                             state.localAdjustments,
-                                        ).also { rendered -> after = rendered }
+                                        ).also { bitmap -> after = bitmap }
+                                        // The test seam is exactly the completed native settle's
+                                        // production completion-before-publication boundary. The
+                                        // SimResult and decoded-source lease remain owned here.
+                                        completionProbeHeld = Ticket139EditorProbe
+                                            .awaitCompletedPreviewBeforePublication(previewProbeLabel)
+                                        rendered
                                     }
                                     Triple(ownedBefore, ownedAfter, true)
+                                }
+                                if (completionProbeHeld) {
+                                    // B cancels this LaunchedEffect while A is held. Complete the
+                                    // actual gate decision and full resource cleanup synchronously
+                                    // here, before withOwnedContext's prompt-cancellation return can
+                                    // discard the owned Triple. This branch is test-armed only.
+                                    val claimed = publicationGate.tryClaim(publicationTicket)
+                                    Ticket139EditorProbe.publishPreviewDecision(
+                                        previewProbeLabel,
+                                        claimed,
+                                    )
+                                    SimResult.reportOutcome(renderId, AppRenderOutcome.SUPERSEDED)
+                                    val (probeBefore, probeAfter, ownsProbeBefore) = submission
+                                    if (!probeAfter.isRecycled) probeAfter.recycle()
+                                    if (ownsProbeBefore && !probeBefore.isRecycled) probeBefore.recycle()
+                                    completionProbeHandled = true
+                                    Ticket139EditorProbe.publishPreviewCleanup(previewProbeLabel)
                                 }
                                 transferred = true
                                 submission
@@ -1920,17 +2707,25 @@ class MainActivity : ComponentActivity() {
                 cached?.close()
             }
             decoding = false
-            if (!isActive || !publicationGate.tryClaim(publicationTicket)) {
+            if (completionProbeHandled) return@LaunchedEffect
+            val publicationClaimed = publicationGate.tryClaim(publicationTicket)
+            Ticket139EditorProbe.publishPreviewDecision(
+                previewProbeLabel,
+                publicationClaimed && isActive,
+            )
+            if (!isActive || !publicationClaimed) {
                 SimResult.reportOutcome(renderId, AppRenderOutcome.SUPERSEDED)
                 result.getOrNull()?.let { (before, after, ownsBefore) ->
                     if (!after.isRecycled) after.recycle()
                     if (ownsBefore && !before.isRecycled) before.recycle()
                 }
+                Ticket139EditorProbe.publishPreviewCleanup(previewProbeLabel)
                 return@LaunchedEffect
             }
             result.onSuccess { (before, after, _) ->
                 beforePreview = before; preview = after
                 SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
+                Ticket139EditorProbe.publishLivePreview(previewProbeLabel)
                 lastRenderMs = System.currentTimeMillis() - renderStart
                 Diag.i("render mode=preview ${after.width}x${after.height} ${after.width * after.height}px ${lastRenderMs}ms")
                 renderErr = null
@@ -1939,6 +2734,7 @@ class MainActivity : ComponentActivity() {
                 SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
                 Diag.w("render mode=preview failed after ${System.currentTimeMillis() - renderStart}ms: ${it.message}")
                 if (sourceKind != SourceKind.DEMO && it.isSourceAuthorizationFailure()) {
+                    retireSourceResources()
                     sourceAuthorizationRequired = true
                     renderErr = "source authorization required"
                     status = "source access expired or file moved · choose it again"
@@ -1954,8 +2750,8 @@ class MainActivity : ComponentActivity() {
         // bake a 33³ .cube of the current look and keep it + the linear proxy for the GPU
         // path. The proxy decode is a cache hit (the main effect already loaded it), so this
         // adds only the LUT bake. Cancelled/replaced cleanly when previewTick advances.
-        LaunchedEffect(previewTick, gpuEnabled) {
-            if (!gpuEnabled) {
+        LaunchedEffect(previewTick, gpuEnabled, sourceRenderAllowed) {
+            if (!gpuEnabled || !sourceRenderAllowed) {
                 gpuLut = null
                 gpuProxyLease?.close()
                 gpuProxyLease = null
@@ -2075,27 +2871,31 @@ class MainActivity : ComponentActivity() {
         // right — but a grade-only edit never fired this effect, so it was not
         // persisted until some other change happened to save it along the way.
         LaunchedEffect(snapshot, recipeKey, recipeReady, defaultsJson, rotation,
-            recipeWriteBlockedKey, recipeWritableKey,
+            recipeAccess,
             state.rawWhiteBalance, state.rawTemperature, state.rawTint,
             state.creativeWbTemp, state.creativeWbTint, state.balanceToFilmStock,
             state.localAdjustments,
             state.saturation, state.vibrance, state.gamutCompress) {
             if (!recipeReady || recipeKey == null) return@LaunchedEffect
-            if (recipeWritableKey != recipeKey) return@LaunchedEffect
-            if (recipeWriteBlockedKey == recipeKey) return@LaunchedEffect
+            val writableGeneration = recipeAccess.writableGenerationFor(recipeKey)
+                ?: return@LaunchedEffect
             val autosaveEpoch = recipeEditEpoch.snapshot()
             delay(700)
             if (!recipeEditEpoch.isCurrent(autosaveEpoch)) return@LaunchedEffect
-            if (recipeWritableKey != recipeKey) return@LaunchedEffect
-            if (recipeWriteBlockedKey == recipeKey) return@LaunchedEffect
+            if (recipeAccess.writableGenerationFor(recipeKey) != writableGeneration) {
+                return@LaunchedEffect
+            }
             val current = runCatching { Presets.toJsonString(state) }.getOrNull()
             // A non-NONE manual rotation is itself an edit worth persisting, even when the
             // params are otherwise default — so only treat as "pristine" if rotation is NONE.
             if (current != null && current == defaultsJson && rotation == SourceRotation.NONE) {
+                if (!hasRecipe) return@LaunchedEffect
                 val pendingDelete = RecipeWorkRuntime.submit {
+                    if (Recipes.generation(recipeKey) != writableGeneration) return@submit null
                     Recipes.delete(ctx, recipeKey)
+                    Recipes.generation(recipeKey)
                 }
-                try {
+                val newGeneration = try {
                     pendingDelete.await()
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -2104,7 +2904,10 @@ class MainActivity : ComponentActivity() {
                     status = "could not clear saved recipe"
                     return@LaunchedEffect
                 }
-                hasRecipe = false
+                if (newGeneration != null) {
+                    recipeAccess = EditorRecipeAccess.Writable(recipeKey, newGeneration)
+                    hasRecipe = false
+                }
                 return@LaunchedEffect
             }
             val saved = try {
@@ -2114,14 +2917,13 @@ class MainActivity : ComponentActivity() {
                 val savedSourceName = sourceName
                 val savedRotationDegrees = rotation.degrees
                 val pendingSave = RecipeWorkRuntime.submit {
-                    val expectedGeneration = Recipes.generation(recipeKey)
                     Recipes.saveJson(
                         ctx,
                         recipeKey,
                         paramsJson,
                         savedSourceName,
                         savedRotationDegrees,
-                        expectedGeneration,
+                        writableGeneration,
                     )
                 }
                 pendingSave.await()
@@ -2157,6 +2959,8 @@ class MainActivity : ComponentActivity() {
         // undid more than the user did.
         LaunchedEffect(snapshot, recipeKey, recipeReady, rotation,
             state.rawWhiteBalance, state.rawTemperature, state.rawTint,
+            state.creativeWbTemp, state.creativeWbTint, state.balanceToFilmStock,
+            state.localAdjustments,
             state.saturation, state.vibrance, state.gamutCompress) {
             if (!recipeReady) return@LaunchedEffect
             delay(500)
@@ -2165,9 +2969,46 @@ class MainActivity : ComponentActivity() {
             // so the edit stays undoable instead of being silently adopted (one-undo-step loss).
             val now = snapshotNow()
             val action = settleDecision(restoring, committedSnapshot, now)
-            action.push?.let { editHistory.push(it) }
+            action.push?.let {
+                editHistory.push(it)
+                liveCursorMutated = true
+            }
             committedSnapshot = action.committed
             restoring = false
+            checkpointEditorSession()
+        }
+
+        // UI-only editor cursor state does not participate in the render snapshot. Persist it on a
+        // short debounce so category/tool/mask, copy/paste and export-sheet choices survive a
+        // navigation round-trip without enqueueing one document per keystroke.
+        LaunchedEffect(
+            recipeReady,
+            sourceUri,
+            sourceKind,
+            sourceName,
+            sourceAuthorizationRequired,
+            activeCategory,
+            cropOverlayOpen,
+            maskOverlayOpen,
+            selectedMaskIndex,
+            sampleOverlayOpen,
+            sampleLuminanceMode,
+            sampleWbMode,
+            presetBaseJson,
+            presetFullJson,
+            presetAmount,
+            settingsClipboard,
+            selectedPreset,
+            presetName,
+            showExportSheet,
+            exportOptions,
+            exportKeepGps,
+            exportPhase,
+            exportRuntimeRunId,
+        ) {
+            if (!recipeReady) return@LaunchedEffect
+            delay(250)
+            checkpointEditorSession()
         }
 
         // catalog-grouped profile options for the Simulation pickers + Settings.
@@ -2181,6 +3022,22 @@ class MainActivity : ComponentActivity() {
             StockCatalog.optionsFor(ctx, available, forFilm = false).toGroups()
         }
         LaunchedEffect(filmGroups, printGroups) { onProfileGroups(filmGroups, printGroups) }
+
+        fun openExportSheetIfAllowed() {
+            if (engine != null && sourceRenderAllowed && !previewBusy && !exporting) {
+                showExportSheet = true
+            }
+        }
+        LaunchedEffect(Unit) {
+            if (!Ticket139EditorProbe.isArmed()) return@LaunchedEffect
+            Ticket139EditorProbe.exportProbeRequests.collect { request ->
+                openExportSheetIfAllowed()
+                Ticket139EditorProbe.publishExportProbeResult(
+                    request.sequence,
+                    showExportSheet,
+                )
+            }
+        }
 
         // --- back handling on the root editor ---
         // 0) crop overlay open -> close it; 1) panel open -> close panel;
@@ -2216,7 +3073,7 @@ class MainActivity : ComponentActivity() {
             Column(Modifier.fillMaxSize()) {
                 // --- TOP BAR ---
                 EditorTopBar(
-                    canExport = engine != null && !previewBusy && !exporting,
+                    canExport = engine != null && sourceRenderAllowed && !previewBusy && !exporting,
                     exporting = exporting,
                     canUndo = editHistory.canUndo,
                     canRedo = editHistory.canRedo,
@@ -2228,9 +3085,15 @@ class MainActivity : ComponentActivity() {
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                         )
                     },
-                    onExport = { if (engine != null) showExportSheet = true },
-                    onOpenSettings = onOpenSettings,
-                    onOpenAbout = onOpenAbout,
+                    onExport = { openExportSheetIfAllowed() },
+                    onOpenSettings = {
+                        checkpointEditorSession()
+                        onOpenSettings()
+                    },
+                    onOpenAbout = {
+                        checkpointEditorSession()
+                        onOpenAbout()
+                    },
                 )
 
                 // --- PREVIEW (pinned, weight) ---
@@ -2286,12 +3149,14 @@ class MainActivity : ComponentActivity() {
                                 filmGroups = filmGroups,
                                 printGroups = printGroups,
                                 onOpenFilmCurves = {
+                                    checkpointEditorSession()
                                     onOpenFilmCurves(
                                         state.filmProfile,
                                         StockCatalog.displayName(ctx, state.filmProfile),
                                     )
                                 },
                                 onOpenPrintCurves = {
+                                    checkpointEditorSession()
                                     onOpenPrintCurves(
                                         state.printProfile,
                                         StockCatalog.displayName(ctx, state.printProfile),
@@ -2335,12 +3200,21 @@ class MainActivity : ComponentActivity() {
                             Category.TONE_CURVE -> ToneCurveSection(state, preview)
                             Category.MASKS -> MasksSection(
                                 state,
-                                onEditOnPhoto = { idx -> maskEditIndex = idx; maskOverlayOpen = true },
+                                selectedIndex = selectedMaskIndex,
+                                onSelectedIndexChange = { selectedMaskIndex = it },
+                                onEditOnPhoto = { idx ->
+                                    selectedMaskIndex = idx
+                                    maskOverlayOpen = true
+                                },
                                 onSampleColor = { idx ->
-                                    sampleMaskIndex = idx; sampleLuminanceMode = false; sampleOverlayOpen = true
+                                    selectedMaskIndex = idx
+                                    sampleLuminanceMode = false
+                                    sampleOverlayOpen = true
                                 },
                                 onSampleLuminance = { idx ->
-                                    sampleMaskIndex = idx; sampleLuminanceMode = true; sampleOverlayOpen = true
+                                    selectedMaskIndex = idx
+                                    sampleLuminanceMode = true
+                                    sampleOverlayOpen = true
                                 },
                             )
                             Category.DISPLAY -> DisplaySection(state)
@@ -2520,38 +3394,43 @@ class MainActivity : ComponentActivity() {
                                 onOpenRaw = { rawPicker.launch(arrayOf("*/*")) },
                                 onUseDemo = {
                                     val selectionGeneration = sourceMutationGate.begin()
-                                    if (sourceUri != null || sourceKind != SourceKind.DEMO) {
-                                        retireSourceResources()
-                                    }
-                                    sourceUri = null; sourceKind = SourceKind.DEMO
-                                    sourceName = "synthetic demo image"; rotation = SourceRotation.NONE
-                                    sourceAuthorizationRequired = false
-                                    // Deliberately do not attach durable clearing to lifecycleScope:
-                                    // a rotation after this tap must not let the old source reappear.
-                                    val pendingClear = sourceRuntime.submitReconciled(selectionGeneration) {
-                                        sourceAccess.clear()
+                                    // Commit an explicit demo tombstone before changing either the
+                                    // visible source or its session checkpoint. A process kill at
+                                    // any later instruction restores demo, never the older URI.
+                                    val pendingDemo = sourceRuntime.submitReconciled(selectionGeneration) {
+                                        sourceAccess.selectDemo()
                                     }
                                     scope.launch {
-                                        val outcome = pendingClear.await() ?: return@launch
+                                        val outcome = pendingDemo.await() ?: return@launch
                                         if (!sourceMutationGate.isCurrent(selectionGeneration)) {
                                             return@launch
                                         }
                                         when (outcome) {
                                             is ReconciledSourceMutation.Applied -> {
+                                                if (sourceUri != null || sourceKind != SourceKind.DEMO) {
+                                                    retireSourceResources()
+                                                    resetEditorCursorForSourceChange()
+                                                }
+                                                sourceUri = null
+                                                sourceKind = SourceKind.DEMO
+                                                sourceName = "synthetic demo image"
+                                                rotation = SourceRotation.NONE
+                                                sourceAuthorizationRequired = false
+                                                checkpointEditorSession()
+                                                previewTick++
                                                 status = "demo image"
                                             }
                                             is ReconciledSourceMutation.Rejected -> {
-                                                Diag.w("source clear failed: ${outcome.failure.message}")
+                                                Diag.w("demo selection failed: ${outcome.failure.message}")
                                                 reconcileVisibleSourceAfterFailure(outcome.durableState)
                                                 snackbarHost.currentSnackbarData?.dismiss()
                                                 snackbarHost.showSnackbar(
-                                                    "Could not clear the previous source; its state was restored.",
+                                                    "Could not select the demo; the previous source was restored.",
                                                     withDismissAction = true,
                                                 )
                                             }
                                         }
                                     }
-                                    previewTick++
                                 },
                                 onResetEdits = {
                                     // Invalidate every pre-reset debounce synchronously. A save that
@@ -2577,8 +3456,12 @@ class MainActivity : ComponentActivity() {
                                             )
                                             return@launch
                                         }
-                                        recipeWriteBlockedKey = null
-                                        recipeWritableKey = recipeKey
+                                        recipeAccess = recipeKey?.let {
+                                            EditorRecipeAccess.Writable(
+                                                it,
+                                                Recipes.generation(it),
+                                            )
+                                        } ?: EditorRecipeAccess.None
                                         Recipes.resetToDefaults(state, settings, profiles)
                                         presetBaseJson = null; presetFullJson = null; presetAmount = 1f
                                         hasRecipe = false; rotation = SourceRotation.NONE
@@ -2663,13 +3546,13 @@ class MainActivity : ComponentActivity() {
             }
 
             // --- draw-on-the-preview mask geometry editor ---
-            if (maskOverlayOpen && cropBmp != null && maskEditIndex in state.localAdjustments.indices) {
+            if (maskOverlayOpen && cropBmp != null && selectedMaskIndex in state.localAdjustments.indices) {
                 MaskGeometryOverlay(
                     bitmap = cropBmp,
-                    mask = state.localAdjustments[maskEditIndex].mask,
+                    mask = state.localAdjustments[selectedMaskIndex].mask,
                     onConfirm = { updated ->
                         val list = state.localAdjustments.toMutableList()
-                        list[maskEditIndex] = list[maskEditIndex].copy(mask = updated)
+                        list[selectedMaskIndex] = list[selectedMaskIndex].copy(mask = updated)
                         state.localAdjustments = list
                         maskOverlayOpen = false
                         previewTick++
@@ -2679,15 +3562,15 @@ class MainActivity : ComponentActivity() {
             }
 
             // --- eyedropper: WB gray-point, or a color-/luminance-range mask target ---
-            val sampleMask = state.localAdjustments.getOrNull(sampleMaskIndex)?.mask
-            val sampleReady = sampleOverlayOpen && cropBmp != null && (
+            val sampleMask = state.localAdjustments.getOrNull(selectedMaskIndex)?.mask
+            val sampleReady = sourceRenderAllowed && sampleOverlayOpen && cropBmp != null && (
                 sampleWbMode ||
                     (sampleMask != null &&
                         (if (sampleLuminanceMode) sampleMask.luminanceRange != null else sampleMask.colorRange != null))
                 )
-            if (sampleReady && cropBmp != null) {
+            if (sampleReady) {
                 PixelSampleOverlay(
-                    bitmap = cropBmp,
+                    bitmap = requireNotNull(cropBmp),
                     title = when {
                         sampleWbMode -> "Tap a neutral (grey / white)"
                         sampleLuminanceMode -> "Tap to pick a tone"
@@ -2724,14 +3607,14 @@ class MainActivity : ComponentActivity() {
                             }
                         } else {
                             val list = state.localAdjustments.toMutableList()
-                            val m = list[sampleMaskIndex].mask
+                            val m = list[selectedMaskIndex].mask
                             val nm = if (sampleLuminanceMode) {
                                 m.copy(luminanceRange = com.spectrafilm.app.masks.LuminanceRange.fromSample(r, g, b))
                             } else {
                                 val cr = m.colorRange ?: com.spectrafilm.app.masks.ColorRange()
                                 m.copy(colorRange = cr.copy(targetR = r, targetG = g, targetB = b))
                             }
-                            list[sampleMaskIndex] = list[sampleMaskIndex].copy(mask = nm)
+                            list[selectedMaskIndex] = list[selectedMaskIndex].copy(mask = nm)
                             state.localAdjustments = list
                             sampleOverlayOpen = false
                             previewTick++
@@ -2745,7 +3628,13 @@ class MainActivity : ComponentActivity() {
             if (exporting) {
                 ExportMask(
                     done = exportDone,
-                    onDismiss = { exporting = false; exportDone = false },
+                    onDismiss = {
+                        exporting = false
+                        exportDone = false
+                        exportPhase = EditorExportPhase.IDLE
+                        exportRuntimeRunId = null
+                        checkpointEditorSession()
+                    },
                     onCancel = {
                         val running = exportRuntimeState as? ExportRuntimeState.Running
                         if (running != null && ExportWorkRuntime.cancel(running.runId)) {
@@ -2796,6 +3685,11 @@ class MainActivity : ComponentActivity() {
                     onKeepGpsChange = { exportKeepGps = it },
                     onDismiss = { showExportSheet = false },
                     onExport = export@{
+                        if (!sourceRenderAllowed) {
+                            showExportSheet = false
+                            status = "source access required before export"
+                            return@export
+                        }
                         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
                             ContextCompat.checkSelfPermission(
                                 ctx,
@@ -2856,6 +3750,7 @@ class MainActivity : ComponentActivity() {
                                 context = exportContext,
                                 format = exportFmt,
                                 startedAtMillis = exportStartMs,
+                                sourceIdentity = exportSourceIdentity,
                             ) {
                                 var phSetup = 0L
                                 var phDecode = 0L
@@ -3113,7 +4008,13 @@ class MainActivity : ComponentActivity() {
                                      }
                                 }
                             }
-                            if (launched == null) status = "an export is already running"
+                            if (launched == null) {
+                                status = "an export is already running"
+                            } else {
+                                exportPhase = EditorExportPhase.RUNNING
+                                exportRuntimeRunId = launched
+                                checkpointEditorSession()
+                            }
                         }
                     },
                 )
