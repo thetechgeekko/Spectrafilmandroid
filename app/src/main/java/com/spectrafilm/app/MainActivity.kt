@@ -2695,18 +2695,24 @@ class MainActivity : ComponentActivity() {
                             return@export
                         }
                         val e = engine
-                        showExportSheet = false
                         if (e != null) {
+                            val outputDescriptor = runCatching {
+                                exportOptions.outputDescriptor(
+                                    state.outputColorSpace,
+                                    state.savingCctfEncoding,
+                                    Build.VERSION.SDK_INT,
+                                ).also { ColorManagement.requireIccBytes(ctx, it) }
+                            }.getOrElse { failure ->
+                                status = failure.message ?: "unsupported export combination"
+                                Toast.makeText(ctx, status, Toast.LENGTH_LONG).show()
+                                return@export
+                            }
+                            showExportSheet = false
                             // Remember the choices as the new Settings defaults.
                             settings.exportFormat = exportOptions.format
                             settings.exportQuality = exportOptions.jpegQuality
                             settings.exportKeepGps = exportKeepGps
-                            var fmt = exportOptions.format
-                            // Ultra HDR needs the API 34 Gainmap class; fall back to JPEG below that.
-                            if (fmt == ExportFormat.ULTRA_HDR && android.os.Build.VERSION.SDK_INT < 34) {
-                                fmt = ExportFormat.JPEG
-                                Toast.makeText(ctx, "Ultra HDR needs Android 14+ — saving JPEG instead", Toast.LENGTH_LONG).show()
-                            }
+                            val fmt = outputDescriptor.format
                             val exportFmt = fmt
                             val baseName = exportBaseName(exportOptions.customName, System.currentTimeMillis())
                             val longEdge = exportOptions.targetLongEdge()
@@ -2714,11 +2720,15 @@ class MainActivity : ComponentActivity() {
                             // Wall-clock breadcrumbs for the on-device baseline capture
                             // (issue #119): logcat-visible start marker + duration on ok/fail.
                             val exportStartMs = System.currentTimeMillis()
-                            Diag.i("export start format=${exportFmt.name}")
+                            Diag.i("export start format=${exportFmt.name} contract=${outputDescriptor.existingExportClass.id}")
                             exporting = true; exportDone = false; status = "rendering full resolution…"
                             val exportContext = ctx.applicationContext
-                            val exportParams = state.toParams()
-                            val exportCctf = state.savingCctfEncoding
+                            val exportParams = if (outputDescriptor.engineColorSpace == null) {
+                                state.toParams()
+                            } else {
+                                outputDescriptor.applyTo(state.toParams())
+                            }
+                            val exportCctf = outputDescriptor.engineCctfEncoding ?: false
                             val exportSaturation = state.saturation
                             val exportVibrance = state.vibrance
                             val exportGamutCompress = state.gamutCompress
@@ -2768,6 +2778,7 @@ class MainActivity : ComponentActivity() {
                                                     saveLinearInputAsTiff32f(
                                                         exportContext,
                                                         image,
+                                                        outputDescriptor,
                                                         baseName,
                                                         onCommitted = destinationCommit::markPublished,
                                                     )
@@ -2811,6 +2822,9 @@ class MainActivity : ComponentActivity() {
                                             }
                                             phSim = System.currentTimeMillis() - tSim0
                                             try {
+                                                check(res.colorSpace == outputDescriptor.engineColorSpace) {
+                                                    "Engine result color space disagrees with output contract"
+                                                }
                                                 val tGrade0 = System.currentTimeMillis()
                                                  val bmp0 = simResultToBitmapGraded(
                                                     res,
@@ -2837,35 +2851,33 @@ class MainActivity : ComponentActivity() {
                                                 phGrade = System.currentTimeMillis() - tGrade0
                                                 val tEnc0 = System.currentTimeMillis()
                                                 withContext(Dispatchers.IO) {
-                                                    when (exportFmt) {
-                                                        ExportFormat.TIFF -> saveSimResultAsTiff(
+                                                    when (outputDescriptor.encoder) {
+                                                        OutputEncoder.NATIVE_TIFF_UINT16,
+                                                        OutputEncoder.NATIVE_TIFF_FLOAT32 -> saveSimResultAsTiff(
                                                             exportContext,
                                                             res,
+                                                            outputDescriptor,
                                                             displayName = baseName,
                                                             onCommitted = destinationCommit::markPublished,
                                                         )
-                                                        ExportFormat.TIFF32F -> saveSimResultAsTiff(
+                                                        OutputEncoder.NATIVE_PNG16 -> saveSimResultAsPng16(
                                                             exportContext,
                                                             res,
-                                                            displayName = baseName,
-                                                            float32 = true,
-                                                            onCommitted = destinationCommit::markPublished,
-                                                        )
-                                                        ExportFormat.PNG16 -> saveSimResultAsPng16(
-                                                            exportContext,
-                                                            res,
+                                                            outputDescriptor,
                                                             displayName = baseName,
                                                             onCommitted = destinationCommit::markPublished,
                                                         )
-                                                        else -> saveToGallery(
+                                                        OutputEncoder.ANDROID_BITMAP_PNG,
+                                                        OutputEncoder.ANDROID_BITMAP_JPEG -> saveToGallery(
                                                             exportContext,
                                                             bmp,
-                                                            exportFmt,
+                                                            outputDescriptor,
                                                             exportJpegQuality,
                                                             srcExif,
                                                             displayName = baseName,
                                                             onCommitted = destinationCommit::markPublished,
                                                         )
+                                                        else -> error("Scene-linear encoder reached rendered branch")
                                                     }
                                                 }
                                                 phEnc = System.currentTimeMillis() - tEnc0

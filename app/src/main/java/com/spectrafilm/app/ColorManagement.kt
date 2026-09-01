@@ -35,14 +35,8 @@ object ColorManagement {
      * export-intent space, not a display space. All other spaces are RGB with a parametric transfer and
      * a [0,1] range, so they tag cleanly on an 8-bit bitmap.
      */
-    fun displayColorSpaceName(cs: ColorSpace): String? = when (cs) {
-        ColorSpace.SRGB -> "SRGB"
-        ColorSpace.ADOBE_RGB -> "ADOBE_RGB"
-        ColorSpace.PROPHOTO -> "PRO_PHOTO_RGB"
-        ColorSpace.REC2020 -> "BT2020"
-        ColorSpace.LINEAR_SRGB -> "LINEAR_SRGB"
-        ColorSpace.ACES2065_1 -> null
-    }
+    fun displayColorSpaceName(cs: ColorSpace): String? =
+        OutputDescriptor.bitmapColorSpaceNameFor(cs)
 
     /**
      * Bundled ICC profile asset path (relative to the merged app assets) describing the exact encoding
@@ -50,19 +44,26 @@ object ColorManagement {
      * are compact V4 standard-space profiles; the two linear spaces use elle-stone γ=1.0 profiles.
      * Transfers/primaries match model/color_output.cpp::output_cctf_encode + kRGB_to_XYZ.
      */
-    fun iccAssetPath(cs: ColorSpace): String = "spektra/icc/" + when (cs) {
-        ColorSpace.SRGB -> "saucecontrol/sRGB-v4.icc"
-        ColorSpace.ADOBE_RGB -> "saucecontrol/AdobeCompat-v4.icc"
-        ColorSpace.PROPHOTO -> "saucecontrol/ProPhoto-v4.icc"
-        ColorSpace.REC2020 -> "saucecontrol/Rec2020-v4.icc"
-        ColorSpace.ACES2065_1 -> "ellelstone/ACES-elle-V4-g10.icc"   // AP0 primaries + linear (γ=1.0)
-        ColorSpace.LINEAR_SRGB -> "ellelstone/sRGB-elle-V4-g10.icc"  // 709 primaries + linear (γ=1.0)
-    }
+    fun iccAssetPath(cs: ColorSpace): String = OutputDescriptor.iccAssetPathFor(cs)
 
     /**
-     * Load the ICC profile bytes for [cs] from app assets, or null if the asset is unavailable — in
-     * which case export degrades cleanly to no embedded profile (plus the advisory EXIF tag for TIFF).
+     * Load exactly the profile selected by the validated output contract. A descriptor that
+     * promises an embedded profile must never degrade to an untagged export.
      */
-    fun loadIccBytes(ctx: Context, cs: ColorSpace): ByteArray? =
-        runCatching { ctx.assets.open(iccAssetPath(cs)).use { it.readBytes() } }.getOrNull()
+    fun requireIccBytes(ctx: Context, descriptor: OutputDescriptor): ByteArray? =
+        requireIccBytes(descriptor) { path -> ctx.assets.open(path).use { it.readBytes() } }
+
+    internal fun requireIccBytes(
+        descriptor: OutputDescriptor,
+        loader: (String) -> ByteArray,
+    ): ByteArray? {
+        val path = descriptor.metadata.iccAssetPath ?: return null
+        val bytes = try {
+            loader(path)
+        } catch (failure: Exception) {
+            throw IllegalStateException("Required output ICC profile is unavailable: $path", failure)
+        }
+        check(bytes.isNotEmpty()) { "Required output ICC profile is empty: $path" }
+        return bytes
+    }
 }

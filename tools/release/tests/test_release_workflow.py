@@ -127,6 +127,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         for contract in (
             "@('shell', 'am', 'instrument', '-w', '-r')",
             "foreach ($pass in 1..2)",
+            "TICKET174_OUTPUT_DESCRIPTOR: PASS",
             "TICKET170_INJECTED_FAILURES: PASS",
             "TICKET172_ACTIVITY_RECREATION: PASS",
             "RELEASE_CANDIDATE_INSTRUMENTATION: PASS",

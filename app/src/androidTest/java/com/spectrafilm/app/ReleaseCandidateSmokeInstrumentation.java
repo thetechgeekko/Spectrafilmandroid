@@ -53,6 +53,9 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                 runCandidateChecks();
                 results.putString(
                         "stream",
+                        "TICKET174_OUTPUT_DESCRIPTOR: PASS "
+                                + "(SDR JPEG/PNG, PNG16, TIFF16, TIFF32F; blocked Ultra HDR)\n"
+                                +
                         "TICKET170_INJECTED_FAILURES: PASS "
                                 + "(deterministic ENOSPC and interrupted-close fakes)\n"
                                 + "TICKET172_ACTIVITY_RECREATION: PASS "
@@ -88,6 +91,7 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
         final String gpl = readAsset(targetContext, "legal/spektrafilm/LICENSE.GPL-3.0");
         require(gpl.contains("GNU GENERAL PUBLIC LICENSE"), "GPL asset is incomplete");
 
+        OutputContractInstrumentationChecks.run(targetContext);
         StorageReliabilityChecks.run(targetContext);
 
         final Intent launch = targetContext.getPackageManager()

@@ -414,8 +414,7 @@ private fun ExportFormat.isJpeg(): Boolean =
  * (the Bitmap-based resize does not apply).
  */
 fun ExportFormat.isHighBitDepth(): Boolean =
-    this == ExportFormat.TIFF || this == ExportFormat.PNG16 ||
-        this == ExportFormat.TIFF32F || this == ExportFormat.SCENE_LINEAR_TIFF
+    OutputDescriptor.fixedBitDepth(this).bitsPerSample > 8
 
 /**
  * Downscale [bmp] so its longer edge is [longEdge] px, preserving aspect and never enlarging
@@ -595,7 +594,13 @@ fun readSourceExif(ctx: Context, sourceUri: Uri?, keepGps: Boolean = false): Sou
  * Works for an empty [source] too: only the overrides are written, which is the desired
  * behaviour for the demo image / EXIF-less sources.
  */
-private fun applySourceExif(dest: ExifInterface, source: SourceExif, outW: Int, outH: Int) {
+private fun applySourceExif(
+    dest: ExifInterface,
+    source: SourceExif,
+    outW: Int,
+    outH: Int,
+    outputColorSpace: OutputExifColorSpace,
+) {
     for ((tag, value) in source.tags) {
         runCatching { dest.setAttribute(tag, value) }
     }
@@ -605,12 +610,20 @@ private fun applySourceExif(dest: ExifInterface, source: SourceExif, outW: Int, 
     dest.setAttribute(ExifInterface.TAG_IMAGE_LENGTH, outH.toString())
     dest.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, outW.toString())
     dest.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, outH.toString())
+    // The source tag describes the camera file, not these rendered samples. Always override it.
+    dest.setAttribute(ExifInterface.TAG_COLOR_SPACE, outputColorSpace.value.toString())
     dest.saveAttributes()
 }
 
 /** Apply [source] EXIF + Spektrafilm overrides to an exported JPEG at filesystem [path]. */
-private fun writeExifToPath(path: String, source: SourceExif, outW: Int, outH: Int) {
-    applySourceExif(ExifInterface(path), source, outW, outH)
+private fun writeExifToPath(
+    path: String,
+    source: SourceExif,
+    outW: Int,
+    outH: Int,
+    outputColorSpace: OutputExifColorSpace,
+) {
+    applySourceExif(ExifInterface(path), source, outW, outH, outputColorSpace)
 }
 
 /**
@@ -632,20 +645,20 @@ private fun writeExifToPath(path: String, source: SourceExif, outW: Int, outH: I
  * Bitmap.compress(JPEG, ...) is called. This is the documented Android 14 behaviour for
  * gainmap-bearing bitmaps. It has NOT been verified on a physical device in this environment.
  */
-private fun attachNeutralGainmap(base: Bitmap) {
+private fun attachNeutralGainmap(base: Bitmap, contract: HdrGainMapContract) {
     if (Build.VERSION.SDK_INT < 34) return
     // A 1x1 uniform gain-map content bitmap: full (255) application of the configured ratios.
     // eraseColor sets the ALPHA_8 channel to 0xFF — setPixel is unreliable on ALPHA_8.
-    val content = Bitmap.createBitmap(1, 1, Bitmap.Config.ALPHA_8)
+    val content = Bitmap.createBitmap(contract.width, contract.height, Bitmap.Config.ALPHA_8)
     content.eraseColor(Color.argb(255, 0, 0, 0))
     val gainmap = Gainmap(content).apply {
-        setRatioMin(1.0f, 1.0f, 1.0f)
-        setRatioMax(1.6f, 1.6f, 1.6f)
-        setGamma(1.0f, 1.0f, 1.0f)
-        setEpsilonSdr(0.015625f, 0.015625f, 0.015625f)
-        setEpsilonHdr(0.015625f, 0.015625f, 0.015625f)
-        setDisplayRatioForFullHdr(1.6f)
-        minDisplayRatioForHdrTransition = 1.0f
+        setRatioMin(contract.ratioMin, contract.ratioMin, contract.ratioMin)
+        setRatioMax(contract.ratioMax, contract.ratioMax, contract.ratioMax)
+        setGamma(contract.gamma, contract.gamma, contract.gamma)
+        setEpsilonSdr(contract.epsilonSdr, contract.epsilonSdr, contract.epsilonSdr)
+        setEpsilonHdr(contract.epsilonHdr, contract.epsilonHdr, contract.epsilonHdr)
+        setDisplayRatioForFullHdr(contract.displayRatioForFullHdr)
+        minDisplayRatioForHdrTransition = contract.minDisplayRatioForHdrTransition
     }
     base.setGainmap(gainmap)
 }
@@ -660,18 +673,37 @@ private fun attachNeutralGainmap(base: Bitmap) {
 suspend fun saveToGallery(
     ctx: Context,
     bmp: Bitmap,
-    format: ExportFormat,
+    descriptor: OutputDescriptor,
     jpegQuality: Int = 95,
     sourceExif: SourceExif = SourceExif(emptyMap()),
     displayName: String? = null,
     onCommitted: () -> Unit = {},
 ): Uri {
-    require(format != ExportFormat.TIFF) {
-        "Use saveSimResultAsTiff() for TIFF export"
+    descriptor.requireExportable(Build.VERSION.SDK_INT)
+    require(descriptor.encoder == OutputEncoder.ANDROID_BITMAP_PNG ||
+        descriptor.encoder == OutputEncoder.ANDROID_BITMAP_JPEG) {
+        "${descriptor.format} is not a Bitmap encoder contract"
+    }
+    val format = descriptor.format
+    val expectedBitmapSpace = requireNotNull(descriptor.metadata.bitmapColorSpaceName)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val expected = android.graphics.ColorSpace.get(
+            android.graphics.ColorSpace.Named.valueOf(expectedBitmapSpace),
+        )
+        require(bmp.colorSpace?.id == expected.id) {
+            "Bitmap color space does not match $expectedBitmapSpace output contract"
+        }
+    } else {
+        require(expectedBitmapSpace == "SRGB") { "Wide-gamut Bitmap export requires API 26+" }
     }
     val name = "${displayName ?: "Spektrafilm_${System.currentTimeMillis()}"}.${format.ext}"
-    val compress = if (format == ExportFormat.PNG) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
-    val quality = if (format == ExportFormat.PNG) 100 else jpegQuality.coerceIn(1, 100)
+    val compress = if (descriptor.encoder == OutputEncoder.ANDROID_BITMAP_PNG) {
+        Bitmap.CompressFormat.PNG
+    } else {
+        Bitmap.CompressFormat.JPEG
+    }
+    val quality = if (descriptor.encoder == OutputEncoder.ANDROID_BITMAP_PNG) 100
+    else jpegQuality.coerceIn(1, 100)
     val exportJob = currentCoroutineContext()[Job]
     val isCancelled = { exportJob?.isActive == false }
     fun ensureExportActive() {
@@ -682,11 +714,11 @@ suspend fun saveToGallery(
     // Ultra HDR: attach a near-neutral gain map so the platform JPEG encoder emits a valid
     // Ultra HDR JPEG (base SDR + gain map + MPF). No-op below API 34. setGainmap mutates
     // [bmp] IN PLACE (the input bitmap carries the gain map); its pixel data is untouched.
-    if (format == ExportFormat.ULTRA_HDR) attachNeutralGainmap(bmp)
+    descriptor.metadata.hdrGainMap?.let { attachNeutralGainmap(bmp, it) }
 
     // EXIF is only writable (via androidx ExifInterface) for JPEG targets. The exported
     // dimensions are taken from the rendered bitmap (post crop/resize/rotate).
-    val writeExif = format.isJpeg()
+    val writeExif = descriptor.metadata.copySourceExif
     val outW = bmp.width
     val outH = bmp.height
 
@@ -721,7 +753,13 @@ suspend fun saveToGallery(
             ensureExportActive()
         }
         ensureExportActive()
-        if (writeExif) writeExifToPath(stage.absolutePath, sourceExif, outW, outH)
+        if (writeExif) writeExifToPath(
+            stage.absolutePath,
+            sourceExif,
+            outW,
+            outH,
+            descriptor.metadata.exifColorSpace,
+        )
         ensureExportActive()
         val artifact = EncodedArtifact.fromCompletedFile(stage, isCancelled = isCancelled)
         return publishStagedToGallery(
@@ -740,13 +778,11 @@ suspend fun saveToGallery(
 }
 
 /**
- * Return the EXIF ColorSpace advisory tag value for a given engine [ColorSpace].
- * Only sRGB and linear sRGB map to EXIF ColorSpace = 1 (sRGB); all wide-gamut
- * spaces map to 0xFFFF (Uncalibrated) per the EXIF spec.
+ * Convert the descriptor's EXIF ColorSpace policy to the native TIFF writer value.
  */
-private fun exifColorSpaceFor(cs: ColorSpace): ExifColorSpace = when (cs) {
-    ColorSpace.SRGB, ColorSpace.LINEAR_SRGB -> ExifColorSpace.SRGB
-    else -> ExifColorSpace.UNCALIBRATED
+private fun OutputExifColorSpace.toNativeTiffTag(): ExifColorSpace = when (this) {
+    OutputExifColorSpace.SRGB -> ExifColorSpace.SRGB
+    OutputExifColorSpace.UNCALIBRATED -> ExifColorSpace.UNCALIBRATED
 }
 
 /**
@@ -761,7 +797,7 @@ private fun exifColorSpaceFor(cs: ColorSpace): ExifColorSpace = when (cs) {
  *
  * ICC: the bundled profile matching the output space is embedded (see [ColorManagement]),
  * so wide-gamut exports open correctly in color-managed apps. The EXIF ColorSpace advisory
- * tag is also set — SRGB when the output space is sRGB/linear-sRGB, UNCALIBRATED otherwise.
+ * tag is also set — SRGB only for encoded sRGB, UNCALIBRATED otherwise.
  *
  * @param ctx     Android context (for MediaStore / cacheDir)
  * @param result  The engine SimResult whose float data is quantised to 16-bit
@@ -770,10 +806,18 @@ private fun exifColorSpaceFor(cs: ColorSpace): ExifColorSpace = when (cs) {
 suspend fun saveSimResultAsTiff(
     ctx: Context,
     result: SimResult,
+    descriptor: OutputDescriptor,
     displayName: String? = null,
-    float32: Boolean = false,
     onCommitted: () -> Unit = {},
 ): Uri {
+    require(descriptor.encoder == OutputEncoder.NATIVE_TIFF_UINT16 ||
+        descriptor.encoder == OutputEncoder.NATIVE_TIFF_FLOAT32) {
+        "${descriptor.format} is not a rendered TIFF contract"
+    }
+    require(descriptor.engineColorSpace == result.colorSpace) {
+        "Engine result ${result.colorSpace} does not match ${descriptor.engineColorSpace} output contract"
+    }
+    val float32 = descriptor.encoder == OutputEncoder.NATIVE_TIFF_FLOAT32
     val w = result.width
     val h = result.height
     val nSamples = checkedRgbFloatByteCount(w, h, "TIFF export") / Float.SIZE_BYTES
@@ -789,8 +833,8 @@ suspend fun saveSimResultAsTiff(
     ensureExportActive()
 
     val dateTime = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date())
-    val exifCs = exifColorSpaceFor(result.colorSpace)
-    val icc = ColorManagement.loadIccBytes(ctx, result.colorSpace)  // embed the matching profile
+    val exifCs = descriptor.metadata.exifColorSpace.toNativeTiffTag()
+    val icc = ColorManagement.requireIccBytes(ctx, descriptor)
 
     // Write to a temp file in cacheDir first; this avoids holding a MediaStore
     // output stream open for the entire (potentially large) TiffWriter write.
@@ -862,7 +906,7 @@ suspend fun saveSimResultAsTiff(
             ctx,
             artifact,
             "${displayName ?: "Spektrafilm_${System.currentTimeMillis()}"}.tif",
-            ExportFormat.TIFF.mime,
+            descriptor.format.mime,
             isCancelled,
             onCommitted,
         )
@@ -1051,9 +1095,17 @@ internal fun recoverAbandonedLegacyExportStages(
 suspend fun saveLinearInputAsTiff32f(
     ctx: Context,
     image: LinearImage,
+    descriptor: OutputDescriptor,
     displayName: String? = null,
     onCommitted: () -> Unit = {},
 ): Uri {
+    require(descriptor.format == ExportFormat.SCENE_LINEAR_TIFF &&
+        descriptor.reference == OutputReference.SCENE_REFERRED &&
+        descriptor.encoder == OutputEncoder.NATIVE_TIFF_FLOAT32 &&
+        descriptor.quantizer == OutputQuantizer.VERBATIM_FLOAT32 &&
+        descriptor.metadata.iccAssetPath == null) {
+        "Scene-linear input requires the untagged verbatim TIFF32F contract"
+    }
     val exportJob = currentCoroutineContext()[Job]
     val isCancelled = { exportJob?.isActive == false }
     val dateTime = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date())
@@ -1070,7 +1122,7 @@ suspend fun saveLinearInputAsTiff32f(
                     height = image.height,
                     outPath = tmpFile.absolutePath,
                     icc = null,
-                    exifColorSpace = ExifColorSpace.UNCALIBRATED,
+                    exifColorSpace = descriptor.metadata.exifColorSpace.toNativeTiffTag(),
                     software = "Spektrafilm (scene-linear ${image.colorSpace})",
                     dateTime = dateTime,
                     packBits = false,
@@ -1086,7 +1138,7 @@ suspend fun saveLinearInputAsTiff32f(
             ctx,
             artifact,
             "${displayName ?: "Spektrafilm_${System.currentTimeMillis()}"}_scene-linear.tif",
-            ExportFormat.TIFF.mime,
+            descriptor.format.mime,
             isCancelled,
             onCommitted,
         )
@@ -1113,9 +1165,17 @@ suspend fun saveLinearInputAsTiff32f(
 suspend fun saveSimResultAsPng16(
     ctx: Context,
     result: SimResult,
+    descriptor: OutputDescriptor,
     displayName: String? = null,
     onCommitted: () -> Unit = {},
 ): Uri {
+    require(descriptor.encoder == OutputEncoder.NATIVE_PNG16 &&
+        descriptor.quantizer == OutputQuantizer.UINT16_ROUND_CLAMP) {
+        "${descriptor.format} is not a PNG16 contract"
+    }
+    require(descriptor.engineColorSpace == result.colorSpace) {
+        "Engine result ${result.colorSpace} does not match ${descriptor.engineColorSpace} output contract"
+    }
     val w = result.width
     val h = result.height
     val nSamples = checkedRgbFloatByteCount(w, h, "PNG16 export") / Float.SIZE_BYTES
@@ -1163,7 +1223,7 @@ suspend fun saveSimResultAsPng16(
                     width = w,
                     height = h,
                     outPath = tmpFile.absolutePath,
-                    icc = ColorManagement.loadIccBytes(ctx, result.colorSpace),
+                    icc = ColorManagement.requireIccBytes(ctx, descriptor),
                     software = "Spektrafilm",
                     cancellation = cancellation,
                 )
@@ -1181,7 +1241,7 @@ suspend fun saveSimResultAsPng16(
             ctx,
             artifact,
             name,
-            ExportFormat.PNG16.mime,
+            descriptor.format.mime,
             isCancelled,
             onCommitted,
         )

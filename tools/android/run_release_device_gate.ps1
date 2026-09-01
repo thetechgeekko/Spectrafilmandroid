@@ -356,6 +356,7 @@ if ($registrations.Output.IndexOf($expectedRegistration, [System.StringCompariso
 }
 
 $fullMarkers = @(
+    'TICKET174_OUTPUT_DESCRIPTOR: PASS',
     'TICKET170_INJECTED_FAILURES: PASS',
     'TICKET172_ACTIVITY_RECREATION: PASS',
     'RELEASE_CANDIDATE_INSTRUMENTATION: PASS',

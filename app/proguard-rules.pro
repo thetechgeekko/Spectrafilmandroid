@@ -55,6 +55,21 @@
 -keep class com.spectrafilm.app.ExportFormat { *; }
 -keep class com.spectrafilm.app.PendingExportBackend$DefaultImpls { *; }
 
+# Ticket #174's separate release test APK calls the production descriptor/color contract and the
+# production float-to-tagged-Bitmap bridge, then parses the encoded files on a physical device.
+-keep class com.spectrafilm.app.OutputDescriptor { *; }
+-keep class com.spectrafilm.app.OutputDescriptor$Companion { *; }
+-keep class com.spectrafilm.app.OutputMetadataPolicy { *; }
+-keep class com.spectrafilm.app.OutputBitDepth { *; }
+-keep class com.spectrafilm.app.OutputEncoder { *; }
+-keep class com.spectrafilm.app.OutputReleaseStatus { *; }
+-keep class com.spectrafilm.app.ExportOptions { *; }
+-keep class com.spectrafilm.app.ExportSize { *; }
+-keep class com.spectrafilm.app.ColorManagement { *; }
+-keepclassmembers class com.spectrafilm.app.EngineHelpersKt {
+    public static android.graphics.Bitmap simResultToBitmap(...);
+}
+
 # Kotlin inline functions in the separately packaged release AndroidTest APK
 # still emit calls to Result's JVM implementation ABI. R8 cannot see those call
 # edges while shrinking the target APK, so it may remove Result.Companion or an

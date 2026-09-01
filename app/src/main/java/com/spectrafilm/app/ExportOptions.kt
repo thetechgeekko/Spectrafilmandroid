@@ -9,6 +9,7 @@
  */
 package com.spectrafilm.app
 
+import com.spectrafilm.engine.ColorSpace
 import kotlin.math.roundToInt
 
 /** Output-size choice in the export sheet (a post-render downscale, like Lightroom's "Dimensions"). */
@@ -41,6 +42,28 @@ data class ExportOptions(
             if (customLongEdge <= 0) null
             else customLongEdge.coerceIn(MIN_CUSTOM_EDGE, MAX_CUSTOM_EDGE)
         else -> size.longEdge
+    }
+
+    /**
+     * Resolve and validate the complete output contract before decode/render starts. The selected
+     * format owns sample depth; the six oracle-backed engine transforms own transfer/CCTF pairing.
+     */
+    fun outputDescriptor(
+        colorSpace: ColorSpace,
+        outputCctfEncoding: Boolean,
+        apiLevel: Int,
+    ): OutputDescriptor {
+        val descriptor = if (format == ExportFormat.SCENE_LINEAR_TIFF) {
+            OutputDescriptor.sceneLinearTiff(OutputDescriptor.fixedBitDepth(format))
+        } else {
+            OutputDescriptor.rendered(
+                format = format,
+                colorSpace = colorSpace,
+                outputCctfEncoding = outputCctfEncoding,
+                bitDepth = OutputDescriptor.fixedBitDepth(format),
+            )
+        }
+        return descriptor.requireExportable(apiLevel)
     }
 
     companion object {
