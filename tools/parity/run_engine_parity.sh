@@ -9,7 +9,7 @@
 # Usage:  tools/parity/run_engine_parity.sh [build_dir]
 # Env:    JOBS=<n>   parallel compile jobs (default: CPU count)
 #
-# NOTE: a plain run reproduces the workflow's -O2 leg only. CI runs the same 39
+# NOTE: a plain run reproduces the workflow's -O2 leg only. CI runs the same 40
 # tests TWICE, the second at the flags the engine actually ships with. To
 # reproduce that leg locally (measured green, and 20% larger codegen, so it is a
 # genuinely different binary rather than a no-op):
@@ -88,6 +88,7 @@ TESTS=(
   "test_print_spatial_e2e|$ASSET|$G/print_portra_spatial|tests/scan_portra_input_rgb.f64|$G"
   "test_grain|$G/scan_portra/film_density_cmy.spkvec|tests/grain_ref_density.spkvec"
   "test_grain_sublayer|$G/scan_portra/film_density_cmy.spkvec|tests/grain_sublayer_ref_density.spkvec|$ASSET/profiles/kodak_portra_400.json"
+  "test_binomial_shortcircuit"
 )
 
 echo "engine-parity: ${#TESTS[@]} tests -> $OUT (jobs=$JOBS)"

@@ -610,6 +610,12 @@ jobs:
           # tests/gen_grain_ref.py / gen_grain_sublayer_ref.py.
           build_run test_grain "$G/scan_portra/film_density_cmy.spkvec" tests/grain_ref_density.spkvec
           build_run test_grain_sublayer "$G/scan_portra/film_density_cmy.spkvec" tests/grain_sublayer_ref_density.spkvec "$ASSET/profiles/kodak_portra_400.json"
+          # test_binomial_shortcircuit: fast_binomial_one returns n directly when
+          # pow(1-p,n) has underflowed to 0 instead of walking the loop to k=n+1.
+          # The two grain tests above are STATISTICAL and cannot see that, so this
+          # gates it element-wise against a verbatim transcription of the loop it
+          # replaces — variate AND surviving RNG stream, both legs.
+          build_run test_binomial_shortcircuit
           exit $fail
 
   # ---------------------------------------------------------------------------
