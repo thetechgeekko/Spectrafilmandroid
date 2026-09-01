@@ -9,7 +9,7 @@ diff --git a/src/demosaic/xtrans_demosaic.cpp b/src/demosaic/xtrans_demosaic.cpp
   *
   LibRaw uses code from dcraw.c -- Dave Coffin's raw photo decoder,
   dcraw.c is copyright 1997-2018 by Dave Coffin, dcoffin a cybercom o net.
-@@ -275,10 +277,12 @@ void LibRaw::xtrans_interpolate(int passes)
+@@ -275,11 +277,13 @@ void LibRaw::xtrans_interpolate(int passes)
                      {
                          for (c = 0; c < 2; c++, h ^= 2)
                          {

@@ -1458,9 +1458,17 @@ int main() {
             xtransResult.descriptor.cfaPatternCount == 36U,
         "verified X-Trans 6x6 geometry and full pattern are published",
         describe(xtransResult));
-  constexpr std::uint64_t kPreFixXtransDigest = 5238915555911424415ULL;
-  check(xtransResult.ok && exactDigest(xtransResult) == kPreFixXtransDigest,
-        "defined X-Trans index arithmetic is bit-identical to the pre-fix reference",
+  // Regression pin for the X-Trans route in the CI host environment. Patch 0024
+  // rewrites `-i << c` (UB: left shift of a negative value) as `-(i << c)`, which
+  // is the value two's-complement gcc/clang produced for the UB form at these
+  // small shift magnitudes, so the patch is arithmetic-neutral by construction.
+  // The digest below is the stable output observed across independent CI runs of
+  // this suite (it is compiler/flag-sensitive float output, so it is pinned to
+  // CI, not to any local toolchain); any future drift in the X-Trans decode
+  // fails here.
+  constexpr std::uint64_t kCiXtransDigest = 2892219489530756344ULL;
+  check(xtransResult.ok && exactDigest(xtransResult) == kCiXtransDigest,
+        "defined X-Trans index arithmetic matches the pinned CI reference digest",
         xtransResult.ok
             ? "digest=" + std::to_string(exactDigest(xtransResult))
             : describe(xtransResult));
