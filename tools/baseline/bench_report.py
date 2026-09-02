@@ -194,10 +194,13 @@ def slo_findings(capture: dict, corpus: dict) -> list[str]:
                 f"reported above and are not an SLO result"]
     times = [float(s["total_ms"]) for s in sorted(samples, key=lambda s: s["run_index"])]
     findings = []
-    if len(times) < protocol["gate_runs"] - protocol["gate_runs_discarded"]:
+    # An SLO claim is a p95 claim, so it needs its own, larger sample count: the baseline
+    # matrix (gate_runs) only has to pin a stable median for ordering optimization work.
+    slo_runs = protocol.get("slo_runs", protocol["gate_runs"])
+    if len(times) < slo_runs - protocol["gate_runs_discarded"]:
         findings.append(
             f"{len(times)} warm {gated_cell}/{gated_format} runs is below the "
-            f"{protocol['gate_runs']}-run protocol")
+            f"{slo_runs}-run SLO protocol")
     p50, p95 = percentile(times, 50), percentile(times, 95)
     if p50 > protocol["slo_p50_ms"]:
         findings.append(f"p50 {p50:.0f} ms exceeds {protocol['slo_p50_ms']} ms")

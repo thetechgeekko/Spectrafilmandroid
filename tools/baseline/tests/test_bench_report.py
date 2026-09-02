@@ -64,6 +64,18 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(
             {"BASE", "HEAVY", "PRINT_GRAIN", "SCAN_CLEAN", "SCAN_GRAIN"}, ids)
 
+    def test_slo_needs_more_samples_than_the_baseline_matrix(self):
+        # The baseline matrix pins a median; an SLO claim is a p95 claim and needs its
+        # own, larger count, so shrinking gate_runs must not quietly weaken the SLO.
+        self.assertGreater(CORPUS["protocol"]["slo_runs"], CORPUS["protocol"]["gate_runs"])
+        capture = load_fixture()
+        cached = [s for s in capture["samples"] if s.get("served_from_cache")]
+        self.assertTrue(cached, "fixture must carry cache-hit samples")
+        capture["samples"] = [s for s in capture["samples"]
+                              if not s.get("served_from_cache")] + cached[:3]
+        findings = bench_report.slo_findings(capture, CORPUS)
+        self.assertTrue(any("below the 11-run SLO protocol" in f for f in findings), findings)
+
     def test_thermal_precondition_timeout_is_a_finding(self):
         capture = load_fixture()
         capture["samples"][0]["thermal_wait"] = {

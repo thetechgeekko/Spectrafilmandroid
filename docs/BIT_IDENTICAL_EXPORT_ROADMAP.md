@@ -171,7 +171,12 @@ as a baseline. One command: `bash tools/baseline/run_bench.sh <app.apk> 11` (add
 must not kill the measurement). The #119 matrix extends the same corpus with grain and film-scan
 route cells, and `bash tools/baseline/run_preview.sh <app.apk> 15` captures the 640 px
 slider-settle preview latency per route (`tools/baseline/preview_report.py`). The canonical owner
-numbers still belong to [#119](https://github.com/thetechgeekko/Spektrafilm-android/issues/119).
+numbers are now recorded in [docs/DEVICE_EXPORT_BASELINE.md](DEVICE_EXPORT_BASELINE.md)
+([#119](https://github.com/thetechgeekko/Spektrafilm-android/issues/119)). Two results from it bound
+this roadmap: decode (977 ms) plus TIFF16 encode (1116 ms) is **2093 ms of non-engine work**, already
+over the 2000 ms p50 budget with `simulate` at zero — so the SLO is unreachable by engine work alone
+and requires the cache (#179) plus streamed output (#175) — and grain is a single ~4.1 s engine stage,
+the largest by more than 2x (#180).
 
 ## Missing measurements before implementation claims
 

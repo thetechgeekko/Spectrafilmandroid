@@ -99,7 +99,7 @@
     "JPEG_Q95": "unsupported"
   },
   "protocol": {
-    "gate_runs": 11,
+    "gate_runs": 5,
     "gate_runs_discarded": 1,
     "smoke_runs_max": 3,
     "slo_p50_ms": 2000,
@@ -112,6 +112,7 @@
       "idle_between_runs_s": 60
     },
     "require_thermal_status": 0,
-    "max_thermal_wait_s": 300
+    "max_thermal_wait_s": 300,
+    "slo_runs": 11
   }
 }

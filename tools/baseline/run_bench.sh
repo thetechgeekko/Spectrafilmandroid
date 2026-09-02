@@ -14,6 +14,9 @@ APP_APK=${1:?usage: run_bench.sh <app.apk> [runs] [cells] [serial]}
 RUNS=${2:-11}
 CELLS=${3:-}
 SERIAL=${4:-}
+# `adb shell` re-parses its argv through the device's shell, so an empty CELLS would
+# vanish entirely and `am` would read the next token as the value of -e ticket177_cells.
+# Both instrument invocations below therefore quote it for that second parse.
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # adb is a native binary: hand it native paths for LOCAL files (on Git Bash a /c/...
@@ -97,7 +100,7 @@ else
     -e ticket177_corpus "$DEVICE_DIR/bench-corpus.json" \
     -e ticket177_source "$DEVICE_DIR/bench-source.png" \
     -e ticket177_runs "$RUNS" \
-    -e ticket177_cells "$CELLS" \
+    -e ticket177_cells "'$CELLS'" \
     -e ticket177_expect_app_sha256 "$APP_SHA" \
     $PKG.test/$PKG.ReleaseCandidateSmokeInstrumentation | tee "$OUT/instrumentation.txt"
 fi
@@ -113,8 +116,13 @@ rm -rf "$OUT/capture"
 # directory inside it and the report would look for a file one level up.
 adb_ pull "$DEVICE_DIR/ticket177" "$(host_path "$OUT/capture")" >/dev/null
 
+# Whether this capture is gateable is the corpus protocol's call, not a constant here: a
+# hard-coded 11 silently skipped the gate the moment gate_runs was lowered, and a skipped
+# gate reports success, which is the worst way to fail.
 GATE=()
-[ "$RUNS" -ge 11 ] && GATE=(--gate)
+GATE_RUNS=$(py_ -c "import json,sys;print(json.load(open(sys.argv[1]))['protocol']['gate_runs'])" \
+  "$REPO/tools/baseline/corpus.json")
+[ "$RUNS" -ge "$GATE_RUNS" ] && GATE=(--gate)
 py_ "$REPO/tools/baseline/bench_report.py" "$OUT/capture/capture.json" \
   --expect-app-sha256 "$APP_SHA" \
   --markdown "$OUT/report.md" "${GATE[@]}"
