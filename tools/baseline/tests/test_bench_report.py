@@ -151,6 +151,13 @@ class GateTest(unittest.TestCase):
         self.assertEqual(0, run(capture))
         self.assertEqual(1, run(capture, "--gate"))
 
+    def test_full_rerender_only_capture_cannot_claim_the_slo(self):
+        capture = load_fixture()
+        for sample in capture["samples"]:
+            sample["served_from_cache"] = False
+        self.assertEqual(0, run(capture))
+        self.assertEqual(1, run(capture, "--gate"))
+
     def test_wrong_device_fails_the_gate_only(self):
         capture = load_fixture()
         capture["device"]["model"] = "Pixel 9"

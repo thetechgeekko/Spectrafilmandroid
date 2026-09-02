@@ -216,6 +216,10 @@ object Ticket177BenchmarkChecks {
             .put("format", formatId)
             .put("run_index", index)
             .put("state", if (cold) "cold" else "warm")
+            // The SLO binds the pre-rendered/cache-hit path (#179). Nothing serves an export
+            // from a content-addressed cache yet, so every sample here is a full re-render and
+            // says so; the reporter refuses to read an SLO out of a full render.
+            .put("served_from_cache", false)
             .put("render_id", renderId)
             .put("total_ms", totalMs)
             .put("phases_ms", JSONObject()

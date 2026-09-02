@@ -34,7 +34,7 @@ C4 = "C4"  # complete container agrees (only where the corpus says it is gated)
 SAMPLE_FIELDS = (
     "cell", "format", "run_index", "state", "total_ms", "phases_ms", "phases_sum_ms",
     "engine_sample_sha256", "decoded_sample_sha256", "normalized_metadata_sha256",
-    "container_sha256", "container_bytes", "memory", "environment",
+    "container_sha256", "container_bytes", "memory", "environment", "served_from_cache",
 )
 
 
@@ -174,11 +174,16 @@ def slo_findings(capture: dict, corpus: dict) -> list[str]:
     gated_format = protocol.get("slo_format", "JPEG_Q95")
     # "warm" already excludes the protocol's discarded first run: the harness marks the
     # process's first render cold, which is exactly the sample the protocol throws away.
+    # served_from_cache additionally separates the path the SLO actually binds (the
+    # pre-rendered/cache-hit export of #179) from a warm full re-render, which is a
+    # different measurement and must never be reported as meeting the SLO.
     samples = [s for s in capture["samples"]
                if s["cell"] == gated_cell and s["format"] == gated_format
-               and s["state"] == "warm"]
+               and s["state"] == "warm" and s.get("served_from_cache") is True]
     if not samples:
-        return [f"no warm {gated_cell}/{gated_format} sample to gate the SLO against"]
+        return [f"no cache-hit {gated_cell}/{gated_format} sample to gate the SLO against "
+                f"(the pre-rendered export path is issue #179); full re-render times are "
+                f"reported above and are not an SLO result"]
     times = [float(s["total_ms"]) for s in sorted(samples, key=lambda s: s["run_index"])]
     findings = []
     if len(times) < protocol["gate_runs"] - protocol["gate_runs_discarded"]:
