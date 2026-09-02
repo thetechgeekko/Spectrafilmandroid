@@ -103,6 +103,11 @@
 -keep class com.spectrafilm.app.BuiltInPreset { *; }
 -keep class com.spectrafilm.app.ColorGrade { *; }
 -keep class com.spectrafilm.app.ExportClock { *; }
+# #179/#140: the benchmark drives the shipping export cache and the render-derived gain map
+# across the APK boundary. The trailing ** matters -- ExportCacheKey.Source/Grade are nested
+# types and compile to separate classes that a bare keep would not cover.
+-keep class com.spectrafilm.app.ExportCache** { *; }
+-keep class com.spectrafilm.app.HdrGainMap** { *; }
 -keep class com.spectrafilm.app.masks.MaskCompositor { *; }
 -keepclassmembers class com.spectrafilm.app.EngineHelpersKt {
     public static android.graphics.Bitmap simResultToBitmapGraded(...);

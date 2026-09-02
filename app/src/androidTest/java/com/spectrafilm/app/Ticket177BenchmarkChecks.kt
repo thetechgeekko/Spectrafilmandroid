@@ -54,6 +54,8 @@ object Ticket177BenchmarkChecks {
         put("JPEG_Q95", ExportFormat.JPEG)
         put("PNG16", ExportFormat.PNG16)
         put("TIFF16", ExportFormat.TIFF)
+        // #140: exercises the render-derived gain map on the same corpus.
+        put("ULTRA_HDR", ExportFormat.ULTRA_HDR)
     }
 
     @JvmStatic
@@ -174,8 +176,80 @@ object Ticket177BenchmarkChecks {
         // The engine owns System.loadLibrary for libspektra: decode allocates through that
         // native boundary, so the engine must exist before the first byte is decoded.
         val engine = EngineHolder.get(context)
+
+        // #179: the same content key the editor's export builds, so the benchmark measures the
+        // shipping cache rather than a parallel one. The decode identity is fixed here because
+        // the harness always decodes the same corpus file the same way.
+        val cache = ExportCaches.of(context)
+        val cacheKey = ExportCacheKey.digestSource { FileInputStream(File(sourcePath)) }
+            ?.let { digested ->
+                ExportCacheKey.compute(
+                    ExportCacheKey.Source(
+                        digested.first, digested.second, EXPORT_MAX_EDGE_PX,
+                        "bench;rot=0;kind=IMAGE",
+                    ),
+                    params,
+                    ExportCacheKey.Grade(
+                        true, state.saturation, state.vibrance, state.gamutCompress,
+                        java.util.Collections.emptyList(),
+                    ),
+                    descriptor,
+                    null,
+                    95,
+                    ExportCaches.contractVersionOf(context),
+                )
+            }
+
         Debug.getMemoryInfo(Debug.MemoryInfo())
         val startMs = System.currentTimeMillis()
+
+        val hit = cacheKey?.let { cache.get(it) }
+        if (hit != null) {
+            val servedName = "spk-bench-" + cell.getString("id") + "-" + formatId + "-" + index
+            val servedUri = ExportClock.pinned(PINNED_CLOCK_MILLIS) {
+                publishCachedExport(
+                    context, hit, servedName + "." + format.ext, format.mime,
+                )
+            }
+            val servedMs = System.currentTimeMillis() - startMs
+            val servedDigests = publishedDigests(context, servedUri, format)
+            context.contentResolver.delete(servedUri, null, null)
+            val servedMemory = Debug.MemoryInfo().also { Debug.getMemoryInfo(it) }
+            return JSONObject()
+                .put("cell", cell.getString("id"))
+                .put("format", formatId)
+                .put("run_index", index)
+                .put("state", "warm")
+                .put("thermal_wait", thermalWait)
+                // The measurement the SLO actually binds: an export served from the
+                // content-addressed cache without re-rendering anything.
+                .put("served_from_cache", true)
+                .put("render_id", 0L)
+                .put("total_ms", servedMs)
+                .put("phases_ms", JSONObject()
+                    .put("decode", 0L).put("simulate", 0L).put("grade", 0L)
+                    .put("encode", servedMs))
+                .put("phases_sum_ms", servedMs)
+                .put("engine_sample_sha256", "")
+                .put("decoded_sample_sha256", servedDigests.getString("decoded_sample_sha256"))
+                .put("normalized_metadata_sha256",
+                    servedDigests.getString("normalized_metadata_sha256"))
+                .put("container_sha256", servedDigests.getString("container_sha256"))
+                .put("container_bytes", servedDigests.getInt("container_bytes"))
+                .put("grade_inputs", JSONObject()
+                    .put("saturation", state.saturation)
+                    .put("vibrance", state.vibrance)
+                    .put("gamut_compress", state.gamutCompress)
+                    .put("active", ColorGrade.isActive(state.saturation, state.vibrance) ||
+                        state.gamutCompress != 0f))
+                .put("memory", JSONObject()
+                    .put("total_pss_kb", servedMemory.totalPss)
+                    .put("total_private_dirty_kb", servedMemory.totalPrivateDirty)
+                    .put("native_heap_alloc_kb", Debug.getNativeHeapAllocatedSize() / 1024L)
+                    .put("vm_hwm_kb", procStatusKb("VmHWM:"))
+                    .put("vm_rss_kb", procStatusKb("VmRSS:")))
+                .put("environment", environment(context))
+        }
         val decodeStart = System.currentTimeMillis()
         val image = decodeToLinearProPhoto(
             context, Uri.fromFile(File(sourcePath)), maxEdge = EXPORT_MAX_EDGE_PX,
@@ -188,6 +262,9 @@ object Ticket177BenchmarkChecks {
         var gradeMs = 0L
         var encodeMs = 0L
         val name = "spk-bench-${cell.getString("id")}-$formatId-$index"
+        val adopt: (File, Long, String) -> Unit = { file, len, sha ->
+            cacheKey?.let { cache.adopt(it, file, len, sha) }
+        }
         val published: Uri
         val result = try {
             val simulateStart = System.currentTimeMillis()
@@ -202,19 +279,29 @@ object Ticket177BenchmarkChecks {
         try {
             val gradeStart = System.currentTimeMillis()
             val bitmap = gradedBitmapOrNull(result, descriptor, state)
+            if (bitmap != null && descriptor.metadata.hdrGainMap != null) {
+                attachRenderedGainmap(result, bitmap, descriptor)
+            }
             gradeMs = System.currentTimeMillis() - gradeStart
             val encodeStart = System.currentTimeMillis()
             published = ExportClock.pinned(PINNED_CLOCK_MILLIS) {
                 runBlocking {
                     when (descriptor.encoder) {
                         OutputEncoder.NATIVE_TIFF_UINT16 ->
-                            saveSimResultAsTiff(context, result, descriptor, displayName = name)
+                            saveSimResultAsTiff(
+                                context, result, descriptor, displayName = name,
+                                onStaged = adopt,
+                            )
                         OutputEncoder.NATIVE_PNG16 ->
-                            saveSimResultAsPng16(context, result, descriptor, displayName = name)
+                            saveSimResultAsPng16(
+                                context, result, descriptor, displayName = name,
+                                onStaged = adopt,
+                            )
                         OutputEncoder.ANDROID_BITMAP_JPEG, OutputEncoder.ANDROID_BITMAP_PNG ->
                             saveToGallery(
                                 context, requireNotNull(bitmap) { "bitmap encoder without bitmap" },
                                 descriptor, jpegQuality = 95, displayName = name,
+                                onStaged = adopt,
                             )
                         else -> error("unexpected encoder ${descriptor.encoder} for $formatId")
                     }

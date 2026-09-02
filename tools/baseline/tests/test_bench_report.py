@@ -64,6 +64,31 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(
             {"BASE", "HEAVY", "PRINT_GRAIN", "SCAN_CLEAN", "SCAN_GRAIN"}, ids)
 
+    def test_a_cache_hit_carries_no_engine_digest_and_is_not_a_C0_break(self):
+        capture = load_fixture()
+        samples = [s for s in capture["samples"]
+                   if s["cell"] == "BASE" and s["format"] == "TIFF16"]
+        self.assertGreaterEqual(len(samples), 2, "fixture needs repeats to compare")
+        samples[0]["served_from_cache"] = True
+        samples[0]["engine_sample_sha256"] = ""
+        findings = bench_report.identity_findings(capture, CORPUS)
+        self.assertEqual([], [f for f in findings if "C0" in f], findings)
+
+    def test_a_cache_that_serves_different_bytes_is_a_finding(self):
+        rendered = {"served_from_cache": False,
+                    "decoded_sample_sha256": "a" * 64, "container_sha256": "b" * 64}
+        cached = {"served_from_cache": True,
+                  "decoded_sample_sha256": "c" * 64, "container_sha256": "b" * 64}
+        findings = bench_report.cache_fidelity_findings("BASE", "TIFF16", [rendered, cached], True)
+        self.assertTrue(any("cache served different bytes" in f for f in findings), findings)
+
+    def test_a_faithful_cache_hit_is_not_a_finding(self):
+        rendered = {"served_from_cache": False,
+                    "decoded_sample_sha256": "a" * 64, "container_sha256": "b" * 64}
+        cached = dict(rendered, served_from_cache=True)
+        self.assertEqual(
+            [], bench_report.cache_fidelity_findings("BASE", "TIFF16", [rendered, cached], True))
+
     def test_slo_needs_more_samples_than_the_baseline_matrix(self):
         # The baseline matrix pins a median; an SLO claim is a p95 claim and needs its
         # own, larger count, so shrinking gate_runs must not quietly weaken the SLO.

@@ -264,12 +264,19 @@ check_member 'Lcom/spectrafilm/app/Category;' field 'GRAIN' 'Lcom/spectrafilm/ap
 
 # Ticket #177's benchmark phase drives the production export path across the APK boundary.
 check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'decodeToLinearProPhoto' '(Landroid/content/Context;Landroid/net/Uri;ILkotlin/jvm/functions/Function0;)Lcom/spectrafilm/engine/LinearImage;'
-check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'saveSimResultAsTiff' '(Landroid/content/Context;Lcom/spectrafilm/engine/SimResult;Lcom/spectrafilm/app/OutputDescriptor;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;'
-check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'saveSimResultAsPng16' '(Landroid/content/Context;Lcom/spectrafilm/engine/SimResult;Lcom/spectrafilm/app/OutputDescriptor;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;'
+check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'saveSimResultAsTiff' '(Landroid/content/Context;Lcom/spectrafilm/engine/SimResult;Lcom/spectrafilm/app/OutputDescriptor;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Lkotlin/jvm/functions/Function3;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;'
+check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'saveSimResultAsPng16' '(Landroid/content/Context;Lcom/spectrafilm/engine/SimResult;Lcom/spectrafilm/app/OutputDescriptor;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Lkotlin/jvm/functions/Function3;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;'
 check_member 'Lcom/spectrafilm/app/EngineHelpersKt;' method 'simResultToBitmapGraded' '(Lcom/spectrafilm/engine/SimResult;ZFFFLjava/util/List;Lcom/spectrafilm/engine/RenderCancellation;)Landroid/graphics/Bitmap;'
 check_member 'Lcom/spectrafilm/app/ParamsState;' method 'toParams' '(Ljava/lang/Integer;Ljava/lang/Float;Z)Lcom/spectrafilm/engine/SpektraParams;'
 check_member 'Lcom/spectrafilm/app/BuiltInPresets;' method 'load' '(Landroid/content/Context;)Ljava/util/List;'
 check_member 'Lcom/spectrafilm/app/ExportClock;' method 'exifDateTime' '()Ljava/lang/String;'
+# #179/#140: the benchmark also drives the export cache and the render-derived gain map.
+check_member 'Lcom/spectrafilm/app/ExportCaches;' method 'of' '(Landroid/content/Context;)Lcom/spectrafilm/app/ExportCache;'
+check_member 'Lcom/spectrafilm/app/ExportCaches;' method 'contractVersionOf' '(Landroid/content/Context;)Ljava/lang/String;'
+check_member 'Lcom/spectrafilm/app/ExportCache;' method 'get' '(Ljava/lang/String;)Lcom/spectrafilm/app/ExportCacheEntry;'
+check_member 'Lcom/spectrafilm/app/ExportCache;' method 'adopt' '(Ljava/lang/String;Ljava/io/File;JLjava/lang/String;)Z'
+check_member 'Lcom/spectrafilm/app/ExportCacheKey;' method 'digestSource' '(Lkotlin/jvm/functions/Function0;)Lkotlin/Pair;'
+check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'attachRenderedGainmap' '(Lcom/spectrafilm/engine/SimResult;Landroid/graphics/Bitmap;Lcom/spectrafilm/app/OutputDescriptor;)Lcom/spectrafilm/app/HdrGainMap$Result;' 
 check_member 'Lkotlin/io/CloseableKt;' method 'closeFinally' '(Ljava/io/Closeable;Ljava/lang/Throwable;)V'
 check_member 'Lkotlin/jvm/internal/Ref$ObjectRef;' method '<init>' '()V'
 

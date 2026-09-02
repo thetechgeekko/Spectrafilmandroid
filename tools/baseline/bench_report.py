@@ -122,11 +122,49 @@ def identity_findings(capture: dict, corpus: dict) -> list[str]:
         if container_policy.get(fmt) == "gated":
             checks.append((C4, "container_sha256"))
         for level, field in checks:
-            digests = {sample[field] for sample in samples}
-            if len(digests) != 1:
+            # A cache hit never invokes the engine, so it carries no engine sample. Counting
+            # its empty digest as a second distinct value would report a C0 break for the very
+            # behaviour the cache exists to provide.
+            digests = {sample[field] for sample in samples if sample.get(field)}
+            if len(digests) > 1:
                 findings.append(
                     f"{level} broken for {cell}/{fmt}: {len(digests)} distinct "
                     f"{field} across {len(samples)} runs")
+        findings.extend(cache_fidelity_findings(
+            cell, fmt, samples, container_policy.get(fmt) == "gated"))
+    return findings
+
+
+def cache_fidelity_findings(
+    cell: str, fmt: str, samples: list[dict], container_gated: bool,
+) -> list[str]:
+    """A cached export must be byte-identical to the render it stands in for.
+
+    This is the whole promise of the content-addressed cache (#179), and the one failure that
+    would be invisible in a wall-time table: a hit that publishes different bytes is a silently
+    wrong image, delivered faster.
+
+    The decoded SAMPLES are compared unconditionally, because the pixels must match whatever the
+    format. The whole CONTAINER is compared only where the corpus gates container identity: a
+    JPEG's bytes are an encoder artifact, so freshly rendered ones may legitimately differ from
+    each other, and comparing a byte-copied cache hit against that moving target would report a
+    fault that is not there.
+    """
+    cached = [s for s in samples if s.get("served_from_cache")]
+    rendered = [s for s in samples if not s.get("served_from_cache")]
+    if not cached or not rendered:
+        return []
+    fields = ["decoded_sample_sha256"]
+    if container_gated:
+        fields.append("container_sha256")
+    findings = []
+    for field in fields:
+        served = {s[field] for s in cached if s.get(field)}
+        fresh = {s[field] for s in rendered if s.get(field)}
+        if served and fresh and served != fresh:
+            findings.append(
+                f"cache served different bytes for {cell}/{fmt}: {field} "
+                f"{sorted(served)} from cache vs {sorted(fresh)} rendered")
     return findings
 
 

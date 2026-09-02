@@ -24,7 +24,8 @@
       "formats": [
         "JPEG_Q95",
         "PNG16",
-        "TIFF16"
+        "TIFF16",
+        "ULTRA_HDR"
       ]
     },
     {
@@ -43,7 +44,8 @@
       "formats": [
         "JPEG_Q95",
         "PNG16",
-        "TIFF16"
+        "TIFF16",
+        "ULTRA_HDR"
       ]
     },
     {
@@ -96,7 +98,8 @@
   "container_identity": {
     "PNG16": "gated",
     "TIFF16": "gated",
-    "JPEG_Q95": "unsupported"
+    "JPEG_Q95": "unsupported",
+    "ULTRA_HDR": "unsupported"
   },
   "protocol": {
     "gate_runs": 5,
