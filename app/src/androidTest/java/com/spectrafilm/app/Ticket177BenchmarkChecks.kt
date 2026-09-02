@@ -862,7 +862,10 @@ object Ticket177BenchmarkChecks {
         val out = StringBuilder()
         var failures = 0
         for (formatId in arrayOf("JPEG_Q95", "PNG16", "TIFF16")) {
-            val format = FORMATS.getValue(formatId)
+            // getValue would pull kotlin.collections.MapsKt, which the app dex does not
+            // ship and the test APK cannot supply: R8 keeps only the Kotlin runtime the app
+            // itself uses. Same reason take() is avoided below.
+            val format = requireNotNull(FORMATS[formatId]) { "unknown format $formatId" }
             val descriptor = ExportOptions(
                 format = format,
                 jpegQuality = 95,
@@ -911,8 +914,8 @@ object Ticket177BenchmarkChecks {
             if (!same) failures++
             out.append("TICKET179_PRERENDER_$formatId: ")
                 .append(if (same) "PASS" else "FAIL")
-                .append(" live=").append(liveSha.take(12))
-                .append(" restored=").append(restoredSha.take(12))
+                .append(" live=").append(liveSha.substring(0, 12))
+                .append(" restored=").append(restoredSha.substring(0, 12))
                 .append(" put_ms=").append(putMs)
                 .append(" restore_encode_ms=").append(restoredMs)
                 .append(" payload_bytes=").append(store.sizeBytes())

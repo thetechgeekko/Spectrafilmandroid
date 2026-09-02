@@ -183,6 +183,7 @@ def reconciliation_findings(capture: dict, tolerance_ms: int = 250) -> list[str]
 def environment_findings(capture: dict, corpus: dict) -> list[str]:
     tier = corpus["protocol"]["tier_a"]
     findings = []
+    low_battery = 101
     device = capture["device"]
     if device.get("model") != tier["model"]:
         findings.append(f"device {device.get('model')} is not Tier A ({tier['model']})")
@@ -194,8 +195,9 @@ def environment_findings(capture: dict, corpus: dict) -> list[str]:
             findings.append(
                 f"{sample['cell']}/{sample['format']} run {sample['run_index']} ran plugged in")
         if env.get("battery_pct", -1) != -1 and env["battery_pct"] < tier["min_battery_pct"]:
-            findings.append(
-                f"battery {env['battery_pct']}% below the {tier['min_battery_pct']}% floor")
+            # One finding for the whole run, naming the worst reading: a long capture drains
+            # several points, and one line per level buries everything else.
+            low_battery = min(low_battery, env["battery_pct"])
         if env.get("thermal_status", 0) > 1:
             findings.append(
                 f"thermal status {env['thermal_status']} during {sample['cell']}/"
@@ -208,8 +210,11 @@ def environment_findings(capture: dict, corpus: dict) -> list[str]:
                 f"{sample['cell']}/{sample['format']} run {sample['run_index']} started at "
                 f"thermal {wait.get('start_status')} after waiting "
                 f"{int(wait.get('waited_ms', 0)) // 1000}s for {wait.get('required')}")
-    # Device-level conditions (battery, model, API) are the same fact seen once per sample;
-    # repeating one line 44 times buries the findings that name a specific run.
+    if low_battery <= 100:
+        findings.append(
+            f"battery fell to {low_battery}%, below the {tier['min_battery_pct']}% floor")
+    # Device-level conditions (model, API) are the same fact seen once per sample; repeating
+    # one line 44 times buries the findings that name a specific run.
     return list(dict.fromkeys(findings))
 
 

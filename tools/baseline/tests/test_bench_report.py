@@ -125,9 +125,12 @@ class CorpusTest(unittest.TestCase):
         capture = load_fixture()
         for sample in capture["samples"]:
             sample["environment"]["battery_pct"] = 41
+        capture["samples"][0]["environment"]["battery_pct"] = 28
         findings = bench_report.environment_findings(capture, CORPUS)
         battery = [f for f in findings if "battery" in f]
         self.assertEqual(1, len(battery), battery)
+        # The worst reading is the one that matters, not the first one seen.
+        self.assertIn("fell to 28%", battery[0])
 
     def test_grade_note_reports_which_path_was_measured(self):
         capture = load_fixture()

@@ -108,6 +108,11 @@
 # types and compile to separate classes that a bare keep would not cover.
 -keep class com.spectrafilm.app.ExportCache** { *; }
 -keep class com.spectrafilm.app.HdrGainMap** { *; }
+# Same boundary for the pre-render payload store: the app only ever constructs it with default
+# arguments, so R8 rewrote the constructor the (unminified) instrumentation calls and the check
+# died with NoSuchMethodError on a device.
+-keep class com.spectrafilm.app.RenderPayloadCache** { *; }
+-keep class com.spectrafilm.app.RenderPayloads** { *; }
 -keep class com.spectrafilm.app.masks.MaskCompositor { *; }
 -keepclassmembers class com.spectrafilm.app.EngineHelpersKt {
     public static android.graphics.Bitmap simResultToBitmapGraded(...);
