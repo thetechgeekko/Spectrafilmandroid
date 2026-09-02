@@ -385,6 +385,18 @@ if ($recoverToken -ne $seedToken) {
     throw "process-death recovery token changed: seed=$seedToken recover=$recoverToken"
 }
 
+# Ticket #181: platform-only accessibility scan of the critical editor journey. Its per-screen
+# node dumps and screenshots land in the app's external files dir; pull them beside the log.
+$a11yOutput = Invoke-Instrumentation `
+    -ExtraArguments @('-e', 'ticket181_phase', 'a11y') `
+    -EvidencePath (Join-Path $EvidenceDir 'accessibility-scan.txt')
+Assert-InstrumentationOutput $a11yOutput @('TICKET181_ACCESSIBILITY: PASS', 'INSTRUMENTATION_CODE: -1') 'accessibility scan'
+$a11yEvidence = Join-Path $EvidenceDir 'accessibility'
+if (Test-Path -LiteralPath $a11yEvidence) {
+    Remove-Item -LiteralPath $a11yEvidence -Recurse -Force
+}
+$null = Invoke-Adb -Arguments @('pull', "/sdcard/Android/data/$TargetPackage/files/ticket181", $a11yEvidence)
+
 $installedTarget = Pull-InstalledBase -PackageName $TargetPackage -Destination (Join-Path $EvidenceDir 'installed-target-base.apk')
 $installedTest = Pull-InstalledBase -PackageName $TestPackage -Destination (Join-Path $EvidenceDir 'installed-test-base.apk')
 $candidateAppHash = (Get-FileHash -LiteralPath $AppApk -Algorithm SHA256).Hash

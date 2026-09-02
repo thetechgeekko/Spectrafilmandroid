@@ -45,6 +45,8 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
     private static final String TICKET139_PHASE_ACTIVITY = "activity";
     private static final String TICKET139_PHASE_SEED = "seed";
     private static final String TICKET139_PHASE_RECOVER = "recover";
+    private static final String ARG_TICKET181_PHASE = "ticket181_phase";
+    private static final String TICKET181_PHASE_A11Y = "a11y";
 
     private Bundle arguments = Bundle.EMPTY;
 
@@ -63,12 +65,15 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
             final String ticket139Phase = arguments.getString(ARG_TICKET139_PHASE, "");
             require(phase.isEmpty() || ticket139Phase.isEmpty(),
                     "ticket #139 and #170 phases are mutually exclusive");
+            final String ticket181Phase = arguments.getString(ARG_TICKET181_PHASE, "");
+            require(ticket181Phase.isEmpty() || (phase.isEmpty() && ticket139Phase.isEmpty()),
+                    "ticket #181 phase is mutually exclusive with ticket #139 and #170 phases");
             final String rawUri = arguments.getString(ARG_TICKET158_RAW_URI, "");
             final String rawPath = arguments.getString(ARG_TICKET158_RAW_PATH, "");
             final boolean ticket141Mode = arguments.containsKey(ARG_TICKET141_WIDTH)
                     || arguments.containsKey(ARG_TICKET141_FORCE_DENIAL);
             if (ticket141Mode) {
-                require(phase.isEmpty() && ticket139Phase.isEmpty()
+                require(phase.isEmpty() && ticket139Phase.isEmpty() && ticket181Phase.isEmpty()
                                 && rawUri.isEmpty() && rawPath.isEmpty(),
                         "ticket #141 mode is mutually exclusive with other ticket modes");
                 final int width = Integer.parseInt(
@@ -91,6 +96,8 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
             } else if (!rawUri.isEmpty() || !rawPath.isEmpty()) {
                 require(rawUri.isEmpty() || rawPath.isEmpty(),
                         "provide only one ticket #158 RAW source");
+                require(ticket181Phase.isEmpty(),
+                        "ticket #181 phase is mutually exclusive with ticket #158 RAW mode");
                 final int repeats = Integer.parseInt(
                         arguments.getString(ARG_TICKET158_REPEATS, "3"));
                 require(repeats >= 1 && repeats <= 10,
@@ -179,7 +186,14 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                                 + "TICKET139_RAPID_SOURCE_NATIVE_CLOSE: PASS "
                                 + nativeEvidence + "\n"
                                 + "TICKET139_EXPORT_TERMINAL_EXACTLY_ONCE: PASS\n");
-            } else if (phase.isEmpty() && ticket139Phase.isEmpty()) {
+            } else if (TICKET181_PHASE_A11Y.equals(ticket181Phase)) {
+                final String stream = runTicket181AccessibilityChecks();
+                results.putString("stream", stream);
+                if (!stream.contains("TICKET181_ACCESSIBILITY: PASS\n")) {
+                    finish(Activity.RESULT_CANCELED, results);
+                    return;
+                }
+            } else if (phase.isEmpty() && ticket139Phase.isEmpty() && ticket181Phase.isEmpty()) {
                 runCandidateChecks();
                 results.putString(
                         "stream",
@@ -193,7 +207,9 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                                 + "RELEASE_CANDIDATE_INSTRUMENTATION: PASS\n");
             } else {
                 throw new IllegalArgumentException(
-                        ticket139Phase.isEmpty()
+                        !ticket181Phase.isEmpty()
+                                ? "unsupported ticket181_phase: " + ticket181Phase
+                                : ticket139Phase.isEmpty()
                                 ? "unsupported ticket170_phase: " + phase
                                 : "unsupported ticket139_phase: " + ticket139Phase);
             }
@@ -201,6 +217,8 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
         } catch (Throwable failure) {
             final String phase = arguments.getString(ARG_TICKET170_PHASE, "");
             final String ticket139Phase = arguments.getString(ARG_TICKET139_PHASE, "");
+            final boolean ticket181Mode =
+                    !arguments.getString(ARG_TICKET181_PHASE, "").isEmpty();
             final boolean rawMode =
                     !arguments.getString(ARG_TICKET158_RAW_URI, "").isEmpty()
                             || !arguments.getString(
@@ -211,6 +229,8 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                     ? "TICKET141_MASK_MEMORY"
                     : rawMode
                     ? "TICKET158_RAW_RELEASE_R8"
+                    : ticket181Mode
+                    ? "TICKET181_ACCESSIBILITY"
                     : !ticket139Phase.isEmpty()
                             ? "TICKET139_" + ticket139Phase.toUpperCase(Locale.ROOT)
                     : phase.isEmpty()
@@ -223,6 +243,30 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                             + Log.getStackTraceString(failure)
                             + "\n");
             finish(Activity.RESULT_CANCELED, results);
+        }
+    }
+
+    /** Ticket #181: platform-only a11y scan over the seeded live editor (ticket #139 route). */
+    private String runTicket181AccessibilityChecks() throws Exception {
+        final Context targetContext = getTargetContext();
+        Ticket139SessionChecks.prepareActivityProbe(targetContext);
+        final Intent launch = targetContext.getPackageManager()
+                .getLaunchIntentForPackage(TARGET_PACKAGE);
+        require(launch != null, "launcher intent missing");
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        final Activity activity = startActivitySync(launch);
+        require(activity != null, "MainActivity did not launch for ticket #181");
+        try {
+            waitForTicket139Destination("EDITOR", 20_000L);
+            waitForTicket139LiveReadyAfter(0L, 45_000L);
+            waitForTicket139CheckpointAfter(0L, 45_000L);
+            waitForTicket139OverlayDraftAfter(0L, "CROP", 60_000L);
+            return Ticket181AccessibilityChecks.run(this, activity);
+        } finally {
+            runOnMainSync(() -> {
+                if (!activity.isFinishing()) activity.finish();
+            });
+            Ticket139EditorTestBridge.reset();
         }
     }
 

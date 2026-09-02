@@ -257,6 +257,11 @@ check_member 'Lcom/spectrafilm/app/Ticket139EditorTestBridge;' method 'armComple
 check_member 'Lcom/spectrafilm/app/Ticket139EditorTestBridge;' method 'releaseCompletedPreviewProbe' '(J)V'
 check_member 'Lcom/spectrafilm/app/Ticket139EditorTestBridge;' method 'verifyCompletedPreviewProbe' '(J)V'
 
+# Ticket #181's accessibility scan (same test APK) walks the editor categories by tab label.
+check_member 'Lcom/spectrafilm/app/Category;' method 'values' '()[Lcom/spectrafilm/app/Category;'
+check_member 'Lcom/spectrafilm/app/Category;' method 'getLabelRes' '()I'
+check_member 'Lcom/spectrafilm/app/Category;' field 'GRAIN' 'Lcom/spectrafilm/app/Category;'
+
 # Kotlin's inline runCatching/Result calls in the separately packaged release
 # AndroidTest APK resolve this JVM ABI from the already-minified target APK.
 # Those call edges are invisible to target-app R8. Checking the exact emitted

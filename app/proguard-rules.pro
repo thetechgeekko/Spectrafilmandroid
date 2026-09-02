@@ -65,6 +65,11 @@
 # public methods; their bodies keep the app-internal implementation edges visible to target R8.
 -keep class com.spectrafilm.app.Ticket139EditorTestBridge { public *; }
 
+# Ticket #181's accessibility scan (same release test APK) walks every editor category by its
+# tab label, so the enum's values()/getLabelRes() are cross-APK ABI. String ids are resolved by
+# name (getIdentifier) on purpose: AGP 8 keeps R ids non-final and R8 drops R$string entirely.
+-keep class com.spectrafilm.app.Category { *; }
+
 # The #139 Activity-recreation probe binds its export's source identity from the release test APK
 # (StorageReliabilityChecks), so the authority and the value types that cross with it are cross-APK
 # ABI exactly like ExportWorkRuntime above. Without these, R8 class-inlines the singleton (its only
