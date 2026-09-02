@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 import urllib.request
 
@@ -48,14 +49,26 @@ def load_json(path: pathlib.Path) -> dict:
 
 
 def asset_tree_sha256(root: pathlib.Path) -> tuple[str, int]:
-    """Digest of (relative path, file digest) pairs in sorted order — one number that
-    moves if any bundled asset is added, removed, renamed, or edited."""
+    """Digest of (relative path, git blob hash) pairs in sorted order — one number that
+    moves if any bundled asset is added, removed, renamed, or edited.
+
+    The per-file hash is `git hash-object`, i.e. the content as git would COMMIT it
+    (clean filters applied), so a Windows checkout with CRLF text files produces the
+    same digest as the LF checkout on a Linux CI runner. Raw working-tree bytes are
+    exactly the thing that differs between the two."""
     entries = sorted(p for p in root.rglob("*") if p.is_file())
+    listing = "\n".join(str(p) for p in entries) + "\n"
+    proc = subprocess.run(
+        ["git", "hash-object", "--stdin-paths"],
+        input=listing, capture_output=True, text=True, check=True, cwd=REPO)
+    hashes = proc.stdout.split()
+    if len(hashes) != len(entries):
+        raise RuntimeError(
+            f"git hash-object returned {len(hashes)} hashes for {len(entries)} files")
     outer = hashlib.sha256()
-    for path in entries:
+    for path, blob in zip(entries, hashes):
         rel = path.relative_to(root).as_posix()
-        inner = hashlib.sha256(path.read_bytes()).hexdigest()
-        outer.update(f"{rel}\n{inner}\n".encode("utf-8"))
+        outer.update(f"{rel}\n{blob}\n".encode("utf-8"))
     return outer.hexdigest(), len(entries)
 
 
