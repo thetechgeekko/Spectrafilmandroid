@@ -121,6 +121,14 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual([], [f for f in bench_report.environment_findings(capture, CORPUS)
                               if "thermal" in f])
 
+    def test_a_device_level_condition_is_reported_once_not_once_per_sample(self):
+        capture = load_fixture()
+        for sample in capture["samples"]:
+            sample["environment"]["battery_pct"] = 41
+        findings = bench_report.environment_findings(capture, CORPUS)
+        battery = [f for f in findings if "battery" in f]
+        self.assertEqual(1, len(battery), battery)
+
     def test_grade_note_reports_which_path_was_measured(self):
         capture = load_fixture()
         for sample in capture["samples"]:

@@ -208,7 +208,9 @@ def environment_findings(capture: dict, corpus: dict) -> list[str]:
                 f"{sample['cell']}/{sample['format']} run {sample['run_index']} started at "
                 f"thermal {wait.get('start_status')} after waiting "
                 f"{int(wait.get('waited_ms', 0)) // 1000}s for {wait.get('required')}")
-    return findings
+    # Device-level conditions (battery, model, API) are the same fact seen once per sample;
+    # repeating one line 44 times buries the findings that name a specific run.
+    return list(dict.fromkeys(findings))
 
 
 def slo_findings(capture: dict, corpus: dict) -> list[str]:

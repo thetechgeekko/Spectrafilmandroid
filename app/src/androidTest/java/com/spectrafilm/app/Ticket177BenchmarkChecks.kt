@@ -105,7 +105,13 @@ object Ticket177BenchmarkChecks {
         // Protocol idle binds gate captures only (a smoke pass stays fast), and the
         // cool-down runs BEFORE each measured export so the previous one cannot heat it.
         val gating = runs >= gateRuns
-        val idleMs = if (gating) protocol.optInt("idle_between_runs_s", 0) * 1000L else 0L
+        // Read with getJSONObject/getInt, NOT optInt: the idle lived under tier_a all along
+        // while this read protocol.idle_between_runs_s, so optInt's default silently made
+        // every capture so far a zero-idle one -- including the #119 baseline, which claims
+        // an idle it never took. A missing key must fail the capture, not shorten it.
+        val idleMs =
+            if (gating) protocol.getJSONObject("tier_a").getInt("idle_between_runs_s") * 1000L
+            else 0L
         // A fixed idle does NOT keep a phone cool: a full matrix is ~45 min of sustained
         // 12 MP work, which walks the SoC into thermal throttling no matter how long the
         // gaps are, and a throttled sample runs materially slower than an unthrottled one.

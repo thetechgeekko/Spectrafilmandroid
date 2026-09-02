@@ -177,6 +177,15 @@ why the reconciliation gap fell from 122 ms to 13 ms); the corpus declares
 `require_thermal_status` and the harness waits for it per sample; and the report now names
 the peak RSS and states whether the grade ran at all.
 
+**Correction (2026-09-02).** All three attempts ran with **no protocol idle between
+samples**. `Ticket177BenchmarkChecks` read `idle_between_runs_s` from the protocol root while
+the corpus declares it under `protocol.tier_a`, so `optInt`'s default silently made every
+capture a zero-idle one. The numbers above still stand — the cool-down that actually governs
+is the per-sample `require_thermal_status` wait, and every attempt-3 sample both started and
+ran at thermal 0 — but the baseline was not taken under the idle the protocol declares. The
+lookup now reads `tier_a` via `getJSONObject`/`getInt`, so a missing key fails the capture
+instead of quietly shortening it.
+
 Throughout all three attempts the engine sample digest was byte-identical
 (`f7ec4764c6a157c3…` on BASE/JPEG_Q95) across three separate APK builds, and C0/C3 each
 showed exactly one distinct digest per cell/format in every capture — so engine determinism
