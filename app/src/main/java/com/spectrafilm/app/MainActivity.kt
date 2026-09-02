@@ -34,6 +34,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -52,6 +53,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -70,11 +72,28 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.paneTitle
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
@@ -335,21 +354,21 @@ private val EditorSavedFallbackSaver = listSaver<EditorSavedFallback, Any>(
 )
 
 /** Adjustment categories shown in the bottom bar; each maps to an existing section. */
-internal enum class Category(val label: String) {
-    SOURCE("Source"),
-    PRESETS("Presets"),
-    SIMULATION("Simulation"),
-    INPUT("Input"),
-    RAW_WB("White Bal"),
-    GRAIN("Grain"),
-    HALATION("Halation"),
-    GLARE("Glare"),
-    COUPLERS("Couplers"),
-    PREFLASH("Preflash"),
-    EXPERIMENTAL("Experimental"),
-    TONE_CURVE("Tone Curve"),
-    MASKS("Masks"),
-    DISPLAY("Display"),
+internal enum class Category(val label: String, @StringRes val labelRes: Int) {
+    SOURCE("Source", R.string.editor_category_source),
+    PRESETS("Presets", R.string.editor_category_presets),
+    SIMULATION("Simulation", R.string.editor_category_simulation),
+    INPUT("Input", R.string.editor_category_input),
+    RAW_WB("White Bal", R.string.editor_category_raw_wb),
+    GRAIN("Grain", R.string.editor_category_grain),
+    HALATION("Halation", R.string.editor_category_halation),
+    GLARE("Glare", R.string.editor_category_glare),
+    COUPLERS("Couplers", R.string.editor_category_couplers),
+    PREFLASH("Preflash", R.string.editor_category_preflash),
+    EXPERIMENTAL("Experimental", R.string.editor_category_experimental),
+    TONE_CURVE("Tone Curve", R.string.editor_category_tone_curve),
+    MASKS("Masks", R.string.editor_category_masks),
+    DISPLAY("Display", R.string.editor_category_display),
 }
 
 // Neutral parameter defaults (a fresh ParamsState) — source for slider
@@ -456,7 +475,10 @@ class MainActivity : ComponentActivity() {
                 Modifier.fillMaxSize().background(SpectraIcons.nearBlackCanvas),
                 contentAlignment = Alignment.Center,
             ) {
-                CircularProgressIndicator(color = Color.White)
+                CircularProgressIndicator(
+                    color = Color.White,
+                    modifier = Modifier.semantics { contentDescription = ctx.getString(R.string.editor_loading) },
+                )
             }
             return
         }
@@ -476,15 +498,15 @@ class MainActivity : ComponentActivity() {
         }
         val sessionRestoreNotice = when {
             loadedSession != null && !initialRestoration.retainedSessionCursor ->
-                "The durable source changed; its saved recipe will be restored"
+                stringResource(R.string.editor_session_source_changed)
             initialRestoration.source.authorizationRequired ->
-                "Source access expired; choose the same file to continue this edit"
+                stringResource(R.string.editor_session_access_expired)
             sessionReadResult is EditorSessionReadResult.CorruptQuarantined ->
-                "Damaged editor session was quarantined; source and saved recipe will be restored"
+                stringResource(R.string.editor_session_quarantined)
             sessionReadResult is EditorSessionReadResult.Unsupported ->
-                "Editor session is from a newer app version and was left untouched"
+                stringResource(R.string.editor_session_newer_version)
             sessionReadResult is EditorSessionReadResult.Unavailable ->
-                "Editor session is unavailable; source and saved recipe will be restored"
+                stringResource(R.string.editor_session_unavailable)
             else -> null
         }
         var pendingSessionRestoreNotice by remember { mutableStateOf(sessionRestoreNotice) }
@@ -549,13 +571,11 @@ class MainActivity : ComponentActivity() {
                     liveSessionMutatedDuringRecovery = false
                     sessionWriteAccess = EditorSessionWriteAccess.WRITABLE
                     editorAuthorityReady = true
-                    pendingSessionRestoreNotice =
-                        "Editor session storage recovered; new edits will now be saved"
+                    pendingSessionRestoreNotice = ctx.getString(R.string.editor_session_recovered)
                 }
                 EditorSessionWriteAccess.PROTECTED -> {
                     sessionWriteAccess = EditorSessionWriteAccess.PROTECTED
-                    pendingSessionRestoreNotice =
-                        "Editor session is from a newer app version and was left untouched"
+                    pendingSessionRestoreNotice = ctx.getString(R.string.editor_session_newer_version)
                 }
                 EditorSessionWriteAccess.RECOVERING -> error("recovery returned unavailable")
             }
@@ -637,10 +657,8 @@ class MainActivity : ComponentActivity() {
             editorRestoration = reconciled
             latestEditorSession = reconciled.document
             pendingSessionRestoreNotice = when {
-                !reconciled.retainedSessionCursor ->
-                    "The durable source changed; its saved recipe will be restored"
-                reconciled.source.authorizationRequired ->
-                    "Source access expired; choose the same file to continue this edit"
+                !reconciled.retainedSessionCursor -> ctx.getString(R.string.editor_session_source_changed)
+                reconciled.source.authorizationRequired -> ctx.getString(R.string.editor_session_access_expired)
                 else -> pendingSessionRestoreNotice
             }
             editorAuthorityReady = true
@@ -708,7 +726,10 @@ class MainActivity : ComponentActivity() {
             // setting impossible, since reaching the toggle destroyed the subject.
             if (screen == Screen.EDITOR && !editorAuthorityReady) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = Color.White)
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        modifier = Modifier.semantics { contentDescription = ctx.getString(R.string.editor_loading) },
+                    )
                 }
             } else screenState.SaveableStateProvider(screen) {
                 when (screen) {
@@ -731,7 +752,7 @@ class MainActivity : ComponentActivity() {
                             },
                         )
                     }
-                    Screen.SETTINGS -> NavScaffold("Settings", onBack = { navigateTo(Screen.EDITOR) }) {
+                    Screen.SETTINGS -> NavScaffold(stringResource(R.string.editor_action_settings), onBack = { navigateTo(Screen.EDITOR) }) {
                         SettingsScreen(
                             settings = settings,
                             filmGroups = settingsFilmGroups,
@@ -741,10 +762,10 @@ class MainActivity : ComponentActivity() {
                             onOpenDiagnostics = { navigateTo(Screen.DIAGNOSTICS) },
                         )
                     }
-                    Screen.DIAGNOSTICS -> NavScaffold("Diagnostics", onBack = { navigateTo(Screen.SETTINGS) }) {
+                    Screen.DIAGNOSTICS -> NavScaffold(stringResource(R.string.editor_nav_diagnostics), onBack = { navigateTo(Screen.SETTINGS) }) {
                         DiagnosticsScreen()
                     }
-                    Screen.ABOUT -> NavScaffold("About", onBack = { navigateTo(Screen.EDITOR) }) {
+                    Screen.ABOUT -> NavScaffold(stringResource(R.string.editor_action_about), onBack = { navigateTo(Screen.EDITOR) }) {
                         AboutScreen()
                     }
                     Screen.CURVES_FILM -> ProfileCurvesScreen(
@@ -790,9 +811,9 @@ class MainActivity : ComponentActivity() {
                     .windowInsetsPadding(WindowInsets.systemBars),
             ) {
                 TopAppBar(
-                    title = { Text(title) },
+                    title = { Text(title, modifier = Modifier.semantics { heading() }) },
                     navigationIcon = {
-                        TextButton(onClick = onBack) { Text("Back") }
+                        TextButton(onClick = onBack) { Text(stringResource(R.string.editor_nav_back)) }
                     },
                 )
                 Box(Modifier.weight(1f)) { content() }
@@ -952,13 +973,12 @@ class MainActivity : ComponentActivity() {
             activeExportRunAtRestore,
         )
         val initialEditorStatus = initialSessionRestoreNotice ?: when (initialExportState.phase) {
-            EditorExportPhase.IDLE -> "initializing…"
-            EditorExportPhase.RUNNING -> "resuming export…"
-            EditorExportPhase.SUCCESS -> "previous export saved to Pictures/Spektrafilm"
-            EditorExportPhase.FAILURE -> "previous export failed"
-            EditorExportPhase.CANCELLED -> "previous export cancelled"
-            EditorExportPhase.RECONCILING ->
-                "previous export interrupted · storage reconciliation is running"
+            EditorExportPhase.IDLE -> stringResource(R.string.editor_status_initializing)
+            EditorExportPhase.RUNNING -> stringResource(R.string.editor_status_resuming_export)
+            EditorExportPhase.SUCCESS -> stringResource(R.string.editor_status_prev_export_saved)
+            EditorExportPhase.FAILURE -> stringResource(R.string.editor_status_prev_export_failed)
+            EditorExportPhase.CANCELLED -> stringResource(R.string.editor_status_prev_export_cancelled)
+            EditorExportPhase.RECONCILING -> stringResource(R.string.editor_status_prev_export_reconciling)
         }
         var status by remember { mutableStateOf(initialEditorStatus) }
         var exportPhase by remember { mutableStateOf(initialExportState.phase) }
@@ -1133,7 +1153,7 @@ class MainActivity : ComponentActivity() {
             if (magnifierOpen) {
                 magnifierBitmap = null
                 magnifierRendering = false
-                magnifierStatus = "edit changed · tap preview again"
+                magnifierStatus = ctx.getString(R.string.editor_magnifier_edit_changed)
             }
         }
         // Cancel any in-flight ROI / magnifier render job when the editor leaves composition
@@ -1220,7 +1240,7 @@ class MainActivity : ComponentActivity() {
                 ExportRuntimeState.Idle -> {
                     if (exportPhase == EditorExportPhase.RECONCILING) {
                         exportRuntimeRunId = null
-                        status = "previous export interrupted · storage reconciliation is running"
+                        status = ctx.getString(R.string.editor_status_prev_export_reconciling)
                     }
                 }
                 is ExportRuntimeState.Running -> {
@@ -1246,7 +1266,7 @@ class MainActivity : ComponentActivity() {
                     }
                     exportPhase = EditorExportPhase.RUNNING
                     exportRuntimeRunId = runtime.runId
-                    status = "rendering full resolution…"
+                    status = ctx.getString(R.string.editor_status_rendering_full)
                     sessionCheckpointAction[0]?.invoke()
                 }
                 is ExportRuntimeState.Finished -> {
@@ -1272,7 +1292,7 @@ class MainActivity : ComponentActivity() {
                     when (val pending = runtime.outcome) {
                         is ExportTerminalOutcome.Success -> {
                             exportPhase = EditorExportPhase.SUCCESS
-                            status = "saved to Pictures/Spektrafilm"
+                            status = ctx.getString(R.string.editor_status_saved_to_gallery)
                         }
                         is ExportTerminalOutcome.Failure -> {
                             exportPhase = if (pending.cause is ExportReconciliationPendingException) {
@@ -1300,14 +1320,14 @@ class MainActivity : ComponentActivity() {
                                 "terminal editor session save retrying " +
                                     "(${failure.javaClass.simpleName})",
                             )
-                            status = "export complete · retrying editor session save"
+                            status = ctx.getString(R.string.editor_status_export_complete_retrying_save)
                             delay(500)
                         },
                     )
                     if (!durableTerminal) {
                         // Startup storage may still be recovering, or a future-version session may
                         // be protected. In both cases the process outcome remains retained.
-                        status = "export complete · editor session save is waiting"
+                        status = ctx.getString(R.string.editor_status_export_complete_save_waiting)
                         return@LaunchedEffect
                     }
                     val publicationTicket = exportPublication
@@ -1340,7 +1360,7 @@ class MainActivity : ComponentActivity() {
                             }
                             if (!identityAuthorized) {
                                 exportPhase = EditorExportPhase.RECONCILING
-                                status = "export completed for a previous or unauthorized source"
+                                status = ctx.getString(R.string.editor_status_export_stale_source)
                                 sessionCheckpointAction[0]?.invoke()
                                 return@LaunchedEffect
                             }
@@ -1358,7 +1378,7 @@ class MainActivity : ComponentActivity() {
                                 published to (outcome.publishedMimeType ?: "image/*")
                             }
                             exportPhase = EditorExportPhase.SUCCESS
-                            status = "saved to Pictures/Spektrafilm"
+                            status = ctx.getString(R.string.editor_status_saved_to_gallery)
                         }
                         is ExportTerminalOutcome.Failure -> {
                             Diag.w(
@@ -1367,18 +1387,18 @@ class MainActivity : ComponentActivity() {
                             )
                             if (outcome.cause is ExportReconciliationPendingException) {
                                 exportPhase = EditorExportPhase.RECONCILING
-                                status = "export outcome pending reconciliation · restart before retry"
+                                status = ctx.getString(R.string.editor_status_export_pending_reconciliation)
                                 Toast.makeText(
                                     ctx,
-                                    "Export outcome is being reconciled. Restart before retrying.",
+                                    ctx.getString(R.string.editor_toast_export_reconciling),
                                     Toast.LENGTH_LONG,
                                 ).show()
                             } else {
                                 exportPhase = EditorExportPhase.FAILURE
-                                status = "export failed: ${outcome.cause.message}"
+                                status = ctx.getString(R.string.editor_status_export_failed, outcome.cause.message)
                                 Toast.makeText(
                                     ctx,
-                                    "Export failed: ${outcome.cause.message}",
+                                    ctx.getString(R.string.editor_toast_export_failed, outcome.cause.message),
                                     Toast.LENGTH_LONG,
                                 ).show()
                             }
@@ -1389,7 +1409,7 @@ class MainActivity : ComponentActivity() {
                                     "${outcome.elapsedMs}ms",
                             )
                             exportPhase = EditorExportPhase.CANCELLED
-                            status = "export cancelled"
+                            status = ctx.getString(R.string.editor_status_export_cancelled)
                         }
                     }
                     sessionCheckpointAction[0]?.invoke()
@@ -1444,14 +1464,14 @@ class MainActivity : ComponentActivity() {
             val target = editHistory.undo(snapshotNow()) ?: return
             liveCursorMutated = true
             applySnapshot(target)
-            status = "undo"
+            status = ctx.getString(R.string.editor_status_undo)
         }
 
         fun doRedo() {
             val target = editHistory.redo(snapshotNow()) ?: return
             liveCursorMutated = true
             applySnapshot(target)
-            status = "redo"
+            status = ctx.getString(R.string.editor_status_redo)
         }
 
         fun captureEditorSessionDocument(): EditorSessionDocument? {
@@ -1626,17 +1646,20 @@ class MainActivity : ComponentActivity() {
                             presetFullJson = null
                             presetAmount = 1f
                             settingsClipboard = null
-                            status = "restored session migrated to available profiles"
+                            status = ctx.getString(R.string.editor_status_session_migrated)
                         }
                     }
                     builtInGroups = presetGroups
                     catalogReady = true
                     refreshPresets()
-                    if (initialSessionRestoreNotice == null && status.startsWith("initializing")) {
+                    if (
+                        initialSessionRestoreNotice == null &&
+                        status == ctx.getString(R.string.editor_status_initializing)
+                    ) {
                         status = if (initialRestoredSession == null) {
-                            "ready · ${list.size} profiles"
+                            ctx.getString(R.string.editor_status_ready_profiles, list.size)
                         } else {
-                            "editor session restored · ${list.size} profiles"
+                            ctx.getString(R.string.editor_status_session_restored_profiles, list.size)
                         }
                     }
                     defaultsJson = freshDefaults
@@ -1712,7 +1735,7 @@ class MainActivity : ComponentActivity() {
                         previewTick++
                         snackbarHost.currentSnackbarData?.dismiss()
                         snackbarHost.showSnackbar(
-                            message = "Restored saved edit for this image",
+                            message = ctx.getString(R.string.editor_snack_recipe_restored),
                             withDismissAction = true,
                         )
                     }
@@ -1727,7 +1750,7 @@ class MainActivity : ComponentActivity() {
                     Diag.w("recipe quarantined: ${restored.reason}")
                     snackbarHost.currentSnackbarData?.dismiss()
                     snackbarHost.showSnackbar(
-                        message = "Damaged saved edit was quarantined; defaults restored",
+                        message = ctx.getString(R.string.editor_snack_recipe_quarantined),
                         withDismissAction = true,
                     )
                 }
@@ -1746,10 +1769,10 @@ class MainActivity : ComponentActivity() {
                         rotation = SourceRotation.NONE
                         previewTick++
                     }
-                    status = "saved edit uses newer recipe version ${restored.version}"
+                    status = ctx.getString(R.string.editor_status_recipe_newer_version, restored.version)
                     snackbarHost.currentSnackbarData?.dismiss()
                     snackbarHost.showSnackbar(
-                        message = "Saved edit is from a newer app version; it was left untouched",
+                        message = ctx.getString(R.string.editor_snack_recipe_newer_version),
                         withDismissAction = true,
                     )
                 }
@@ -1767,10 +1790,10 @@ class MainActivity : ComponentActivity() {
                         else -> error("unreachable")
                     }
                     Diag.w("recipe unavailable and writes paused: $reason")
-                    status = "saved edit unavailable; writes paused"
+                    status = ctx.getString(R.string.editor_status_recipe_unavailable)
                     snackbarHost.currentSnackbarData?.dismiss()
                     snackbarHost.showSnackbar(
-                        message = "Saved edit could not be safely opened; reset it explicitly to continue saving",
+                        message = ctx.getString(R.string.editor_snack_recipe_unavailable),
                         withDismissAction = true,
                     )
                 }
@@ -1782,7 +1805,7 @@ class MainActivity : ComponentActivity() {
             if (dngFallbackNotice) {
                 snackbarHost.currentSnackbarData?.dismiss()
                 snackbarHost.showSnackbar(
-                    message = "DNG imported via system decoder (display-referred)",
+                    message = ctx.getString(R.string.editor_snack_dng_fallback),
                     withDismissAction = true,
                 )
                 dngFallbackNotice = false
@@ -1803,10 +1826,10 @@ class MainActivity : ComponentActivity() {
             ActivityResultContracts.RequestPermission(),
         ) { granted ->
             if (!granted) {
-                status = "storage permission required to export on this Android version"
+                status = ctx.getString(R.string.editor_status_storage_permission_required)
                 Toast.makeText(
                     ctx,
-                    "Allow Photos and media access to save exports.",
+                    ctx.getString(R.string.editor_toast_storage_permission),
                     Toast.LENGTH_LONG,
                 ).show()
             }
@@ -1828,10 +1851,10 @@ class MainActivity : ComponentActivity() {
                     }
                     sourceUri = null
                     sourceKind = SourceKind.DEMO
-                    sourceName = "synthetic demo image"
+                    sourceName = ctx.getString(R.string.editor_source_demo_name)
                     sourceAuthorizationRequired = false
                     rotation = SourceRotation.NONE
-                    status = "demo image"
+                    status = ctx.getString(R.string.editor_status_demo_image)
                 }
                 is SourceRestoreResult.Ready -> {
                     val switched = !shouldRetainEditorCursor(visibleSourceState(), durable)
@@ -1844,7 +1867,7 @@ class MainActivity : ComponentActivity() {
                     sourceName = durable.ref.displayName
                     sourceAuthorizationRequired = false
                     if (switched) rotation = SourceRotation.NONE
-                    status = "selection failed · previous source restored"
+                    status = ctx.getString(R.string.editor_status_selection_failed_restored)
                 }
                 is SourceRestoreResult.NeedsAuthorization -> {
                     val switched = !shouldRetainEditorCursor(visibleSourceState(), durable)
@@ -1857,26 +1880,26 @@ class MainActivity : ComponentActivity() {
                     sourceName = durable.ref.displayName
                     sourceAuthorizationRequired = true
                     if (switched) rotation = SourceRotation.NONE
-                    status = "selection failed · previous source needs authorization"
+                    status = ctx.getString(R.string.editor_status_selection_failed_auth)
                 }
                 SourceRestoreResult.None -> {
                     if (sourceUri != null && sourceKind != SourceKind.DEMO) {
                         retireSourceResources()
                         sourceAuthorizationRequired = true
-                        status = "selection failed · previous source needs authorization"
+                        status = ctx.getString(R.string.editor_status_selection_failed_auth)
                     } else {
                         sourceUri = null
                         sourceKind = SourceKind.DEMO
-                        sourceName = "synthetic demo image"
+                        sourceName = ctx.getString(R.string.editor_source_demo_name)
                         sourceAuthorizationRequired = false
                         rotation = SourceRotation.NONE
-                        status = "source unavailable · using demo image"
+                        status = ctx.getString(R.string.editor_status_source_unavailable_demo)
                     }
                 }
                 is SourceRestoreResult.Invalid, null -> {
                     sourceAuthorizationRequired = sourceUri != null && sourceKind != SourceKind.DEMO
                     if (sourceAuthorizationRequired) retireSourceResources()
-                    status = "source state unavailable · choose the file again"
+                    status = ctx.getString(R.string.editor_status_source_state_unavailable)
                 }
             }
             previewTick++
@@ -1918,7 +1941,7 @@ class MainActivity : ComponentActivity() {
                         status = if (ref.accessMode == SourceAccessMode.PERSISTED) {
                             readyStatus
                         } else {
-                            "$readyStatus · access is temporary"
+                            ctx.getString(R.string.editor_status_access_temporary, readyStatus)
                         }
                         previewTick++
                         probeLabel?.let(Ticket139EditorProbe::publishProbeSource)
@@ -1928,7 +1951,7 @@ class MainActivity : ComponentActivity() {
                         reconcileVisibleSourceAfterFailure(outcome.durableState)
                         snackbarHost.currentSnackbarData?.dismiss()
                         snackbarHost.showSnackbar(
-                            "Could not open that source. The previous source state was restored.",
+                            ctx.getString(R.string.editor_snack_source_open_failed),
                             withDismissAction = true,
                         )
                     }
@@ -1971,8 +1994,8 @@ class MainActivity : ComponentActivity() {
         ) { uri ->
             if (uri != null) {
                 val displayName = uri.lastPathSegment?.substringAfterLast('/')
-                    ?.takeIf { it.isNotBlank() } ?: "picked photo"
-                adoptSource(uri, SourceKind.PHOTO, displayName, "photo selected")
+                    ?.takeIf { it.isNotBlank() } ?: ctx.getString(R.string.editor_source_picked_photo_name)
+                adoptSource(uri, SourceKind.PHOTO, displayName, ctx.getString(R.string.editor_status_photo_selected))
             }
         }
         // Shared RAW/photo dispatch for the document picker AND #162 inbound VIEW/SEND:
@@ -1984,10 +2007,10 @@ class MainActivity : ComponentActivity() {
                     // MotionCam RAW-video container: recognized (see McrawContainer /
                     // docs/RESEARCH_MCRAW.md) but native frame decode isn't wired yet, so
                     // don't set a RAW source that would fail — tell the user instead.
-                    status = "MotionCam .mcraw clips aren't supported yet (RAW-video import in progress)"
+                    status = ctx.getString(R.string.editor_status_mcraw_unsupported)
                     scope.launch {
                         snackbarHost.currentSnackbarData?.dismiss()
-                        snackbarHost.showSnackbar("MotionCam .mcraw import is coming — single RAW/DNG works today")
+                        snackbarHost.showSnackbar(ctx.getString(R.string.editor_snack_mcraw_coming))
                     }
                 } else {
                     val mime = runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
@@ -1997,13 +2020,13 @@ class MainActivity : ComponentActivity() {
                         // fall back to a lossy display-referred decode). RAW/DNG and ambiguous
                         // content URIs (e.g. MIUI document IDs with no extension) fall through to
                         // the RAW path below, so a genuine DNG is never misrouted.
-                        adoptSource(uri, SourceKind.PHOTO, name.substringAfterLast('/'), "photo selected")
+                        adoptSource(uri, SourceKind.PHOTO, name.substringAfterLast('/'), ctx.getString(R.string.editor_status_photo_selected))
                     } else {
                         adoptSource(
                             uri,
                             SourceKind.RAW,
-                            "RAW: ${name.substringAfterLast('/')}",
-                            "RAW selected",
+                            ctx.getString(R.string.editor_source_raw_name, name.substringAfterLast('/')),
+                            ctx.getString(R.string.editor_status_raw_selected),
                         )
                     }
                 }
@@ -2025,7 +2048,7 @@ class MainActivity : ComponentActivity() {
             if (action != Intent.ACTION_VIEW && action != Intent.ACTION_SEND) return@LaunchedEffect
             val incoming = incomingImageUri(intent)
             if (incoming == null) {
-                status = "couldn't open the shared image (unsupported source)"
+                status = ctx.getString(R.string.editor_status_shared_image_unsupported)
                 return@LaunchedEffect
             }
             adoptIncomingImage(incoming)
@@ -2039,7 +2062,7 @@ class MainActivity : ComponentActivity() {
                     val text = withContext(Dispatchers.IO) {
                         runCatching { Presets.readUri(ctx, uri) }.getOrNull()
                     }
-                    if (text == null) { status = "import failed"; return@launch }
+                    if (text == null) { status = ctx.getString(R.string.editor_status_preset_import_failed); return@launch }
                     runCatching {
                         // Decode into a detached clone first. The live Compose state changes only
                         // after the entire bounded/versioned import has validated successfully.
@@ -2048,8 +2071,8 @@ class MainActivity : ComponentActivity() {
                         Presets.decode(org.json.JSONObject(text), candidate)
                         Presets.decode(Presets.encode(candidate), state)
                     }
-                        .onSuccess { status = "preset imported"; previewTick++ }
-                        .onFailure { status = "import failed: ${it.message}" }
+                        .onSuccess { status = ctx.getString(R.string.editor_status_preset_imported); previewTick++ }
+                        .onFailure { status = ctx.getString(R.string.editor_status_preset_import_failed_reason, it.message) }
                 }
             }
         }
@@ -2060,10 +2083,10 @@ class MainActivity : ComponentActivity() {
                 scope.launch {
                     // Serialize on main (live Compose-state read); write off-main.
                     val json = runCatching { Presets.toJsonString(state) }.getOrNull()
-                    if (json == null) { status = "export failed"; return@launch }
+                    if (json == null) { status = ctx.getString(R.string.editor_status_preset_export_failed); return@launch }
                     val r = withContext(Dispatchers.IO) { runCatching { Presets.exportJson(ctx, uri, json) } }
-                    r.onSuccess { status = "preset exported" }
-                        .onFailure { status = "export failed: ${it.message}" }
+                    r.onSuccess { status = ctx.getString(R.string.editor_status_preset_exported) }
+                        .onFailure { status = ctx.getString(R.string.editor_status_preset_export_failed_reason, it.message) }
                 }
             }
         }
@@ -2075,8 +2098,8 @@ class MainActivity : ComponentActivity() {
                 scope.launch {
                     // SAF write off-main; status (Compose state) lands back on main.
                     val r = withContext(Dispatchers.IO) { runCatching { saveTextToUri(ctx, uri, text) } }
-                    r.onSuccess { status = "LUT saved" }
-                        .onFailure { status = "LUT save failed: ${it.message}" }
+                    r.onSuccess { status = ctx.getString(R.string.editor_status_lut_saved) }
+                        .onFailure { status = ctx.getString(R.string.editor_status_lut_save_failed, it.message) }
                 }
             }
             pendingLutText = null
@@ -2087,8 +2110,8 @@ class MainActivity : ComponentActivity() {
             showExportSheet = false
             snackbarHost.currentSnackbarData?.dismiss()
             val result = snackbarHost.showSnackbar(
-                message = "Source access expired or the file moved",
-                actionLabel = "Choose again",
+                message = ctx.getString(R.string.editor_snack_source_expired),
+                actionLabel = ctx.getString(R.string.editor_snack_choose_again),
                 withDismissAction = true,
                 duration = SnackbarDuration.Indefinite,
             )
@@ -2245,7 +2268,7 @@ class MainActivity : ComponentActivity() {
             magnifierOpen = true
             magnifierBitmap = null
             magnifierRendering = true
-            magnifierStatus = "rendering 100% crop…"
+            magnifierStatus = ctx.getString(R.string.editor_magnifier_rendering)
             magnifierJobRef.value = scope.launch {
                 var renderId = 0L
                 val result = runCatching {
@@ -2308,10 +2331,10 @@ class MainActivity : ComponentActivity() {
                 result.onSuccess {
                     magnifierBitmap = it
                     SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
-                    magnifierStatus = "${it.width}×${it.height}px · 1:1 full-res render"
+                    magnifierStatus = ctx.getString(R.string.editor_magnifier_done, it.width, it.height)
                 }.onFailure {
                     SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
-                    magnifierStatus = "crop render failed: ${it.message}"
+                    magnifierStatus = ctx.getString(R.string.editor_magnifier_failed, it.message)
                 }
                 magnifierRendering = false
             }
@@ -2592,7 +2615,7 @@ class MainActivity : ComponentActivity() {
             )
             previewBusy = true
             renderErr = null
-            status = "rendering preview…"
+            status = ctx.getString(R.string.editor_status_rendering_preview)
             val renderStart = System.currentTimeMillis()
             val fullEdge = state.previewMaxSize.coerceAtLeast(256)
             // Key built on MAIN (reads Compose state); the same snapshot renders below,
@@ -2753,18 +2776,18 @@ class MainActivity : ComponentActivity() {
                 lastRenderMs = System.currentTimeMillis() - renderStart
                 Diag.i("render mode=preview ${after.width}x${after.height} ${after.width * after.height}px ${lastRenderMs}ms")
                 renderErr = null
-                status = "preview ready"
+                status = ctx.getString(R.string.editor_status_preview_ready)
             }.onFailure {
                 SimResult.reportOutcome(renderId, AppRenderOutcome.FAILED)
                 Diag.w("render mode=preview failed after ${System.currentTimeMillis() - renderStart}ms: ${it.message}")
                 if (sourceKind != SourceKind.DEMO && it.isSourceAuthorizationFailure()) {
                     retireSourceResources()
                     sourceAuthorizationRequired = true
-                    renderErr = "source authorization required"
-                    status = "source access expired or file moved · choose it again"
+                    renderErr = ctx.getString(R.string.editor_render_error_auth_required)
+                    status = ctx.getString(R.string.editor_status_source_expired)
                 } else {
                     renderErr = it.message?.take(60)
-                    status = "preview error: ${it.message}"
+                    status = ctx.getString(R.string.editor_status_preview_error, it.message)
                 }
             }
             previewBusy = false
@@ -2925,7 +2948,7 @@ class MainActivity : ComponentActivity() {
                     throw cancelled
                 } catch (failure: Throwable) {
                     Diag.w("pristine recipe delete failed: ${failure.message}")
-                    status = "could not clear saved recipe"
+                    status = ctx.getString(R.string.editor_status_recipe_clear_failed)
                     return@LaunchedEffect
                 }
                 if (newGeneration != null) {
@@ -3080,7 +3103,7 @@ class MainActivity : ComponentActivity() {
                     if (firstTime) {
                         BackHintStore.markShown(ctx)
                         snackbarHost.currentSnackbarData?.dismiss()
-                        snackbarHost.showSnackbar("Press back again to exit")
+                        snackbarHost.showSnackbar(ctx.getString(R.string.editor_snack_back_again))
                     }
                     delay(2000)
                     backArmed = false
@@ -3089,12 +3112,30 @@ class MainActivity : ComponentActivity() {
         }
 
         // ============================ LAYOUT ============================
+        // Overlay predicates, shared with the overlay branches below the chrome.
+        val cropBmp = preview
+        val cropShown = cropOverlayOpen && cropBmp != null
+        val maskGeometryShown = maskOverlayOpen && cropBmp != null &&
+            selectedMaskIndex in state.localAdjustments.indices
+        val sampleMask = state.localAdjustments.getOrNull(selectedMaskIndex)?.mask
+        val sampleReady = sourceRenderAllowed && sampleOverlayOpen && cropBmp != null && (
+            sampleWbMode ||
+                (sampleMask != null &&
+                    (if (sampleLuminanceMode) sampleMask.luminanceRange != null else sampleMask.colorRange != null))
+            )
+        // #181: a full-screen tool overlay is modal. Compose overlays share the window, so the
+        // chrome beneath would otherwise stay reachable by TalkBack explore-by-touch.
+        val modalOverlayShown = magnifierOpen || cropShown || maskGeometryShown || sampleReady
         Box(
             Modifier
                 .fillMaxSize()
                 .background(SpectraIcons.nearBlackCanvas),
         ) {
-            Column(Modifier.fillMaxSize()) {
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .then(if (modalOverlayShown) Modifier.clearAndSetSemantics {} else Modifier),
+            ) {
                 // --- TOP BAR ---
                 EditorTopBar(
                     canExport = engine != null && sourceRenderAllowed && !previewBusy && !exportInFlight,
@@ -3120,48 +3161,21 @@ class MainActivity : ComponentActivity() {
                     },
                 )
 
-                // --- PREVIEW (pinned, weight) ---
-                Box(
+                // Adaptive editor chrome. Narrow (phone portrait): the preview over a floating
+                // bottom panel over the category bar, as before. Wide (tablets, landscape phones,
+                // desktop windows, unfolded foldables): the active panel docks as a side column
+                // beside the preview + category bar. Neither branch touches PreviewRegion or the
+                // GPU/CPU render paths; only where the panel body is hosted differs.
+                BoxWithConstraints(
                     Modifier
                         .fillMaxWidth()
-                        .weight(1f)
-                        .heightIn(min = 220.dp),
+                        .weight(1f),
                 ) {
-                    PreviewRegion(
-                        preview = preview,
-                        before = beforePreview,
-                        busy = previewBusy,
-                        decoding = decoding,
-                        exporting = exportInFlight,
-                        lastRenderMs = lastRenderMs,
-                        renderErr = renderErr,
-                        compareMode = compareMode,
-                        showHistogram = showHistogram,
-                        gpuEnabled = gpuEnabled,
-                        gpuProxy = gpuProxy,
-                        gpuLut = gpuLut,
-                        gpuGain = gpuGain,
-                        onToggleCompare = { compareMode = !compareMode },
-                        onToggleHistogram = { showHistogram = !showHistogram },
-                        onRotate = { rotation = rotation.next() },
-                        onEditCrop = { cropOverlayOpen = true },
-                        onPointPicked = { nx, ny -> openMagnifier(nx, ny) },
-                        renderKey = previewTick,
-                        roiOverlay = roiOverlay,
-                        onRoiSettled = { renderRoi(it) },
-                        onRoiCleared = { clearRoi() },
-                    )
+                    val wide = maxWidth >= 600.dp || maxWidth > maxHeight
 
-                // --- ADJUSTMENT PANEL (floating bottom overlay) ---
-                // Floated INSIDE the preview Box (aligned to its bottom) so opening/closing a
-                // panel no longer resizes the weight(1f) preview every frame. That per-frame
-                // resize churned the GLSurfaceView (it forced GPU preview off) and jolted the
-                // CPU preview too; a constant-height preview fixes both and unblocks GPU.
-                PanelOverlay(visible = activeCategory != null) {
-                    AdjustmentPanel(
-                        category = activeCategory,
-                        onDismiss = { activeCategory = null },
-                    ) {
+                    // The active panel body, shared by both branches so the per-category
+                    // `when` below is not duplicated.
+                    val panelContent: @Composable ColumnScope.() -> Unit = {
                         CompositionLocalProvider(LocalSliderInteraction provides sliderInteraction) {
                         when (activeCategory) {
                             Category.INPUT -> InputSection(state, onEditCrop = { cropOverlayOpen = true },
@@ -3196,12 +3210,12 @@ class MainActivity : ComponentActivity() {
                                         // otherwise offer to drop the previous stock's tweaks.
                                         if (StockCatalog.isReversalFilm(ctx, id) && !state.scanFilm) {
                                             offerSnackbarSuggestion(scope, snackbarHost,
-                                                "$name is a slide film — view it as a positive?",
-                                                "Slide mode") { state.scanFilm = true }
+                                                ctx.getString(R.string.editor_snack_slide_film, name),
+                                                ctx.getString(R.string.editor_snack_slide_mode)) { state.scanFilm = true }
                                         } else {
                                             offerSnackbarSuggestion(scope, snackbarHost,
-                                                "Switched to $name",
-                                                "Use its defaults") { state.resetStockCharacter() }
+                                                ctx.getString(R.string.editor_snack_switched_to, name),
+                                                ctx.getString(R.string.editor_snack_use_defaults)) { state.resetStockCharacter() }
                                         }
                                     }
                                 },
@@ -3210,8 +3224,8 @@ class MainActivity : ComponentActivity() {
                                     state.printProfile = id
                                     if (changed) {
                                         offerSnackbarSuggestion(scope, snackbarHost,
-                                            "Switched to ${StockCatalog.displayName(ctx, id)}",
-                                            "Use its defaults") { state.resetStockCharacter() }
+                                            ctx.getString(R.string.editor_snack_switched_to, StockCatalog.displayName(ctx, id)),
+                                            ctx.getString(R.string.editor_snack_use_defaults)) { state.resetStockCharacter() }
                                     }
                                 },
                             )
@@ -3246,7 +3260,7 @@ class MainActivity : ComponentActivity() {
                                 builtInGroups = builtInGroups,
                                 onApplyBuiltIn = { p ->
                                     applyWithAmount { BuiltInPresets.apply(p, state) }
-                                    status = "applied built-in '${p.name}'"; previewTick++
+                                    status = ctx.getString(R.string.editor_status_applied_builtin, p.name); previewTick++
                                 },
                                 amount = presetAmount,
                                 amountEnabled = presetFullJson != null,
@@ -3280,7 +3294,7 @@ class MainActivity : ComponentActivity() {
                                                 Presets.saveJson(ctx, name, json); Presets.list(ctx)
                                             }
                                             presetList = names
-                                            status = "saved preset '$name'"
+                                            status = ctx.getString(R.string.editor_status_preset_saved, name)
                                         }
                                     }
                                 },
@@ -3293,12 +3307,12 @@ class MainActivity : ComponentActivity() {
                                             val text = withContext(Dispatchers.IO) {
                                                 runCatching { Presets.read(ctx, name) }.getOrNull()
                                             }
-                                            if (text == null) { status = "apply failed"; return@launch }
+                                            if (text == null) { status = ctx.getString(R.string.editor_status_preset_apply_failed); return@launch }
                                             runCatching {
                                                 applyWithAmount { Presets.decode(org.json.JSONObject(text), state) }
                                             }
-                                                .onSuccess { status = "applied '$name'"; previewTick++ }
-                                                .onFailure { status = "apply failed: ${it.message}" }
+                                                .onSuccess { status = ctx.getString(R.string.editor_status_preset_applied, name); previewTick++ }
+                                                .onFailure { status = ctx.getString(R.string.editor_status_preset_apply_failed_reason, it.message) }
                                         }
                                     }
                                 },
@@ -3310,7 +3324,7 @@ class MainActivity : ComponentActivity() {
                                                 Presets.delete(ctx, name); Presets.list(ctx)
                                             }
                                             presetList = names
-                                            status = "deleted '$name'"; selectedPreset = ""
+                                            status = ctx.getString(R.string.editor_status_preset_deleted, name); selectedPreset = ""
                                         }
                                     }
                                 },
@@ -3318,7 +3332,10 @@ class MainActivity : ComponentActivity() {
                                 onExport = { presetExporter.launch("spectrafilm_preset.json") },
                                 onCopySettings = {
                                     settingsClipboard = runCatching { Presets.toJsonString(state) }.getOrNull()
-                                    status = if (settingsClipboard != null) "settings copied" else "copy failed"
+                                    status = ctx.getString(
+                                        if (settingsClipboard != null) R.string.editor_status_settings_copied
+                                        else R.string.editor_status_copy_failed,
+                                    )
                                 },
                                 canPasteSettings = settingsClipboard != null,
                                 onPasteSettings = {
@@ -3329,14 +3346,14 @@ class MainActivity : ComponentActivity() {
                                                 // amount blend anchor is now stale — clear it so a
                                                 // later slider move can't overwrite the pasted look.
                                                 presetBaseJson = null; presetFullJson = null; presetAmount = 1f
-                                                status = "settings pasted"; previewTick++
+                                                status = ctx.getString(R.string.editor_status_settings_pasted); previewTick++
                                             }
-                                            .onFailure { status = "paste failed: ${it.message}" }
+                                            .onFailure { status = ctx.getString(R.string.editor_status_paste_failed, it.message) }
                                     }
                                 },
                                 onExportLut = { size, clf ->
                                     val e = engine ?: return@PresetPanel
-                                    bakingLut = true; status = "baking ${if (clf) "CLF" else ".cube"} LUT…"
+                                    bakingLut = true; status = ctx.getString(R.string.editor_status_baking_lut, if (clf) "CLF" else ".cube")
                                     scope.launch {
                                         var lutRenderId = 0L
                                         val r = runCatching {
@@ -3382,11 +3399,11 @@ class MainActivity : ComponentActivity() {
                                                 size, clf,
                                             )
                                             runCatching { lutExporter.launch(fileName) }
-                                                .onFailure { status = "could not open save dialog: ${it.message}" }
+                                                .onFailure { status = ctx.getString(R.string.editor_status_save_dialog_failed, it.message) }
                                         }.onFailure {
                                             SimResult.reportOutcome(lutRenderId, AppRenderOutcome.FAILED)
-                                            status = "LUT bake failed: ${it.message}"
-                                            Toast.makeText(ctx, "LUT bake failed: ${it.message}", Toast.LENGTH_LONG).show()
+                                            status = ctx.getString(R.string.editor_status_lut_bake_failed, it.message)
+                                            Toast.makeText(ctx, status, Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 },
@@ -3437,19 +3454,19 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 sourceUri = null
                                                 sourceKind = SourceKind.DEMO
-                                                sourceName = "synthetic demo image"
+                                                sourceName = ctx.getString(R.string.editor_source_demo_name)
                                                 rotation = SourceRotation.NONE
                                                 sourceAuthorizationRequired = false
                                                 checkpointEditorSession()
                                                 previewTick++
-                                                status = "demo image"
+                                                status = ctx.getString(R.string.editor_status_demo_image)
                                             }
                                             is ReconciledSourceMutation.Rejected -> {
                                                 Diag.w("demo selection failed: ${outcome.failure.message}")
                                                 reconcileVisibleSourceAfterFailure(outcome.durableState)
                                                 snackbarHost.currentSnackbarData?.dismiss()
                                                 snackbarHost.showSnackbar(
-                                                    "Could not select the demo; the previous source was restored.",
+                                                    ctx.getString(R.string.editor_snack_demo_failed),
                                                     withDismissAction = true,
                                                 )
                                             }
@@ -3473,10 +3490,10 @@ class MainActivity : ComponentActivity() {
                                             throw cancelled
                                         } catch (failure: Throwable) {
                                             Diag.w("explicit recipe reset delete failed: ${failure.message}")
-                                            status = "could not clear saved recipe"
+                                            status = ctx.getString(R.string.editor_status_recipe_clear_failed)
                                             snackbarHost.currentSnackbarData?.dismiss()
                                             snackbarHost.showSnackbar(
-                                                "Saved recipe could not be cleared; edits were not reset",
+                                                ctx.getString(R.string.editor_snack_recipe_clear_failed),
                                             )
                                             return@launch
                                         }
@@ -3493,9 +3510,9 @@ class MainActivity : ComponentActivity() {
                                         // empty-history baseline (you can't undo back across a
                                         // reset). `restoring` makes the next settle adopt it.
                                         editHistory.clear(); committedSnapshot = null; restoring = true
-                                        status = "edits reset · recipe cleared"; previewTick++
+                                        status = ctx.getString(R.string.editor_status_edits_reset); previewTick++
                                         snackbarHost.currentSnackbarData?.dismiss()
-                                        snackbarHost.showSnackbar("Edits reset; saved recipe cleared")
+                                        snackbarHost.showSnackbar(ctx.getString(R.string.editor_snack_edits_reset))
                                     }
                                 },
                             )
@@ -3503,16 +3520,109 @@ class MainActivity : ComponentActivity() {
                         }
                         }
                     }
-                }
-                }
+                    // Measured height of the floating adjustment panel (narrow layout only). The
+                    // preview's zoom control is inset by it so it never sits under the panel.
+                    var panelHeightPx by remember { mutableIntStateOf(0) }
+                    val panelInset = if (!wide && activeCategory != null)
+                        with(LocalDensity.current) { panelHeightPx.toDp() } else 0.dp
+                    val previewRegion: @Composable () -> Unit = {
+                        PreviewRegion(
+                            controlsBottomInset = panelInset,
+                            preview = preview,
+                            before = beforePreview,
+                            busy = previewBusy,
+                            decoding = decoding,
+                            exporting = exportInFlight,
+                            lastRenderMs = lastRenderMs,
+                            renderErr = renderErr,
+                            compareMode = compareMode,
+                            showHistogram = showHistogram,
+                            gpuEnabled = gpuEnabled,
+                            gpuProxy = gpuProxy,
+                            gpuLut = gpuLut,
+                            gpuGain = gpuGain,
+                            onToggleCompare = { compareMode = !compareMode },
+                            onToggleHistogram = { showHistogram = !showHistogram },
+                            onRotate = { rotation = rotation.next() },
+                            onEditCrop = { cropOverlayOpen = true },
+                            onPointPicked = { nx, ny -> openMagnifier(nx, ny) },
+                            renderKey = previewTick,
+                            roiOverlay = roiOverlay,
+                            onRoiSettled = { renderRoi(it) },
+                            onRoiCleared = { clearRoi() },
+                        )
+                    }
+                    val categoryBar: @Composable () -> Unit = {
+                        CategoryBar(
+                            active = activeCategory,
+                            onSelect = { cat ->
+                                activeCategory = if (activeCategory == cat) null else cat
+                            },
+                        )
+                    }
 
-                // --- BOTTOM CATEGORY BAR ---
-                CategoryBar(
-                    active = activeCategory,
-                    onSelect = { cat ->
-                        activeCategory = if (activeCategory == cat) null else cat
-                    },
-                )
+                    if (wide) {
+                        Row(Modifier.fillMaxSize()) {
+                            Column(
+                                Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight(),
+                            ) {
+                                // --- PREVIEW (pinned, weight) ---
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .weight(1f)
+                                        .heightIn(min = 220.dp),
+                                ) { previewRegion() }
+                                // --- CATEGORY BAR (under the preview column) ---
+                                categoryBar()
+                            }
+                            // --- ADJUSTMENT PANEL (docked side column) ---
+                            // A Row sibling, deliberately not animated: the preview keeps its
+                            // height, and the panel's one-shot width change never becomes the
+                            // per-frame GLSurfaceView resize the narrow branch guards against.
+                            val sideCategory = activeCategory
+                            if (sideCategory != null) {
+                                SidePanel(
+                                    category = sideCategory,
+                                    onDismiss = { activeCategory = null },
+                                    content = panelContent,
+                                )
+                            }
+                        }
+                    } else {
+                        Column(Modifier.fillMaxSize()) {
+                            // --- PREVIEW (pinned, weight) ---
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                                    .heightIn(min = 220.dp),
+                            ) {
+                                previewRegion()
+
+                                // --- ADJUSTMENT PANEL (floating bottom overlay) ---
+                                // Floated INSIDE the preview Box (aligned to its bottom) so
+                                // opening/closing a panel no longer resizes the weight(1f) preview
+                                // every frame. That per-frame resize churned the GLSurfaceView (it
+                                // forced GPU preview off) and jolted the CPU preview too; a
+                                // constant-height preview fixes both and unblocks GPU.
+                                PanelOverlay(visible = activeCategory != null) {
+                                    AdjustmentPanel(
+                                        modifier = Modifier.onSizeChanged { panelHeightPx = it.height },
+                                        category = activeCategory,
+                                        onDismiss = { activeCategory = null },
+                                        content = panelContent,
+                                    )
+                                }
+                            }
+
+                            // --- BOTTOM CATEGORY BAR ---
+                            categoryBar()
+                        }
+                    }
+                }
             }
 
             // --- 100% grain magnifier overlay ---
@@ -3550,8 +3660,7 @@ class MainActivity : ComponentActivity() {
             // --- interactive crop overlay (Lightroom-style) ---
             // Only shown once a preview bitmap exists (the crop tool needs the image
             // to draw and to read its aspect ratio).
-            val cropBmp = preview
-            if (cropOverlayOpen && cropBmp != null) {
+            if (cropShown && cropBmp != null) {
                 CropOverlay(
                     bitmap = cropBmp,
                     initialCrop = state.crop,
@@ -3570,7 +3679,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // --- draw-on-the-preview mask geometry editor ---
-            if (maskOverlayOpen && cropBmp != null && selectedMaskIndex in state.localAdjustments.indices) {
+            if (maskGeometryShown && cropBmp != null) {
                 MaskGeometryOverlay(
                     bitmap = cropBmp,
                     mask = state.localAdjustments[selectedMaskIndex].mask,
@@ -3586,24 +3695,18 @@ class MainActivity : ComponentActivity() {
             }
 
             // --- eyedropper: WB gray-point, or a color-/luminance-range mask target ---
-            val sampleMask = state.localAdjustments.getOrNull(selectedMaskIndex)?.mask
-            val sampleReady = sourceRenderAllowed && sampleOverlayOpen && cropBmp != null && (
-                sampleWbMode ||
-                    (sampleMask != null &&
-                        (if (sampleLuminanceMode) sampleMask.luminanceRange != null else sampleMask.colorRange != null))
-                )
             if (sampleReady) {
                 PixelSampleOverlay(
                     bitmap = requireNotNull(cropBmp),
                     title = when {
-                        sampleWbMode -> "Tap a neutral (grey / white)"
-                        sampleLuminanceMode -> "Tap to pick a tone"
-                        else -> "Tap to pick a color"
+                        sampleWbMode -> stringResource(R.string.editor_sample_title_wb)
+                        sampleLuminanceMode -> stringResource(R.string.editor_sample_title_tone)
+                        else -> stringResource(R.string.editor_sample_title_color)
                     },
                     hint = when {
-                        sampleWbMode -> "Tap something that should be neutral grey or white — white balance is set to make it neutral."
-                        sampleLuminanceMode -> "Tap a tone (a highlight or a shadow) to target it, then apply."
-                        else -> "Tap the color you want the mask to target (e.g. a red), then apply."
+                        sampleWbMode -> stringResource(R.string.editor_sample_hint_wb)
+                        sampleLuminanceMode -> stringResource(R.string.editor_sample_hint_tone)
+                        else -> stringResource(R.string.editor_sample_hint_color)
                     },
                     onPick = { r, g, b, nx, ny ->
                         if (sampleWbMode) {
@@ -3624,9 +3727,13 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }.onSuccess { (t, ti) ->
                                     state.creativeWbTemp = t; state.creativeWbTint = ti
-                                    status = "white balance set from neutral"
+                                    status = ctx.getString(R.string.editor_status_wb_set)
                                 }.onFailure {
-                                    Toast.makeText(ctx, "Couldn't sample for white balance: ${it.message}", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(
+                                        ctx,
+                                        ctx.getString(R.string.editor_toast_wb_sample_failed, it.message),
+                                        Toast.LENGTH_LONG,
+                                    ).show()
                                 }
                             }
                         } else {
@@ -3668,16 +3775,16 @@ class MainActivity : ComponentActivity() {
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                             try {
-                                ctx.startActivity(Intent.createChooser(send, "Share export"))
+                                ctx.startActivity(Intent.createChooser(send, ctx.getString(R.string.editor_share_export_title)))
                             } catch (_: ActivityNotFoundException) {
-                                status = "no installed app can receive this image"
+                                status = ctx.getString(R.string.editor_status_no_share_target)
                             }
                         }
                     },
                     onCancel = {
                         val running = exportRuntimeState as? ExportRuntimeState.Running
                         if (running != null && ExportWorkRuntime.cancel(running.runId)) {
-                            status = "cancelling export"
+                            status = ctx.getString(R.string.editor_status_cancelling_export)
                         }
                     },
                 )
@@ -3726,7 +3833,7 @@ class MainActivity : ComponentActivity() {
                     onExport = export@{
                         if (!sourceRenderAllowed) {
                             showExportSheet = false
-                            status = "source access required before export"
+                            status = ctx.getString(R.string.editor_status_source_access_required)
                             return@export
                         }
                         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
@@ -3740,7 +3847,7 @@ class MainActivity : ComponentActivity() {
                                     android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
                                 )
                             }
-                            status = "grant storage access, then tap Export again"
+                            status = ctx.getString(R.string.editor_status_grant_storage)
                             return@export
                         }
                         val e = engine
@@ -3752,7 +3859,7 @@ class MainActivity : ComponentActivity() {
                                     Build.VERSION.SDK_INT,
                                 ).also { ColorManagement.requireIccBytes(ctx, it) }
                             }.getOrElse { failure ->
-                                status = failure.message ?: "unsupported export combination"
+                                status = failure.message ?: ctx.getString(R.string.editor_status_unsupported_export)
                                 Toast.makeText(ctx, status, Toast.LENGTH_LONG).show()
                                 return@export
                             }
@@ -3770,7 +3877,7 @@ class MainActivity : ComponentActivity() {
                             // (issue #119): logcat-visible start marker + duration on ok/fail.
                             val exportStartMs = System.currentTimeMillis()
                             Diag.i("export start format=${exportFmt.name} contract=${outputDescriptor.existingExportClass.id}")
-                            status = "rendering full resolution…"
+                            status = ctx.getString(R.string.editor_status_rendering_full)
                             val exportContext = ctx.applicationContext
                             val exportParams = if (outputDescriptor.engineColorSpace == null) {
                                 state.toParams()
@@ -4055,7 +4162,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             if (launched == null) {
-                                status = "an export is already running"
+                                status = ctx.getString(R.string.editor_status_export_running)
                             } else {
                                 exportPhase = EditorExportPhase.RUNNING
                                 exportRuntimeRunId = launched
@@ -4112,62 +4219,72 @@ class MainActivity : ComponentActivity() {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 // Open / pick a source photo (was an app-exit bug previously).
-                TextTooltip("Open photo") {
+                TextTooltip(stringResource(R.string.editor_open_photo)) {
                     PressIconButton(onClick = onOpenSource) {
                         Icon(
-                            SpectraIcons.OpenPhoto, contentDescription = "Open photo",
+                            SpectraIcons.OpenPhoto, contentDescription = stringResource(R.string.editor_open_photo),
                             tint = Color.White,
                         )
                     }
                 }
-                Spacer(Modifier.weight(1f))
+                // weight(1f): the title yields to the six 48dp actions, so at 200% font it
+                // ellipsizes instead of pushing Settings/About off the right edge (#181).
                 Text(
-                    "Spektrafilm",
+                    stringResource(R.string.app_name),
                     color = Color.White.copy(alpha = 0.92f),
                     fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f)
+                        .semantics { heading() },
                 )
-                Spacer(Modifier.weight(1f))
                 // Undo / redo — in-session edit history. Disabled (dimmed) when the
                 // respective stack is empty; one slider drag = one undo step.
-                TextTooltip("Undo") {
+                TextTooltip(stringResource(R.string.editor_action_undo)) {
                     PressIconButton(onClick = onUndo, enabled = canUndo) {
                         Icon(
-                            SpectraIcons.Undo, contentDescription = "Undo",
+                            SpectraIcons.Undo, contentDescription = stringResource(R.string.editor_action_undo),
                             tint = if (canUndo) Color.White else Color.White.copy(alpha = 0.4f),
                         )
                     }
                 }
-                TextTooltip("Redo") {
+                TextTooltip(stringResource(R.string.editor_action_redo)) {
                     PressIconButton(onClick = onRedo, enabled = canRedo) {
                         Icon(
-                            SpectraIcons.Redo, contentDescription = "Redo",
+                            SpectraIcons.Redo, contentDescription = stringResource(R.string.editor_action_redo),
                             tint = if (canRedo) Color.White else Color.White.copy(alpha = 0.4f),
                         )
                     }
                 }
                 // Export / save
-                TextTooltip("Export to gallery") {
+                TextTooltip(stringResource(R.string.editor_tooltip_export_gallery)) {
                     PressIconButton(onClick = onExport, enabled = canExport) {
                         if (exporting) {
+                            val exportingDesc = stringResource(R.string.editor_exporting)
                             CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White,
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .semantics { contentDescription = exportingDesc },
+                                strokeWidth = 2.dp, color = Color.White,
                             )
                         } else {
                             Icon(
-                                SpectraIcons.Presets, contentDescription = "Export to gallery",
+                                SpectraIcons.Presets, contentDescription = stringResource(R.string.editor_action_export),
                                 tint = if (canExport) Color.White else Color.White.copy(alpha = 0.4f),
                             )
                         }
                     }
                 }
-                TextTooltip("Settings") {
+                TextTooltip(stringResource(R.string.editor_action_settings)) {
                     PressIconButton(onClick = onOpenSettings) {
-                        Icon(SpectraIcons.Settings, contentDescription = "Settings", tint = Color.White)
+                        Icon(SpectraIcons.Settings, contentDescription = stringResource(R.string.editor_action_settings), tint = Color.White)
                     }
                 }
-                TextTooltip("About") {
+                TextTooltip(stringResource(R.string.editor_action_about)) {
                     PressIconButton(onClick = onOpenAbout) {
-                        Icon(SpectraIcons.Help, contentDescription = "About", tint = Color.White)
+                        Icon(SpectraIcons.Help, contentDescription = stringResource(R.string.editor_action_about), tint = Color.White)
                     }
                 }
             }
@@ -4199,12 +4316,37 @@ class MainActivity : ComponentActivity() {
         roiOverlay: RoiOverlay?,
         onRoiSettled: (RoiRect) -> Unit,
         onRoiCleared: () -> Unit,
+        controlsBottomInset: Dp = 0.dp,
     ) {
+        // Accessibility: the canvas gestures (pinch/double-tap zoom, drag to inspect a region,
+        // tap to open the 100% grain magnifier) have no widget of their own, so the region is
+        // described and the tap-to-pick gesture gets a custom action at the frame centre. The
+        // ROI drag is bound to the live zoom state inside ZoomableImage and has no safe
+        // one-shot equivalent, so it is described only. Semantics-only: no gesture changes.
+        val previewDesc = when {
+            preview == null -> stringResource(R.string.editor_preview_desc_empty)
+            compareMode -> stringResource(R.string.editor_preview_desc_compare)
+            else -> stringResource(R.string.editor_preview_desc_film)
+        }
+        val previewActions = if (preview != null && !compareMode) {
+            listOf(
+                CustomAccessibilityAction(stringResource(R.string.editor_preview_action_magnifier)) {
+                    onPointPicked(0.5f, 0.5f)
+                    true
+                },
+            )
+        } else {
+            emptyList()
+        }
         Box(
             Modifier
                 .fillMaxSize()
                 .background(SpectraIcons.nearBlackCanvas)
-                .padding(horizontal = 16.dp),
+                .padding(horizontal = 16.dp)
+                .semantics {
+                    contentDescription = previewDesc
+                    customActions = previewActions
+                },
             contentAlignment = Alignment.Center,
         ) {
             val bmp = preview
@@ -4226,6 +4368,7 @@ class MainActivity : ComponentActivity() {
                     lut = gpuLut!!,
                     exposureGain = gpuGain,
                     modifier = Modifier.fillMaxSize(),
+                    controlsBottomInset = controlsBottomInset,
                     onPointPicked = onPointPicked,
                     onZoomStart = { gpuZoomHandoff = true; gpuZoomInitial = 1f },
                     onZoomIn = { gpuZoomHandoff = true; gpuZoomInitial = 2f },
@@ -4248,8 +4391,9 @@ class MainActivity : ComponentActivity() {
                     // Returning to fit also re-arms the GPU fit surface.
                     onRoiCleared = { onRoiCleared(); gpuZoomHandoff = false },
                     roiOverlay = roiOverlay,
+                    controlsBottomInset = controlsBottomInset,
                 )
-                else -> Text("No preview yet", color = Color.White.copy(alpha = 0.7f))
+                else -> Text(stringResource(R.string.editor_preview_none), color = Color.White.copy(alpha = 0.7f))
             }
 
             // Compact translucent histogram overlaid at the TOP EDGE of the preview
@@ -4285,30 +4429,30 @@ class MainActivity : ComponentActivity() {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextTooltip("Histogram") {
-                    CircleScrimButton(onClick = onToggleHistogram, active = showHistogram) {
+                TextTooltip(stringResource(R.string.editor_histogram)) {
+                    CircleScrimButton(onClick = onToggleHistogram, active = showHistogram, toggle = true) {
                         Icon(
-                            SpectraIcons.Histogram, contentDescription = "Toggle histogram",
+                            SpectraIcons.Histogram, contentDescription = stringResource(R.string.editor_toggle_histogram),
                             tint = Color.White,
                         )
                     }
                 }
-                TextTooltip("Before / after compare") {
-                    CircleScrimButton(onClick = onToggleCompare, active = compareMode) {
+                TextTooltip(stringResource(R.string.editor_compare)) {
+                    CircleScrimButton(onClick = onToggleCompare, active = compareMode, toggle = true) {
                         Icon(
-                            SpectraIcons.Display, contentDescription = "Before / after compare",
+                            SpectraIcons.Display, contentDescription = stringResource(R.string.editor_compare),
                             tint = Color.White,
                         )
                     }
                 }
-                TextTooltip("Crop & transform") {
+                TextTooltip(stringResource(R.string.editor_crop_transform_tooltip)) {
                     CircleScrimButton(onClick = onEditCrop) {
-                        Icon(SpectraIcons.Crop, contentDescription = "Crop and transform", tint = Color.White)
+                        Icon(SpectraIcons.Crop, contentDescription = stringResource(R.string.editor_crop_transform), tint = Color.White)
                     }
                 }
-                TextTooltip("Rotate 90°") {
+                TextTooltip(stringResource(R.string.editor_rotate_90)) {
                     CircleScrimButton(onClick = onRotate) {
-                        Icon(SpectraIcons.Rotate, contentDescription = "Rotate 90°", tint = Color.White)
+                        Icon(SpectraIcons.Rotate, contentDescription = stringResource(R.string.editor_rotate_90), tint = Color.White)
                     }
                 }
             }
@@ -4333,9 +4477,9 @@ class MainActivity : ComponentActivity() {
     ) {
         // Derive a single status from the priority chain.
         val pillState: PillState = when {
-            exporting -> PillState.Busy("Exporting…")
-            decoding  -> PillState.Busy("Decoding…")
-            rendering -> PillState.Busy("Rendering…")
+            exporting -> PillState.Busy(stringResource(R.string.editor_exporting))
+            decoding  -> PillState.Busy(stringResource(R.string.editor_decoding))
+            rendering -> PillState.Busy(stringResource(R.string.editor_rendering))
             renderErr != null -> PillState.Error(renderErr)
             lastRenderMs != null -> PillState.Done(lastRenderMs)
             else -> PillState.Hidden
@@ -4359,8 +4503,8 @@ class MainActivity : ComponentActivity() {
 
         val pillDesc = when (pillState) {
             is PillState.Busy  -> pillState.label
-            is PillState.Error -> "Render error: ${pillState.message}"
-            is PillState.Done  -> "Rendered in ${pillState.ms} ms"
+            is PillState.Error -> stringResource(R.string.editor_pill_render_error, pillState.message)
+            is PillState.Done  -> stringResource(R.string.editor_pill_rendered_in, pillState.ms)
             PillState.Hidden   -> ""
         }
 
@@ -4376,7 +4520,11 @@ class MainActivity : ComponentActivity() {
                 contentColor = Color.White,
                 modifier = Modifier
                     .wrapContentSize()
-                    .semantics { contentDescription = pillDesc },
+                    // One merged node: the spinner + text read as a single polite live status.
+                    .semantics(mergeDescendants = true) {
+                        contentDescription = pillDesc
+                        liveRegion = LiveRegionMode.Polite
+                    },
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
@@ -4398,7 +4546,7 @@ class MainActivity : ComponentActivity() {
                         }
                         is PillState.Error -> {
                             Text(
-                                "Error: ${pillState.message}",
+                                stringResource(R.string.editor_pill_error, pillState.message),
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.errorContainer,
                                 maxLines = 1,
@@ -4407,7 +4555,7 @@ class MainActivity : ComponentActivity() {
                         }
                         is PillState.Done -> {
                             Text(
-                                "Rendered in ${pillState.ms} ms",
+                                stringResource(R.string.editor_pill_rendered_in_text, pillState.ms),
                                 fontSize = 12.sp,
                                 color = Color.White.copy(alpha = 0.85f),
                             )
@@ -4427,15 +4575,20 @@ class MainActivity : ComponentActivity() {
         data object Hidden : PillState
     }
 
-    /** 40dp circular control over a ~35% scrim. */
+    /**
+     * 40dp circular control over a ~35% scrim. [toggle] marks a two-state control so the
+     * [active] tint (otherwise colour-only) is also announced as "On"/"Off".
+     */
     @Composable
     private fun CircleScrimButton(
         onClick: () -> Unit,
         active: Boolean = false,
+        toggle: Boolean = false,
         content: @Composable () -> Unit,
     ) {
         val interaction = remember { MutableInteractionSource() }
         val pressed by interaction.collectIsPressedAsState()
+        val stateLabel = stringResource(if (active) R.string.editor_state_on else R.string.editor_state_off)
         Box(
             Modifier
                 .size(40.dp)
@@ -4447,7 +4600,13 @@ class MainActivity : ComponentActivity() {
                 ),
             contentAlignment = Alignment.Center,
         ) {
-            IconButton(onClick = onClick, interactionSource = interaction) { content() }
+            IconButton(
+                onClick = onClick,
+                interactionSource = interaction,
+                modifier = Modifier.semantics {
+                    if (toggle) stateDescription = stateLabel
+                },
+            ) { content() }
         }
     }
 
@@ -4495,29 +4654,44 @@ class MainActivity : ComponentActivity() {
     private fun AdjustmentPanel(
         category: Category?,
         onDismiss: () -> Unit,
+        modifier: Modifier = Modifier,
         content: @Composable ColumnScope.() -> Unit,
     ) {
         val maxH = (localConfigurationHeightDp() * 0.38f).dp
+        val title = category?.let { stringResource(it.labelRes) } ?: ""
+        val panelTitle = stringResource(R.string.editor_panel_title, title)
+        val closeLabel = stringResource(R.string.editor_close_panel_named, title)
+        val closeAction = stringResource(R.string.editor_close)
         Surface(
             tonalElevation = 3.dp,
             shadowElevation = 8.dp,
             color = MaterialTheme.colorScheme.surface,
             shape = RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = modifier
+                .fillMaxWidth()
+                .semantics { paneTitle = panelTitle },
         ) {
             Column(
                 Modifier
                     .fillMaxWidth()
                     .heightIn(max = maxH),
             ) {
-                // drag-handle header: swipe DOWN to dismiss; tap to dismiss too.
+                // drag-handle header: swipe DOWN to dismiss. The drag has no accessible
+                // equivalent, so the header is also exposed as a "Close <category> panel"
+                // button via a semantics-only click action (touch behaviour unchanged).
                 Box(
                     Modifier
                         .fillMaxWidth()
+                        .heightIn(min = 48.dp) // #181: it is a button for TalkBack; 46dp natural
                         .pointerInput(category) {
                             detectVerticalDragGestures { _, dragAmount ->
                                 if (dragAmount > 18f) onDismiss()
                             }
+                        }
+                        .semantics(mergeDescendants = true) {
+                            role = Role.Button
+                            contentDescription = closeLabel
+                            onClick(label = closeAction) { onDismiss(); true }
                         },
                     contentAlignment = Alignment.Center,
                 ) {
@@ -4530,7 +4704,7 @@ class MainActivity : ComponentActivity() {
                                 .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)),
                         )
                         Text(
-                            category?.label ?: "",
+                            title,
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(vertical = 6.dp),
@@ -4541,6 +4715,64 @@ class MainActivity : ComponentActivity() {
                     Modifier
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp)
+                        .padding(bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    content = content,
+                )
+            }
+        }
+    }
+
+    /**
+     * Wide-layout counterpart of [AdjustmentPanel]: the same [content], docked as a fixed-width
+     * side column beside the preview instead of floating over it. No height cap (the column
+     * scrolls) and a plain title + close button instead of the drag handle.
+     */
+    @Composable
+    private fun SidePanel(
+        category: Category,
+        onDismiss: () -> Unit,
+        content: @Composable ColumnScope.() -> Unit,
+    ) {
+        val title = stringResource(category.labelRes)
+        val panelTitle = stringResource(R.string.editor_panel_title, title)
+        val closeLabel = stringResource(R.string.editor_close_panel_named, title)
+        Surface(
+            tonalElevation = 3.dp,
+            color = MaterialTheme.colorScheme.surface,
+            modifier = Modifier
+                .width(360.dp)
+                .fillMaxHeight()
+                .semantics { paneTitle = panelTitle },
+        ) {
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 4.dp, top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier
+                            .weight(1f)
+                            .semantics { heading() },
+                    )
+                    TextTooltip(stringResource(R.string.editor_close_panel)) {
+                        IconButton(onClick = onDismiss) {
+                            Icon(SpectraIcons.Cancel, contentDescription = closeLabel)
+                        }
+                    }
+                }
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState())
+                        .navigationBarsPadding()
                         .padding(horizontal = 16.dp)
                         .padding(bottom = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -4576,7 +4808,8 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier
                     .fillMaxWidth()
                     .navigationBarsPadding()
-                    .padding(vertical = 6.dp),
+                    .padding(vertical = 6.dp)
+                    .selectableGroup(),
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) {
@@ -4600,6 +4833,9 @@ class MainActivity : ComponentActivity() {
         val accent = MaterialTheme.colorScheme.primary
         val interaction = remember { MutableInteractionSource() }
         val pressed by interaction.collectIsPressedAsState()
+        // Local copy: inside `semantics {}` the receiver's `selected` property would shadow
+        // the parameter.
+        val isSelected = selected
         TextTooltip(categoryHint(category)) {
         Column(
             Modifier
@@ -4608,18 +4844,24 @@ class MainActivity : ComponentActivity() {
                 .clip(RoundedCornerShape(12.dp))
                 .background(if (selected) accent.copy(alpha = 0.18f) else Color.Transparent)
                 .clickableNoRipple(interaction, onClick)
+                // One tab node: icon + label merged, selection exposed (not colour-only).
+                .semantics(mergeDescendants = true) {
+                    role = Role.Tab
+                    this.selected = isSelected
+                }
                 .padding(vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Icon(
                 imageVector = categoryIcon(category),
-                contentDescription = category.label,
+                // Decorative: the visible label text below carries the name.
+                contentDescription = null,
                 tint = if (selected) accent else Color.White.copy(alpha = 0.78f),
                 modifier = Modifier.size(24.dp),
             )
             Text(
-                category.label,
+                stringResource(category.labelRes),
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -4638,22 +4880,25 @@ class MainActivity : ComponentActivity() {
     }
 
     /** One-line tooltip description for each editor category. */
-    private fun categoryHint(c: Category) = when (c) {
-        Category.SOURCE -> "Pick a photo / RAW, demo image, histogram & reset edits"
-        Category.PRESETS -> "Built-in looks and your saved presets; import/export & LUT"
-        Category.SIMULATION -> "Film stock, print paper, exposure & auto-exposure metering"
-        Category.INPUT -> "Input colour space, spectral upsampling, filters, crop & upscale"
-        Category.RAW_WB -> "White balance — eyedropper + warmth/tint (all sources), and RAW Kelvin"
-        Category.GRAIN -> "Film grain structure, size and blur"
-        Category.HALATION -> "Halation glow and in-emulsion light scatter"
-        Category.GLARE -> "Print glare (stochastic; off by default)"
-        Category.COUPLERS -> "Film color character — DIR couplers (chemical color crosstalk). Plain saturation lives in Output."
-        Category.PREFLASH -> "Enlarger pre-flash exposure and filtration"
-        Category.EXPERIMENTAL -> "Film and print density-curve gamma factors"
-        Category.TONE_CURVE -> "Point tone curve on the final RGB — master + per-channel"
-        Category.MASKS -> "Local adjustments — limit Exposure/Saturation/Contrast to a radial area"
-        Category.DISPLAY -> "Output colour space, CCTF encoding and preview size"
-    }
+    @Composable
+    private fun categoryHint(c: Category) = stringResource(
+        when (c) {
+            Category.SOURCE -> R.string.editor_hint_source
+            Category.PRESETS -> R.string.editor_hint_presets
+            Category.SIMULATION -> R.string.editor_hint_simulation
+            Category.INPUT -> R.string.editor_hint_input
+            Category.RAW_WB -> R.string.editor_hint_raw_wb
+            Category.GRAIN -> R.string.editor_hint_grain
+            Category.HALATION -> R.string.editor_hint_halation
+            Category.GLARE -> R.string.editor_hint_glare
+            Category.COUPLERS -> R.string.editor_hint_couplers
+            Category.PREFLASH -> R.string.editor_hint_preflash
+            Category.EXPERIMENTAL -> R.string.editor_hint_experimental
+            Category.TONE_CURVE -> R.string.editor_hint_tone_curve
+            Category.MASKS -> R.string.editor_hint_masks
+            Category.DISPLAY -> R.string.editor_hint_display
+        },
+    )
 
     private fun categoryIcon(c: Category) = when (c) {
         Category.SIMULATION -> SpectraIcons.Simulation
@@ -4700,13 +4945,17 @@ class MainActivity : ComponentActivity() {
         bakingLut: Boolean,
     ) {
         if (builtInGroups.isNotEmpty()) {
-            Text("Built-in looks", style = MaterialTheme.typography.titleSmall)
+            Text(
+                stringResource(R.string.editor_preset_builtin_heading),
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.semantics { heading() },
+            )
             var selectedBuiltIn by remember {
                 mutableStateOf(builtInGroups.values.firstOrNull()?.firstOrNull()?.id ?: "")
             }
             val all = remember(builtInGroups) { builtInGroups.values.flatten() }
             GroupedDropdown(
-                label = "Built-in preset",
+                label = stringResource(R.string.editor_preset_builtin_label),
                 selectedId = selectedBuiltIn,
                 groups = builtInGroups.map { (g, ps) ->
                     DropdownGroup(g, ps.map { DropdownOption(it.id, it.name) })
@@ -4725,22 +4974,26 @@ class MainActivity : ComponentActivity() {
                 onClick = { current?.let(onApplyBuiltIn) },
                 enabled = current != null,
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Apply built-in preset") }
+            ) { Text(stringResource(R.string.editor_preset_apply_builtin)) }
             Divider()
-            Text("Your presets", style = MaterialTheme.typography.titleSmall)
+            Text(
+                stringResource(R.string.editor_preset_yours_heading),
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.semantics { heading() },
+            )
         }
 
         // Lightroom-style preset amount: cross-fade the last-applied preset against the
         // look that preceded it. Shown only once a preset has been applied this session.
         if (amountEnabled) {
             EnhancedSlider(
-                label = "Preset amount",
+                label = stringResource(R.string.editor_preset_amount),
                 value = amount * 100f,
                 range = 0f..100f,
                 step = 1f,
                 decimals = 0,
                 default = 100f,
-                tooltip = "Mix the applied preset over the previous look (0% = before, 100% = full).",
+                tooltip = stringResource(R.string.editor_preset_amount_tooltip),
                 onValueChange = { onAmountChange((it / 100f).coerceIn(0f, 1f)) },
             )
             Divider()
@@ -4748,47 +5001,47 @@ class MainActivity : ComponentActivity() {
 
         OutlinedTextField(
             value = name, onValueChange = onNameChange,
-            label = { Text("Preset name") }, singleLine = true,
+            label = { Text(stringResource(R.string.editor_preset_name)) }, singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        Button(onClick = onSave, modifier = Modifier.fillMaxWidth()) { Text("Save current as preset") }
+        Button(onClick = onSave, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.editor_preset_save)) }
         if (presets.isNotEmpty()) {
             Dropdown(
-                label = "Saved presets",
+                label = stringResource(R.string.editor_preset_saved),
                 selected = selected.ifEmpty { presets.first() },
                 options = presets,
                 display = { it },
                 onSelect = onSelect,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onApply, modifier = Modifier.weight(1f)) { Text("Apply") }
-                OutlinedButton(onClick = onDelete, modifier = Modifier.weight(1f)) { Text("Delete") }
+                Button(onClick = onApply, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_preset_apply)) }
+                OutlinedButton(onClick = onDelete, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_preset_delete)) }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) { Text("Import .json") }
-            OutlinedButton(onClick = onExport, modifier = Modifier.weight(1f)) { Text("Export / share") }
+            OutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_preset_import_json)) }
+            OutlinedButton(onClick = onExport, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_preset_export_share)) }
         }
         // Copy the current edit and paste it onto another image (session clipboard).
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onCopySettings, modifier = Modifier.weight(1f)) { Text("Copy settings") }
+            OutlinedButton(onClick = onCopySettings, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_preset_copy_settings)) }
             OutlinedButton(
                 onClick = onPasteSettings,
                 enabled = canPasteSettings,
                 modifier = Modifier.weight(1f),
-            ) { Text("Paste settings") }
+            ) { Text(stringResource(R.string.editor_preset_paste_settings)) }
         }
         Divider()
         var lutSize by remember { mutableIntStateOf(33) }
         var lutClf by remember { mutableStateOf(false) }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Size", style = MaterialTheme.typography.bodySmall)
+            Text(stringResource(R.string.editor_lut_size), style = MaterialTheme.typography.bodySmall)
             listOf(17, 33, 65).forEach { sz ->
                 FilterChip(selected = lutSize == sz, onClick = { lutSize = sz }, label = { Text("$sz³") })
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Format", style = MaterialTheme.typography.bodySmall)
+            Text(stringResource(R.string.editor_lut_format), style = MaterialTheme.typography.bodySmall)
             FilterChip(selected = !lutClf, onClick = { lutClf = false }, label = { Text(".cube") })
             FilterChip(selected = lutClf, onClick = { lutClf = true }, label = { Text(".clf") })
         }
@@ -4803,16 +5056,13 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.onPrimary,
                 )
                 Spacer(Modifier.width(10.dp))
-                Text("Baking LUT…")
+                Text(stringResource(R.string.editor_lut_baking))
             } else {
-                Text("Export LUT (${if (lutClf) ".clf" else ".cube"}, $lutSize³)")
+                Text(stringResource(R.string.editor_lut_export, if (lutClf) ".clf" else ".cube", lutSize))
             }
         }
         Text(
-            "Bakes the current film + print look into a 3D LUT. .cube imports into most apps; " +
-                ".clf (Common LUT Format) imports into DaVinci Resolve / OpenColorIO 2.3+. Spatial/" +
-                "stochastic effects (grain, halation, diffusion, glare) can't be captured in a 3D LUT " +
-                "and are omitted from the bake.",
+            stringResource(R.string.editor_lut_explainer),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -4832,49 +5082,49 @@ class MainActivity : ComponentActivity() {
         onUseDemo: () -> Unit,
         onResetEdits: () -> Unit,
     ) {
-        Text("Source: $sourceName", style = MaterialTheme.typography.bodySmall)
+        Text(stringResource(R.string.editor_source_label, sourceName), style = MaterialTheme.typography.bodySmall)
         Text(status, style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
         if (needsAuthorization) {
             Button(onClick = onReauthorize, modifier = Modifier.fillMaxWidth()) {
-                Text("Choose source again")
+                Text(stringResource(R.string.editor_source_choose_again))
             }
             Text(
-                "The previous permission expired, was revoked, or the file moved. Your recipe is kept.",
+                stringResource(R.string.editor_source_permission_expired),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = onPickPhoto, modifier = Modifier.weight(1f)) { Text("Pick photo") }
-            Button(onClick = onOpenRaw, modifier = Modifier.weight(1f)) { Text("Open RAW/DNG") }
+            Button(onClick = onPickPhoto, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_source_pick_photo)) }
+            Button(onClick = onOpenRaw, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_source_open_raw)) }
         }
-        OutlinedButton(onClick = onUseDemo, modifier = Modifier.fillMaxWidth()) { Text("Use demo image") }
+        OutlinedButton(onClick = onUseDemo, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.editor_source_use_demo)) }
 
         FilterChip(
             selected = showHistogram,
             onClick = onToggleHistogram,
-            label = { Text("Histogram") },
+            label = { Text(stringResource(R.string.editor_histogram)) },
         )
         Text(
-            "Shows a live RGB histogram over the top of the preview.",
+            stringResource(R.string.editor_source_histogram_help),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         if (hasRecipe) {
             Text(
-                "Edits auto-saved for this image (original never modified).",
+                stringResource(R.string.editor_source_autosaved),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             OutlinedButton(onClick = onResetEdits, modifier = Modifier.fillMaxWidth()) {
-                Text("Reset edits / clear recipe")
+                Text(stringResource(R.string.editor_source_reset_edits))
             }
         }
         Text(
-            "Tip: pinch to zoom · double-tap for 2x · tap a point for a 100% grain crop · " +
-                "use the rotate button under the preview to rotate the image (preview + export).",
+            stringResource(R.string.editor_source_tip),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -4908,28 +5158,33 @@ class MainActivity : ComponentActivity() {
             ) {
                 if (!done) {
                     CircularProgressIndicator(color = Color.White)
-                    Button(onClick = onCancel) { Text("Cancel export") }
+                    Button(onClick = onCancel) { Text(stringResource(R.string.editor_export_cancel)) }
                     Text(
-                        "Rendering at full resolution…",
+                        stringResource(R.string.editor_export_rendering),
                         color = Color.White,
                         style = MaterialTheme.typography.titleMedium,
                         textAlign = TextAlign.Center,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                     )
                 } else {
                     Text(
-                        "Saved to gallery",
+                        stringResource(R.string.editor_export_saved),
                         color = Color.White,
                         style = MaterialTheme.typography.titleLarge,
                         textAlign = TextAlign.Center,
+                        modifier = Modifier.semantics {
+                            heading()
+                            liveRegion = LiveRegionMode.Polite
+                        },
                     )
                     Text(
                         "Pictures/Spektrafilm",
                         color = Color.White.copy(alpha = 0.8f),
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    Button(onClick = onDismiss) { Text("View result") }
+                    Button(onClick = onDismiss) { Text(stringResource(R.string.editor_export_view_result)) }
                     if (onShare != null) {
-                        Button(onClick = onShare) { Text("Share") }
+                        Button(onClick = onShare) { Text(stringResource(R.string.editor_export_share)) }
                     }
                 }
             }
@@ -4943,72 +5198,78 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun InputSection(s: ParamsState, onEditCrop: () -> Unit, onPickNeutral: () -> Unit = {}) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Input", expanded, { expanded = it }) {
+        SectionCard(stringResource(R.string.editor_input_title), expanded, { expanded = it }) {
             // Honesty: the engine's input space is fixed to linear ProPhoto RGB (the
             // runtime InputColorSpace enum has a single value). RAW imports are decoded
             // ACES2065-1 -> ProPhoto and photos are converted sRGB -> ProPhoto before the
             // engine, so this selector is retained for presets/forward-compat but does not
             // change the render. Other input spaces are the deferred input-gamut work.
-            GatedBlock("The engine renders every input as linear ProPhoto RGB — other input color spaces aren't wired yet.") {
-                Dropdown("Input color space", s.inputColorSpace, INPUT_COLOR_SPACES, { it },
+            GatedBlock(stringResource(R.string.editor_input_gated_colorspace)) {
+                Dropdown(stringResource(R.string.editor_input_color_space), s.inputColorSpace, INPUT_COLOR_SPACES, { it },
                     { s.inputColorSpace = it })
             }
-            SwitchRow("Apply CCTF decoding", s.inputCctfDecoding, { s.inputCctfDecoding = it },
-                "Apply the inverse cctf transfer function of the color space")
+            SwitchRow(stringResource(R.string.editor_input_cctf), s.inputCctfDecoding, { s.inputCctfDecoding = it },
+                stringResource(R.string.editor_input_cctf_tooltip))
             // Honesty: the engine only implements HANATOS2025 (filming.expose always calls
             // rgb_to_raw_hanatos2025); MALLETT2019 marshals but falls back, so the choice is inert.
             Divider()
-            Text("Creative white balance", style = MaterialTheme.typography.labelLarge)
             Text(
-                "A warm/cool + green/magenta grade on the image going into the film — works on every " +
-                    "source (RAW, JPEG, HEIC). Separate from the RAW white balance; 0 = off.",
+                stringResource(R.string.editor_input_creative_wb_heading),
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.semantics { heading() },
+            )
+            Text(
+                stringResource(R.string.editor_input_creative_wb_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            EnhancedSlider("Creative warmth", s.creativeWbTemp, -100f..100f, { s.creativeWbTemp = it },
+            EnhancedSlider(stringResource(R.string.editor_input_creative_warmth), s.creativeWbTemp, -100f..100f, { s.creativeWbTemp = it },
                 step = 1f, decimals = 0,
-                tooltip = "Warm/cool the scene before the film sees it (Bradford adaptation in linear " +
-                    "ProPhoto). Positive = warmer. 0 = no change.", default = 0f)
-            EnhancedSlider("Creative tint", s.creativeWbTint, -100f..100f, { s.creativeWbTint = it },
+                tooltip = stringResource(R.string.editor_input_creative_warmth_tooltip), default = 0f)
+            EnhancedSlider(stringResource(R.string.editor_input_creative_tint), s.creativeWbTint, -100f..100f, { s.creativeWbTint = it },
                 step = 1f, decimals = 0,
-                tooltip = "Green ↔ magenta shift. Positive = magenta, negative = green. 0 = no change.",
+                tooltip = stringResource(R.string.editor_input_creative_tint_tooltip),
                 default = 0f)
             OutlinedButton(onClick = onPickNeutral, modifier = Modifier.fillMaxWidth()) {
-                Text("Eyedropper — tap a neutral to set white balance")
+                Text(stringResource(R.string.editor_wb_eyedropper))
             }
             Divider()
-            GatedBlock("MALLETT2019 isn't implemented yet — both options currently render as HANATOS2025.") {
-                Dropdown("Spectral upsampling", s.spectralUpsampling, Rgb2Raw.entries.toList(),
+            GatedBlock(stringResource(R.string.editor_input_gated_upsampling)) {
+                Dropdown(stringResource(R.string.editor_input_spectral_upsampling), s.spectralUpsampling, Rgb2Raw.entries.toList(),
                     { it.name.lowercase() }, { s.spectralUpsampling = it })
             }
-            SwitchRow("hanatos2025 adaptation window", s.adaptationWindow, { s.adaptationWindow = it },
-                "Apply the hanatos2025 bandpass adaptation window when reconstructing spectra.")
-            SwitchRow("hanatos2025 adaptation surface", s.adaptationSurface, { s.adaptationSurface = it },
-                "Apply the hanatos2025 surface adaptation polynomial when reconstructing spectra.")
-            EnhancedSlider("Spectral gaussian blur", s.spectralGaussianBlur, OperationalParamLimits.SPECTRAL_GAUSSIAN_BLUR,
+            SwitchRow(stringResource(R.string.editor_input_adaptation_window), s.adaptationWindow, { s.adaptationWindow = it },
+                stringResource(R.string.editor_input_adaptation_window_tooltip))
+            SwitchRow(stringResource(R.string.editor_input_adaptation_surface), s.adaptationSurface, { s.adaptationSurface = it },
+                stringResource(R.string.editor_input_adaptation_surface_tooltip))
+            EnhancedSlider(stringResource(R.string.editor_input_spectral_blur), s.spectralGaussianBlur, OperationalParamLimits.SPECTRAL_GAUSSIAN_BLUR,
                 { s.spectralGaussianBlur = it }, step = 0.1f, decimals = 1,
-                tooltip = "Gaussian blur sigma applied to the reconstructed spectra (spectral-axis " +
-                    "samples; each sample is 5 nm). 0 = off.", default = PARAM_DEFAULTS.spectralGaussianBlur)
-            TripleSlider("UV filter", s.filterUv, 0f..800f, { s.filterUv = it }, step = 1f, decimals = 0,
-                tooltip = "Filter UV light (amplitude, wavelength cutoff nm, sigma nm).",
+                tooltip = stringResource(R.string.editor_input_spectral_blur_tooltip),
+                default = PARAM_DEFAULTS.spectralGaussianBlur)
+            TripleSlider(stringResource(R.string.editor_input_uv_filter), s.filterUv, 0f..800f, { s.filterUv = it },
+                step = 1f, decimals = 0,
+                tooltip = stringResource(R.string.editor_input_uv_filter_tooltip),
                 componentLabels = Triple("amp", "λ", "σ"), default = PARAM_DEFAULTS.filterUv)
-            TripleSlider("IR filter", s.filterIr, 0f..800f, { s.filterIr = it }, step = 1f, decimals = 0,
-                tooltip = "Filter IR light (amplitude, wavelength cutoff nm, sigma nm).",
+            TripleSlider(stringResource(R.string.editor_input_ir_filter), s.filterIr, 0f..800f, { s.filterIr = it },
+                step = 1f, decimals = 0,
+                tooltip = stringResource(R.string.editor_input_ir_filter_tooltip),
                 componentLabels = Triple("amp", "λ", "σ"), default = PARAM_DEFAULTS.filterIr)
-            EnhancedSlider("Upscale factor", s.upscaleFactor, OperationalParamLimits.UPSCALE_FACTOR, { s.upscaleFactor = it },
-                step = 0.5f, decimals = 1, tooltip = "Scale image size up to increase resolution", default = PARAM_DEFAULTS.upscaleFactor)
+            EnhancedSlider(stringResource(R.string.editor_input_upscale), s.upscaleFactor, OperationalParamLimits.UPSCALE_FACTOR, { s.upscaleFactor = it },
+                step = 0.5f, decimals = 1,
+                tooltip = stringResource(R.string.editor_input_upscale_tooltip),
+                default = PARAM_DEFAULTS.upscaleFactor)
             // Crop is now an interactive overlay (see the crop button under the
             // preview). Upscale stays a slider: it is a resolution multiplier, not
             // part of the crop rectangle, so it does not fit the crop metaphor.
             Divider()
             Text(
-                if (s.crop) "Crop: enabled (use the crop tool to adjust)"
-                else "Crop: off (full frame)",
+                if (s.crop) stringResource(R.string.editor_input_crop_enabled)
+                else stringResource(R.string.editor_input_crop_off),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onEditCrop, modifier = Modifier.weight(1f)) { Text("Edit crop") }
+                Button(onClick = onEditCrop, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.editor_input_edit_crop)) }
                 if (s.crop) {
                     OutlinedButton(
                         onClick = {
@@ -5016,7 +5277,7 @@ class MainActivity : ComponentActivity() {
                             s.cropCenter = 0.5f to 0.5f
                             s.cropSize = 0.1f to 0.1f
                         },
-                    ) { Text("Clear") }
+                    ) { Text(stringResource(R.string.editor_input_clear_crop)) }
                 }
             }
             // Granular reset scope (Lightroom-style): restore just crop + upscale to
@@ -5031,7 +5292,7 @@ class MainActivity : ComponentActivity() {
                         s.upscaleFactor = PARAM_DEFAULTS.upscaleFactor
                     },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Reset crop & geometry") }
+                ) { Text(stringResource(R.string.editor_input_reset_geometry)) }
             }
         }
     }
@@ -5039,25 +5300,24 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun ImportRawSection(s: ParamsState, isRaw: Boolean, onPickNeutral: () -> Unit = {}) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("White balance", expanded, { expanded = it }) {
+        SectionCard(stringResource(R.string.editor_wb_title), expanded, { expanded = it }) {
             // The eyedropper + creative warmth/tint work on EVERY source, so they're shown FIRST and
             // always — the eyedropper is the most prominent control so it's findable. The native RAW
             // camera WB (Kelvin/tint, re-decodes the file) is appended only for RAW/DNG sources.
             OutlinedButton(onClick = onPickNeutral, modifier = Modifier.fillMaxWidth()) {
-                Text("Eyedropper — tap a neutral to set white balance")
+                Text(stringResource(R.string.editor_wb_eyedropper))
             }
             Text(
-                "Tap a grey or white area in your photo and the white balance is set to neutralize it. " +
-                    "Works on every source — or use the sliders below.",
+                stringResource(R.string.editor_wb_eyedropper_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            EnhancedSlider("Warmth", s.creativeWbTemp, -100f..100f, { s.creativeWbTemp = it },
+            EnhancedSlider(stringResource(R.string.editor_wb_warmth), s.creativeWbTemp, -100f..100f, { s.creativeWbTemp = it },
                 step = 1f, decimals = 0, default = 0f,
-                tooltip = "Warm / cool the image. Positive = warmer; 0 = off. Works on every source.")
-            EnhancedSlider("Tint", s.creativeWbTint, -100f..100f, { s.creativeWbTint = it },
+                tooltip = stringResource(R.string.editor_wb_warmth_tooltip))
+            EnhancedSlider(stringResource(R.string.editor_wb_tint), s.creativeWbTint, -100f..100f, { s.creativeWbTint = it },
                 step = 1f, decimals = 0, default = 0f,
-                tooltip = "Green ↔ magenta. Positive = magenta, negative = green; 0 = off.")
+                tooltip = stringResource(R.string.editor_wb_tint_tooltip))
 
             Divider()
             // Balance to film stock (virtual 85-filter): the escape hatch for tungsten stocks, which
@@ -5066,25 +5326,21 @@ class MainActivity : ComponentActivity() {
             val ctx = LocalContext.current
             val tungsten = StockCatalog.entry(ctx, s.filmProfile)?.balance == "tungsten"
             SwitchRow(
-                "Balance to film stock",
+                stringResource(R.string.editor_wb_balance_to_stock),
                 s.balanceToFilmStock,
                 { s.balanceToFilmStock = it },
-                if (tungsten) {
-                    "This is a tungsten-balanced stock, so it renders a daylight scene blue — that's " +
-                        "authentic film behaviour. Turn this on to warm the input to the film's reference " +
-                        "light and render neutral, like an 85 filter on the lens."
-                } else {
-                    "The virtual 85 filter — warms the input to a tungsten stock's reference light so it " +
-                        "renders neutral. This stock is daylight-balanced (already neutral), so it has no " +
-                        "effect here."
-                },
+                stringResource(if (tungsten) R.string.editor_wb_balance_tungsten else R.string.editor_wb_balance_daylight),
             )
 
             if (isRaw) {
                 Divider()
-                Text("RAW camera white balance (re-decodes the file):", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    stringResource(R.string.editor_wb_raw_heading),
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.semantics { heading() },
+                )
                 val customActive = s.rawWhiteBalance == WhiteBalance.CUSTOM
-                Dropdown("Camera white balance", s.rawWhiteBalance, WhiteBalance.entries.toList(),
+                Dropdown(stringResource(R.string.editor_wb_camera), s.rawWhiteBalance, WhiteBalance.entries.toList(),
                     { it.name.lowercase() }, { s.rawWhiteBalance = it })
                 OutlinedButton(
                     onClick = {
@@ -5093,7 +5349,7 @@ class MainActivity : ComponentActivity() {
                         s.rawTint = 1f
                     },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Reset to camera / as-shot WB") }
+                ) { Text(stringResource(R.string.editor_wb_reset_as_shot)) }
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -5102,23 +5358,23 @@ class MainActivity : ComponentActivity() {
                 ) {
                     if (!customActive) {
                         Text(
-                            "Temperature and Tint are used only when \"custom\" is selected above.",
+                            stringResource(R.string.editor_wb_custom_only),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     EnhancedSlider(
-                        "Temperature (K)", s.rawTemperature, 1000f..12000f,
+                        stringResource(R.string.editor_wb_temperature), s.rawTemperature, 1000f..12000f,
                         { s.rawTemperature = it },
                         step = 100f, decimals = 0,
-                        tooltip = "Colour temperature in Kelvin for Custom white balance (1000 K – 12000 K).",
+                        tooltip = stringResource(R.string.editor_wb_temperature_tooltip),
                         default = PARAM_DEFAULTS.rawTemperature,
                     )
                     EnhancedSlider(
-                        "Tint multiplier", s.rawTint, 0f..2f,
+                        stringResource(R.string.editor_wb_tint_multiplier), s.rawTint, 0f..2f,
                         { s.rawTint = it },
                         step = 0.01f, decimals = 2,
-                        tooltip = "Green/magenta tint multiplier for Custom white balance (1.0 = neutral).",
+                        tooltip = stringResource(R.string.editor_wb_tint_multiplier_tooltip),
                         default = PARAM_DEFAULTS.rawTint,
                     )
                 }
@@ -5161,15 +5417,22 @@ class MainActivity : ComponentActivity() {
         onPrintProfileChange: (String) -> Unit,
     ) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Simulation", expanded, { expanded = it }) {
+        SectionCard(stringResource(R.string.editor_sim_title), expanded, { expanded = it }) {
             // Lightroom-style sub-tabs split this tool's four groups (Film / Print / Scanner /
             // Output) so only one shows at a time, instead of one long scroll behind dividers.
             var simTab by remember { mutableIntStateOf(0) }
-            SubTabRow(listOf("Film", "Print", "Scanner", "Output"), simTab, { simTab = it })
+            SubTabRow(
+                listOf(
+                    stringResource(R.string.editor_sim_tab_film),
+                    stringResource(R.string.editor_sim_tab_print),
+                    stringResource(R.string.editor_sim_tab_scanner),
+                    stringResource(R.string.editor_sim_tab_output),
+                ),
+                simTab, { simTab = it })
             when (simTab) {
                 0 -> {
                     GroupedDropdown(
-                        label = "Film profile",
+                        label = stringResource(R.string.editor_sim_film_profile),
                         selectedId = s.filmProfile,
                         groups = filmGroups,
                         onSelect = onFilmProfileChange,
@@ -5177,10 +5440,10 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(
                         onClick = onOpenFilmCurves,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("View film profile curves") }
-                    EnhancedSlider("Camera compensation EV", s.exposureCompensationEv, -10f..10f,
+                    ) { Text(stringResource(R.string.editor_sim_view_film_curves)) }
+                    EnhancedSlider(stringResource(R.string.editor_sim_camera_ev), s.exposureCompensationEv, -10f..10f,
                         { s.exposureCompensationEv = it }, step = 0.25f, decimals = 2, default = 0f,
-                        tooltip = "Add a bias to the auto-exposure of the camera")
+                        tooltip = stringResource(R.string.editor_sim_camera_ev_tooltip))
 
                     AutoExposureControl(
                         autoExposure = s.autoExposure,
@@ -5189,18 +5452,19 @@ class MainActivity : ComponentActivity() {
                         onAutoExposureChange = { s.autoExposure = it },
                         onMethodChange = { s.autoExposureMethod = it },
                     )
-                    EnhancedSlider("Film format mm", s.filmFormatMm, OperationalParamLimits.FILM_FORMAT_MM, { s.filmFormatMm = it },
+                    EnhancedSlider(stringResource(R.string.editor_sim_film_format), s.filmFormatMm, OperationalParamLimits.FILM_FORMAT_MM, { s.filmFormatMm = it },
                         step = 1f, decimals = 0,
-                        tooltip = "Long edge of the film format in mm (8, 16, 35, 60, 120)", default = PARAM_DEFAULTS.filmFormatMm)
-                    EnhancedSlider("Camera lens blur um", s.cameraLensBlurUm, 0f..20f, { s.cameraLensBlurUm = it },
+                        tooltip = stringResource(R.string.editor_sim_film_format_tooltip),
+                        default = PARAM_DEFAULTS.filmFormatMm)
+                    EnhancedSlider(stringResource(R.string.editor_sim_camera_lens_blur), s.cameraLensBlurUm, 0f..20f, { s.cameraLensBlurUm = it },
                         step = 0.05f, decimals = 2,
-                        tooltip = "Sigma of gaussian filter in um for the camera lens blur. " +
-                            "Spatial effect — applied only when Halation is enabled (the spatial branch).", default = PARAM_DEFAULTS.cameraLensBlurUm)
-                    DiffusionGroup("Camera diffusion filter", s.cameraDiffusionState)
+                        tooltip = stringResource(R.string.editor_sim_camera_lens_blur_tooltip),
+                        default = PARAM_DEFAULTS.cameraLensBlurUm)
+                    DiffusionGroup(stringResource(R.string.editor_sim_camera_diffusion), s.cameraDiffusionState)
                 }
                 1 -> {
                     GroupedDropdown(
-                        label = "Print profile",
+                        label = stringResource(R.string.editor_sim_print_profile),
                         selectedId = s.printProfile,
                         groups = printGroups,
                         onSelect = onPrintProfileChange,
@@ -5208,28 +5472,34 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(
                         onClick = onOpenPrintCurves,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("View print profile curves") }
-                    EnhancedSlider("Print exposure", s.printExposure, 0f..4f, { s.printExposure = it },
-                        step = 0.02f, decimals = 2, tooltip = "Changes the exposure time set in the virtual enlarger", default = PARAM_DEFAULTS.printExposure)
-                    SwitchRow("Print auto compensation", s.printExposureCompensation,
+                    ) { Text(stringResource(R.string.editor_sim_view_print_curves)) }
+                    EnhancedSlider(stringResource(R.string.editor_sim_print_exposure), s.printExposure, 0f..4f, { s.printExposure = it },
+                        step = 0.02f, decimals = 2,
+                        tooltip = stringResource(R.string.editor_sim_print_exposure_tooltip),
+                        default = PARAM_DEFAULTS.printExposure)
+                    SwitchRow(stringResource(R.string.editor_sim_print_auto_comp), s.printExposureCompensation,
                         { s.printExposureCompensation = it },
-                        "Auto adjust the print exposure for the camera exposure compensation ev")
-                    EnhancedSlider("Print Y filter shift", s.printYFilterShift, -50f..50f, { s.printYFilterShift = it },
-                        step = 1f, decimals = 0, default = 0f, tooltip = "Y filter shift from neutral, in Kodak CC units")
-                    EnhancedSlider("Print M filter shift", s.printMFilterShift, -50f..50f, { s.printMFilterShift = it },
-                        step = 1f, decimals = 0, default = 0f, tooltip = "M filter shift from neutral, in Kodak CC units")
-                    GatedBlock("Enlarger lens blur is not applicable to the enlarger stage (no engine call site).") {
-                        EnhancedSlider("Enlarger lens blur", s.enlargerLensBlur, 0f..20f, { s.enlargerLensBlur = it },
-                            step = 0.05f, decimals = 2, tooltip = "Sigma of gaussian filter for the enlarger lens blur", default = PARAM_DEFAULTS.enlargerLensBlur)
+                        stringResource(R.string.editor_sim_print_auto_comp_tooltip))
+                    EnhancedSlider(stringResource(R.string.editor_sim_print_y_shift), s.printYFilterShift, -50f..50f, { s.printYFilterShift = it },
+                        step = 1f, decimals = 0, default = 0f,
+                        tooltip = stringResource(R.string.editor_sim_print_y_shift_tooltip))
+                    EnhancedSlider(stringResource(R.string.editor_sim_print_m_shift), s.printMFilterShift, -50f..50f, { s.printMFilterShift = it },
+                        step = 1f, decimals = 0, default = 0f,
+                        tooltip = stringResource(R.string.editor_sim_print_m_shift_tooltip))
+                    GatedBlock(stringResource(R.string.editor_sim_gated_enlarger_blur)) {
+                        EnhancedSlider(stringResource(R.string.editor_sim_enlarger_lens_blur), s.enlargerLensBlur, 0f..20f, { s.enlargerLensBlur = it },
+                            step = 0.05f, decimals = 2,
+                            tooltip = stringResource(R.string.editor_sim_enlarger_lens_blur_tooltip),
+                            default = PARAM_DEFAULTS.enlargerLensBlur)
                     }
-                    DiffusionGroup("Print diffusion filter", s.printDiffusionState)
+                    DiffusionGroup(stringResource(R.string.editor_sim_print_diffusion), s.printDiffusionState)
                 }
                 2 -> {
                     val ctx = LocalContext.current
-                    EnhancedSlider("Scan lens blur", s.scanLensBlur, 0f..20f, { s.scanLensBlur = it },
+                    EnhancedSlider(stringResource(R.string.editor_sim_scan_lens_blur), s.scanLensBlur, 0f..20f, { s.scanLensBlur = it },
                         step = 0.05f, decimals = 2,
-                        tooltip = "Sigma of gaussian filter in pixel for the scanner lens blur. " +
-                            "Spatial effect — applied only when Halation is enabled (the spatial branch).", default = PARAM_DEFAULTS.scanLensBlur)
+                        tooltip = stringResource(R.string.editor_sim_scan_lens_blur_tooltip),
+                        default = PARAM_DEFAULTS.scanLensBlur)
                     // Scan white/black correction pins the scan's white/black points to the target levels
                     // below. The engine makes it a STRICT no-op in Slide mode on a negative stock (it's
                     // active only for a slide/positive film on the scan-film route, or in print mode — all
@@ -5238,9 +5508,7 @@ class MainActivity : ComponentActivity() {
                     val correctionNoOp = s.scanFilm && !StockCatalog.isReversalFilm(ctx, s.filmProfile)
                     if (correctionNoOp) {
                         Text(
-                            "Scan white/black correction has no effect in Slide mode on a negative stock — " +
-                                "it applies only to a slide/positive film, or in print mode. Matches the " +
-                                "spektrafilm engine.",
+                            stringResource(R.string.editor_sim_scan_correction_noop),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -5249,23 +5517,27 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth().alpha(if (correctionNoOp) 0.5f else 1f),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        SwitchRow("Scan white correction", s.scanWhiteCorrection, { s.scanWhiteCorrection = it },
-                            "Pin the scan's white point to the target white level below. Subtle at the " +
-                                "default 0.98 — lower the white level to see it pull the highlights down.")
-                        EnhancedSlider("Scan white level", s.scanWhiteLevel, 0f..1f, { s.scanWhiteLevel = it },
-                            step = 0.005f, decimals = 3, tooltip = "Target white level when white correction is enabled", default = PARAM_DEFAULTS.scanWhiteLevel)
-                        SwitchRow("Scan black correction", s.scanBlackCorrection, { s.scanBlackCorrection = it },
-                            "Pin the scan's black point to the target black level below. Subtle at the " +
-                                "default 0.01 — raise the black level to see it lift the shadows.")
-                        EnhancedSlider("Scan black level", s.scanBlackLevel, 0f..1f, { s.scanBlackLevel = it },
-                            step = 0.005f, decimals = 3, tooltip = "Target black level when black correction is enabled", default = PARAM_DEFAULTS.scanBlackLevel)
+                        SwitchRow(stringResource(R.string.editor_sim_scan_white_correction), s.scanWhiteCorrection, { s.scanWhiteCorrection = it },
+                            stringResource(R.string.editor_sim_scan_white_correction_tooltip))
+                        EnhancedSlider(stringResource(R.string.editor_sim_scan_white_level), s.scanWhiteLevel, 0f..1f, { s.scanWhiteLevel = it },
+                            step = 0.005f, decimals = 3,
+                            tooltip = stringResource(R.string.editor_sim_scan_white_level_tooltip),
+                            default = PARAM_DEFAULTS.scanWhiteLevel)
+                        SwitchRow(stringResource(R.string.editor_sim_scan_black_correction), s.scanBlackCorrection, { s.scanBlackCorrection = it },
+                            stringResource(R.string.editor_sim_scan_black_correction_tooltip))
+                        EnhancedSlider(stringResource(R.string.editor_sim_scan_black_level), s.scanBlackLevel, 0f..1f, { s.scanBlackLevel = it },
+                            step = 0.005f, decimals = 3,
+                            tooltip = stringResource(R.string.editor_sim_scan_black_level_tooltip),
+                            default = PARAM_DEFAULTS.scanBlackLevel)
                     }
-                    PairSlider("Scan unsharp mask", s.scanUnsharpMask, 0f..5f, { s.scanUnsharpMask = it },
-                        step = 0.05f, decimals = 2, tooltip = "[sigma in pixel, amount]",
+                    PairSlider(stringResource(R.string.editor_sim_scan_unsharp), s.scanUnsharpMask, 0f..5f, { s.scanUnsharpMask = it },
+                        step = 0.05f, decimals = 2,
+                        tooltip = stringResource(R.string.editor_sim_scan_unsharp_tooltip),
                         componentLabels = "σ" to "amt", default = PARAM_DEFAULTS.scanUnsharpMask)
                 }
                 else -> {
-                    Dropdown("Output color space", s.outputColorSpace, ColorSpace.entries.toList(),
+                    val res = LocalContext.current.resources
+                    Dropdown(stringResource(R.string.editor_sim_output_color_space), s.outputColorSpace, ColorSpace.entries.toList(),
                         { it.name }, { s.outputColorSpace = it })
                     // Opt-in gamut compression (default Off => byte-identical to the
                     // parity oracle). Output: ACES Reference Gamut Compression softens
@@ -5274,7 +5546,7 @@ class MainActivity : ComponentActivity() {
                     // spectral locus, baked into the filming reconstruction LUT, tames
                     // over-saturated input before the film responds to it.
                     Dropdown(
-                        "Output gamut compression",
+                        stringResource(R.string.editor_sim_output_gamut),
                         s.outputGamutCompress,
                         listOf(
                             OutputGamutCompress.LEGACY_CLIP,
@@ -5284,23 +5556,23 @@ class MainActivity : ComponentActivity() {
                         ),
                         {
                             when (it) {
-                                OutputGamutCompress.LEGACY_CLIP -> "Off"
-                                OutputGamutCompress.OFF -> "Off (no clip)"
-                                OutputGamutCompress.ACES_RGC -> "ACES (tame out-of-gamut)"
-                                OutputGamutCompress.OKLCH -> "Oklch (perceptual, keep hue)"
-                                OutputGamutCompress.OKLRAB -> "Oklrab (perceptual, even lightness)"
+                                OutputGamutCompress.LEGACY_CLIP -> res.getString(R.string.editor_gamut_off)
+                                OutputGamutCompress.OFF -> res.getString(R.string.editor_gamut_off_no_clip)
+                                OutputGamutCompress.ACES_RGC -> res.getString(R.string.editor_gamut_aces)
+                                OutputGamutCompress.OKLCH -> res.getString(R.string.editor_gamut_oklch)
+                                OutputGamutCompress.OKLRAB -> res.getString(R.string.editor_gamut_oklrab)
                             }
                         },
                         { s.outputGamutCompress = it },
                     )
                     Dropdown(
-                        "Input gamut compression",
+                        stringResource(R.string.editor_sim_input_gamut),
                         s.inputGamutCompress,
                         InputGamutCompress.entries.toList(),
                         {
                             when (it) {
-                                InputGamutCompress.OFF -> "Off"
-                                InputGamutCompress.XY -> "Spectral locus (tame saturated input)"
+                                InputGamutCompress.OFF -> res.getString(R.string.editor_gamut_off)
+                                InputGamutCompress.XY -> res.getString(R.string.editor_gamut_spectral_locus)
                             }
                         },
                         { s.inputGamutCompress = it },
@@ -5308,24 +5580,19 @@ class MainActivity : ComponentActivity() {
                     // Creative output grade (post-engine Oklab chroma; parity-safe). Negative
                     // Saturation mutes a too-punchy look; Vibrance boosts muted colors while
                     // sparing already-saturated ones.
-                    EnhancedSlider("Saturation", s.saturation, -100f..100f, { s.saturation = it },
+                    EnhancedSlider(stringResource(R.string.editor_sim_saturation), s.saturation, -100f..100f, { s.saturation = it },
                         step = 1f, decimals = 0, default = 0f,
-                        tooltip = "Overall colorfulness of the output. Negative = softer/more muted " +
-                            "(tame a too-punchy look); positive = more vivid. Applied after the film render.")
-                    EnhancedSlider("Vibrance", s.vibrance, -100f..100f, { s.vibrance = it },
+                        tooltip = stringResource(R.string.editor_sim_saturation_tooltip))
+                    EnhancedSlider(stringResource(R.string.editor_sim_vibrance), s.vibrance, -100f..100f, { s.vibrance = it },
                         step = 1f, decimals = 0, default = 0f,
-                        tooltip = "Like Saturation but weighted to muted colors, so already-saturated " +
-                            "tones (and skin) shift less. Applied after the film render.")
-                    EnhancedSlider("Gamut compression", s.gamutCompress, 0f..100f, { s.gamutCompress = it },
+                        tooltip = stringResource(R.string.editor_sim_vibrance_tooltip))
+                    EnhancedSlider(stringResource(R.string.editor_sim_gamut_compression), s.gamutCompress, 0f..100f, { s.gamutCompress = it },
                         step = 1f, decimals = 0, default = 0f,
-                        tooltip = "ACES-style: softens the harsh cyan/edge fringe on very saturated colors " +
-                            "by pulling them toward neutral. 0 = off. Helps when saturated highlights look unnatural.")
-                    SwitchRow("Saving CCTF encoding", s.savingCctfEncoding, { s.savingCctfEncoding = it },
-                        "Add or not the CCTF to the saved image file")
-                    SwitchRow("Slide mode (skip print)", s.scanFilm, { s.scanFilm = it },
-                        "Show the scanned film directly instead of a print — the natural view for " +
-                            "slide/reversal stocks (a positive). For negative stocks this shows the " +
-                            "raw orange negative.")
+                        tooltip = stringResource(R.string.editor_sim_gamut_compression_tooltip))
+                    SwitchRow(stringResource(R.string.editor_sim_saving_cctf), s.savingCctfEncoding, { s.savingCctfEncoding = it },
+                        stringResource(R.string.editor_sim_saving_cctf_tooltip))
+                    SwitchRow(stringResource(R.string.editor_sim_slide_mode), s.scanFilm, { s.scanFilm = it },
+                        stringResource(R.string.editor_sim_slide_mode_tooltip))
                 }
             }
         }
@@ -5336,27 +5603,35 @@ class MainActivity : ComponentActivity() {
         var expanded by remember { mutableStateOf(false) }
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SwitchRow(title, d.active, { d.active = it },
-                "Toggle the diffusion filter on this stage.")
+                stringResource(R.string.editor_diff_toggle_tooltip))
             TextButton(onClick = { expanded = !expanded }) {
-                Text(if (expanded) "Hide diffusion details" else "Show diffusion details")
+                Text(stringResource(if (expanded) R.string.editor_diff_hide_details else R.string.editor_diff_show_details))
             }
             if (expanded) {
-                Dropdown("Diffusion family", d.family, DIFFUSION_FAMILIES, { it }, { d.family = it })
-                EnhancedSlider("Diffusion strength", d.strength, 0f..2f, { d.strength = it },
-                    step = 0.125f, decimals = 3, tooltip = "Commercial filter stop: 0, 1/8, 1/4, 1/2, 1, 2.", default = PARAM_DEFAULTS.cameraDiffusionState.strength)
-                EnhancedSlider("Spatial scale", d.spatialScale, 0f..4f, { d.spatialScale = it },
-                    step = 0.1f, decimals = 2, tooltip = "Multiplier on the image-plane PSF widths.", default = PARAM_DEFAULTS.cameraDiffusionState.spatialScale)
-                EnhancedSlider("Halo warmth", d.haloWarmth, -1.5f..1.5f, { d.haloWarmth = it },
-                    step = 0.05f, decimals = 2, default = 0f, tooltip = "Additive offset on the halo warmth axis.")
-                EnhancedSlider("Core intensity", d.coreIntensity, 0f..4f, { d.coreIntensity = it },
+                Dropdown(stringResource(R.string.editor_diff_family), d.family, DIFFUSION_FAMILIES, { it }, { d.family = it })
+                EnhancedSlider(stringResource(R.string.editor_diff_strength), d.strength, 0f..2f, { d.strength = it },
+                    step = 0.125f, decimals = 3,
+                    tooltip = stringResource(R.string.editor_diff_strength_tooltip),
+                    default = PARAM_DEFAULTS.cameraDiffusionState.strength)
+                EnhancedSlider(stringResource(R.string.editor_diff_spatial_scale), d.spatialScale, 0f..4f, { d.spatialScale = it },
+                    step = 0.1f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_diff_spatial_scale_tooltip),
+                    default = PARAM_DEFAULTS.cameraDiffusionState.spatialScale)
+                EnhancedSlider(stringResource(R.string.editor_diff_halo_warmth), d.haloWarmth, -1.5f..1.5f, { d.haloWarmth = it },
+                    step = 0.05f, decimals = 2, default = 0f,
+                    tooltip = stringResource(R.string.editor_diff_halo_warmth_tooltip))
+                EnhancedSlider(stringResource(R.string.editor_diff_core_intensity), d.coreIntensity, 0f..4f, { d.coreIntensity = it },
                     step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.coreIntensity)
-                EnhancedSlider("Core size", d.coreSize, 0.1f..4f, { d.coreSize = it }, step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.coreSize)
-                EnhancedSlider("Halo intensity", d.haloIntensity, 0f..4f, { d.haloIntensity = it },
+                EnhancedSlider(stringResource(R.string.editor_diff_core_size), d.coreSize, 0.1f..4f, { d.coreSize = it },
+                    step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.coreSize)
+                EnhancedSlider(stringResource(R.string.editor_diff_halo_intensity), d.haloIntensity, 0f..4f, { d.haloIntensity = it },
                     step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.haloIntensity)
-                EnhancedSlider("Halo size", d.haloSize, 0.1f..4f, { d.haloSize = it }, step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.haloSize)
-                EnhancedSlider("Bloom intensity", d.bloomIntensity, 0f..4f, { d.bloomIntensity = it },
+                EnhancedSlider(stringResource(R.string.editor_diff_halo_size), d.haloSize, 0.1f..4f, { d.haloSize = it },
+                    step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.haloSize)
+                EnhancedSlider(stringResource(R.string.editor_diff_bloom_intensity), d.bloomIntensity, 0f..4f, { d.bloomIntensity = it },
                     step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.bloomIntensity)
-                EnhancedSlider("Bloom size", d.bloomSize, 0.1f..4f, { d.bloomSize = it }, step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.bloomSize)
+                EnhancedSlider(stringResource(R.string.editor_diff_bloom_size), d.bloomSize, 0.1f..4f, { d.bloomSize = it },
+                    step = 0.05f, decimals = 2, default = PARAM_DEFAULTS.cameraDiffusionState.bloomSize)
             }
         }
     }
@@ -5364,36 +5639,42 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun GrainSection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Grain", expanded, { expanded = it }, enabledSwitch = s.grainActive,
+        SectionCard(stringResource(R.string.editor_grain_title), expanded, { expanded = it }, enabledSwitch = s.grainActive,
             onEnabledChange = { s.grainActive = it }, help = ParamHelpText.forKey(ParamHelpText.GRAIN)) {
             var advanced by remember { mutableStateOf(false) }
             // Basic: the two knobs most users reach for — grain size (ISO) and softness.
-            EnhancedSlider("Particle area um2", s.grainParticleAreaUm2, OperationalParamLimits.GRAIN_PARTICLE_AREA_UM2, { s.grainParticleAreaUm2 = it },
-                step = 0.2f, decimals = 2, tooltip = "Area of particles in um2, relates to ISO.", default = PARAM_DEFAULTS.grainParticleAreaUm2)
-            EnhancedSlider("Blur", s.grainBlur, 0f..3f, { s.grainBlur = it }, step = 0.05f, decimals = 2,
-                tooltip = "Sigma of gaussian blur in pixels for the grain.", default = PARAM_DEFAULTS.grainBlur)
+            EnhancedSlider(stringResource(R.string.editor_grain_particle_area), s.grainParticleAreaUm2, OperationalParamLimits.GRAIN_PARTICLE_AREA_UM2, { s.grainParticleAreaUm2 = it },
+                step = 0.2f, decimals = 2,
+                tooltip = stringResource(R.string.editor_grain_particle_area_tooltip),
+                default = PARAM_DEFAULTS.grainParticleAreaUm2)
+            EnhancedSlider(stringResource(R.string.editor_grain_blur), s.grainBlur, 0f..3f, { s.grainBlur = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_grain_blur_tooltip), default = PARAM_DEFAULTS.grainBlur)
             AdvancedToggle(advanced) { advanced = it }
             if (advanced) {
-                SwitchRow("Sublayers active", s.grainSublayersActive, { s.grainSublayersActive = it })
-                TripleSlider("Particle scale", s.grainParticleScale, OperationalParamLimits.GRAIN_PARTICLE_SCALE, { s.grainParticleScale = it },
-                    step = 0.1f, decimals = 2, tooltip = "Scale of particle area for the RGB layers.",
+                SwitchRow(stringResource(R.string.editor_grain_sublayers_active), s.grainSublayersActive, { s.grainSublayersActive = it })
+                TripleSlider(stringResource(R.string.editor_grain_particle_scale), s.grainParticleScale, OperationalParamLimits.GRAIN_PARTICLE_SCALE, { s.grainParticleScale = it },
+                    step = 0.1f, decimals = 2, tooltip = stringResource(R.string.editor_grain_particle_scale_tooltip),
                     default = PARAM_DEFAULTS.grainParticleScale)
-                TripleSlider("Particle scale layers", s.grainParticleScaleLayers, OperationalParamLimits.GRAIN_PARTICLE_SCALE_LAYERS,
+                TripleSlider(stringResource(R.string.editor_grain_particle_scale_layers), s.grainParticleScaleLayers, OperationalParamLimits.GRAIN_PARTICLE_SCALE_LAYERS,
                     { s.grainParticleScaleLayers = it }, step = 0.25f, decimals = 2,
-                    tooltip = "Scale of particle area for the sublayers in each color layer.",
+                    tooltip = stringResource(R.string.editor_grain_particle_scale_layers_tooltip),
                     default = PARAM_DEFAULTS.grainParticleScaleLayers)
-                TripleSlider("Density min", s.grainDensityMin, OperationalParamLimits.GRAIN_DENSITY_MIN, { s.grainDensityMin = it },
-                    step = 0.01f, decimals = 3, tooltip = "Minimum density of the grain (0.03-0.06).",
+                TripleSlider(stringResource(R.string.editor_grain_density_min), s.grainDensityMin, OperationalParamLimits.GRAIN_DENSITY_MIN, { s.grainDensityMin = it },
+                    step = 0.01f, decimals = 3, tooltip = stringResource(R.string.editor_grain_density_min_tooltip),
                     default = PARAM_DEFAULTS.grainDensityMin)
-                TripleSlider("Uniformity", s.grainUniformity, 0.5f..1f, { s.grainUniformity = it },
-                    step = 0.005f, decimals = 3, tooltip = "Uniformity of the grain (0.94-0.98).",
+                TripleSlider(stringResource(R.string.editor_grain_uniformity), s.grainUniformity, 0.5f..1f, { s.grainUniformity = it },
+                    step = 0.005f, decimals = 3, tooltip = stringResource(R.string.editor_grain_uniformity_tooltip),
                     default = PARAM_DEFAULTS.grainUniformity)
-                EnhancedSlider("Blur dye clouds um", s.grainBlurDyeCloudsUm, 0f..5f, { s.grainBlurDyeCloudsUm = it },
-                    step = 0.1f, decimals = 2, tooltip = "Scale the sigma of gaussian blur in um for the dye clouds.", default = PARAM_DEFAULTS.grainBlurDyeCloudsUm)
-                PairSlider("Micro structure", s.grainMicroStructure, 0f..100f, { s.grainMicroStructure = it },
-                    step = 0.1f, decimals = 2, tooltip = "[sigma blur um, molecular clump size nm]",
+                EnhancedSlider(stringResource(R.string.editor_grain_blur_dye_clouds), s.grainBlurDyeCloudsUm, 0f..5f, { s.grainBlurDyeCloudsUm = it },
+                    step = 0.1f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_grain_blur_dye_clouds_tooltip),
+                    default = PARAM_DEFAULTS.grainBlurDyeCloudsUm)
+                PairSlider(stringResource(R.string.editor_grain_micro_structure), s.grainMicroStructure, 0f..100f, { s.grainMicroStructure = it },
+                    step = 0.1f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_grain_micro_structure_tooltip),
                     componentLabels = "σ" to "nm", default = PARAM_DEFAULTS.grainMicroStructure)
-                IntSlider("Sublayers", s.grainNSubLayers, OperationalParamLimits.GRAIN_SUBLAYERS, { s.grainNSubLayers = it },
+                IntSlider(stringResource(R.string.editor_grain_sublayers), s.grainNSubLayers, OperationalParamLimits.GRAIN_SUBLAYERS, { s.grainNSubLayers = it },
                     default = PARAM_DEFAULTS.grainNSubLayers)
             }
             Divider()
@@ -5414,72 +5695,89 @@ class MainActivity : ComponentActivity() {
                     s.grainNSubLayers = d.grainNSubLayers
                 },
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Reset grain to defaults") }
+            ) { Text(stringResource(R.string.editor_grain_reset)) }
         }
     }
 
     @Composable
     private fun PreflashSection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Preflash", expanded, { expanded = it }, help = ParamHelpText.forKey(ParamHelpText.PREFLASH)) {
-            EnhancedSlider("Exposure", s.preflashExposure, 0f..2f, { s.preflashExposure = it },
-                step = 0.005f, decimals = 3, tooltip = "Preflash exposure value in ev for the print", default = PARAM_DEFAULTS.preflashExposure)
-            EnhancedSlider("Y filter shift", s.preflashYFilterShift, -20f..20f, { s.preflashYFilterShift = it },
-                step = 1f, decimals = 0, default = 0f, tooltip = "Shift the Y filter from neutral for the preflash (Kodak CC)")
-            EnhancedSlider("M filter shift", s.preflashMFilterShift, -20f..20f, { s.preflashMFilterShift = it },
-                step = 1f, decimals = 0, default = 0f, tooltip = "Shift the M filter from neutral for the preflash (Kodak CC)")
+        SectionCard(stringResource(R.string.editor_preflash_title), expanded, { expanded = it }, help = ParamHelpText.forKey(ParamHelpText.PREFLASH)) {
+            EnhancedSlider(stringResource(R.string.editor_preflash_exposure), s.preflashExposure, 0f..2f, { s.preflashExposure = it },
+                step = 0.005f, decimals = 3,
+                tooltip = stringResource(R.string.editor_preflash_exposure_tooltip),
+                default = PARAM_DEFAULTS.preflashExposure)
+            EnhancedSlider(stringResource(R.string.editor_preflash_y_shift), s.preflashYFilterShift, -20f..20f, { s.preflashYFilterShift = it },
+                step = 1f, decimals = 0, default = 0f,
+                tooltip = stringResource(R.string.editor_preflash_y_shift_tooltip))
+            EnhancedSlider(stringResource(R.string.editor_preflash_m_shift), s.preflashMFilterShift, -20f..20f, { s.preflashMFilterShift = it },
+                step = 1f, decimals = 0, default = 0f,
+                tooltip = stringResource(R.string.editor_preflash_m_shift_tooltip))
         }
     }
 
     @Composable
     private fun HalationSection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Halation", expanded, { expanded = it }, enabledSwitch = s.halationActive,
+        SectionCard(stringResource(R.string.editor_hal_title), expanded, { expanded = it }, enabledSwitch = s.halationActive,
             onEnabledChange = { s.halationActive = it }, help = ParamHelpText.forKey(ParamHelpText.HALATION)) {
             var advanced by remember { mutableStateOf(false) }
             // Basic: glow strength + size, the scatter strength, and the highlight boost.
-            EnhancedSlider("Halation amount", s.halHalationAmount, 0f..4f, { s.halHalationAmount = it },
-                step = 0.05f, decimals = 2, tooltip = "High-level halation strength multiplier.", default = PARAM_DEFAULTS.halHalationAmount)
-            EnhancedSlider("Halation spatial scale", s.halHalationSpatialScale, 0f..4f,
+            EnhancedSlider(stringResource(R.string.editor_hal_amount), s.halHalationAmount, 0f..4f, { s.halHalationAmount = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_hal_amount_tooltip),
+                default = PARAM_DEFAULTS.halHalationAmount)
+            EnhancedSlider(stringResource(R.string.editor_hal_spatial_scale), s.halHalationSpatialScale, 0f..4f,
                 { s.halHalationSpatialScale = it }, step = 0.1f, decimals = 2,
-                tooltip = "High-level halation size multiplier.", default = PARAM_DEFAULTS.halHalationSpatialScale)
-            EnhancedSlider("Scatter amount", s.halScatterAmount, 0f..4f, { s.halScatterAmount = it },
-                step = 0.05f, decimals = 2, tooltip = "High-level scatter strength. 1.0 = full physical scatter.", default = PARAM_DEFAULTS.halScatterAmount)
-            EnhancedSlider("Boost EV", s.halBoostEv, 0f..6f, { s.halBoostEv = it }, step = 0.5f, decimals = 1,
-                tooltip = "Maximum highlight boost in stops.", default = PARAM_DEFAULTS.halBoostEv)
+                tooltip = stringResource(R.string.editor_hal_spatial_scale_tooltip),
+                default = PARAM_DEFAULTS.halHalationSpatialScale)
+            EnhancedSlider(stringResource(R.string.editor_hal_scatter_amount), s.halScatterAmount, 0f..4f, { s.halScatterAmount = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_hal_scatter_amount_tooltip),
+                default = PARAM_DEFAULTS.halScatterAmount)
+            EnhancedSlider(stringResource(R.string.editor_hal_boost_ev), s.halBoostEv, 0f..6f, { s.halBoostEv = it },
+                step = 0.5f, decimals = 1,
+                tooltip = stringResource(R.string.editor_hal_boost_ev_tooltip), default = PARAM_DEFAULTS.halBoostEv)
             AdvancedToggle(advanced) { advanced = it }
             if (advanced) {
-                EnhancedSlider("Scatter spatial scale", s.halScatterSpatialScale, 0f..4f,
+                EnhancedSlider(stringResource(R.string.editor_hal_scatter_spatial_scale), s.halScatterSpatialScale, 0f..4f,
                     { s.halScatterSpatialScale = it }, step = 0.1f, decimals = 2,
-                    tooltip = "High-level scatter size multiplier (1.0 = physical defaults).", default = PARAM_DEFAULTS.halScatterSpatialScale)
-                EnhancedSlider("Protect EV", s.halProtectEv, 0f..10f, { s.halProtectEv = it }, step = 0.5f, decimals = 1,
-                    tooltip = "Protected range above midgray for the boost onset in stops.", default = PARAM_DEFAULTS.halProtectEv)
-                EnhancedSlider("Boost range", s.halBoostRange, 0f..1f, { s.halBoostRange = it },
-                    step = 0.05f, decimals = 2, tooltip = "How quickly the highlight boost ramps in (0-1).", default = PARAM_DEFAULTS.halBoostRange)
-                TripleSlider("Scatter core um", s.halScatterCoreUm, 0f..20f, { s.halScatterCoreUm = it },
-                    step = 0.5f, decimals = 2, tooltip = "Sigma of the scatter core Gaussian per channel, in um.",
+                    tooltip = stringResource(R.string.editor_hal_scatter_spatial_scale_tooltip),
+                    default = PARAM_DEFAULTS.halScatterSpatialScale)
+                EnhancedSlider(stringResource(R.string.editor_hal_protect_ev), s.halProtectEv, 0f..10f, { s.halProtectEv = it },
+                    step = 0.5f, decimals = 1,
+                    tooltip = stringResource(R.string.editor_hal_protect_ev_tooltip),
+                    default = PARAM_DEFAULTS.halProtectEv)
+                EnhancedSlider(stringResource(R.string.editor_hal_boost_range), s.halBoostRange, 0f..1f, { s.halBoostRange = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_hal_boost_range_tooltip),
+                    default = PARAM_DEFAULTS.halBoostRange)
+                TripleSlider(stringResource(R.string.editor_hal_scatter_core), s.halScatterCoreUm, 0f..20f, { s.halScatterCoreUm = it },
+                    step = 0.5f, decimals = 2, tooltip = stringResource(R.string.editor_hal_scatter_core_tooltip),
                     default = PARAM_DEFAULTS.halScatterCoreUm)
-                TripleSlider("Scatter tail um", s.halScatterTailUm, 0f..40f, { s.halScatterTailUm = it },
-                    step = 1f, decimals = 1, tooltip = "Decay constant of the scatter exponential tail per channel, in um.",
+                TripleSlider(stringResource(R.string.editor_hal_scatter_tail), s.halScatterTailUm, 0f..40f, { s.halScatterTailUm = it },
+                    step = 1f, decimals = 1, tooltip = stringResource(R.string.editor_hal_scatter_tail_tooltip),
                     default = PARAM_DEFAULTS.halScatterTailUm)
-                TripleSlider("Scatter tail weight %", s.halScatterTailWeightPct, 0f..100f,
+                TripleSlider(stringResource(R.string.editor_hal_scatter_tail_weight), s.halScatterTailWeightPct, 0f..100f,
                     { s.halScatterTailWeightPct = it }, step = 1f, decimals = 1,
-                    tooltip = "Weight of the scatter tail Gaussian per channel (0-100%).",
+                    tooltip = stringResource(R.string.editor_hal_scatter_tail_weight_tooltip),
                     default = PARAM_DEFAULTS.halScatterTailWeightPct)
-                TripleSlider("Halation strength %", s.halHalationStrengthPct, 0f..100f,
+                TripleSlider(stringResource(R.string.editor_hal_strength), s.halHalationStrengthPct, 0f..100f,
                     { s.halHalationStrengthPct = it }, step = 0.5f, decimals = 2,
-                    tooltip = "Total back-reflection halation amplitude per channel (0-100%).",
+                    tooltip = stringResource(R.string.editor_hal_strength_tooltip),
                     default = PARAM_DEFAULTS.halHalationStrengthPct)
-                TripleSlider("First sigma um", s.halFirstSigmaUm, 0f..200f, { s.halFirstSigmaUm = it },
-                    step = 1f, decimals = 1, tooltip = "Sigma of the first halation bounce per channel, in um.",
+                TripleSlider(stringResource(R.string.editor_hal_first_sigma), s.halFirstSigmaUm, 0f..200f, { s.halFirstSigmaUm = it },
+                    step = 1f, decimals = 1, tooltip = stringResource(R.string.editor_hal_first_sigma_tooltip),
                     default = PARAM_DEFAULTS.halFirstSigmaUm)
-                IntSlider("N bounces", s.halNBounces, OperationalParamLimits.HALATION_BOUNCES, { s.halNBounces = it },
-                    tooltip = "Number of multi-bounce Gaussians summed (typical 2-3).",
+                IntSlider(stringResource(R.string.editor_hal_n_bounces), s.halNBounces, OperationalParamLimits.HALATION_BOUNCES, { s.halNBounces = it },
+                    tooltip = stringResource(R.string.editor_hal_n_bounces_tooltip),
                     default = PARAM_DEFAULTS.halNBounces)
-                EnhancedSlider("Bounce decay", s.halBounceDecay, 0f..1f, { s.halBounceDecay = it },
-                    step = 0.05f, decimals = 2, tooltip = "Per-bounce amplitude decay ratio (0.3-0.7).", default = PARAM_DEFAULTS.halBounceDecay)
-                SwitchRow("Renormalize", s.halRenormalize, { s.halRenormalize = it },
-                    "Divide by (1 + sum of bounce amplitudes) so mid-grey is preserved.")
+                EnhancedSlider(stringResource(R.string.editor_hal_bounce_decay), s.halBounceDecay, 0f..1f, { s.halBounceDecay = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_hal_bounce_decay_tooltip),
+                    default = PARAM_DEFAULTS.halBounceDecay)
+                SwitchRow(stringResource(R.string.editor_hal_renormalize), s.halRenormalize, { s.halRenormalize = it },
+                    stringResource(R.string.editor_hal_renormalize_tooltip))
             }
         }
     }
@@ -5487,48 +5785,56 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun CouplersSection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Film color character (couplers)", expanded, { expanded = it }, enabledSwitch = s.couplersActive,
+        SectionCard(stringResource(R.string.editor_coup_title), expanded, { expanded = it }, enabledSwitch = s.couplersActive,
             onEnabledChange = { s.couplersActive = it }, help = ParamHelpText.forKey(ParamHelpText.COUPLERS)) {
             var advanced by remember { mutableStateOf(false) }
             Text(
-                "Models film's chemical color crosstalk (DIR couplers) — the cause of film's " +
-                    "characteristic color separation and edge effects. Looking for a plain saturation " +
-                    "control? Use Saturation / Vibrance in Simulation → Output.",
+                stringResource(R.string.editor_coup_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             // Basic: the three overall strengths. The per-channel mix matrix is advanced.
-            EnhancedSlider("Effect strength", s.couplersAmount, 0f..4f, { s.couplersAmount = it },
-                step = 0.05f, decimals = 2, tooltip = "Global multiplier on the DIR coupler inhibition matrix.", default = PARAM_DEFAULTS.couplersAmount)
-            EnhancedSlider("Within-layer strength", s.couplersInhibitionSamelayer, 0f..4f,
+            EnhancedSlider(stringResource(R.string.editor_coup_amount), s.couplersAmount, 0f..4f, { s.couplersAmount = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_coup_amount_tooltip),
+                default = PARAM_DEFAULTS.couplersAmount)
+            EnhancedSlider(stringResource(R.string.editor_coup_samelayer), s.couplersInhibitionSamelayer, 0f..4f,
                 { s.couplersInhibitionSamelayer = it }, step = 0.05f, decimals = 2,
-                tooltip = "Same-layer (diagonal) inhibition — within-channel contrast/acutance.", default = PARAM_DEFAULTS.couplersInhibitionSamelayer)
-            EnhancedSlider("Cross-color strength", s.couplersInhibitionInterlayer, 0f..4f,
+                tooltip = stringResource(R.string.editor_coup_samelayer_tooltip),
+                default = PARAM_DEFAULTS.couplersInhibitionSamelayer)
+            EnhancedSlider(stringResource(R.string.editor_coup_interlayer), s.couplersInhibitionInterlayer, 0f..4f,
                 { s.couplersInhibitionInterlayer = it }, step = 0.05f, decimals = 2,
-                tooltip = "Cross-layer (off-diagonal) inhibition — how much each dye layer bleeds into the others.", default = PARAM_DEFAULTS.couplersInhibitionInterlayer)
+                tooltip = stringResource(R.string.editor_coup_interlayer_tooltip),
+                default = PARAM_DEFAULTS.couplersInhibitionInterlayer)
             AdvancedToggle(advanced) { advanced = it }
             if (advanced) {
-                GatedBlock("The DIR gamma matrix is set per film stock by the engine (each stock overwrites these) — adjusting them has no effect.") {
-                    TripleSlider("Within-layer curve (R, G, B)", s.couplersGammaSamelayer, 0f..2f, { s.couplersGammaSamelayer = it },
-                        step = 0.02f, decimals = 3, tooltip = "Per-channel same-layer DIR gamma (R, G, B).",
+                GatedBlock(stringResource(R.string.editor_coup_gated_gamma)) {
+                    TripleSlider(stringResource(R.string.editor_coup_gamma_samelayer), s.couplersGammaSamelayer, 0f..2f, { s.couplersGammaSamelayer = it },
+                        step = 0.02f, decimals = 3,
+                        tooltip = stringResource(R.string.editor_coup_gamma_samelayer_tooltip),
                         default = PARAM_DEFAULTS.couplersGammaSamelayer)
-                    PairSlider("Color mix R→G/B", s.couplersGammaRtoGb, 0f..2f, { s.couplersGammaRtoGb = it },
-                        step = 0.02f, decimals = 3, tooltip = "Cross-channel DIR inhibition (a color-mixing matrix term): from R onto G and B.",
+                    PairSlider(stringResource(R.string.editor_coup_mix_r), s.couplersGammaRtoGb, 0f..2f, { s.couplersGammaRtoGb = it },
+                        step = 0.02f, decimals = 3, tooltip = stringResource(R.string.editor_coup_mix_r_tooltip),
                         componentLabels = "→G" to "→B", default = PARAM_DEFAULTS.couplersGammaRtoGb)
-                    PairSlider("Color mix G→R/B", s.couplersGammaGtoRb, 0f..2f, { s.couplersGammaGtoRb = it },
-                        step = 0.02f, decimals = 3, tooltip = "Cross-channel DIR inhibition (a color-mixing matrix term): from G onto R and B.",
+                    PairSlider(stringResource(R.string.editor_coup_mix_g), s.couplersGammaGtoRb, 0f..2f, { s.couplersGammaGtoRb = it },
+                        step = 0.02f, decimals = 3, tooltip = stringResource(R.string.editor_coup_mix_g_tooltip),
                         componentLabels = "→R" to "→B", default = PARAM_DEFAULTS.couplersGammaGtoRb)
-                    PairSlider("Color mix B→R/G", s.couplersGammaBtoRg, 0f..2f, { s.couplersGammaBtoRg = it },
-                        step = 0.02f, decimals = 3, tooltip = "Cross-channel DIR inhibition (a color-mixing matrix term): from B onto R and G.",
+                    PairSlider(stringResource(R.string.editor_coup_mix_b), s.couplersGammaBtoRg, 0f..2f, { s.couplersGammaBtoRg = it },
+                        step = 0.02f, decimals = 3, tooltip = stringResource(R.string.editor_coup_mix_b_tooltip),
                         componentLabels = "→R" to "→G", default = PARAM_DEFAULTS.couplersGammaBtoRg)
                 }
-                EnhancedSlider("Color bleed radius (µm)", s.couplersDiffusionSizeUm, 0f..100f, { s.couplersDiffusionSizeUm = it },
-                    step = 5f, decimals = 1, tooltip = "Sigma in µm for the diffusion of the couplers (5-20 µm).", default = PARAM_DEFAULTS.couplersDiffusionSizeUm)
-                EnhancedSlider("Color bleed tail (µm)", s.couplersDiffusionTailUm, 0f..500f, { s.couplersDiffusionTailUm = it },
-                    step = 5f, decimals = 1, tooltip = "Long-range tail sigma in µm for the coupler diffusion.", default = PARAM_DEFAULTS.couplersDiffusionTailUm)
-                EnhancedSlider("Color bleed tail weight", s.couplersDiffusionTailWeight, 0f..1f,
+                EnhancedSlider(stringResource(R.string.editor_coup_bleed_radius), s.couplersDiffusionSizeUm, 0f..100f, { s.couplersDiffusionSizeUm = it },
+                    step = 5f, decimals = 1,
+                    tooltip = stringResource(R.string.editor_coup_bleed_radius_tooltip),
+                    default = PARAM_DEFAULTS.couplersDiffusionSizeUm)
+                EnhancedSlider(stringResource(R.string.editor_coup_bleed_tail), s.couplersDiffusionTailUm, 0f..500f, { s.couplersDiffusionTailUm = it },
+                    step = 5f, decimals = 1,
+                    tooltip = stringResource(R.string.editor_coup_bleed_tail_tooltip),
+                    default = PARAM_DEFAULTS.couplersDiffusionTailUm)
+                EnhancedSlider(stringResource(R.string.editor_coup_bleed_tail_weight), s.couplersDiffusionTailWeight, 0f..1f,
                     { s.couplersDiffusionTailWeight = it }, step = 0.01f, decimals = 3,
-                    tooltip = "Weight of the long-range diffusion tail.", default = PARAM_DEFAULTS.couplersDiffusionTailWeight)
+                    tooltip = stringResource(R.string.editor_coup_bleed_tail_weight_tooltip),
+                    default = PARAM_DEFAULTS.couplersDiffusionTailWeight)
             }
         }
     }
@@ -5536,49 +5842,72 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun GlareSection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Glare", expanded, { expanded = it }, enabledSwitch = s.glareActive,
+        SectionCard(stringResource(R.string.editor_glare_title), expanded, { expanded = it }, enabledSwitch = s.glareActive,
             onEnabledChange = { s.glareActive = it }, help = ParamHelpText.forKey(ParamHelpText.GLARE)) {
             // Live control, but only on one route — say so instead of dimming.
             Text(
-                "Glare applies on the print route only (no effect in Slide mode / scan-film).",
+                stringResource(R.string.editor_glare_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            EnhancedSlider("Percent", s.glarePercent, 0f..1f, { s.glarePercent = it },
-                step = 0.01f, decimals = 2, tooltip = "Percentage of the glare light (typically 0.1-0.25)", default = PARAM_DEFAULTS.glarePercent)
-            EnhancedSlider("Roughness", s.glareRoughness, 0f..1f, { s.glareRoughness = it },
-                step = 0.05f, decimals = 2, tooltip = "Roughness of the glare light (0-1)", default = PARAM_DEFAULTS.glareRoughness)
-            EnhancedSlider("Blur", s.glareBlur, 0f..10f, { s.glareBlur = it }, step = 0.1f, decimals = 2,
-                tooltip = "Sigma of gaussian blur in pixels for the glare", default = PARAM_DEFAULTS.glareBlur)
+            EnhancedSlider(stringResource(R.string.editor_glare_percent), s.glarePercent, 0f..1f, { s.glarePercent = it },
+                step = 0.01f, decimals = 2,
+                tooltip = stringResource(R.string.editor_glare_percent_tooltip),
+                default = PARAM_DEFAULTS.glarePercent)
+            EnhancedSlider(stringResource(R.string.editor_glare_roughness), s.glareRoughness, 0f..1f, { s.glareRoughness = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_glare_roughness_tooltip),
+                default = PARAM_DEFAULTS.glareRoughness)
+            EnhancedSlider(stringResource(R.string.editor_glare_blur), s.glareBlur, 0f..10f, { s.glareBlur = it },
+                step = 0.1f, decimals = 2,
+                tooltip = stringResource(R.string.editor_glare_blur_tooltip), default = PARAM_DEFAULTS.glareBlur)
         }
     }
 
     @Composable
     private fun ExperimentalSection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Experimental", expanded, { expanded = it },
+        SectionCard(stringResource(R.string.editor_exp_title), expanded, { expanded = it },
             help = ParamHelpText.forKey(ParamHelpText.PRINT_GAMMA)) {
-            EnhancedSlider("Film gamma factor", s.filmGammaFactor, 0f..3f, { s.filmGammaFactor = it },
-                step = 0.05f, decimals = 2, tooltip = "Gamma factor of the negative density curves.", default = PARAM_DEFAULTS.filmGammaFactor)
-            EnhancedSlider("Print gamma factor", s.printGammaFactor, 0f..3f, { s.printGammaFactor = it },
-                step = 0.05f, decimals = 2, tooltip = "Gamma factor of the print paper.", default = PARAM_DEFAULTS.printGammaFactor)
-            SwitchRow("Print curve morph (s023)", s.morphActive, { s.morphActive = it },
-                tooltip = "Re-develop the print from the paper's parametric density-curve model with a coupled-gamma + developer-exhaustion morph. Off = the stock's measured curves.")
+            EnhancedSlider(stringResource(R.string.editor_exp_film_gamma), s.filmGammaFactor, 0f..3f, { s.filmGammaFactor = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_exp_film_gamma_tooltip),
+                default = PARAM_DEFAULTS.filmGammaFactor)
+            EnhancedSlider(stringResource(R.string.editor_exp_print_gamma), s.printGammaFactor, 0f..3f, { s.printGammaFactor = it },
+                step = 0.05f, decimals = 2,
+                tooltip = stringResource(R.string.editor_exp_print_gamma_tooltip),
+                default = PARAM_DEFAULTS.printGammaFactor)
+            SwitchRow(stringResource(R.string.editor_exp_morph), s.morphActive, { s.morphActive = it },
+                tooltip = stringResource(R.string.editor_exp_morph_tooltip))
             if (s.morphActive) {
-                EnhancedSlider("Morph · overall gamma", s.morphGammaFactor, 0.2f..3f, { s.morphGammaFactor = it },
-                    step = 0.05f, decimals = 2, tooltip = "Global coupled gamma applied to all print curves.", default = PARAM_DEFAULTS.morphGammaFactor)
-                EnhancedSlider("Morph · fast band", s.morphGammaFactorFast, 0.2f..3f, { s.morphGammaFactorFast = it },
-                    step = 0.05f, decimals = 2, tooltip = "Gamma of the fast (low-threshold) sub-layer.", default = PARAM_DEFAULTS.morphGammaFactorFast)
-                EnhancedSlider("Morph · slow band", s.morphGammaFactorSlow, 0.2f..3f, { s.morphGammaFactorSlow = it },
-                    step = 0.05f, decimals = 2, tooltip = "Gamma of the slow (high-threshold) sub-layers.", default = PARAM_DEFAULTS.morphGammaFactorSlow)
-                EnhancedSlider("Morph · red gamma", s.morphGammaFactorRed, 0.2f..3f, { s.morphGammaFactorRed = it },
-                    step = 0.05f, decimals = 2, tooltip = "Per-channel gamma (red).", default = PARAM_DEFAULTS.morphGammaFactorRed)
-                EnhancedSlider("Morph · green gamma", s.morphGammaFactorGreen, 0.2f..3f, { s.morphGammaFactorGreen = it },
-                    step = 0.05f, decimals = 2, tooltip = "Per-channel gamma (green).", default = PARAM_DEFAULTS.morphGammaFactorGreen)
-                EnhancedSlider("Morph · blue gamma", s.morphGammaFactorBlue, 0.2f..3f, { s.morphGammaFactorBlue = it },
-                    step = 0.05f, decimals = 2, tooltip = "Per-channel gamma (blue).", default = PARAM_DEFAULTS.morphGammaFactorBlue)
-                EnhancedSlider("Morph · developer exhaustion", s.morphDeveloperExhaustion, 0f..1f, { s.morphDeveloperExhaustion = it },
-                    step = 0.02f, decimals = 2, tooltip = "Blend toward a Gumbel-matched curve shape (shoulder roll-off); preserves midgray.", default = PARAM_DEFAULTS.morphDeveloperExhaustion)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_gamma), s.morphGammaFactor, 0.2f..3f, { s.morphGammaFactor = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_gamma_tooltip),
+                    default = PARAM_DEFAULTS.morphGammaFactor)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_fast), s.morphGammaFactorFast, 0.2f..3f, { s.morphGammaFactorFast = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_fast_tooltip),
+                    default = PARAM_DEFAULTS.morphGammaFactorFast)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_slow), s.morphGammaFactorSlow, 0.2f..3f, { s.morphGammaFactorSlow = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_slow_tooltip),
+                    default = PARAM_DEFAULTS.morphGammaFactorSlow)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_red), s.morphGammaFactorRed, 0.2f..3f, { s.morphGammaFactorRed = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_red_tooltip),
+                    default = PARAM_DEFAULTS.morphGammaFactorRed)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_green), s.morphGammaFactorGreen, 0.2f..3f, { s.morphGammaFactorGreen = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_green_tooltip),
+                    default = PARAM_DEFAULTS.morphGammaFactorGreen)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_blue), s.morphGammaFactorBlue, 0.2f..3f, { s.morphGammaFactorBlue = it },
+                    step = 0.05f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_blue_tooltip),
+                    default = PARAM_DEFAULTS.morphGammaFactorBlue)
+                EnhancedSlider(stringResource(R.string.editor_exp_morph_exhaustion), s.morphDeveloperExhaustion, 0f..1f, { s.morphDeveloperExhaustion = it },
+                    step = 0.02f, decimals = 2,
+                    tooltip = stringResource(R.string.editor_exp_morph_exhaustion_tooltip),
+                    default = PARAM_DEFAULTS.morphDeveloperExhaustion)
             }
         }
     }
@@ -5586,9 +5915,9 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun DisplaySection(s: ParamsState) {
         var expanded by remember { mutableStateOf(true) }
-        SectionCard("Display", expanded, { expanded = it }) {
-            IntSlider("Preview max size", s.previewMaxSize, 128..1024, { s.previewMaxSize = it },
-                tooltip = "Max size of the long edge of the preview image, in pixels.",
+        SectionCard(stringResource(R.string.editor_display_title), expanded, { expanded = it }) {
+            IntSlider(stringResource(R.string.editor_display_preview_max_size), s.previewMaxSize, 128..1024, { s.previewMaxSize = it },
+                tooltip = stringResource(R.string.editor_display_preview_max_size_tooltip),
                 default = PARAM_DEFAULTS.previewMaxSize)
         }
     }

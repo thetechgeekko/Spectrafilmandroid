@@ -191,7 +191,7 @@ class ExportForegroundService : Service() {
         ensureChannel(this)
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Exporting photo…")
+            .setContentText(getString(R.string.tool_export_notification_text))
             .setSmallIcon(R.drawable.ic_launcher_monochrome)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -205,7 +205,7 @@ class ExportForegroundService : Service() {
         if (runId > INVALID_RUN_ID) {
             builder.addAction(
                 0,
-                "Cancel",
+                getString(R.string.tool_cancel),
                 PendingIntent.getService(
                     this,
                     runId.toInt(),
@@ -231,8 +231,12 @@ class ExportForegroundService : Service() {
             val mgr = ctx.getSystemService(NotificationManager::class.java) ?: return
             if (mgr.getNotificationChannel(CHANNEL_ID) != null) return
             mgr.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Export", NotificationManager.IMPORTANCE_LOW).apply {
-                    description = "Keeps a photo export running at full speed in the background."
+                NotificationChannel(
+                    CHANNEL_ID,
+                    ctx.getString(R.string.tool_export_channel_name),
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    description = ctx.getString(R.string.tool_export_channel_description)
                     setShowBadge(false)
                 },
             )

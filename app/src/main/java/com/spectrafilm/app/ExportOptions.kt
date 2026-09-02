@@ -9,16 +9,17 @@
  */
 package com.spectrafilm.app
 
+import androidx.annotation.StringRes
 import com.spectrafilm.engine.ColorSpace
 import kotlin.math.roundToInt
 
 /** Output-size choice in the export sheet (a post-render downscale, like Lightroom's "Dimensions"). */
-enum class ExportSize(val label: String, val longEdge: Int?) {
-    FULL("Full resolution", null),
-    LARGE("Large — 4096 px", 4096),
-    MEDIUM("Medium — 2048 px", 2048),
-    SMALL("Small — 1024 px", 1024),
-    CUSTOM("Custom long edge", null),
+enum class ExportSize(@StringRes val labelRes: Int, val longEdge: Int?) {
+    FULL(R.string.tool_export_size_full, null),
+    LARGE(R.string.tool_export_size_large, 4096),
+    MEDIUM(R.string.tool_export_size_medium, 2048),
+    SMALL(R.string.tool_export_size_small, 1024),
+    CUSTOM(R.string.tool_export_size_custom, null),
 }
 
 /** The user's choices in the export sheet. Pure data; the UI binds to it and the pipeline reads it. */

@@ -65,6 +65,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            // en-XA / ar-XB for the #181 layout checks (expanded text, RTL).
+            isPseudoLocalesEnabled = true
+        }
         release {
             isMinifyEnabled = true
             ndk {

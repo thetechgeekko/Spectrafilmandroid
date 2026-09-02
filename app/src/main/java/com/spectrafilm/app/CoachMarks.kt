@@ -34,6 +34,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
@@ -51,6 +54,7 @@ fun EditorCoachOverlay(onDismiss: () -> Unit) {
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
+                onClickLabel = stringResource(R.string.tool_coach_dismiss),
                 onClick = onDismiss,
             ),
         contentAlignment = Alignment.Center,
@@ -65,20 +69,33 @@ fun EditorCoachOverlay(onDismiss: () -> Unit) {
         ) {
             Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text(
-                    "Quick tips",
+                    stringResource(R.string.tool_coach_title),
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.semantics { heading() },
                 )
-                CoachTip("Tap a category", "Pick a section in the bottom bar to reveal its sliders.")
-                CoachTip("Before / after", "Toggle the compare split to judge an edit against the original.")
-                CoachTip("Inspect at 100%", "Tap the preview to check grain and detail at full resolution.")
-                CoachTip("Pinch to zoom", "Pinch and drag the preview to inspect any area.")
+                CoachTip(
+                    stringResource(R.string.tool_coach_category_title),
+                    stringResource(R.string.tool_coach_category_body),
+                )
+                CoachTip(
+                    stringResource(R.string.tool_coach_compare_title),
+                    stringResource(R.string.tool_coach_compare_body),
+                )
+                CoachTip(
+                    stringResource(R.string.tool_coach_inspect_title),
+                    stringResource(R.string.tool_coach_inspect_body),
+                )
+                CoachTip(
+                    stringResource(R.string.tool_coach_zoom_title),
+                    stringResource(R.string.tool_coach_zoom_body),
+                )
                 Button(
                     onClick = onDismiss,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 4.dp),
-                ) { Text("Got it") }
+                ) { Text(stringResource(R.string.tool_coach_got_it)) }
             }
         }
     }
@@ -86,7 +103,8 @@ fun EditorCoachOverlay(onDismiss: () -> Unit) {
 
 @Composable
 private fun CoachTip(title: String, body: String) {
-    Row(verticalAlignment = Alignment.Top) {
+    // One TalkBack node per tip (title + body); the bullet is decorative.
+    Row(verticalAlignment = Alignment.Top, modifier = Modifier.semantics(mergeDescendants = true) {}) {
         Box(
             Modifier
                 .padding(top = 6.dp, end = 12.dp)

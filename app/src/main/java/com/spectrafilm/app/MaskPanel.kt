@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.spectrafilm.app.masks.BlendMode
 import com.spectrafilm.app.masks.ColorRange
@@ -49,12 +50,9 @@ fun MasksSection(
     var expanded by remember { mutableStateOf(true) }
     val masks = s.localAdjustments
 
-    SectionCard("Masks", expanded, { expanded = it }) {
+    SectionCard(stringResource(R.string.tool_masks_title), expanded, { expanded = it }) {
         Text(
-            "Local adjustments: a mask limits the full adjustment set — exposure, temp/tint, " +
-                "saturation, hue, contrast, whites/blacks, and the detail controls — to one area. A radial " +
-                "targets a spot (brighten a face); a gradient ramps across the frame (darken a sky from " +
-                "the top). Composited on the final image — the film render is untouched.",
+            stringResource(R.string.tool_masks_intro),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -62,78 +60,78 @@ fun MasksSection(
             TextButton(onClick = {
                 s.localAdjustments = masks + defaultRadialAdjustment()
                 onSelectedIndexChange(masks.size)
-            }) { Text("+ Radial mask") }
+            }) { Text(stringResource(R.string.tool_masks_add_radial)) }
             TextButton(onClick = {
                 s.localAdjustments = masks + defaultLinearAdjustment()
                 onSelectedIndexChange(masks.size)
-            }) { Text("+ Gradient mask") }
+            }) { Text(stringResource(R.string.tool_masks_add_gradient)) }
         }
 
         if (masks.isEmpty()) return@SectionCard
 
         val idx = clampSelectedMaskIndex(selectedIndex, masks.size)
         if (masks.size > 1) {
-            SubTabRow(List(masks.size) { "Mask ${it + 1}" }, idx, onSelectedIndexChange)
+            SubTabRow(List(masks.size) { stringResource(R.string.tool_masks_tab, it + 1) }, idx, onSelectedIndexChange)
         }
         val adj = masks[idx]
         fun set(updated: LocalAdjustment) {
             s.localAdjustments = masks.toMutableList().also { it[idx] = updated }
         }
 
-        TextButton(onClick = { onEditOnPhoto(idx) }) { Text("Position on photo") }
+        TextButton(onClick = { onEditOnPhoto(idx) }) { Text(stringResource(R.string.tool_masks_position_on_photo)) }
 
         // --- Adjustment applied where the mask is opaque (Tier-A, pointwise on the output) ---
-        EnhancedSlider("Temp", adj.delta.temp, -100f..100f,
+        EnhancedSlider(stringResource(R.string.tool_masks_temp), adj.delta.temp, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(temp = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "White balance inside the mask: + warms (yellow), − cools (blue).")
-        EnhancedSlider("Tint", adj.delta.tint, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_temp_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_tint), adj.delta.tint, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(tint = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "White balance inside the mask: + magenta, − green.")
-        EnhancedSlider("Exposure", adj.delta.exposureEv, -4f..4f,
+            tooltip = stringResource(R.string.tool_masks_tint_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_exposure), adj.delta.exposureEv, -4f..4f,
             { set(adj.copy(delta = adj.delta.copy(exposureEv = it))) },
             step = 0.05f, decimals = 2, default = 0f,
-            tooltip = "Brighten / darken inside the mask, in stops (local dodge & burn).")
-        EnhancedSlider("Saturation", adj.delta.saturation, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_exposure_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_saturation), adj.delta.saturation, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(saturation = it))) },
-            step = 1f, decimals = 0, default = 0f, tooltip = "Colorfulness inside the mask.")
-        EnhancedSlider("Hue shift", adj.delta.hue, -180f..180f,
+            step = 1f, decimals = 0, default = 0f, tooltip = stringResource(R.string.tool_masks_saturation_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_hue), adj.delta.hue, -180f..180f,
             { set(adj.copy(delta = adj.delta.copy(hue = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "Rotate the hue of colors inside the mask, in degrees (e.g. shift a sky toward teal).")
-        EnhancedSlider("Contrast", adj.delta.contrast, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_hue_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_contrast), adj.delta.contrast, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(contrast = it))) },
-            step = 1f, decimals = 0, default = 0f, tooltip = "Contrast inside the mask.")
-        EnhancedSlider("Whites", adj.delta.whites, -100f..100f,
+            step = 1f, decimals = 0, default = 0f, tooltip = stringResource(R.string.tool_masks_contrast_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_whites), adj.delta.whites, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(whites = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "The brightest tones inside the mask: + brightens highlights, − recovers them.")
-        EnhancedSlider("Blacks", adj.delta.blacks, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_whites_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_blacks), adj.delta.blacks, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(blacks = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "The darkest tones inside the mask: + lifts shadows, − deepens them.")
+            tooltip = stringResource(R.string.tool_masks_blacks_help))
         // Class-S spatial ops (edge-aware; a neighborhood blur on the output luma).
-        EnhancedSlider("Clarity", adj.delta.clarity, -100f..100f,
+        EnhancedSlider(stringResource(R.string.tool_masks_clarity), adj.delta.clarity, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(clarity = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "Midtone local contrast inside the mask (+ punch, − soften).")
-        EnhancedSlider("Texture", adj.delta.texture, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_clarity_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_texture), adj.delta.texture, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(texture = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "Fine detail inside the mask: + emphasizes, − smooths.")
-        EnhancedSlider("Sharpness", adj.delta.sharpness, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_texture_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_sharpness), adj.delta.sharpness, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(sharpness = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "Edge sharpness inside the mask (unsharp mask on fine detail).")
-        EnhancedSlider("Highlights", adj.delta.highlights, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_sharpness_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_highlights), adj.delta.highlights, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(highlights = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "Bright regions inside the mask: − recovers, + brightens.")
-        EnhancedSlider("Shadows", adj.delta.shadows, -100f..100f,
+            tooltip = stringResource(R.string.tool_masks_highlights_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_shadows), adj.delta.shadows, -100f..100f,
             { set(adj.copy(delta = adj.delta.copy(shadows = it))) },
             step = 1f, decimals = 0, default = 0f,
-            tooltip = "Dark regions inside the mask: + lifts, − deepens.")
+            tooltip = stringResource(R.string.tool_masks_shadows_help))
 
         // --- Shape (radial: position / size / feather) ---
         val comp = adj.mask.components.firstOrNull()
@@ -141,14 +139,16 @@ fun MasksSection(
         if (comp != null && radial != null) {
             fun setShape(r: MaskComponent.Radial) =
                 set(adj.copy(mask = adj.mask.copy(components = listOf(comp.copy(shape = r)))))
-            EnhancedSlider("Position X", radial.cx, 0f..1f, { setShape(radial.copy(cx = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f)
-            EnhancedSlider("Position Y", radial.cy, 0f..1f, { setShape(radial.copy(cy = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f)
-            EnhancedSlider("Size", radial.rx, 0.02f..1f, { setShape(radial.copy(rx = it, ry = it)) },
-                step = 0.01f, decimals = 2, default = 0.3f, tooltip = "Radius of the mask (fraction of the frame).")
-            EnhancedSlider("Feather", radial.feather, 0f..1f, { setShape(radial.copy(feather = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f, tooltip = "Softness of the mask edge.")
+            EnhancedSlider(stringResource(R.string.tool_masks_position_x), radial.cx, 0f..1f,
+                { setShape(radial.copy(cx = it)) }, step = 0.01f, decimals = 2, default = 0.5f)
+            EnhancedSlider(stringResource(R.string.tool_masks_position_y), radial.cy, 0f..1f,
+                { setShape(radial.copy(cy = it)) }, step = 0.01f, decimals = 2, default = 0.5f)
+            EnhancedSlider(stringResource(R.string.tool_masks_size), radial.rx, 0.02f..1f,
+                { setShape(radial.copy(rx = it, ry = it)) },
+                step = 0.01f, decimals = 2, default = 0.3f, tooltip = stringResource(R.string.tool_masks_size_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_feather), radial.feather, 0f..1f,
+                { setShape(radial.copy(feather = it)) },
+                step = 0.01f, decimals = 2, default = 0.5f, tooltip = stringResource(R.string.tool_masks_feather_help))
         }
 
         // --- Shape (gradient: the two endpoints the ramp runs between) ---
@@ -157,71 +157,79 @@ fun MasksSection(
             fun setShape(l: MaskComponent.Linear) =
                 set(adj.copy(mask = adj.mask.copy(components = listOf(comp.copy(shape = l)))))
             Text(
-                "The effect ramps from 0 at the start point to full at the end point.",
+                stringResource(R.string.tool_masks_gradient_note),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            EnhancedSlider("Start X", linear.x0, 0f..1f, { setShape(linear.copy(x0 = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f, tooltip = "Where the gradient begins (no effect).")
-            EnhancedSlider("Start Y", linear.y0, 0f..1f, { setShape(linear.copy(y0 = it)) },
-                step = 0.01f, decimals = 2, default = 0.2f, tooltip = "Where the gradient begins (no effect).")
-            EnhancedSlider("End X", linear.x1, 0f..1f, { setShape(linear.copy(x1 = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f, tooltip = "Where the gradient reaches full effect.")
-            EnhancedSlider("End Y", linear.y1, 0f..1f, { setShape(linear.copy(y1 = it)) },
-                step = 0.01f, decimals = 2, default = 0.8f, tooltip = "Where the gradient reaches full effect.")
+            val startHelp = stringResource(R.string.tool_masks_gradient_start_help)
+            val endHelp = stringResource(R.string.tool_masks_gradient_end_help)
+            EnhancedSlider(stringResource(R.string.tool_masks_start_x), linear.x0, 0f..1f,
+                { setShape(linear.copy(x0 = it)) }, step = 0.01f, decimals = 2, default = 0.5f, tooltip = startHelp)
+            EnhancedSlider(stringResource(R.string.tool_masks_start_y), linear.y0, 0f..1f,
+                { setShape(linear.copy(y0 = it)) }, step = 0.01f, decimals = 2, default = 0.2f, tooltip = startHelp)
+            EnhancedSlider(stringResource(R.string.tool_masks_end_x), linear.x1, 0f..1f,
+                { setShape(linear.copy(x1 = it)) }, step = 0.01f, decimals = 2, default = 0.5f, tooltip = endHelp)
+            EnhancedSlider(stringResource(R.string.tool_masks_end_y), linear.y1, 0f..1f,
+                { setShape(linear.copy(y1 = it)) }, step = 0.01f, decimals = 2, default = 0.8f, tooltip = endHelp)
         }
 
-        SwitchRow("Invert (affect outside)", adj.mask.invert,
+        SwitchRow(stringResource(R.string.tool_masks_invert), adj.mask.invert,
             { set(adj.copy(mask = adj.mask.copy(invert = it))) },
-            "Apply the adjustment OUTSIDE the mask instead of inside (e.g. darken all but the subject).")
-        EnhancedSlider("Mask opacity", adj.mask.opacity, 0f..1f,
+            stringResource(R.string.tool_masks_invert_help))
+        EnhancedSlider(stringResource(R.string.tool_masks_opacity), adj.mask.opacity, 0f..1f,
             { set(adj.copy(mask = adj.mask.copy(opacity = it))) },
             step = 0.01f, decimals = 2, default = 1f)
 
         // --- Limit to a tonal range (luminance range mask) ---
         val lum = adj.mask.luminanceRange
-        SwitchRow("Limit to tones", lum != null,
+        SwitchRow(stringResource(R.string.tool_masks_limit_tones), lum != null,
             { on -> set(adj.copy(mask = adj.mask.copy(luminanceRange = if (on) LuminanceRange() else null))) },
-            "Restrict the adjustment to a brightness range — e.g. only the highlights, or only the " +
-                "shadows. Turn on, then use the eyedropper to pick the tone from your photo.")
+            stringResource(R.string.tool_masks_limit_tones_help))
         if (lum != null) {
             fun setLum(r: LuminanceRange) = set(adj.copy(mask = adj.mask.copy(luminanceRange = r)))
             OutlinedButton(onClick = { onSampleLuminance(idx) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Eyedropper — pick a tone from the photo")
+                Text(stringResource(R.string.tool_masks_eyedropper_tone))
             }
-            EnhancedSlider("Tone min", lum.lumMin, 0f..1f, { setLum(lum.copy(lumMin = it)) },
-                step = 0.01f, decimals = 2, default = 0f, tooltip = "Darkest tone the adjustment affects.")
-            EnhancedSlider("Tone max", lum.lumMax, 0f..1f, { setLum(lum.copy(lumMax = it)) },
-                step = 0.01f, decimals = 2, default = 1f, tooltip = "Brightest tone the adjustment affects.")
-            EnhancedSlider("Tone feather", lum.feather, 0.01f..0.5f, { setLum(lum.copy(feather = it)) },
-                step = 0.01f, decimals = 2, default = 0.1f, tooltip = "Softness of the tonal range edges.")
-            SwitchRow("Invert tones", lum.invert, { setLum(lum.copy(invert = it)) },
-                "Affect the tones OUTSIDE the range instead.")
+            EnhancedSlider(stringResource(R.string.tool_masks_tone_min), lum.lumMin, 0f..1f,
+                { setLum(lum.copy(lumMin = it)) },
+                step = 0.01f, decimals = 2, default = 0f, tooltip = stringResource(R.string.tool_masks_tone_min_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_tone_max), lum.lumMax, 0f..1f,
+                { setLum(lum.copy(lumMax = it)) },
+                step = 0.01f, decimals = 2, default = 1f, tooltip = stringResource(R.string.tool_masks_tone_max_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_tone_feather), lum.feather, 0.01f..0.5f,
+                { setLum(lum.copy(feather = it)) },
+                step = 0.01f, decimals = 2, default = 0.1f, tooltip = stringResource(R.string.tool_masks_tone_feather_help))
+            SwitchRow(stringResource(R.string.tool_masks_invert_tones), lum.invert, { setLum(lum.copy(invert = it)) },
+                stringResource(R.string.tool_masks_invert_tones_help))
         }
 
         // --- Limit to a color (color range mask) — "tame the reds, not the skin" ---
         val col = adj.mask.colorRange
-        SwitchRow("Limit to a color", col != null,
+        SwitchRow(stringResource(R.string.tool_masks_limit_color), col != null,
             { on -> set(adj.copy(mask = adj.mask.copy(colorRange = if (on) ColorRange() else null))) },
-            "Restrict the adjustment to one color family — e.g. only the reds, leaving skin untouched. " +
-                "Turn on, then use the eyedropper to pick the color from your photo.")
+            stringResource(R.string.tool_masks_limit_color_help))
         if (col != null) {
             fun setCol(r: ColorRange) = set(adj.copy(mask = adj.mask.copy(colorRange = r)))
             OutlinedButton(onClick = { onSampleColor(idx) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Eyedropper — pick a color from the photo")
+                Text(stringResource(R.string.tool_masks_eyedropper_color))
             }
-            EnhancedSlider("Target red", col.targetR, 0f..1f, { setCol(col.copy(targetR = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f, tooltip = "The color to affect — red component.")
-            EnhancedSlider("Target green", col.targetG, 0f..1f, { setCol(col.copy(targetG = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f, tooltip = "The color to affect — green component.")
-            EnhancedSlider("Target blue", col.targetB, 0f..1f, { setCol(col.copy(targetB = it)) },
-                step = 0.01f, decimals = 2, default = 0.5f, tooltip = "The color to affect — blue component.")
-            EnhancedSlider("Color range", col.tolerance, 0.02f..1f, { setCol(col.copy(tolerance = it)) },
-                step = 0.01f, decimals = 2, default = 0.6f, tooltip = "How wide a range of colors counts as a match.")
-            EnhancedSlider("Color feather", col.feather, 0.01f..0.5f, { setCol(col.copy(feather = it)) },
-                step = 0.01f, decimals = 2, default = 0.1f, tooltip = "Softness of the color-selection edges.")
-            SwitchRow("Invert color", col.invert, { setCol(col.copy(invert = it)) },
-                "Affect the colors OUTSIDE the range instead.")
+            EnhancedSlider(stringResource(R.string.tool_masks_target_red), col.targetR, 0f..1f,
+                { setCol(col.copy(targetR = it)) },
+                step = 0.01f, decimals = 2, default = 0.5f, tooltip = stringResource(R.string.tool_masks_target_red_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_target_green), col.targetG, 0f..1f,
+                { setCol(col.copy(targetG = it)) },
+                step = 0.01f, decimals = 2, default = 0.5f, tooltip = stringResource(R.string.tool_masks_target_green_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_target_blue), col.targetB, 0f..1f,
+                { setCol(col.copy(targetB = it)) },
+                step = 0.01f, decimals = 2, default = 0.5f, tooltip = stringResource(R.string.tool_masks_target_blue_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_color_range), col.tolerance, 0.02f..1f,
+                { setCol(col.copy(tolerance = it)) },
+                step = 0.01f, decimals = 2, default = 0.6f, tooltip = stringResource(R.string.tool_masks_color_range_help))
+            EnhancedSlider(stringResource(R.string.tool_masks_color_feather), col.feather, 0.01f..0.5f,
+                { setCol(col.copy(feather = it)) },
+                step = 0.01f, decimals = 2, default = 0.1f, tooltip = stringResource(R.string.tool_masks_color_feather_help))
+            SwitchRow(stringResource(R.string.tool_masks_invert_color), col.invert, { setCol(col.copy(invert = it)) },
+                stringResource(R.string.tool_masks_invert_color_help))
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -229,7 +237,7 @@ fun MasksSection(
                 val remaining = masks.toMutableList().also { it.removeAt(idx) }
                 s.localAdjustments = remaining
                 onSelectedIndexChange(clampSelectedMaskIndex(idx, remaining.size))
-            }) { Text("Delete mask") }
+            }) { Text(stringResource(R.string.tool_masks_delete)) }
         }
     }
 }

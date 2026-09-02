@@ -46,6 +46,12 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -106,24 +112,28 @@ fun MaskGeometryOverlay(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextTooltip("Cancel") {
+                val cancelLabel = stringResource(R.string.tool_cancel)
+                TextTooltip(cancelLabel) {
                     IconButton(onClick = onCancel) {
-                        Icon(SpectraIcons.Cancel, contentDescription = "Cancel", tint = Color.White)
+                        Icon(SpectraIcons.Cancel, contentDescription = cancelLabel, tint = Color.White)
                     }
                 }
                 Text(
-                    "Position mask", color = Color.White,
+                    stringResource(R.string.tool_mask_geometry_title), color = Color.White,
                     style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(start = 4.dp),
+                    modifier = Modifier.padding(start = 4.dp).semantics { heading() },
                 )
                 Spacer(Modifier.weight(1f))
-                TextTooltip("Apply") {
+                val applyLabel = stringResource(R.string.tool_apply)
+                TextTooltip(applyLabel) {
                     IconButton(onClick = { confirm() }) {
-                        Icon(SpectraIcons.Confirm, contentDescription = "Apply", tint = Color.White)
+                        Icon(SpectraIcons.Confirm, contentDescription = applyLabel, tint = Color.White)
                     }
                 }
             }
 
+            val canvasDesc = stringResource(R.string.tool_mask_geometry_canvas_desc)
+            val revertLabel = stringResource(R.string.tool_mask_geometry_revert)
             Box(
                 Modifier.weight(1f).fillMaxWidth().padding(12.dp),
                 contentAlignment = Alignment.Center,
@@ -133,6 +143,14 @@ fun MaskGeometryOverlay(
                         .aspectRatio(imageAspect)
                         .fillMaxWidth()
                         .onSizeChanged { canvasSize = it }
+                        // Drag-only canvas: the Masks panel's position sliders are the accessible
+                        // editor; here a screen reader can revert the draft to the saved shape.
+                        .semantics {
+                            contentDescription = canvasDesc
+                            customActions = listOf(
+                                CustomAccessibilityAction(revertLabel) { shape = committedShape; true },
+                            )
+                        }
                         .pointerInput(canvasSize) {
                             detectDragGestures(
                                 onDragStart = { pos ->
@@ -162,7 +180,7 @@ fun MaskGeometryOverlay(
             }
 
             Text(
-                "Drag to move · drag a handle to resize the radial / move a gradient end.",
+                stringResource(R.string.tool_mask_geometry_hint),
                 color = Color.White.copy(alpha = 0.7f),
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),

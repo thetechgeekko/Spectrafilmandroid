@@ -46,6 +46,10 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import com.spectrafilm.engine.TONE_CURVE_MAX_POINTS
 import kotlinx.coroutines.CancellationException
@@ -231,6 +235,10 @@ fun ToneCurveEditor(
     val latestPoints by rememberUpdatedState(points)
     val latestOnChange by rememberUpdatedState(onChange)
     var dragIndex by remember { mutableIntStateOf(-1) }
+    // Touch-only editor: the description says so honestly and points at the accessible
+    // alternatives (Contrast slider + Reset channel); the point count is the only readable state.
+    val editorDesc = stringResource(R.string.tool_curve_editor_desc)
+    val pointsState = stringResource(R.string.tool_curve_points_state, ToneCurveMath.effective(points).size)
 
     Canvas(
         modifier
@@ -239,6 +247,10 @@ fun ToneCurveEditor(
             .clip(RoundedCornerShape(12.dp))
             .background(canvasBg)
             .border(1.dp, Color.White.copy(alpha = 0.14f), RoundedCornerShape(12.dp))
+            .semantics {
+                contentDescription = editorDesc
+                stateDescription = pointsState
+            }
             .pointerInput(Unit) {
                 val touchPx = 22.dp.toPx()
                 detectTapGestures(
@@ -347,8 +359,13 @@ fun ToneCurveEditor(
     }
 }
 
-/** The four editable channels, ordered Master / Red / Green / Blue. */
-private val TONE_CHANNELS = listOf("Master", "Red", "Green", "Blue")
+/** The four editable channels, ordered Master / Red / Green / Blue (label resources). */
+private val TONE_CHANNELS = listOf(
+    R.string.tool_curve_channel_master,
+    R.string.tool_curve_channel_red,
+    R.string.tool_curve_channel_green,
+    R.string.tool_curve_channel_blue,
+)
 
 /**
  * The Tone Curve adjustment panel: a channel selector over the [ToneCurveEditor], a one-line
@@ -399,14 +416,14 @@ fun ToneCurveSection(s: ParamsState, preview: Bitmap?) {
     }
 
     SectionCard(
-        "Tone Curve", expanded, { expanded = it },
+        stringResource(R.string.tool_curve_title), expanded, { expanded = it },
         enabledSwitch = s.toneCurveActive,
         onEnabledChange = { s.toneCurveActive = it },
     ) {
         // Contrast: a hue-neutral S-curve composed into the master curve below. Auto-arms the stage
         // so the effect shows; "Reset all" clears it. Negative = mute the punchy look (forum #3).
         EnhancedSlider(
-            label = "Contrast",
+            label = stringResource(R.string.tool_curve_contrast),
             value = s.contrast,
             range = -100f..100f,
             onValueChange = {
@@ -415,13 +432,12 @@ fun ToneCurveSection(s: ParamsState, preview: Bitmap?) {
             },
             decimals = 0,
             default = 0f,
-            tooltip = "Hue-neutral contrast via the master tone curve. " +
-                "Negative softens a too-punchy look; positive adds punch. Composes with a drawn curve.",
+            tooltip = stringResource(R.string.tool_curve_contrast_help),
         )
-        SubTabRow(TONE_CHANNELS, channel, { channel = it })
+        SubTabRow(TONE_CHANNELS.map { stringResource(it) }, channel, { channel = it })
         ToneCurveEditor(points = points, histo = histo, curveColor = curveColor, onChange = setPoints)
         Text(
-            "Tap to add a point · drag to shape · double-tap a point to remove.",
+            stringResource(R.string.tool_curve_hint),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -437,7 +453,7 @@ fun ToneCurveSection(s: ParamsState, preview: Bitmap?) {
                     3 -> s.toneCurveBlue = emptyList()
                     else -> s.toneCurveMaster = emptyList()
                 }
-            }) { Text("Reset channel") }
+            }) { Text(stringResource(R.string.tool_curve_reset_channel)) }
             TextButton(onClick = {
                 s.toneCurveMaster = emptyList()
                 s.toneCurveRed = emptyList()
@@ -445,7 +461,7 @@ fun ToneCurveSection(s: ParamsState, preview: Bitmap?) {
                 s.toneCurveBlue = emptyList()
                 s.contrast = 0f
                 s.toneCurveActive = false
-            }) { Text("Reset all") }
+            }) { Text(stringResource(R.string.tool_curve_reset_all)) }
         }
     }
 }

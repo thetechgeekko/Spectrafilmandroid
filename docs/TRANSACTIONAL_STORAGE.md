@@ -421,7 +421,9 @@ currently installed app and test base APK and requires their single signer to ma
 an absent package is allowed, but a mismatched installed signer aborts without changing device data.
 It then requires the registered runner, runs the full release instrumentation twice, rejects every
 `FAIL`, and asserts all ticket #170/#172 `PASS` markers plus `INSTRUMENTATION_CODE: -1`. Its real
-`seed -> force-stop -> recover` sequence requires the same token in both phases. Finally it pulls both
+`seed -> force-stop -> recover` sequence requires the same token in both phases. It then runs the
+ticket #181 `ticket181_phase=a11y` accessibility scan (`TICKET181_ACCESSIBILITY: PASS`) and pulls its
+per-screen node dumps and screenshots into `<evidence>/accessibility/`. Finally it pulls both
 installed packages and requires candidate-equal SHA-256 bytes and signer digests before emitting
 `RELEASE_DEVICE_GATE: PASS`.
 

@@ -36,10 +36,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -67,6 +71,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -84,8 +89,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.dismiss
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
@@ -158,10 +172,25 @@ fun SectionCard(
         ),
     ) {
         val rotation by animateFloatAsState(if (expanded) 180f else 0f, label = "chevron")
+        // The header is one TalkBack node: "<title>, Expanded/Collapsed, heading, button".
+        // The help badge and the enable switch stay separate, individually focusable nodes.
+        val expandedState = stringResource(
+            if (expanded) R.string.widget_state_expanded else R.string.widget_state_collapsed,
+        )
+        val toggleLabel = stringResource(
+            if (expanded) R.string.widget_section_collapse else R.string.widget_section_expand,
+        )
+        val enableDescription = stringResource(R.string.widget_section_enable_switch, title)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickableNoRipple { onExpandedChange(!expanded) }
+                .clickableNoRipple(onClickLabel = toggleLabel, role = Role.Button) {
+                    onExpandedChange(!expanded)
+                }
+                .semantics {
+                    heading()
+                    stateDescription = expandedState
+                }
                 .padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -175,7 +204,11 @@ fun SectionCard(
                 Spacer(Modifier.width(8.dp))
             }
             if (enabledSwitch != null && onEnabledChange != null) {
-                Switch(checked = enabledSwitch, onCheckedChange = onEnabledChange)
+                Switch(
+                    checked = enabledSwitch,
+                    onCheckedChange = onEnabledChange,
+                    modifier = Modifier.semantics { contentDescription = enableDescription },
+                )
                 Spacer(Modifier.width(8.dp))
             }
             Chevron(modifier = Modifier.rotate(rotation))
@@ -202,14 +235,17 @@ fun SectionCard(
 @Composable
 private fun HelpBadge(title: String, onClick: () -> Unit) {
     val accent = MaterialTheme.colorScheme.primary
-    TextTooltip("What does \"$title\" do?") {
+    val description = stringResource(R.string.widget_help_badge_description, title)
+    val showHelpLabel = stringResource(R.string.widget_help_badge_action)
+    TextTooltip(stringResource(R.string.widget_help_badge_tooltip, title)) {
         Box(
             modifier = Modifier
+                .minimumInteractiveComponentSize()
                 .size(26.dp)
                 .clip(CircleShape)
                 .border(BorderStroke(1.dp, accent.copy(alpha = 0.55f)), CircleShape)
-                .clickable(onClick = onClick)
-                .semantics { contentDescription = "About $title" },
+                .clickable(onClickLabel = showHelpLabel, role = Role.Button, onClick = onClick)
+                .semantics { contentDescription = description },
             contentAlignment = Alignment.Center,
         ) {
             Text(
@@ -238,7 +274,11 @@ fun HelpSheet(help: ParamHelp, onDismiss: () -> Unit) {
                 .padding(start = 24.dp, end = 24.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(help.title, style = MaterialTheme.typography.headlineSmall)
+            Text(
+                help.title,
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.semantics { heading() },
+            )
             Text(
                 help.summary,
                 style = MaterialTheme.typography.titleSmall,
@@ -269,7 +309,11 @@ fun AdvancedToggle(advanced: Boolean, onToggle: (Boolean) -> Unit) {
         onClick = { onToggle(!advanced) },
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Text(if (advanced) "Hide advanced options" else "Show advanced options")
+        Text(
+            stringResource(
+                if (advanced) R.string.widget_advanced_hide else R.string.widget_advanced_show,
+            ),
+        )
     }
 }
 
@@ -290,18 +334,24 @@ private fun Chevron(modifier: Modifier = Modifier) {
 
 /** Convenience clickable without a ripple import dependency cost. */
 @Composable
-private fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier =
+private fun Modifier.clickableNoRipple(
+    onClickLabel: String? = null,
+    role: Role? = null,
+    onClick: () -> Unit,
+): Modifier =
     this.then(
-        Modifier.clickableImpl(onClick),
+        Modifier.clickableImpl(onClickLabel, role, onClick),
     )
 
 @Composable
-private fun Modifier.clickableImpl(onClick: () -> Unit): Modifier {
+private fun Modifier.clickableImpl(onClickLabel: String?, role: Role?, onClick: () -> Unit): Modifier {
     val interaction = remember { MutableInteractionSource() }
     return this.then(
         Modifier.clickable(
             interactionSource = interaction,
             indication = null,
+            onClickLabel = onClickLabel,
+            role = role,
             onClick = onClick,
         ),
     )
@@ -327,27 +377,43 @@ fun EnhancedSlider(
     val view = LocalView.current
     val interaction = LocalSliderInteraction.current
     var editing by remember { mutableStateOf(false) }
+    val formatted = formatValue(value, decimals)
     Column(modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
             // The value pill is interactive (Lightroom-style): single-tap to type an exact
             // value, double-tap to reset to the parameter's neutral default. Typing works on
             // every slider; reset is offered only when a [default] is supplied and the value
-            // isn't already there. Both give a tick of haptic feedback.
+            // isn't already there. Both give a tick of haptic feedback. The double-tap has no
+            // TalkBack equivalent, so the reset is also exposed as a custom accessibility action.
             val resetDefault = default?.takeIf { it != value }
+            val reset: (() -> Unit)? = resetDefault?.let { dv ->
+                {
+                    onValueChange(snap(dv, range, step))
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                }
+            }
+            val pillDescription = stringResource(R.string.widget_value_pill_description, label, formatted)
+            val enterLabel = stringResource(R.string.widget_value_pill_enter_exact, label)
+            val resetLabel = stringResource(R.string.widget_value_pill_reset_default, label)
             ValuePill(
-                formatValue(value, decimals),
-                modifier = Modifier.combinedClickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = { editing = true },
-                    onDoubleClick = resetDefault?.let { dv ->
-                        {
-                            onValueChange(snap(dv, range, step))
-                            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                formatted,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClickLabel = enterLabel,
+                        role = Role.Button,
+                        onClick = { editing = true },
+                        onDoubleClick = reset,
+                    )
+                    .semantics {
+                        contentDescription = pillDescription
+                        if (reset != null) {
+                            customActions = listOf(CustomAccessibilityAction(resetLabel) { reset(); true })
                         }
                     },
-                ),
             )
         }
         val steps = if (step > 0f) {
@@ -364,6 +430,11 @@ fun EnhancedSlider(
             },
             valueRange = range,
             steps = steps,
+            // Announce "<label>, <value>" rather than a bare percentage.
+            modifier = Modifier.semantics {
+                contentDescription = label
+                stateDescription = formatted
+            },
         )
         if (tooltip != null) {
             Text(
@@ -415,7 +486,11 @@ fun TripleSlider(
     step: Float = 0f,
     decimals: Int = 2,
     tooltip: String? = null,
-    componentLabels: Triple<String, String, String> = Triple("R", "G", "B"),
+    componentLabels: Triple<String, String, String> = Triple(
+        stringResource(R.string.widget_component_r),
+        stringResource(R.string.widget_component_g),
+        stringResource(R.string.widget_component_b),
+    ),
     default: Triple<Float, Float, Float>? = null,
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -446,7 +521,8 @@ fun PairSlider(
     step: Float = 0f,
     decimals: Int = 2,
     tooltip: String? = null,
-    componentLabels: Pair<String, String> = "1" to "2",
+    componentLabels: Pair<String, String> =
+        stringResource(R.string.widget_component_1) to stringResource(R.string.widget_component_2),
     default: Pair<Float, Float>? = null,
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -473,7 +549,21 @@ fun SwitchRow(
     onCheckedChange: (Boolean) -> Unit,
     tooltip: String? = null,
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+    // The whole row toggles and is ONE TalkBack node (label + tooltip + state); the inner Switch
+    // is display-only (onCheckedChange = null), so the row keeps its own >= 48 dp height.
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .toggleable(
+                value = checked,
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                role = Role.Switch,
+                onValueChange = onCheckedChange,
+            ),
+    ) {
         Column(Modifier.weight(1f)) {
             Text(label, style = MaterialTheme.typography.bodyMedium)
             if (tooltip != null) {
@@ -484,7 +574,7 @@ fun SwitchRow(
                 )
             }
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 
@@ -525,7 +615,8 @@ fun SubTabRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
+            .horizontalScroll(rememberScrollState())
+            .selectableGroup(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         tabs.forEachIndexed { i, label ->
@@ -534,7 +625,10 @@ fun SubTabRow(
                 shape = RoundedCornerShape(10.dp),
                 color = if (active) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { onSelect(i) },
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .clip(RoundedCornerShape(10.dp))
+                    .selectable(selected = active, role = Role.Tab) { onSelect(i) },
             ) {
                 Text(
                     label,
@@ -636,7 +730,9 @@ fun GroupedDropdown(
                         group.title,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(start = 16.dp, top = if (gi == 0) 8.dp else 12.dp, bottom = 4.dp),
+                        modifier = Modifier
+                            .padding(start = 16.dp, top = if (gi == 0) 8.dp else 12.dp, bottom = 4.dp)
+                            .semantics { heading() },
                     )
                 }
                 group.options.forEach { opt ->
@@ -657,15 +753,18 @@ fun GroupedDropdown(
  */
 @Composable
 fun NotYetActiveNote(
-    detail: String = "These controls are wired for a future engine update and have no effect yet.",
+    detail: String = stringResource(R.string.widget_not_yet_active_detail),
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.semantics(mergeDescendants = true) {},
+    ) {
         Surface(
             shape = RoundedCornerShape(8.dp),
             color = MaterialTheme.colorScheme.tertiaryContainer,
         ) {
             Text(
-                "not yet active",
+                stringResource(R.string.widget_not_yet_active_badge),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onTertiaryContainer,
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -687,7 +786,7 @@ fun NotYetActiveNote(
  */
 @Composable
 fun GatedBlock(
-    note: String = "These controls are wired for a future engine update and have no effect yet.",
+    note: String = stringResource(R.string.widget_not_yet_active_detail),
     content: @Composable () -> Unit,
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -743,9 +842,21 @@ private fun NumericEntryDialog(
 ) {
     var text by remember { mutableStateOf(initial) }
     val parsed = parseSliderInput(text, range, step)
+    // [parsed] clamps out-of-range input (Set still works, landing on the bound), so the range
+    // hint is flagged as an error both for unparseable text and for a typed value outside the
+    // range — the latter would otherwise be clamped silently.
+    val typed = text.trim().removePrefix("+").replace(',', '.').toFloatOrNull()
+    val outOfRange = typed != null && (typed < range.start || typed > range.endInclusive)
+    val isError = text.isNotBlank() && (parsed == null || outOfRange)
+    val rangeHint = stringResource(
+        R.string.widget_numeric_entry_range_hint,
+        formatValue(range.start, decimals),
+        formatValue(range.endInclusive, decimals),
+    )
+    val signDescription = stringResource(R.string.widget_numeric_entry_sign_toggle)
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(label) },
+        title = { Text(label, modifier = Modifier.semantics { heading() }) },
         text = {
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -753,36 +864,43 @@ private fun NumericEntryDialog(
                         value = text,
                         onValueChange = { text = it },
                         singleLine = true,
-                        isError = parsed == null && text.isNotBlank(),
+                        label = { Text(stringResource(R.string.widget_numeric_entry_field_label)) },
+                        isError = isError,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.weight(1f),
                     )
                     if (range.start < 0f) {
                         Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = {
-                            text = when {
-                                text.startsWith("-") -> text.removePrefix("-")
-                                text.isBlank() -> "-"
-                                else -> "-$text"
-                            }
-                        }) { Text("±") }
+                        OutlinedButton(
+                            onClick = {
+                                text = when {
+                                    text.startsWith("-") -> text.removePrefix("-")
+                                    text.isBlank() -> "-"
+                                    else -> "-$text"
+                                }
+                            },
+                            modifier = Modifier.semantics { contentDescription = signDescription },
+                        ) { Text("±") }
                     }
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Enter a value between ${formatValue(range.start, decimals)} and " +
-                        "${formatValue(range.endInclusive, decimals)}.",
+                    rangeHint,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (isError) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.semantics { if (isError) error(rangeHint) },
                 )
             }
         },
         confirmButton = {
             TextButton(enabled = parsed != null, onClick = { parsed?.let(onConfirm); onDismiss() }) {
-                Text("Set")
+                Text(stringResource(R.string.widget_numeric_entry_set))
             }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.widget_numeric_entry_cancel)) }
+        },
     )
 }
 
@@ -904,6 +1022,15 @@ fun AutoExposureControl(
         MeteringPopupPositionProvider(onPlacedAbove = { popupIsAbove = it })
     }
 
+    // The drag handle's swipe-to-collapse has no TalkBack equivalent, so (as Material's bottom
+    // sheet handle does) it carries a name plus a "dismiss" accessibility action.
+    val handleDescription = stringResource(R.string.widget_ae_drag_handle)
+    val dismissLabel = stringResource(R.string.widget_ae_dismiss_menu)
+    val handleSemantics = Modifier.semantics(mergeDescendants = true) {
+        contentDescription = handleDescription
+        dismiss(dismissLabel) { collapse(); true }
+    }
+
     // ----- Popup containing the metering-method panel -----
     // Placed outside the normal layout flow; the anchor Box below provides the bounds.
     // focusable = true enables tap-outside-to-dismiss and back-press dismissal.
@@ -970,6 +1097,7 @@ fun AutoExposureControl(
                             Box(
                                 modifier = Modifier
                                     .wrapContentSize()
+                                    .then(handleSemantics)
                                     .padding(top = 8.dp, bottom = 4.dp)
                                     .align(Alignment.CenterHorizontally),
                                 contentAlignment = Alignment.Center,
@@ -978,56 +1106,53 @@ fun AutoExposureControl(
                             }
                         }
 
-                        if (popupIsAbove) {
-                            Text(
-                                "Metering method",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                            )
-                        } else {
-                            Text(
-                                "Metering method",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                            )
-                        }
+                        Text(
+                            stringResource(R.string.widget_ae_metering_method),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp, vertical = 4.dp)
+                                .semantics { heading() },
+                        )
 
                         HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
 
-                        // "Off / Manual" entry — always at the top.
-                        MeteringMethodRow(
-                            label = "Off / Manual",
-                            isSelected = !autoExposure,
-                            onClick = {
-                                onAutoExposureChange(false)
-                                expanded = false
-                            },
-                        )
-
-                        HorizontalDivider(
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
-                        )
-
-                        // All metering methods.
-                        methods.forEachIndexed { index, method ->
+                        // The rows form one radio group: exactly one of Off / Manual or a
+                        // metering method is selected at a time.
+                        Column(Modifier.selectableGroup()) {
+                            // "Off / Manual" entry — always at the top.
                             MeteringMethodRow(
-                                label = meteringMethodLabel(method),
-                                isSelected = autoExposure && autoExposureMethod == method,
+                                label = stringResource(R.string.widget_ae_off_manual),
+                                isSelected = !autoExposure,
                                 onClick = {
-                                    onAutoExposureChange(true)
-                                    onMethodChange(method)
-                                    // Keep the list open so the user sees the selection.
-                                    // Dismissed via swipe, tap-outside, or back-press.
+                                    onAutoExposureChange(false)
+                                    expanded = false
                                 },
                             )
-                            if (index < methods.lastIndex) {
-                                HorizontalDivider(
-                                    modifier = Modifier.padding(horizontal = 16.dp),
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f),
+
+                            HorizontalDivider(
+                                modifier = Modifier.padding(horizontal = 16.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                            )
+
+                            // All metering methods.
+                            methods.forEachIndexed { index, method ->
+                                MeteringMethodRow(
+                                    label = meteringMethodLabel(method),
+                                    isSelected = autoExposure && autoExposureMethod == method,
+                                    onClick = {
+                                        onAutoExposureChange(true)
+                                        onMethodChange(method)
+                                        // Keep the list open so the user sees the selection.
+                                        // Dismissed via swipe, tap-outside, or back-press.
+                                    },
                                 )
+                                if (index < methods.lastIndex) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(horizontal = 16.dp),
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f),
+                                    )
+                                }
                             }
                         }
 
@@ -1036,6 +1161,7 @@ fun AutoExposureControl(
                             Box(
                                 modifier = Modifier
                                     .wrapContentSize()
+                                    .then(handleSemantics)
                                     .padding(top = 4.dp, bottom = 8.dp)
                                     .align(Alignment.CenterHorizontally),
                                 contentAlignment = Alignment.Center,
@@ -1076,10 +1202,14 @@ fun AutoExposureControl(
                 )
             },
     ) {
-        TextTooltip(
-            "Auto-exposure: tap to choose a metering pattern, or swipe up to expand. " +
-                "When off, exposure is fully manual.",
-        ) {
+        // Both buttons announce as "Auto-exposure, <On, method | Off, manual exposure>, button";
+        // the swipe-up gesture needs no accessible twin because a tap does the same thing.
+        val aeDescription = stringResource(R.string.widget_ae_description)
+        val aeStateOn = stringResource(R.string.widget_ae_state_on, currentLabel)
+        val aeStateOff = stringResource(R.string.widget_ae_state_off)
+        val chooseLabel = stringResource(R.string.widget_ae_choose_method)
+        val turnOnLabel = stringResource(R.string.widget_ae_turn_on)
+        TextTooltip(stringResource(R.string.widget_ae_tooltip)) {
         if (autoExposure) {
             // ON: filled/accent button showing active method name.
             Button(
@@ -1087,14 +1217,20 @@ fun AutoExposureControl(
                     // Tap while on: toggle the list panel.
                     expanded = !expanded
                 },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics {
+                        contentDescription = aeDescription
+                        stateDescription = aeStateOn
+                        onClick(label = chooseLabel, action = null)
+                    },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,
                 ),
             ) {
                 Text(
-                    "Auto  ·  $currentLabel",
+                    stringResource(R.string.widget_ae_button_on, currentLabel),
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
@@ -1107,12 +1243,18 @@ fun AutoExposureControl(
                         onAutoExposureChange(true)
                         expanded = true
                     },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics {
+                            contentDescription = aeDescription
+                            stateDescription = aeStateOff
+                            onClick(label = turnOnLabel, action = null)
+                        },
                 ) {
-                    Text("Auto")
+                    Text(stringResource(R.string.widget_ae_button_off))
                 }
                 Text(
-                    "Manual exposure",
+                    stringResource(R.string.widget_ae_manual_exposure),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 4.dp, top = 2.dp),
@@ -1134,10 +1276,13 @@ private fun MeteringMethodRow(
 ) {
     val primaryColor = MaterialTheme.colorScheme.primary
     val onSurface = MaterialTheme.colorScheme.onSurface
+    // Radio-button semantics expose the selection that is otherwise shown only by colour/weight
+    // and the drawn checkmark.
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .heightIn(min = 48.dp)
+            .selectable(selected = isSelected, role = Role.RadioButton, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,

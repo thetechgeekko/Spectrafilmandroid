@@ -14,6 +14,7 @@
  */
 package com.spectrafilm.app
 
+import androidx.annotation.StringRes
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
@@ -53,6 +54,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -70,38 +77,17 @@ private val SPECTRUM = listOf(
 )
 
 private data class OnboardPage(
-    val title: String,
-    val body: String,
+    @StringRes val titleRes: Int,
+    @StringRes val bodyRes: Int,
     val accent: Color,
 )
 
 private val PAGES = listOf(
-    OnboardPage(
-        title = "Spectral film simulation,\non your phone",
-        body = "Spektrafilm renders your photos through a physically-modelled film " +
-            "stock and darkroom print — spectrum-accurate, not a preset filter.",
-        accent = SPECTRUM[0],
-    ),
-    OnboardPage(
-        title = "How it works",
-        body = "Pick a photo or RAW/DNG → choose a film stock and a print paper → " +
-            "tune the look (grain, halation, couplers, glare) → export at full resolution.",
-        accent = SPECTRUM[2],
-    ),
-    OnboardPage(
-        title = "Under the hood",
-        body = "A bit-exact port of the spektrafilm spectral pipeline, RAW decoding via " +
-            "LibRaw, and an Image-Toolbox-inspired Compose UI. Previews are downscaled " +
-            "for speed; exports render at full resolution.",
-        accent = SPECTRUM[4],
-    ),
-    OnboardPage(
-        title = "Credits",
-        body = "Dedicated to the pixls.us community. Film modeling powered by spektrafilm " +
-            "(Andrea Volpato). Thanks to Image Toolbox (T8RIN), colour-science and LibRaw. " +
-            "Free software under the GPLv3.",
-        accent = SPECTRUM[6],
-    ),
+    OnboardPage(R.string.screen_welcome_page1_title, R.string.screen_welcome_page1_body, SPECTRUM[0]),
+    OnboardPage(R.string.screen_welcome_page2_title, R.string.screen_welcome_page2_body, SPECTRUM[2]),
+    OnboardPage(R.string.screen_welcome_page3_title, R.string.screen_welcome_page3_body, SPECTRUM[4]),
+    // The credits body carries the verbatim GPL line "Film modeling powered by spektrafilm".
+    OnboardPage(R.string.screen_welcome_page4_title, R.string.screen_welcome_page4_body, SPECTRUM[6]),
 )
 
 /**
@@ -129,15 +115,26 @@ fun WelcomeFlow(
     val pagerState = rememberPagerState(pageCount = { PAGES.size })
     val scope = rememberCoroutineScope()
 
-    // Slowly drifting spectral gradient backdrop.
-    val transition = rememberInfiniteTransition(label = "spectrum")
-    val shift by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 9000, easing = LinearEasing),
-        ),
-        label = "shift",
+    // Slowly drifting spectral gradient backdrop — held static when the user has turned
+    // system animations off (reduced motion), since an infinite transition never settles.
+    val ctx = LocalContext.current
+    val reduceMotion = remember(ctx) {
+        android.provider.Settings.Global.getFloat(
+            ctx.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f,
+        ) == 0f
+    }
+    val shift = if (reduceMotion) 0f else {
+        rememberInfiniteTransition(label = "spectrum").animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 9000, easing = LinearEasing),
+            ),
+            label = "shift",
+        ).value
+    }
+    val pageIndicator = stringResource(
+        R.string.screen_welcome_page_indicator, pagerState.currentPage + 1, PAGES.size,
     )
 
     Box(
@@ -160,7 +157,10 @@ fun WelcomeFlow(
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 if (pagerState.currentPage < PAGES.lastIndex) {
                     TextButton(onClick = onFinish) {
-                        Text("Skip", color = Color.White.copy(alpha = 0.85f))
+                        Text(
+                            stringResource(R.string.screen_welcome_skip),
+                            color = Color.White.copy(alpha = 0.85f),
+                        )
                     }
                 } else {
                     Spacer(Modifier.height(48.dp))
@@ -187,9 +187,12 @@ fun WelcomeFlow(
                 )
             }
 
-            // Page indicator dots.
+            // Page indicator dots (colour-only, so the row announces "Page n of m").
             Row(
-                Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 16.dp)
+                    .semantics { contentDescription = pageIndicator },
                 horizontalArrangement = Arrangement.Center,
             ) {
                 repeat(PAGES.size) { i ->
@@ -218,16 +221,16 @@ fun WelcomeFlow(
                     OutlinedButton(
                         onClick = { scope.launch { pagerState.animateScrollToPage(pagerState.currentPage - 1) } },
                         modifier = Modifier.weight(1f),
-                    ) { Text("Back") }
+                    ) { Text(stringResource(R.string.screen_back)) }
                 }
                 if (pagerState.currentPage < PAGES.lastIndex) {
                     Button(
                         onClick = { scope.launch { pagerState.animateScrollToPage(pagerState.currentPage + 1) } },
                         modifier = Modifier.weight(1f),
-                    ) { Text("Next") }
+                    ) { Text(stringResource(R.string.screen_welcome_next)) }
                 } else {
                     Button(onClick = onFinish, modifier = Modifier.weight(1f)) {
-                        Text("Get started")
+                        Text(stringResource(R.string.screen_welcome_get_started))
                     }
                 }
             }
@@ -259,15 +262,16 @@ private fun OnboardingPageContent(
         )
         Spacer(Modifier.height(36.dp))
         Text(
-            page.title,
+            stringResource(page.titleRes),
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             color = Color.White,
             textAlign = TextAlign.Center,
+            modifier = Modifier.semantics { heading() },
         )
         Spacer(Modifier.height(20.dp))
         Text(
-            page.body,
+            stringResource(page.bodyRes),
             style = MaterialTheme.typography.bodyLarge,
             color = Color.White.copy(alpha = 0.85f),
             textAlign = TextAlign.Center,
@@ -275,7 +279,7 @@ private fun OnboardingPageContent(
         if (isLast) {
             Spacer(Modifier.height(28.dp))
             Text(
-                "Akshay · instagram.com/akshay.pool · youtube.com/@Akshayishere",
+                stringResource(R.string.screen_welcome_author_links),
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.White.copy(alpha = 0.7f),
                 textAlign = TextAlign.Center,
@@ -284,11 +288,18 @@ private fun OnboardingPageContent(
             OutlinedButton(
                 onClick = onOpenHowTo,
                 modifier = Modifier.fillMaxWidth(0.85f),
-            ) { Text("How to use this app") }
+            ) { Text(stringResource(R.string.screen_how_to_use_app)) }
             Spacer(Modifier.height(8.dp))
+            val opensInBrowser = stringResource(R.string.screen_opens_in_browser)
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = onOpenSettings) { Text("Settings") }
-                OutlinedButton(onClick = onReportIssue) { Text("Report an issue") }
+                OutlinedButton(onClick = onOpenSettings) {
+                    Text(stringResource(R.string.screen_welcome_open_settings))
+                }
+                OutlinedButton(
+                    onClick = onReportIssue,
+                    // Label only: the button's own click action is kept (null action merges).
+                    modifier = Modifier.semantics { onClick(label = opensInBrowser, action = null) },
+                ) { Text(stringResource(R.string.screen_report_issue)) }
             }
         }
     }

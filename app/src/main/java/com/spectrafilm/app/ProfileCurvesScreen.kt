@@ -32,6 +32,12 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -160,28 +166,40 @@ fun ProfileCurvesScreen(
         // --- Top bar ---
         @OptIn(ExperimentalMaterial3Api::class)
         TopAppBar(
-            title = { Text("Curves · $displayName") },
+            title = {
+                Text(
+                    stringResource(R.string.screen_curves_title, displayName),
+                    modifier = Modifier.semantics { heading() },
+                )
+            },
             navigationIcon = {
-                TextButton(onClick = onBack) { Text("Back") }
+                TextButton(onClick = onBack) { Text(stringResource(R.string.screen_back)) }
             },
         )
 
         Box(Modifier.weight(1f)) {
+            // Status shown by a spinner / colour is also announced as text.
+            val statusModifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }
             when {
                 loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
+                    val loadingDesc = stringResource(R.string.screen_curves_loading)
+                    CircularProgressIndicator(
+                        modifier = statusModifier.semantics { contentDescription = loadingDesc },
+                    )
                 }
                 error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Error loading profile: $error",
+                    Text(stringResource(R.string.screen_curves_error, error ?: ""),
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.error)
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = statusModifier)
                 }
                 curveData == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Profile data not found for '$profileId'",
+                    Text(stringResource(R.string.screen_curves_not_found, profileId),
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = statusModifier)
                 }
-                else -> CurveContent(data = curveData!!)
+                else -> curveData?.let { CurveContent(data = it, displayName = displayName) }
             }
         }
     }
@@ -192,7 +210,7 @@ fun ProfileCurvesScreen(
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun CurveContent(data: ProfileCurveData) {
+private fun CurveContent(data: ProfileCurveData, displayName: String) {
     Column(
         Modifier
             .fillMaxSize()
@@ -217,64 +235,79 @@ private fun CurveContent(data: ProfileCurveData) {
 
         // --- Chart 1: Spectral Sensitivity ---
         if (data.logSensitivity != null) {
-            ChartCard(
-                title = "Spectral Sensitivity",
-                subtitle = "log sensitivity vs wavelength (nm)",
-            ) {
+            val title = stringResource(R.string.screen_curves_sensitivity_title)
+            val subtitle = stringResource(R.string.screen_curves_sensitivity_subtitle)
+            val labels = listOf(
+                stringResource(R.string.screen_curves_legend_r_layer),
+                stringResource(R.string.screen_curves_legend_g_layer),
+                stringResource(R.string.screen_curves_legend_b_layer),
+            )
+            ChartCard(title = title, subtitle = subtitle) {
                 val channelColors = channelColors()
                 SpectralChart(
                     xValues = data.wavelengths,
                     ySeriesList = transposeSeries(data.logSensitivity, 3),
                     channelColors = channelColors,
-                    channelLabels = listOf("R layer", "G layer", "B layer"),
-                    xLabel = "Wavelength (nm)",
-                    yLabel = "log S",
+                    channelLabels = labels,
+                    xLabel = stringResource(R.string.screen_curves_axis_wavelength),
+                    yLabel = stringResource(R.string.screen_curves_axis_log_s),
+                    description = chartDescription(title, displayName, subtitle, labels),
                     xRange = 380f..780f,
                 )
             }
         } else {
-            MissingDataNote("Spectral sensitivity data not available for this profile.")
+            MissingDataNote(stringResource(R.string.screen_curves_sensitivity_missing))
         }
 
         // --- Chart 2: H-D / Density curves ---
         if (data.densityCurves != null && data.logExposure != null) {
-            ChartCard(
-                title = "Characteristic (H-D) Curves",
-                subtitle = "density vs log exposure",
-            ) {
+            val title = stringResource(R.string.screen_curves_hd_title)
+            val subtitle = stringResource(R.string.screen_curves_hd_subtitle)
+            val labels = listOf(
+                stringResource(R.string.screen_curves_legend_r),
+                stringResource(R.string.screen_curves_legend_g),
+                stringResource(R.string.screen_curves_legend_b),
+            )
+            ChartCard(title = title, subtitle = subtitle) {
                 val channelColors = channelColors()
                 GenericChart(
                     xValues = data.logExposure,
                     ySeriesList = transposeSeries(data.densityCurves, 3),
                     channelColors = channelColors,
-                    channelLabels = listOf("R", "G", "B"),
-                    xLabel = "log E",
-                    yLabel = "Density",
+                    channelLabels = labels,
+                    xLabel = stringResource(R.string.screen_curves_axis_log_e),
+                    yLabel = stringResource(R.string.screen_curves_axis_density),
+                    description = chartDescription(title, displayName, subtitle, labels),
                 )
             }
         } else {
-            MissingDataNote("Density curve data not available for this profile.")
+            MissingDataNote(stringResource(R.string.screen_curves_hd_missing))
         }
 
         // --- Chart 3: Dye density spectra ---
         if (data.channelDensity != null) {
-            ChartCard(
-                title = "Dye Density Spectra",
-                subtitle = "dye density vs wavelength (nm)",
-            ) {
+            val title = stringResource(R.string.screen_curves_dye_title)
+            val subtitle = stringResource(R.string.screen_curves_dye_subtitle)
+            val labels = listOf(
+                stringResource(R.string.screen_curves_legend_c_dye),
+                stringResource(R.string.screen_curves_legend_m_dye),
+                stringResource(R.string.screen_curves_legend_y_dye),
+            )
+            ChartCard(title = title, subtitle = subtitle) {
                 val channelColors = channelColors()
                 SpectralChart(
                     xValues = data.wavelengths,
                     ySeriesList = transposeSeries(data.channelDensity, 3),
                     channelColors = channelColors,
-                    channelLabels = listOf("C dye (R layer)", "M dye (G layer)", "Y dye (B layer)"),
-                    xLabel = "Wavelength (nm)",
-                    yLabel = "Density",
+                    channelLabels = labels,
+                    xLabel = stringResource(R.string.screen_curves_axis_wavelength),
+                    yLabel = stringResource(R.string.screen_curves_axis_density),
+                    description = chartDescription(title, displayName, subtitle, labels),
                     xRange = 380f..780f,
                 )
             }
         } else {
-            MissingDataNote("Dye density spectra not available for this profile.")
+            MissingDataNote(stringResource(R.string.screen_curves_dye_missing))
         }
 
         Spacer(Modifier.height(32.dp))
@@ -305,7 +338,11 @@ private fun ChartCard(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(
+                title,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.semantics { heading() },
+            )
             Text(subtitle,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -313,6 +350,17 @@ private fun ChartCard(
         }
     }
 }
+
+/** Spoken summary of a chart, e.g. "Density curve chart for Kodak Portra 400: ... Series: R, G, B." */
+@Composable
+private fun chartDescription(
+    title: String,
+    displayName: String,
+    subtitle: String,
+    channelLabels: List<String>,
+): String = stringResource(
+    R.string.screen_curves_chart_desc, title, displayName, subtitle, channelLabels.joinToString(", "),
+)
 
 @Composable
 private fun MissingDataNote(text: String) {
@@ -342,6 +390,7 @@ private fun SpectralChart(
     channelLabels: List<String>,
     xLabel: String,
     yLabel: String,
+    description: String,
     xRange: ClosedFloatingPointRange<Float> = 380f..780f,
     chartHeight: Dp = 200.dp,
 ) {
@@ -352,6 +401,7 @@ private fun SpectralChart(
         channelLabels = channelLabels,
         xLabel = xLabel,
         yLabel = yLabel,
+        description = description,
         xMin = xRange.start,
         xMax = xRange.endInclusive,
         chartHeight = chartHeight,
@@ -371,6 +421,7 @@ private fun GenericChart(
     channelLabels: List<String>,
     xLabel: String,
     yLabel: String,
+    description: String,
     xMin: Float? = null,
     xMax: Float? = null,
     chartHeight: Dp = 200.dp,
@@ -401,7 +452,9 @@ private fun GenericChart(
     Canvas(
         modifier = Modifier
             .fillMaxWidth()
-            .height(chartHeight),
+            .height(chartHeight)
+            // The plot is pixels only; this is what TalkBack reads for it.
+            .semantics { contentDescription = description },
     ) {
         val padLeft = 52f
         val padRight = 12f

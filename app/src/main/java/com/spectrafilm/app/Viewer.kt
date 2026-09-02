@@ -41,6 +41,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -64,12 +65,23 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.IntOffset
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlin.math.min
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
@@ -103,12 +115,18 @@ fun GpuPreviewSurface(
     onZoomStart: () -> Unit = {},
     onZoomIn: () -> Unit = onZoomStart,
     onUnavailable: () -> Unit = {},
+    // Height of whatever overlays the bottom of this surface (the floating adjustment panel):
+    // the zoom control centres in the part that is still visible (#181, 200% font).
+    controlsBottomInset: Dp = 0.dp,
 ) {
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     val aspect = proxy.width.toFloat() / proxy.height.toFloat()
+    val previewDesc = stringResource(R.string.tool_viewer_preview_desc)
     Box(
         modifier = modifier
             .onSizeChanged { viewSize = it }
+            // The GL view has no semantics of its own; describe the preview + its gestures here.
+            .semantics { contentDescription = previewDesc }
             .pointerInput(Unit) {
                 // This surface is fit-only; any pinch hands off to the CPU zoom path.
                 detectTransformGestures { _, _, zoom, _ ->
@@ -136,7 +154,10 @@ fun GpuPreviewSurface(
         // ZoomableImage already zoomed (the CPU path owns pinch/pan + the sharp ROI render).
         ZoomButton(
             "+",
-            modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
+            contentDescription = stringResource(R.string.tool_viewer_zoom_in),
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 6.dp, bottom = controlsBottomInset),
         ) { onZoomIn() }
     }
 }
@@ -178,6 +199,8 @@ fun ZoomableImage(
     onRoiSettled: ((RoiRect) -> Unit)? = null,
     onRoiCleared: (() -> Unit)? = null,
     roiOverlay: RoiOverlay? = null,
+    // See [GpuPreviewSurface.controlsBottomInset].
+    controlsBottomInset: Dp = 0.dp,
     // Scale to start at on first composition — used when the GPU fit surface hands off via its
     // "+" button so zoom-in lands already zoomed instead of at fit. Default 1f (fit) everywhere else.
     initialScale: Float = 1f,
@@ -273,13 +296,15 @@ fun ZoomableImage(
             },
         contentAlignment = Alignment.Center,
     ) {
+        val zoomState = stringResource(R.string.tool_viewer_zoom_state, (scale * 100f).roundToInt())
         Image(
             bitmap = image,
-            contentDescription = "preview",
+            contentDescription = stringResource(R.string.tool_viewer_preview_desc),
             contentScale = ContentScale.Fit,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspect)
+                .semantics { stateDescription = zoomState }
                 .graphicsLayer(
                     scaleX = scale,
                     scaleY = scale,
@@ -320,30 +345,35 @@ fun ZoomableImage(
         // drive the SAME scale/offset as the gestures, so pan-clamping and the sharp ROI render
         // apply identically. Anchored to the right edge so it clears the bottom control row.
         Column(
-            modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 6.dp, bottom = controlsBottomInset),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ZoomButton("+") {
+            ZoomButton("+", stringResource(R.string.tool_viewer_zoom_in)) {
                 val ns = (scale * 1.6f).coerceIn(MIN_ZOOM, MAX_ZOOM)
                 scale = ns
                 offset = clampOffset(offset, ns)
             }
             if (scale > 1.01f) {
                 Text(
-                    "${(scale * 100f).roundToInt()}%",
+                    stringResource(R.string.tool_viewer_zoom_percent, (scale * 100f).roundToInt()),
                     color = Color.White,
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier
                         .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
                         .padding(horizontal = 6.dp, vertical = 2.dp),
                 )
-                ZoomButton("−") {  // minus
+                ZoomButton("−", stringResource(R.string.tool_viewer_zoom_out)) {  // minus
                     val ns = (scale / 1.6f).coerceIn(MIN_ZOOM, MAX_ZOOM)
                     scale = ns
                     offset = if (ns <= 1.01f) Offset.Zero else clampOffset(offset, ns)
                 }
-                ZoomButton("Fit") {
+                ZoomButton(
+                    stringResource(R.string.tool_viewer_zoom_fit_short),
+                    stringResource(R.string.tool_viewer_zoom_fit),
+                ) {
                     scale = 1f
                     offset = Offset.Zero
                 }
@@ -352,16 +382,26 @@ fun ZoomableImage(
     }
 }
 
-/** A small translucent circular button for the [ZoomableImage] zoom-control cluster. */
+/**
+ * A small translucent circular button for the [ZoomableImage] zoom-control cluster. [label] is the
+ * visible glyph ("+", "−", "Fit"); [contentDescription] is what TalkBack announces instead of it.
+ */
 @Composable
-private fun ZoomButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun ZoomButton(
+    label: String,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Surface(
         shape = CircleShape,
         color = Color.Black.copy(alpha = 0.5f),
         modifier = modifier
+            .minimumInteractiveComponentSize()
             .size(40.dp)
             .clip(CircleShape)
-            .clickable(onClick = onClick),
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { this.contentDescription = contentDescription },
     ) {
         Box(contentAlignment = Alignment.Center) {
             Text(
@@ -491,6 +531,13 @@ fun CompareSlider(
     val aspect = after.width.toFloat() / after.height.toFloat()
     val beforeImg = remember(before) { before.asImageBitmap() }
     val afterImg = remember(after) { after.asImageBitmap() }
+    // Drag/tap-only wipe: one merged node describing the comparison, its split as state, and
+    // three custom actions so a screen reader can move the wipe without a gesture.
+    val compareDesc = stringResource(R.string.tool_viewer_compare_desc)
+    val compareState = stringResource(R.string.tool_viewer_compare_state, (split * 100f).roundToInt())
+    val showBefore = stringResource(R.string.tool_viewer_compare_show_before)
+    val showAfter = stringResource(R.string.tool_viewer_compare_show_after)
+    val splitHalf = stringResource(R.string.tool_viewer_compare_split_half)
 
     Box(
         modifier = modifier
@@ -498,6 +545,15 @@ fun CompareSlider(
             .aspectRatio(aspect)
             .clipToBounds()
             .onSizeChanged { width = it.width }
+            .semantics(mergeDescendants = true) {
+                contentDescription = compareDesc
+                stateDescription = compareState
+                customActions = listOf(
+                    CustomAccessibilityAction(showBefore) { split = 1f; true },
+                    CustomAccessibilityAction(showAfter) { split = 0f; true },
+                    CustomAccessibilityAction(splitHalf) { split = 0.5f; true },
+                )
+            }
             .pointerInput(Unit) {
                 detectTapGestures { pos ->
                     if (width > 0) split = (pos.x / width).coerceIn(0f, 1f)
@@ -510,12 +566,12 @@ fun CompareSlider(
             },
         contentAlignment = Alignment.Center,
     ) {
-        // After (full frame).
-        Image(afterImg, "after", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+        // After (full frame). Both images are described by the parent node, so no per-image cd.
+        Image(afterImg, null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
         // Before, clipped to the left of the split via a draw-phase rect clip.
         Image(
             bitmap = beforeImg,
-            contentDescription = "before",
+            contentDescription = null,
             contentScale = ContentScale.Fit,
             modifier = Modifier
                 .fillMaxSize()
@@ -534,8 +590,8 @@ fun CompareSlider(
                     strokeWidth = 3f,
                 )
             }
-            CompareTag("BEFORE", Alignment.TopStart)
-            CompareTag("AFTER", Alignment.TopEnd)
+            CompareTag(stringResource(R.string.tool_viewer_before_tag), Alignment.TopStart)
+            CompareTag(stringResource(R.string.tool_viewer_after_tag), Alignment.TopEnd)
         }
     }
 }
@@ -578,12 +634,14 @@ fun PreviewHistogramOverlay(bitmap: Bitmap, modifier: Modifier = Modifier) {
         }
     }
     val h = hist ?: return
+    val histogramDesc = stringResource(R.string.tool_viewer_histogram_desc)
     Box(
         modifier = modifier
             .fillMaxWidth(0.6f)
             .height(56.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(Color.Black.copy(alpha = 0.42f)),
+            .background(Color.Black.copy(alpha = 0.42f))
+            .semantics { contentDescription = histogramDesc },
     ) {
         Canvas(Modifier.fillMaxSize().padding(4.dp)) { drawHistogram(h) }
     }
@@ -785,9 +843,10 @@ fun MagnifierOverlay(
             modifier = Modifier.padding(24.dp),
         ) {
             Text(
-                "100% crop",
+                stringResource(R.string.tool_viewer_magnifier_title),
                 color = Color.White,
                 style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.semantics { heading() },
             )
             Box(
                 Modifier
@@ -802,7 +861,7 @@ fun MagnifierOverlay(
                     // 1:1 — no upscale of the preview — so dye-cloud grain truly resolves.
                     Image(
                         bitmap = c.asImageBitmap(),
-                        contentDescription = "100% crop",
+                        contentDescription = stringResource(R.string.tool_viewer_magnifier_image_desc),
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -810,20 +869,23 @@ fun MagnifierOverlay(
                     CircularProgressIndicator(color = Color.White)
                 }
             }
+            // Progress copy is announced as it changes (polite: never interrupts).
             Text(
                 status,
                 color = Color.White.copy(alpha = 0.8f),
                 style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
             )
             if (rendering) {
                 Text(
-                    "Rendering full-resolution crop…",
+                    stringResource(R.string.tool_viewer_magnifier_rendering),
                     color = Color.White.copy(alpha = 0.7f),
                     style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
             }
             TextButton(onClick = onClose) {
-                Text("Close", color = Color.White)
+                Text(stringResource(R.string.tool_close), color = Color.White)
             }
         }
     }
