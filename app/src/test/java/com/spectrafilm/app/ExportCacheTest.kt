@@ -171,6 +171,43 @@ class ExportCacheTest {
     }
 
     @Test
+    fun `adopt takes over a staged file and serves it back`() {
+        val bytes = payload(16 * 1024)
+        val staged = temp.newFile("spectrafilm-export-abc.tif.part")
+        staged.writeBytes(bytes)
+        val sha = ExportCache.hex(
+            java.security.MessageDigest.getInstance("SHA-256").digest(bytes),
+        )
+        val subject = cache()
+        assertTrue(subject.adopt("k1", staged, bytes.size.toLong(), sha))
+        assertFalse("the stage must be moved, not copied", staged.exists())
+        val entry = subject.get("k1")
+        assertNotNull(entry)
+        assertArrayEquals(bytes, requireNotNull(entry).payload.readBytes())
+    }
+
+    @Test
+    fun `adopt refuses a stage whose length disagrees with the encoder`() {
+        val staged = temp.newFile("stage-mismatch.part")
+        staged.writeBytes(payload(1024))
+        val subject = cache()
+        assertFalse(subject.adopt("k1", staged, 999L, "0".repeat(64)))
+        assertNull(subject.get("k1"))
+    }
+
+    @Test
+    fun `adopt with a wrong digest still fails closed on read`() {
+        // adopt trusts the encoder's digest rather than re-hashing 70 MB, so a wrong one is
+        // caught by the read-side validation instead. Either way nothing bad is ever served.
+        val staged = temp.newFile("stage-baddigest.part")
+        val bytes = payload(2048)
+        staged.writeBytes(bytes)
+        val subject = cache()
+        assertTrue(subject.adopt("k1", staged, bytes.size.toLong(), "f".repeat(64)))
+        assertNull("a mis-declared digest must not be served", subject.get("k1"))
+    }
+
+    @Test
     fun `a missing cache directory is created on write`() {
         val nested = File(root, "does/not/exist/yet")
         val subject = ExportCache(nested, ExportCache.Budget(), "v1", log = { _, _ -> })

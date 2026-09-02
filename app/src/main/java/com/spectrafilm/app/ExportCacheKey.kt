@@ -33,17 +33,18 @@ import java.security.MessageDigest
 internal object ExportCacheKey {
 
     /**
-     * Identifies the source bytes. [contentSha256] is the digest of the decoded-from bytes;
-     * [decodeMaxEdge] and [rotationDegrees] are part of the identity because they change the
-     * pixels that reach the engine.
+     * Identifies the pixels that reach the engine. [contentSha256] digests the source bytes;
+     * [decodeIdentity] renders every decode-time input that changes them — orientation, RAW
+     * white balance and development, the creative temperature/tint applied during decode, and
+     * the source kind. It is rendered by the caller rather than taken as a whole
+     * SourceDecodeRequest because that type carries a Context, whose toString is an identity
+     * and would differ between two otherwise identical exports.
      */
     class Source(
         val contentSha256: String,
         val bytes: Long,
         val decodeMaxEdge: Int,
-        val rotationDegrees: Int,
-        /** RAW development inputs; null for non-RAW sources. */
-        val rawDevelopment: String?,
+        val decodeIdentity: String,
     )
 
     /** Post-engine, app-side edits. The engine parameters do not carry these. */
@@ -76,8 +77,7 @@ internal object ExportCacheKey {
             line("source.sha256", source.contentSha256)
             line("source.bytes", source.bytes)
             line("source.decodeMaxEdge", source.decodeMaxEdge)
-            line("source.rotation", source.rotationDegrees)
-            line("source.raw", source.rawDevelopment ?: "-")
+            line("source.decode", source.decodeIdentity)
 
             // The whole engine parameter tree, in one deterministic rendering.
             line("params", params.toString())

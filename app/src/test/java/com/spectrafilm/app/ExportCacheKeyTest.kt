@@ -30,9 +30,8 @@ class ExportCacheKeyTest {
         sha: String = "a".repeat(64),
         bytes: Long = 37_460_417L,
         maxEdge: Int = 16384,
-        rotation: Int = 0,
-        raw: String? = null,
-    ) = ExportCacheKey.Source(sha, bytes, maxEdge, rotation, raw)
+        decode: String = "kind=IMAGE;rot=NONE;wb=AS_SHOT",
+    ) = ExportCacheKey.Source(sha, bytes, maxEdge, decode)
 
     private fun grade(
         cctf: Boolean = true,
@@ -78,8 +77,10 @@ class ExportCacheKeyTest {
         assertNotEquals("different bytes", base, key(source = source(sha = "b".repeat(64))))
         assertNotEquals("different length", base, key(source = source(bytes = 1L)))
         assertNotEquals("different decode cap", base, key(source = source(maxEdge = 2048)))
-        assertNotEquals("different rotation", base, key(source = source(rotation = 90)))
-        assertNotEquals("raw development", base, key(source = source(raw = "wb=5200,tint=3")))
+        assertNotEquals("different orientation", base,
+            key(source = source(decode = "kind=IMAGE;rot=CW90;wb=AS_SHOT")))
+        assertNotEquals("different RAW development", base,
+            key(source = source(decode = "kind=RAW;rot=NONE;wb=5200/3")))
     }
 
     @Test

@@ -138,16 +138,61 @@ internal class ExportCache(
         }
         val bytes = tempPayload.length()
         if (bytes <= 0L) throw IOException("encoder produced $bytes bytes")
+        // Payload first, metadata second: the reverse order could advertise an entry whose
+        // bytes are not there yet.
+        if (!tempPayload.renameTo(payloadFile(key))) throw IOException("cannot commit payload")
+        writeMetadata(key, bytes, hex(digest.digest()))
+        evict(keep = key)
+        return true
+    }
+
+    /**
+     * Take ownership of an already-encoded, already-digested staged file by moving it under
+     * [key]. The encoder has just hashed these exact bytes to publish them, so re-reading 70 MB
+     * to hash them again would be pure waste; [sha256] is that digest and [bytes] its length.
+     *
+     * The move is a rename within the app's own cache tree, so it is atomic and costs nothing.
+     * Callers must invoke this only AFTER the artifact has published successfully — a cache is
+     * a record of exports that happened, not of exports that were attempted.
+     */
+    fun adopt(key: String, staged: File, bytes: Long, sha256: String): Boolean =
+        synchronized(lock) {
+            runCatching {
+                if (!root.isDirectory && !root.mkdirs()) throw IOException("cannot create $root")
+                if (!staged.isFile) throw IOException("staged artifact is missing: $staged")
+                if (staged.length() != bytes) {
+                    throw IOException("staged length ${staged.length()} != declared $bytes")
+                }
+                val payload = payloadFile(key)
+                payload.delete()
+                if (!staged.renameTo(payload)) {
+                    // Different filesystem, or a stage the platform will not let us move: copying
+                    // is slower but the caller has already published, so this is off the hot path.
+                    staged.inputStream().use { source ->
+                        FileOutputStream(payload).use { sink ->
+                            source.copyTo(sink, DEFAULT_BUFFER)
+                            sink.flush()
+                            sink.fd.sync()
+                        }
+                    }
+                }
+                writeMetadata(key, bytes, sha256)
+                evict(keep = key)
+                true
+            }.getOrElse { failure ->
+                log("cache adopt failed for $key", failure)
+                discard(key)
+                false
+            }
+        }
+
+    private fun writeMetadata(key: String, bytes: Long, sha256: String) {
         val meta = JSONObject()
             .put("key", key)
             .put("contract", contractVersion)
             .put("bytes", bytes)
-            .put("sha256", hex(digest.digest()))
+            .put("sha256", sha256)
             .put("created_at", System.currentTimeMillis())
-
-        // Payload first, metadata second: the reverse order could advertise an entry whose
-        // bytes are not there yet.
-        if (!tempPayload.renameTo(payloadFile(key))) throw IOException("cannot commit payload")
         val tempMeta = File(root, "$key.json.tmp")
         FileOutputStream(tempMeta).use { sink ->
             sink.write(meta.toString().toByteArray(Charsets.UTF_8))
@@ -155,8 +200,6 @@ internal class ExportCache(
             sink.fd.sync()
         }
         if (!tempMeta.renameTo(metaFile(key))) throw IOException("cannot commit metadata")
-        evict(keep = key)
-        return true
     }
 
     /** Copy a validated entry to [sink]. Returns false if it stopped being valid. */
@@ -267,5 +310,59 @@ internal class ExportCache(
         }
 
         fun readAll(input: InputStream): ByteArray = input.readBytes()
+    }
+}
+
+/**
+ * Process-wide handle to the export cache (#179).
+ *
+ * The directory deliberately sits in a SUBDIRECTORY of cacheDir: `recoverAbandonedExportStages`
+ * reclaims anything in the cacheDir root matching the encoder's `spektrafilm-export-*.part`
+ * staging pattern, and a cache living beside those would be swept away on the next launch.
+ * Being under cacheDir also means the existing backup allowlist already excludes it from cloud
+ * backup and device transfer, which is what rendered photographs require.
+ */
+internal object ExportCaches {
+    private const val DIR = "export-cache"
+
+    @Volatile
+    private var instance: ExportCache? = null
+
+    fun of(context: android.content.Context): ExportCache {
+        val app = context.applicationContext
+        return instance ?: synchronized(this) {
+            instance ?: ExportCache(
+                root = java.io.File(app.cacheDir, DIR),
+                contractVersion = contractVersionOf(app),
+            ).also { instance = it }
+        }
+    }
+
+    /**
+     * Read from PackageManager rather than BuildConfig, which this module does not generate.
+     *
+     * `lastUpdateTime` is included deliberately: it changes on every install, so ANY rebuild
+     * invalidates the whole cache automatically. Without it, a developer who rebuilds the engine
+     * without touching the version would be served pre-change bytes from a cache that had no way
+     * to know the pixels moved — the same silently-stale hazard the numeric contract exists for,
+     * except hit constantly during development rather than rarely in release.
+     */
+    fun contractVersionOf(app: android.content.Context): String {
+        val info = runCatching {
+            app.packageManager.getPackageInfo(app.packageName, 0)
+        }.getOrNull()
+        @Suppress("DEPRECATION")
+        val code = when {
+            info == null -> -1L
+            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P ->
+                info.longVersionCode
+            else -> info.versionCode.toLong()
+        }
+        val installed = info?.lastUpdateTime ?: -1L
+        return ExportCacheKey.contractVersion(
+            code.toInt(),
+            "${info?.versionName ?: "?"}+$installed",
+            ExportCacheKey.NUMERIC_CONTRACT,
+        )
     }
 }

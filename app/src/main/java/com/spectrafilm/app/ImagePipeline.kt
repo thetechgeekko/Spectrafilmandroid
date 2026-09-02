@@ -680,6 +680,16 @@ suspend fun saveToGallery(
     sourceExif: SourceExif = SourceExif(emptyMap()),
     displayName: String? = null,
     onCommitted: () -> Unit = {},
+    /**
+     * Invoked with the staged, verified artifact AFTER it has published successfully, so the
+     * export cache (#179) can adopt the exact bytes that reached the gallery without re-encoding
+     * or re-hashing them: the arguments are the staged file, its length and the SHA-256 the
+     * publish path already computed. The stage is deleted immediately afterwards, so an
+     * implementation that wants to keep it must move it. Never called for a failed or cancelled
+     * export. Deliberately not an EncodedArtifact: these encoders are public API and that type
+     * is internal.
+     */
+    onStaged: (File, Long, String) -> Unit = { _, _, _ -> },
 ): Uri {
     descriptor.requireExportable(Build.VERSION.SDK_INT)
     require(descriptor.encoder == OutputEncoder.ANDROID_BITMAP_PNG ||
@@ -764,7 +774,7 @@ suspend fun saveToGallery(
         )
         ensureExportActive()
         val artifact = EncodedArtifact.fromCompletedFile(stage, isCancelled = isCancelled)
-        return publishStagedToGallery(
+        val published = publishStagedToGallery(
             ctx,
             artifact,
             name,
@@ -772,6 +782,8 @@ suspend fun saveToGallery(
             isCancelled,
             onCommitted,
         )
+        onStaged(artifact.file, artifact.length, artifact.sha256)
+        return published
     } finally {
         if (stage.exists() && !stage.delete()) {
             Diag.w("could not delete export stage ${stage.name}")
@@ -811,6 +823,16 @@ suspend fun saveSimResultAsTiff(
     descriptor: OutputDescriptor,
     displayName: String? = null,
     onCommitted: () -> Unit = {},
+    /**
+     * Invoked with the staged, verified artifact AFTER it has published successfully, so the
+     * export cache (#179) can adopt the exact bytes that reached the gallery without re-encoding
+     * or re-hashing them: the arguments are the staged file, its length and the SHA-256 the
+     * publish path already computed. The stage is deleted immediately afterwards, so an
+     * implementation that wants to keep it must move it. Never called for a failed or cancelled
+     * export. Deliberately not an EncodedArtifact: these encoders are public API and that type
+     * is internal.
+     */
+    onStaged: (File, Long, String) -> Unit = { _, _, _ -> },
 ): Uri {
     require(descriptor.encoder == OutputEncoder.NATIVE_TIFF_UINT16 ||
         descriptor.encoder == OutputEncoder.NATIVE_TIFF_FLOAT32) {
@@ -905,7 +927,7 @@ suspend fun saveSimResultAsTiff(
         ensureExportActive()
         val isCancelled = { exportJob?.isActive == false }
         val artifact = EncodedArtifact.fromCompletedFile(tmpFile, encodedBytes, isCancelled)
-        return publishStagedToGallery(
+        val published = publishStagedToGallery(
             ctx,
             artifact,
             "${displayName ?: "Spektrafilm_${System.currentTimeMillis()}"}.tif",
@@ -913,12 +935,38 @@ suspend fun saveSimResultAsTiff(
             isCancelled,
             onCommitted,
         )
+        onStaged(artifact.file, artifact.length, artifact.sha256)
+        return published
     } finally {
         // Delete on ALL paths: a writer/publish throw must not leave the (potentially
         // huge) temp file behind in cacheDir. Publish has consumed the bytes by now.
         tmpFile.delete()
     }
 }
+
+/**
+ * Publish an export straight from the content-addressed cache (#179), skipping decode, engine,
+ * grade and encode entirely.
+ *
+ * The entry was already validated against its recorded key, length and SHA-256 when it was read,
+ * so its digest is reused here rather than re-hashing 70 MB: publishStagedToGallery still verifies
+ * what it writes and reads back, so the published bytes are checked end to end regardless.
+ */
+internal fun publishCachedExport(
+    ctx: Context,
+    entry: ExportCacheEntry,
+    displayName: String,
+    mime: String,
+    isCancelled: () -> Boolean = { false },
+    onCommitted: () -> Unit = {},
+): Uri = publishStagedToGallery(
+    ctx,
+    EncodedArtifact(entry.payload, entry.bytes, entry.sha256),
+    displayName,
+    mime,
+    isCancelled,
+    onCommitted,
+)
 
 /** Publish one already-encoded, verified stage through the shared transaction path. */
 private fun publishStagedToGallery(
@@ -1171,6 +1219,16 @@ suspend fun saveSimResultAsPng16(
     descriptor: OutputDescriptor,
     displayName: String? = null,
     onCommitted: () -> Unit = {},
+    /**
+     * Invoked with the staged, verified artifact AFTER it has published successfully, so the
+     * export cache (#179) can adopt the exact bytes that reached the gallery without re-encoding
+     * or re-hashing them: the arguments are the staged file, its length and the SHA-256 the
+     * publish path already computed. The stage is deleted immediately afterwards, so an
+     * implementation that wants to keep it must move it. Never called for a failed or cancelled
+     * export. Deliberately not an EncodedArtifact: these encoders are public API and that type
+     * is internal.
+     */
+    onStaged: (File, Long, String) -> Unit = { _, _, _ -> },
 ): Uri {
     require(descriptor.encoder == OutputEncoder.NATIVE_PNG16 &&
         descriptor.quantizer == OutputQuantizer.UINT16_ROUND_CLAMP) {
@@ -1240,7 +1298,7 @@ suspend fun saveSimResultAsPng16(
         val name = "${displayName ?: "Spektrafilm_${System.currentTimeMillis()}"}.png"
         val isCancelled = { exportJob?.isActive == false }
         val artifact = EncodedArtifact.fromCompletedFile(tmpFile, encodedBytes, isCancelled)
-        return publishStagedToGallery(
+        val published = publishStagedToGallery(
             ctx,
             artifact,
             name,
@@ -1248,6 +1306,8 @@ suspend fun saveSimResultAsPng16(
             isCancelled,
             onCommitted,
         )
+        onStaged(artifact.file, artifact.length, artifact.sha256)
+        return published
     } finally {
         tmpFile.delete()
     }

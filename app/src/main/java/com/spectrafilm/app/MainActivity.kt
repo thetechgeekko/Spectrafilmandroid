@@ -3892,6 +3892,19 @@ class MainActivity : ComponentActivity() {
                             val exportJpegQuality = exportOptions.jpegQuality
                             val exportSourceUri = sourceUri
                             val exportDecodeRequest = currentSourceDecodeRequest()
+                            // #179 cache identity. The decode identity is spelled out rather
+                            // than taken from exportDecodeRequest.toString(), which embeds a
+                            // Context whose toString differs between two identical exports.
+                            val exportDecodeIdentity = with(exportDecodeRequest) {
+                                "kind=$kind;rot=$rotation;rawWb=$rawWhiteBalance;" +
+                                    "rawTemp=$rawTemperature;rawTint=$rawTint;" +
+                                    "temp=$creativeTemp;tint=$creativeTint;" +
+                                    "balance=$balanceToFilmStock;film=$filmProfile"
+                            }
+                            val exportGradeKey = ExportCacheKey.Grade(
+                                exportCctf, exportSaturation, exportVibrance,
+                                exportGamutCompress, exportAdjustments,
+                            )
                             val launched = ExportWorkRuntime.launch(
                                 context = exportContext,
                                 format = exportFmt,
@@ -3904,6 +3917,8 @@ class MainActivity : ComponentActivity() {
                                 var phSim = 0L
                                 var phGrade = 0L
                                 var phEnc = 0L
+                                var exportCacheKey: String? = null
+                                var servedFromCache = false
                                 var renderId = 0L
                                 val destinationCommit = ExportCommitLinearization()
                                 var previewCandidate: Bitmap? = null
@@ -3924,6 +3939,52 @@ class MainActivity : ComponentActivity() {
                                         // IPC round trip and the coroutine dispatch hops.
                                         val tDecode0 = System.currentTimeMillis()
                                         phSetup = tDecode0 - exportStartMs
+
+                                        // #179: a complete-key hit publishes the exact bytes a
+                                        // previous export produced, skipping decode, engine,
+                                        // grade and encode. Scene-linear TIFF bypasses the engine
+                                        // on a separate path and is not cached.
+                                        exportCacheKey = if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
+                                            null
+                                        } else {
+                                            ExportCacheKey.digestSource {
+                                                exportSourceUri?.let {
+                                                    exportContext.contentResolver.openInputStream(it)
+                                                }
+                                            }?.let { (sha, bytes) ->
+                                                ExportCacheKey.compute(
+                                                    ExportCacheKey.Source(
+                                                        sha, bytes, EXPORT_MAX_EDGE_PX,
+                                                        exportDecodeIdentity,
+                                                    ),
+                                                    exportParams,
+                                                    exportGradeKey,
+                                                    outputDescriptor,
+                                                    longEdge,
+                                                    exportJpegQuality,
+                                                    ExportCaches.contractVersionOf(exportContext),
+                                                )
+                                            }
+                                        }
+                                        val cached = exportCacheKey?.let {
+                                            ExportCaches.of(exportContext).get(it)
+                                        }
+                                        if (cached != null) {
+                                            publishedUri = withContext(Dispatchers.IO) {
+                                                publishCachedExport(
+                                                    exportContext,
+                                                    cached,
+                                                    "$baseName.${exportFmt.ext}",
+                                                    outputDescriptor.format.mime,
+                                                    onCommitted = destinationCommit::markPublished,
+                                                )
+                                            }
+                                            servedFromCache = true
+                                            phEnc = System.currentTimeMillis() - tDecode0
+                                            Diag.i("export served from cache in ${phEnc} ms")
+                                            return@withContext null
+                                        }
+
                                         val image = decodeSourceRequest(
                                             exportDecodeRequest,
                                             EXPORT_MAX_EDGE_PX,
@@ -4047,6 +4108,12 @@ class MainActivity : ComponentActivity() {
                                                             outputDescriptor,
                                                             displayName = baseName,
                                                             onCommitted = destinationCommit::markPublished,
+                                                            onStaged = { file, len, sha ->
+                                                                exportCacheKey?.let { k ->
+                                                                    ExportCaches.of(exportContext)
+                                                                        .adopt(k, file, len, sha)
+                                                                }
+                                                            },
                                                         )
                                                         OutputEncoder.NATIVE_PNG16 -> saveSimResultAsPng16(
                                                             exportContext,
@@ -4054,6 +4121,12 @@ class MainActivity : ComponentActivity() {
                                                             outputDescriptor,
                                                             displayName = baseName,
                                                             onCommitted = destinationCommit::markPublished,
+                                                            onStaged = { file, len, sha ->
+                                                                exportCacheKey?.let { k ->
+                                                                    ExportCaches.of(exportContext)
+                                                                        .adopt(k, file, len, sha)
+                                                                }
+                                                            },
                                                         )
                                                         OutputEncoder.ANDROID_BITMAP_PNG,
                                                         OutputEncoder.ANDROID_BITMAP_JPEG -> saveToGallery(
@@ -4066,6 +4139,12 @@ class MainActivity : ComponentActivity() {
                                                             srcExif,
                                                             displayName = baseName,
                                                             onCommitted = destinationCommit::markPublished,
+                                                            onStaged = { file, len, sha ->
+                                                                exportCacheKey?.let { k ->
+                                                                    ExportCaches.of(exportContext)
+                                                                        .adopt(k, file, len, sha)
+                                                                }
+                                                            },
                                                         )
                                                         else -> error("Scene-linear encoder reached rendered branch")
                                                     }
@@ -4092,10 +4171,18 @@ class MainActivity : ComponentActivity() {
                                     // Keep cleanup authority pointed at the final proxy until the terminal
                                     // outcome object is successfully constructed and owns it.
                                     previewCandidate = retainedBitmap
-                                    runCatching {
-                                        SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
+                                    // A cache hit never asked the engine to render, so there is
+                                    // no outcome to report and renderId is still its 0 sentinel.
+                                    if (!servedFromCache) {
+                                        runCatching {
+                                            SimResult.reportOutcome(renderId, AppRenderOutcome.CONSUMED)
+                                        }
                                     }
                                     val totalMs = System.currentTimeMillis() - exportStartMs
+                                    Diag.i(
+                                        "export done in $totalMs ms " +
+                                            (if (servedFromCache) "(cache hit)" else "(rendered)"),
+                                    )
                                     val success = ExportTerminalOutcome.Success(
                                         format = exportFmt,
                                         renderId = renderId,
