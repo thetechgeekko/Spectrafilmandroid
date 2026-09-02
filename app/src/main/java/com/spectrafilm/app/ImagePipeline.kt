@@ -35,8 +35,6 @@ import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Job
@@ -836,7 +834,7 @@ suspend fun saveSimResultAsTiff(
     }
     ensureExportActive()
 
-    val dateTime = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date())
+    val dateTime = ExportClock.exifDateTime()
     val exifCs = descriptor.metadata.exifColorSpace.toNativeTiffTag()
     val icc = ColorManagement.requireIccBytes(ctx, descriptor)
 
@@ -1113,7 +1111,7 @@ suspend fun saveLinearInputAsTiff32f(
     }
     val exportJob = currentCoroutineContext()[Job]
     val isCancelled = { exportJob?.isActive == false }
-    val dateTime = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date())
+    val dateTime = ExportClock.exifDateTime()
     val tmpFile = File.createTempFile("spectrafilm-export-", ".tif.part", ctx.cacheDir)
     try {
         val encodedBytes = runCancellableTiffWrite { cancellation ->

@@ -94,6 +94,20 @@
     public static android.graphics.Bitmap simResultToBitmap(...);
 }
 
+# Ticket #177's benchmark phase (same release test APK) measures the SHIPPING export path:
+# it calls the production decode, params, engine, grade and encoder entry points on the
+# minified app rather than re-implementing them, so those are cross-APK ABI too.
+-keep class com.spectrafilm.app.ImagePipelineKt { *; }
+-keep class com.spectrafilm.app.ParamsState { *; }
+-keep class com.spectrafilm.app.BuiltInPresets { *; }
+-keep class com.spectrafilm.app.BuiltInPreset { *; }
+-keep class com.spectrafilm.app.ColorGrade { *; }
+-keep class com.spectrafilm.app.ExportClock { *; }
+-keep class com.spectrafilm.app.masks.MaskCompositor { *; }
+-keepclassmembers class com.spectrafilm.app.EngineHelpersKt {
+    public static android.graphics.Bitmap simResultToBitmapGraded(...);
+}
+
 # Kotlin inline functions in the separately packaged release AndroidTest APK
 # still emit calls to Result's JVM implementation ABI. R8 cannot see those call
 # edges while shrinking the target APK, so it may remove Result.Companion or an
@@ -127,6 +141,13 @@
 }
 -keep class kotlin.coroutines.jvm.internal.Boxing { *; }
 -keep class kotlin.jdk7.AutoCloseableKt { *; }
+-keep class kotlin.io.CloseableKt {
+    public static void closeFinally(java.io.Closeable, java.lang.Throwable);
+}
+# A `var` captured by a lambda in the release test APK (Ticket141MaskMemoryChecks) boxes
+# through Ref$ObjectRef, which the app APK otherwise never instantiates -- a device-only
+# NoClassDefFoundError that no build step can see.
+-keep class kotlin.jvm.internal.Ref$ObjectRef { *; }
 -keep class kotlin.ranges.RangesKt
 -keep class kotlin.ranges.RangesKt___RangesKt {
     public static kotlin.ranges.IntRange until(int, int);

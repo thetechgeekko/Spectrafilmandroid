@@ -1,0 +1,2154 @@
+{
+  "schema": "spk.bench_capture.v1",
+  "captured_at_millis": 1756700000000,
+  "app": {
+    "package": "com.spectrafilm.app",
+    "apk_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version_code": 11,
+    "version_name": "0.9.0",
+    "debuggable": false
+  },
+  "device": {
+    "model": "SM-S948W",
+    "device": "e3q",
+    "manufacturer": "samsung",
+    "sdk_int": 36,
+    "release": "16",
+    "build_fingerprint": "samsung/fixture",
+    "abis": [
+      "arm64-v8a"
+    ],
+    "cpu_count": 8,
+    "gpu_renderer": "gles=3.2"
+  },
+  "corpus": {
+    "source_sha256": "66381a8ed2d1a6ab471690ec5c5725798a15e134ada94c7feeb43c59bdb93195",
+    "source_bytes": 37460417,
+    "width": 4080,
+    "height": 3060
+  },
+  "protocol": {
+    "requested_runs": 11,
+    "gate_runs": 11,
+    "smoke": false
+  },
+  "samples": [
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 0,
+      "state": "cold",
+      "render_id": 1000,
+      "total_ms": 1500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1500,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 0,
+      "state": "warm",
+      "render_id": 1000,
+      "total_ms": 1760,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1140,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1760,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 0,
+      "state": "warm",
+      "render_id": 1000,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 1,
+      "state": "warm",
+      "render_id": 1001,
+      "total_ms": 1540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1540,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 1,
+      "state": "warm",
+      "render_id": 1001,
+      "total_ms": 1800,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1180,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1800,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 1,
+      "state": "warm",
+      "render_id": 1001,
+      "total_ms": 1880,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1260,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1880,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 2,
+      "state": "warm",
+      "render_id": 1002,
+      "total_ms": 1580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1580,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 2,
+      "state": "warm",
+      "render_id": 1002,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 2,
+      "state": "warm",
+      "render_id": 1002,
+      "total_ms": 1920,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1300,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1920,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 3,
+      "state": "warm",
+      "render_id": 1003,
+      "total_ms": 1500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1500,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 3,
+      "state": "warm",
+      "render_id": 1003,
+      "total_ms": 1760,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1140,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1760,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 3,
+      "state": "warm",
+      "render_id": 1003,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 4,
+      "state": "warm",
+      "render_id": 1004,
+      "total_ms": 1540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1540,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 4,
+      "state": "warm",
+      "render_id": 1004,
+      "total_ms": 1800,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1180,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1800,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 4,
+      "state": "warm",
+      "render_id": 1004,
+      "total_ms": 1880,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1260,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1880,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 5,
+      "state": "warm",
+      "render_id": 1005,
+      "total_ms": 1580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1580,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 5,
+      "state": "warm",
+      "render_id": 1005,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 5,
+      "state": "warm",
+      "render_id": 1005,
+      "total_ms": 1920,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1300,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1920,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 6,
+      "state": "warm",
+      "render_id": 1006,
+      "total_ms": 1500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1500,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 6,
+      "state": "warm",
+      "render_id": 1006,
+      "total_ms": 1760,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1140,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1760,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 6,
+      "state": "warm",
+      "render_id": 1006,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 7,
+      "state": "warm",
+      "render_id": 1007,
+      "total_ms": 1540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1540,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 7,
+      "state": "warm",
+      "render_id": 1007,
+      "total_ms": 1800,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1180,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1800,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 7,
+      "state": "warm",
+      "render_id": 1007,
+      "total_ms": 1880,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1260,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1880,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 8,
+      "state": "warm",
+      "render_id": 1008,
+      "total_ms": 1580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1580,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 8,
+      "state": "warm",
+      "render_id": 1008,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 8,
+      "state": "warm",
+      "render_id": 1008,
+      "total_ms": 1920,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1300,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1920,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 9,
+      "state": "warm",
+      "render_id": 1009,
+      "total_ms": 1500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1500,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 9,
+      "state": "warm",
+      "render_id": 1009,
+      "total_ms": 1760,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1140,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1760,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 9,
+      "state": "warm",
+      "render_id": 1009,
+      "total_ms": 1840,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1220,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1840,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 10,
+      "state": "warm",
+      "render_id": 1010,
+      "total_ms": 1540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1540,
+      "engine_sample_sha256": "6161616161616161424153454a5045475f513935000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153454a5045475f513935000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153454a5045475f513935000000000000000000000000",
+      "container_sha256": "6464646464646464424153454a5045475f513935000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 10,
+      "state": "warm",
+      "render_id": 1010,
+      "total_ms": 1800,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1180,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1800,
+      "engine_sample_sha256": "616161616161616142415345504e473136000000000000000000000000000000",
+      "decoded_sample_sha256": "626262626262626242415345504e473136000000000000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636342415345504e473136000000000000000000000000000000",
+      "container_sha256": "646464646464646442415345504e473136000000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 10,
+      "state": "warm",
+      "render_id": 1010,
+      "total_ms": 1880,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 1260,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 1880,
+      "engine_sample_sha256": "6161616161616161424153455449464631360000000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262424153455449464631360000000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363424153455449464631360000000000000000000000000000",
+      "container_sha256": "6464646464646464424153455449464631360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 0,
+      "state": "warm",
+      "render_id": 1000,
+      "total_ms": 4200,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3580,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4200,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 0,
+      "state": "warm",
+      "render_id": 1000,
+      "total_ms": 4460,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3840,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4460,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 0,
+      "state": "warm",
+      "render_id": 1000,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 1,
+      "state": "warm",
+      "render_id": 1001,
+      "total_ms": 4240,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3620,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4240,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 1,
+      "state": "warm",
+      "render_id": 1001,
+      "total_ms": 4500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4500,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 1,
+      "state": "warm",
+      "render_id": 1001,
+      "total_ms": 4580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4580,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 2,
+      "state": "warm",
+      "render_id": 1002,
+      "total_ms": 4280,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3660,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4280,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 2,
+      "state": "warm",
+      "render_id": 1002,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 2,
+      "state": "warm",
+      "render_id": 1002,
+      "total_ms": 4620,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 4000,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4620,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 3,
+      "state": "warm",
+      "render_id": 1003,
+      "total_ms": 4200,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3580,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4200,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 3,
+      "state": "warm",
+      "render_id": 1003,
+      "total_ms": 4460,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3840,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4460,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 3,
+      "state": "warm",
+      "render_id": 1003,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 4,
+      "state": "warm",
+      "render_id": 1004,
+      "total_ms": 4240,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3620,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4240,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 4,
+      "state": "warm",
+      "render_id": 1004,
+      "total_ms": 4500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4500,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 4,
+      "state": "warm",
+      "render_id": 1004,
+      "total_ms": 4580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4580,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 5,
+      "state": "warm",
+      "render_id": 1005,
+      "total_ms": 4280,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3660,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4280,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 5,
+      "state": "warm",
+      "render_id": 1005,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 5,
+      "state": "warm",
+      "render_id": 1005,
+      "total_ms": 4620,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 4000,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4620,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 6,
+      "state": "warm",
+      "render_id": 1006,
+      "total_ms": 4200,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3580,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4200,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 6,
+      "state": "warm",
+      "render_id": 1006,
+      "total_ms": 4460,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3840,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4460,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 6,
+      "state": "warm",
+      "render_id": 1006,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 7,
+      "state": "warm",
+      "render_id": 1007,
+      "total_ms": 4240,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3620,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4240,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 7,
+      "state": "warm",
+      "render_id": 1007,
+      "total_ms": 4500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4500,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 7,
+      "state": "warm",
+      "render_id": 1007,
+      "total_ms": 4580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4580,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 8,
+      "state": "warm",
+      "render_id": 1008,
+      "total_ms": 4280,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3660,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4280,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 8,
+      "state": "warm",
+      "render_id": 1008,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 8,
+      "state": "warm",
+      "render_id": 1008,
+      "total_ms": 4620,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 4000,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4620,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 9,
+      "state": "warm",
+      "render_id": 1009,
+      "total_ms": 4200,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3580,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4200,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 9,
+      "state": "warm",
+      "render_id": 1009,
+      "total_ms": 4460,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3840,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4460,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 9,
+      "state": "warm",
+      "render_id": 1009,
+      "total_ms": 4540,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3920,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4540,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 10,
+      "state": "warm",
+      "render_id": 1010,
+      "total_ms": 4240,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3620,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4240,
+      "engine_sample_sha256": "616161616161616148454156594a5045475f5139350000000000000000000000",
+      "decoded_sample_sha256": "626262626262626248454156594a5045475f5139350000000000000000000000",
+      "normalized_metadata_sha256": "636363636363636348454156594a5045475f5139350000000000000000000000",
+      "container_sha256": "646464646464646448454156594a5045475f5139350000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 10,
+      "state": "warm",
+      "render_id": 1010,
+      "total_ms": 4500,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3880,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4500,
+      "engine_sample_sha256": "61616161616161614845415659504e4731360000000000000000000000000000",
+      "decoded_sample_sha256": "62626262626262624845415659504e4731360000000000000000000000000000",
+      "normalized_metadata_sha256": "63636363636363634845415659504e4731360000000000000000000000000000",
+      "container_sha256": "64646464646464644845415659504e4731360000000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 10,
+      "state": "warm",
+      "render_id": 1010,
+      "total_ms": 4580,
+      "phases_ms": {
+        "decode": 320,
+        "simulate": 3960,
+        "grade": 120,
+        "encode": 180
+      },
+      "phases_sum_ms": 4580,
+      "engine_sample_sha256": "6161616161616161484541565954494646313600000000000000000000000000",
+      "decoded_sample_sha256": "6262626262626262484541565954494646313600000000000000000000000000",
+      "normalized_metadata_sha256": "6363636363636363484541565954494646313600000000000000000000000000",
+      "container_sha256": "6464646464646464484541565954494646313600000000000000000000000000",
+      "container_bytes": 12345678,
+      "memory": {
+        "total_pss_kb": 410000,
+        "total_private_dirty_kb": 390000,
+        "native_heap_alloc_kb": 250000
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 78,
+        "plugged": 0,
+        "cpuset": "/top-app",
+        "process_importance": 100
+      }
+    }
+  ],
+  "journeys": {
+    "cancellation": "cancelled:RenderCancelledException",
+    "foreground_during_export": true,
+    "reopen_published": "pass"
+  }
+}

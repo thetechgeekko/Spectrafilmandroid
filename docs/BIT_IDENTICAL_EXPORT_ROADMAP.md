@@ -160,6 +160,15 @@ filming, printing, and scan in one resident three-dispatch Vulkan chain, but spa
 effects still fall back to CPU. Cold 1–2 seconds needs the remaining resident graph, not more
 isolated shaders.
 
+### Where the evidence comes from
+
+[Create a release export-digest benchmark and instrumented device gate](https://github.com/thetechgeekko/Spektrafilm-android/issues/177) implements this contract as a
+runnable gate: `tools/baseline/corpus.json` pins the cells, `ticket177_phase=bench` measures the
+shipping export path on the exact installed candidate, and `tools/baseline/bench_report.py`
+computes p50/p95 with a confidence interval, checks C0/C3/C4 and refuses to publish a smoke run
+as a baseline. One command: `bash tools/baseline/run_bench.sh <app.apk> 11`. The canonical owner
+numbers still belong to [#119](https://github.com/thetechgeekko/Spektrafilm-android/issues/119).
+
 ## Missing measurements before implementation claims
 
 - no current-HEAD release-device rerun after the latest planar filter/coupler changes;

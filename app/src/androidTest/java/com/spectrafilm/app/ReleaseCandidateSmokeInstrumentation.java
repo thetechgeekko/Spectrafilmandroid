@@ -47,6 +47,14 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
     private static final String TICKET139_PHASE_RECOVER = "recover";
     private static final String ARG_TICKET181_PHASE = "ticket181_phase";
     private static final String TICKET181_PHASE_A11Y = "a11y";
+    private static final String ARG_TICKET177_PHASE = "ticket177_phase";
+    private static final String TICKET177_PHASE_BENCH = "bench";
+    private static final String ARG_TICKET177_CORPUS = "ticket177_corpus";
+    private static final String ARG_TICKET177_SOURCE = "ticket177_source";
+    private static final String ARG_TICKET177_RUNS = "ticket177_runs";
+    private static final String ARG_TICKET177_CELLS = "ticket177_cells";
+    private static final String ARG_TICKET177_EXPECT_APP_SHA256 =
+            "ticket177_expect_app_sha256";
 
     private Bundle arguments = Bundle.EMPTY;
 
@@ -68,6 +76,11 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
             final String ticket181Phase = arguments.getString(ARG_TICKET181_PHASE, "");
             require(ticket181Phase.isEmpty() || (phase.isEmpty() && ticket139Phase.isEmpty()),
                     "ticket #181 phase is mutually exclusive with ticket #139 and #170 phases");
+            final String ticket177Phase = arguments.getString(ARG_TICKET177_PHASE, "");
+            require(ticket177Phase.isEmpty()
+                            || (phase.isEmpty() && ticket139Phase.isEmpty()
+                                    && ticket181Phase.isEmpty()),
+                    "ticket #177 phase is mutually exclusive with the other ticket phases");
             final String rawUri = arguments.getString(ARG_TICKET158_RAW_URI, "");
             final String rawPath = arguments.getString(ARG_TICKET158_RAW_PATH, "");
             final boolean ticket141Mode = arguments.containsKey(ARG_TICKET141_WIDTH)
@@ -186,6 +199,26 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                                 + "TICKET139_RAPID_SOURCE_NATIVE_CLOSE: PASS "
                                 + nativeEvidence + "\n"
                                 + "TICKET139_EXPORT_TERMINAL_EXACTLY_ONCE: PASS\n");
+            } else if (TICKET177_PHASE_BENCH.equals(ticket177Phase)) {
+                final int runs = Integer.parseInt(
+                        arguments.getString(ARG_TICKET177_RUNS, "1"));
+                require(runs >= 1 && runs <= 25, "ticket177_runs must be in [1,25]");
+                final String corpus = arguments.getString(ARG_TICKET177_CORPUS, "");
+                final String source = arguments.getString(ARG_TICKET177_SOURCE, "");
+                require(!corpus.isEmpty() && !source.isEmpty(),
+                        "ticket177_corpus and ticket177_source are required");
+                final String expectedApp = arguments.getString(
+                        ARG_TICKET177_EXPECT_APP_SHA256, "").trim().toLowerCase(Locale.ROOT);
+                require(isSha256(expectedApp),
+                        "ticket177_expect_app_sha256 must be exactly 64 hex digits");
+                final String stream = Ticket177BenchmarkChecks.run(
+                        getTargetContext(), corpus, source, runs,
+                        arguments.getString(ARG_TICKET177_CELLS, ""), expectedApp);
+                results.putString("stream", stream);
+                if (!stream.contains("TICKET177_BENCH: PASS\n")) {
+                    finish(Activity.RESULT_CANCELED, results);
+                    return;
+                }
             } else if (TICKET181_PHASE_A11Y.equals(ticket181Phase)) {
                 final String stream = runTicket181AccessibilityChecks();
                 results.putString("stream", stream);
@@ -193,7 +226,8 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                     finish(Activity.RESULT_CANCELED, results);
                     return;
                 }
-            } else if (phase.isEmpty() && ticket139Phase.isEmpty() && ticket181Phase.isEmpty()) {
+            } else if (phase.isEmpty() && ticket139Phase.isEmpty() && ticket181Phase.isEmpty()
+                    && ticket177Phase.isEmpty()) {
                 runCandidateChecks();
                 results.putString(
                         "stream",
@@ -207,7 +241,9 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                                 + "RELEASE_CANDIDATE_INSTRUMENTATION: PASS\n");
             } else {
                 throw new IllegalArgumentException(
-                        !ticket181Phase.isEmpty()
+                        !ticket177Phase.isEmpty()
+                                ? "unsupported ticket177_phase: " + ticket177Phase
+                                : !ticket181Phase.isEmpty()
                                 ? "unsupported ticket181_phase: " + ticket181Phase
                                 : ticket139Phase.isEmpty()
                                 ? "unsupported ticket170_phase: " + phase

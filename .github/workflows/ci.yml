@@ -664,6 +664,9 @@ jobs:
             tools/docs/tests/test_check_docs_consistency.py \
             tools/wayfinder/frontier.py \
             tools/wayfinder/tests/test_frontier.py \
+            tools/baseline/bench_report.py \
+            tools/baseline/corpus/make_source.py \
+            tools/baseline/tests/test_bench_report.py \
             tools/compliance/libraw_bundle.py \
             tools/compliance/tests/test_libraw_bundle.py \
             tools/release/app_spdx.py \
@@ -684,6 +687,13 @@ jobs:
 
       - name: Test fail-closed release tooling and workflow policy
         run: python -m unittest discover -s tools/release/tests -p 'test_*.py'
+
+      - name: Validate the export benchmark corpus and reporter (device-free smoke)
+        run: |
+          python tools/baseline/corpus/make_source.py --check
+          python -m unittest discover -s tools/baseline/tests -p 'test_*.py'
+          python tools/baseline/bench_report.py \
+            tools/baseline/tests/fixtures/capture-gate.json --gate
 
       - name: Check current documentation against repository facts
         run: python tools/docs/check_docs_consistency.py

@@ -262,6 +262,17 @@ check_member 'Lcom/spectrafilm/app/Category;' method 'values' '()[Lcom/spectrafi
 check_member 'Lcom/spectrafilm/app/Category;' method 'getLabelRes' '()I'
 check_member 'Lcom/spectrafilm/app/Category;' field 'GRAIN' 'Lcom/spectrafilm/app/Category;'
 
+# Ticket #177's benchmark phase drives the production export path across the APK boundary.
+check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'decodeToLinearProPhoto' '(Landroid/content/Context;Landroid/net/Uri;ILkotlin/jvm/functions/Function0;)Lcom/spectrafilm/engine/LinearImage;'
+check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'saveSimResultAsTiff' '(Landroid/content/Context;Lcom/spectrafilm/engine/SimResult;Lcom/spectrafilm/app/OutputDescriptor;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;'
+check_member 'Lcom/spectrafilm/app/ImagePipelineKt;' method 'saveSimResultAsPng16' '(Landroid/content/Context;Lcom/spectrafilm/engine/SimResult;Lcom/spectrafilm/app/OutputDescriptor;Ljava/lang/String;Lkotlin/jvm/functions/Function0;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;'
+check_member 'Lcom/spectrafilm/app/EngineHelpersKt;' method 'simResultToBitmapGraded' '(Lcom/spectrafilm/engine/SimResult;ZFFFLjava/util/List;Lcom/spectrafilm/engine/RenderCancellation;)Landroid/graphics/Bitmap;'
+check_member 'Lcom/spectrafilm/app/ParamsState;' method 'toParams' '(Ljava/lang/Integer;Ljava/lang/Float;Z)Lcom/spectrafilm/engine/SpektraParams;'
+check_member 'Lcom/spectrafilm/app/BuiltInPresets;' method 'load' '(Landroid/content/Context;)Ljava/util/List;'
+check_member 'Lcom/spectrafilm/app/ExportClock;' method 'exifDateTime' '()Ljava/lang/String;'
+check_member 'Lkotlin/io/CloseableKt;' method 'closeFinally' '(Ljava/io/Closeable;Ljava/lang/Throwable;)V'
+check_member 'Lkotlin/jvm/internal/Ref$ObjectRef;' method '<init>' '()V'
+
 # Kotlin's inline runCatching/Result calls in the separately packaged release
 # AndroidTest APK resolve this JVM ABI from the already-minified target APK.
 # Those call edges are invisible to target-app R8. Checking the exact emitted
