@@ -100,11 +100,19 @@ object Ticket177BenchmarkChecks {
         // render: asset wiring is process setup, not part of any measured export.
         EngineHolder.get(context)
 
+        // Protocol idle binds gate captures only (a smoke pass stays fast), and the
+        // cool-down runs BEFORE each measured export so the previous one cannot heat it.
+        val idleMs =
+            if (runs >= gateRuns) protocol.optInt("idle_between_runs_s", 0) * 1000L else 0L
         val samples = JSONArray()
         var firstRender = true
-        for (cell in cells) {
-            for (index in 0 until runs) {
+        // Runs outermost: samples of one cell/format never run back-to-back, so thermal
+        // drift spreads across every cell instead of biasing whichever block ran hot.
+        for (index in 0 until runs) {
+            for (cell in cells) {
                 for (entry in FORMATS.entries) {
+                    if (!cellHasFormat(cell, entry.key)) continue
+                    if (!firstRender && idleMs > 0) Thread.sleep(idleMs)
                     val sample = measure(
                         context, cell, entry.value, entry.key, sourcePath, index,
                         cold = firstRender,
@@ -238,7 +246,9 @@ object Ticket177BenchmarkChecks {
             .put("memory", JSONObject()
                 .put("total_pss_kb", memory.totalPss)
                 .put("total_private_dirty_kb", memory.totalPrivateDirty)
-                .put("native_heap_alloc_kb", Debug.getNativeHeapAllocatedSize() / 1024L))
+                .put("native_heap_alloc_kb", Debug.getNativeHeapAllocatedSize() / 1024L)
+                .put("vm_hwm_kb", procStatusKb("VmHWM:"))
+                .put("vm_rss_kb", procStatusKb("VmRSS:")))
             .put("environment", environment(context))
     }
 
@@ -380,7 +390,10 @@ object Ticket177BenchmarkChecks {
         return selected
     }
 
-    private fun paramsFor(context: Context, cell: JSONObject): com.spectrafilm.engine.SpektraParams {
+    private fun paramsFor(context: Context, cell: JSONObject): com.spectrafilm.engine.SpektraParams =
+        stateFor(context, cell).toParams()
+
+    private fun stateFor(context: Context, cell: JSONObject): ParamsState {
         val state = ParamsState()
         val presetName = cell.getString("preset")
         var preset: BuiltInPreset? = null
@@ -395,7 +408,20 @@ object Ticket177BenchmarkChecks {
         state.grainActive = effects.contains("grain")
         state.halationActive = effects.contains("halation")
         state.couplersActive = effects.contains("dir_couplers")
-        return state.toParams()
+        // The corpus route picks the pipeline: "print" is the default negative->print->scan
+        // chain; "scan" flips the film-scan toggle (UI: slide mode), skipping the print
+        // stage, and stays reachable for any stock from the editor's simulation panel.
+        if (cell.has("route")) state.scanFilm = "scan" == cell.getString("route")
+        return state
+    }
+
+    /** A cell without a formats array measures every known format (legacy corpus). */
+    private fun cellHasFormat(cell: JSONObject, formatId: String): Boolean {
+        val declared = cell.optJSONArray("formats") ?: return true
+        for (i in 0 until declared.length()) {
+            if (formatId == declared.getString(i)) return true
+        }
+        return false
     }
 
     /** Fails closed when the installed APK is not the artifact the caller pinned. */
@@ -604,4 +630,105 @@ object Ticket177BenchmarkChecks {
         }
         return out.toString()
     }
+
+    /** Peak ("VmHWM:") / current ("VmRSS:") resident set from /proc/self/status, in kB. */
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+    private fun procStatusKb(prefix: String): Long {
+        val lines = (readProc("/proc/self/status") as java.lang.String).split("\n")
+        for (i in lines.indices) {
+            val line = lines[i] as java.lang.String
+            if (!line.startsWith(prefix)) continue
+            val rest = (line.substring(prefix.length) as java.lang.String).trim()
+            val space = (rest as java.lang.String).indexOf(32)
+            val digits = if (space > 0) rest.substring(0, space) else rest
+            return try {
+                java.lang.Long.parseLong(digits)
+            } catch (ignored: NumberFormatException) {
+                -1L
+            }
+        }
+        return -1L
+    }
+
+    // ---- #119 preview-latency probe ----------------------------------------------------------
+
+    /**
+     * Slider-drag settle at the default 640 px preview: times engine.simulatePreview on the
+     * already-decoded source (the editor re-renders without re-decoding while a slider drags),
+     * print vs film-scan route, alternating a +/-0.1 EV exposure nudge so no render can serve
+     * a memoized result. Compose/present cost is deliberately outside this number and the
+     * evidence says so.
+     */
+    @JvmStatic
+    fun preview(
+        context: Context,
+        corpusPath: String,
+        sourcePath: String,
+        runs: Int,
+        expectedAppSha256: String,
+    ): String {
+        val corpus = JSONObject(String(readAllBytes(File(corpusPath)), Charsets.UTF_8))
+        require(corpus.optString("schema") == "spk.bench_corpus.v1") {
+            "unexpected corpus schema ${corpus.optString("schema")}"
+        }
+        val identity = appIdentity(context, expectedAppSha256)
+        val source = verifiedSource(corpus, sourcePath)
+        val baseCell = corpus.getJSONArray("cells").getJSONObject(0)
+
+        val evidence = File(context.getExternalFilesDir(null), EVIDENCE_DIR)
+        require(evidence.mkdirs() || evidence.isDirectory) { "cannot create $evidence" }
+
+        val engine = EngineHolder.get(context)
+        val image = decodeToLinearProPhoto(
+            context, Uri.fromFile(File(sourcePath)), maxEdge = EXPORT_MAX_EDGE_PX,
+        )
+        val routes = JSONArray()
+        try {
+            val routeIds = arrayOf("print", "scan")
+            for (r in routeIds.indices) {
+                val routeId = routeIds[r]
+                val state = stateFor(context, baseCell)
+                state.scanFilm = "scan" == routeId
+                // Two unrecorded warm-ups absorb one-time allocation and LUT-memo work.
+                for (warm in 0 until 2) {
+                    state.exposureCompensationEv = 0f
+                    engine.simulatePreview(image, state.toParams(), RenderKind.PREVIEW, null)
+                        .close()
+                }
+                val samplesMs = JSONArray()
+                for (i in 0 until runs) {
+                    state.exposureCompensationEv = if (i % 2 == 0) 0.1f else -0.1f
+                    val params = state.toParams()
+                    val start = System.nanoTime()
+                    engine.simulatePreview(image, params, RenderKind.PREVIEW, null).use { res ->
+                        require(res.width > 0 && res.height > 0) { "empty preview result" }
+                    }
+                    samplesMs.put((System.nanoTime() - start) / 1000000L)
+                }
+                routes.put(JSONObject()
+                    .put("route", routeId)
+                    .put("preset", baseCell.getString("preset"))
+                    .put("preview_max_size", 640)
+                    .put("samples_ms", samplesMs))
+            }
+        } finally {
+            image.close()
+        }
+        val capture = JSONObject()
+            .put("schema", "spk.bench_preview.v1")
+            .put("captured_at_millis", System.currentTimeMillis())
+            .put("app", identity)
+            .put("device", deviceFingerprint(context))
+            .put("source_sha256", source.sha256)
+            .put("decode_max_edge", EXPORT_MAX_EDGE_PX)
+            .put("environment", environment(context))
+            .put("routes", routes)
+        val out = File(evidence, "preview.json")
+        writeText(out, capture.toString(2))
+        return StringBuilder()
+            .append("TICKET177_PREVIEW_CAPTURE: ").append(out.absolutePath).append('\n')
+            .append("TICKET177_PREVIEW: PASS\n")
+            .toString()
+    }
+
 }

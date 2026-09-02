@@ -45,6 +45,12 @@ reporter decides everything statistical.
 bash tools/baseline/run_bench.sh app/build/outputs/apk/release/app-release-unsigned.apk 11
 # smoke (2 runs, reports but is refused as a baseline)
 bash tools/baseline/run_bench.sh <app.apk> 2 BASE
+# unplugged gate over Wi-Fi adb: run detached on-device and poll, so a dropped
+# stream cannot kill an hours-long capture (doze is disabled for the run)
+SPK_BENCH_DETACH=1 bash tools/baseline/run_bench.sh <app.apk> 11
+# #119 preview latency (640 px slider settle, print vs film-scan route); run AFTER
+# run_bench.sh — the bench phase clears the on-device evidence directory
+bash tools/baseline/run_preview.sh <app.apk> 15
 ```
 
 - **Corpus** — `tools/baseline/corpus.json` pins the source bytes, dimensions, preset,

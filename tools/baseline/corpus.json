@@ -45,6 +45,52 @@
         "PNG16",
         "TIFF16"
       ]
+    },
+    {
+      "id": "PRINT_GRAIN",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "print",
+      "effects": [
+        "grain"
+      ],
+      "formats": [
+        "PNG16",
+        "TIFF16"
+      ]
+    },
+    {
+      "id": "SCAN_CLEAN",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "scan",
+      "effects": [],
+      "formats": [
+        "PNG16",
+        "TIFF16"
+      ]
+    },
+    {
+      "id": "SCAN_GRAIN",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "scan",
+      "effects": [
+        "grain"
+      ],
+      "formats": [
+        "PNG16",
+        "TIFF16"
+      ]
     }
   ],
   "container_identity": {

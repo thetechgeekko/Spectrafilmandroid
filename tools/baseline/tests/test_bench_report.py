@@ -60,7 +60,9 @@ class CorpusTest(unittest.TestCase):
             for fmt in cell["formats"]:
                 self.assertIn(fmt, CORPUS["container_identity"],
                               f"{fmt} has no container-identity policy")
-        self.assertEqual({"BASE", "HEAVY"}, ids)
+        # BASE/HEAVY carry the #126 gates; the grain/route cells are the #119 matrix.
+        self.assertEqual(
+            {"BASE", "HEAVY", "PRINT_GRAIN", "SCAN_CLEAN", "SCAN_GRAIN"}, ids)
 
     def test_jpeg_container_identity_is_unsupported(self):
         # #126: a JPEG's container bytes are an encoder artifact, not a contract.

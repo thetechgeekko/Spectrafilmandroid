@@ -672,8 +672,10 @@ jobs:
             tools/wayfinder/frontier.py \
             tools/wayfinder/tests/test_frontier.py \
             tools/baseline/bench_report.py \
+            tools/baseline/preview_report.py \
             tools/baseline/corpus/make_source.py \
             tools/baseline/tests/test_bench_report.py \
+            tools/baseline/tests/test_preview_report.py \
             tools/upstream/gen_upstream_parity.py \
             tools/upstream/tests/test_upstream_parity.py \
             tools/compliance/libraw_bundle.py \

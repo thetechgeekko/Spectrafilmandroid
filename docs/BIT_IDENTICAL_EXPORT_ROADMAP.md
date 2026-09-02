@@ -166,7 +166,11 @@ isolated shaders.
 runnable gate: `tools/baseline/corpus.json` pins the cells, `ticket177_phase=bench` measures the
 shipping export path on the exact installed candidate, and `tools/baseline/bench_report.py`
 computes p50/p95 with a confidence interval, checks C0/C3/C4 and refuses to publish a smoke run
-as a baseline. One command: `bash tools/baseline/run_bench.sh <app.apk> 11`. The canonical owner
+as a baseline. One command: `bash tools/baseline/run_bench.sh <app.apk> 11` (add
+`SPK_BENCH_DETACH=1` for the hours-long unplugged gate over Wi-Fi adb, where a dropped stream
+must not kill the measurement). The #119 matrix extends the same corpus with grain and film-scan
+route cells, and `bash tools/baseline/run_preview.sh <app.apk> 15` captures the 640 px
+slider-settle preview latency per route (`tools/baseline/preview_report.py`). The canonical owner
 numbers still belong to [#119](https://github.com/thetechgeekko/Spektrafilm-android/issues/119).
 
 ## Missing measurements before implementation claims
