@@ -56,7 +56,11 @@ def asset_tree_sha256(root: pathlib.Path) -> tuple[str, int]:
     (clean filters applied), so a Windows checkout with CRLF text files produces the
     same digest as the LF checkout on a Linux CI runner. Raw working-tree bytes are
     exactly the thing that differs between the two."""
-    entries = sorted(p for p in root.rglob("*") if p.is_file())
+    # Sort by the POSIX relative string: WindowsPath ordering is case-insensitive,
+    # so sorting Path objects puts mixed-case ICC filenames in a different order
+    # than on Linux and the outer digest diverges per platform.
+    entries = sorted((p for p in root.rglob("*") if p.is_file()),
+                     key=lambda p: p.relative_to(root).as_posix())
     listing = "\n".join(str(p) for p in entries) + "\n"
     proc = subprocess.run(
         ["git", "hash-object", "--stdin-paths"],

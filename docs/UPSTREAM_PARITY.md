@@ -16,7 +16,7 @@ input, not coverage claims.
   Every committed golden reproduces bit-exactly here and only here; the
   first diverging child is `a9bccd6`.
 - **Reviewed upstream main:** `3bb2c2d` (tree `0aaea99`) — fix: vlog midgray exposure (2026-06-06), reviewed 2026-09-01.
-- **Bundled assets:** 216 files under `engine/spektra-core/src/main/assets/spektra`, tree digest `3ce2843434343df0…`
+- **Bundled assets:** 216 files under `engine/spektra-core/src/main/assets/spektra`, tree digest `f7ae37537ae50344…`
 - **Track-only branches:** `couplers-tuning-iterations@a273e49`, `dev@6cd00c8`, `experimental@28bf883`.
 
 ## Status vocabulary
