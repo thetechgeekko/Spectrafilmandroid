@@ -100,10 +100,10 @@ g++ -std=c++17 -O2 -pthread -I. -I../../../../../tools/parity \
 A test passes when its output contains no `FAIL` line. `tools/parity/run_engine_parity.sh`
 builds and runs the whole suite locally with the same argv as CI (it fails loudly if its table
 drifts from the workflow's `build_run` count). `engine-parity` is a **two-leg matrix** — the same
-40 tests at `-O2` and at the shipping `-O3 -ffast-math -fno-finite-math-only`, because the release
+42 tests at `-O2` and at the shipping `-O3 -ffast-math -fno-finite-math-only`, because the release
 APK's numerics were otherwise never gated. A plain local run reproduces the `-O2` leg only; for the
 other, prefix `SPK_PARITY_EXTRA_FLAGS="-O3 -ffast-math -fno-finite-math-only"`. CI `engine-parity`
-gates (40 tests):
+gates (42 tests):
 `simulate_e2e` (goldens + BOTH film-density memos + the print-density memo + per-param key
 completeness), `filming`, `spatial`, `crop_resize`, `downscale` (minification AA prefilter),
 `autoexposure`, `small_preview_aa` (AE metering downscale AA), `diffusion` (+`_e2e`),
@@ -114,8 +114,9 @@ every key-folded param perturbed one at a time, 1-vs-8 workers through a warm ca
 `scanner_lut_e2e`, `enlarger_lut_e2e`, `output_spaces`, `lensblur`, `tonecurve`,
 `half`, `bake_lut`, `params_passthrough`, `print_curves_morph` (opt-in s023 morph),
 `np_interp` (non-monotonic DIR axis), `gamut_out_aces` + `gamut_out_oklch` + `gamut_out_oklrab`
-(opt-in output gamut compression — ACES-RGC, Oklch perceptual, and Oklrab = Oklch indexed by
-Ottosson's rebased lightness Lr) + `gamut_in_xy` (opt-in input gamut
++ `gamut_out_jzazbz` + `gamut_out_cam16ucs`
+(opt-in output gamut compression — ACES-RGC, Oklch perceptual, Oklrab = Oklch indexed by
+Ottosson's rebased lightness Lr, JzCzhz, and CAM16-UCS) + `gamut_in_xy` (opt-in input gamut
 compression), the spektral-param wiring gates
 `spectral_blur_e2e`, `hanatos_surface_e2e`, `camera_uvir_e2e`, `preflash_e2e`, `print_evcomp_e2e`,
 `scanner_bwcorr_e2e`, `provia_couplers_e2e` (the last gates the positive-film DIR-coupler path),
@@ -137,7 +138,7 @@ per-test argv is in `.github/workflows/ci.yml` — copy from there rather than g
 - Engine `CMAKE_CXX_FLAGS_RELEASE` is `-O3 -ffast-math -fno-finite-math-only`.
   **`-fno-finite-math-only` is required** — the scanning stage relies on NaN propagation through
   `density_to_light` to match spektrafilm's profile null handling. Do not strip it.
-  All 40 gates pass at these flags as well as at `-O2`; note this holds for the **band**, not for
+  All 42 gates pass at these flags as well as at `-O2`; note this holds for the **band**, not for
   byte-equality between the two builds — `-ffast-math` reassociates, which is exactly what
   invalidated a Highway f64 byte-identity claim proven only at `-O2` (`docs/research/perf-lab.md` §14).
 - `tools/parity/` is the standalone `.spkvec` golden-vector comparator (CMake + ctest self-test,

@@ -29,7 +29,7 @@ input, not coverage claims.
 | inapplicable | Not applicable here — desktop-only, or ruled out by the pinned baseline; rationale given |
 | missing | Applicable and absent; owned by the linked atomic ticket |
 
-**Totals:** 12 matched, 7 adapted, 5 extension, 8 inapplicable, 2 missing (34 items).
+**Totals:** 13 matched, 7 adapted, 5 extension, 8 inapplicable, 1 missing (34 items).
 
 ## Runtime stages and taps
 
@@ -89,7 +89,7 @@ input, not coverage claims.
 | Upstream item | Status | Android / evidence |
 |---|---|---|
 | Output gamut compression, algorithms aces_rgc / oklch / oklrab (default-ON upstream at 3bb2c2d) | adapted | Ported as default-OFF opt-ins so the c1d0e44 default render stays byte-identical; gates `gamut_out_aces`, `gamut_out_oklch`, `gamut_out_oklrab` with newer-oracle goldens |
-| Output gamut compression, remaining perceptual algorithms jzazbz / cam16ucs (cam16ucs is the upstream default) | missing | Reserved enum slots kJzazbz=5 / kCam16ucs=6 exist; algorithms not ported — ticket https://github.com/thetechgeekko/Spektrafilm-android/issues/201 |
+| Output gamut compression, remaining perceptual algorithms jzazbz / cam16ucs (cam16ucs is the upstream default) | matched | Ported default-OFF as opt-ins with 3bb2c2d-oracle goldens (#201); gates `gamut_out_jzazbz`, `gamut_out_cam16ucs`; upstream's fixed one-sided _compress_lightness applied |
 | Input gamut compression: xy locus bake portion | adapted | Ported default-OFF; gate `gamut_in_xy` |
 | Input-side CAT02→CAT16 swap + lrgb/xy hard-clip removal; color_reference and spectral_upsampling/calibration_targets CAT16 rework | inapplicable | docs/UPSTREAM_SYNC_2026-06-24.md §4 — *Default-path changes whose 3bb2c2d goldens cannot be isolated from the ad5c8d2 profile refit and the a9bccd6 raw-scaling drift without new profile-injection tooling; tractable only under the Strategy-B rebaseline (docs/UPSTREAM_SYNC_2026-06-24.md §4/§5)* |
 | Print density-curve morph (morph_curves.py / develop_print_morph) | adapted | Ported default-OFF (upstream replaces the tabulated print interp on the default path); gate `print_curves_morph` (opt-in s023 morph) |

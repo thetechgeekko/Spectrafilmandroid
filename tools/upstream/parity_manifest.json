@@ -182,9 +182,8 @@
       "id": "delta-gc-output-remaining",
       "area": "upstream-delta",
       "upstream": "Output gamut compression, remaining perceptual algorithms jzazbz / cam16ucs (cam16ucs is the upstream default)",
-      "status": "missing",
-      "evidence": "Reserved enum slots kJzazbz=5 / kCam16ucs=6 exist; algorithms not ported",
-      "ticket": "https://github.com/thetechgeekko/Spektrafilm-android/issues/201"
+      "status": "matched",
+      "evidence": "Ported default-OFF as opt-ins with 3bb2c2d-oracle goldens (#201); gates `gamut_out_jzazbz`, `gamut_out_cam16ucs`; upstream's fixed one-sided _compress_lightness applied"
     },
     {
       "id": "delta-gc-input",

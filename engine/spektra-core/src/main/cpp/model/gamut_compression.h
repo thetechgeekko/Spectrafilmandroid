@@ -49,7 +49,7 @@ namespace spk {
 //                 Ottosson's rebased lightness Lr = f(L) (a monotonic remap of OkLab L
 //                 toward CIELAB L*), so the knee response is more perceptually uniform
 //                 across light/dark. Opt-in; gated by tests/test_gamut_out_oklrab.cpp.
-//   kJzazbz/kCam16ucs — perceptual chroma reduction. RESERVED (P2 follow-up);
+//   kJzazbz/kCam16ucs — perceptual chroma reduction in JzCzhz / CAM16-UCS (#201);
 //                 not implemented yet.
 enum class OutputGamutCompress {
     kLegacyClip = 0,
@@ -138,6 +138,33 @@ void compress_rgb_oklch_chroma(double* rgb, int npix, int output_space,
 // stays byte-identical.
 void compress_rgb_oklrab_chroma(double* rgb, int npix, int output_space,
                                 double threshold, double limit, double power);
+
+// ---- Output-side: JzCzhz perceptual chroma reduction (Safdar 2017) ---------------
+// (gamut_compression.py::compress_rgb_jzazbz_chroma, dispatched by compress_rgb with
+// algorithm=="jzazbz".) Same algorithm shape as kOklch, but the perceptual space is
+// JzAzBz at an absolute reference white of Y_w = 100 cd/m^2 (linear RGB=1 maps to
+// Y=100 cd/m^2 before the forward, undone after the inverse), the Cz_max table's
+// lightness grid is linspace(0.002, 0.18, 64) with chroma headroom 0.3, and the
+// one-sided lightness knee is normalized by the output whitepoint's Jz. Keeps
+// perceived hue stable across the magenta<->cyan arc where OkLch twists. OPT-IN:
+// gated by tests/test_gamut_out_jzazbz.cpp; scanning runs it only when
+// output_gamut_compress == kJzazbz, so every pre-existing golden stays byte-identical.
+void compress_rgb_jzazbz_chroma(double* rgb, int npix, int output_space,
+                                double threshold, double limit, double power);
+
+// ---- Output-side: CAM16-UCS perceptual chroma reduction (Li et al. 2017) ---------
+// (gamut_compression.py::compress_rgb_cam16ucs_chroma, dispatched by compress_rgb
+// with algorithm=="cam16ucs" — the oracle's DEFAULT algorithm at 3bb2c2d.) Same
+// algorithm shape in CIECAM16-UCS J'a'b': adapting whitepoint = the output space's
+// whitepoint (Y=1, x100 in-model), fixed viewing conditions L_A=64 cd/m^2, Y_b=20,
+// Average surround; Cp_max grid linspace(1, 110, 64) with chroma headroom 150; the
+// lightness knee is normalized by the whitepoint's Jp (~100). The heaviest of the
+// perceptual options (full CAM16 forward+inverse per pixel and per bisection step).
+// OPT-IN: gated by tests/test_gamut_out_cam16ucs.cpp; scanning runs it only when
+// output_gamut_compress == kCam16ucs, so every pre-existing golden stays
+// byte-identical.
+void compress_rgb_cam16ucs_chroma(double* rgb, int npix, int output_space,
+                                  double threshold, double limit, double power);
 
 // ---- Input-side: radial xy compression toward the visible spectral locus --------
 // (gamut_compression.py input path: spectral_locus_xy + compress_xy_radial.) These

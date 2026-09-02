@@ -344,6 +344,8 @@
     <string name="editor_gamut_aces">ACES (tame out-of-gamut)</string>
     <string name="editor_gamut_oklch">Oklch (perceptual, keep hue)</string>
     <string name="editor_gamut_oklrab">Oklrab (perceptual, even lightness)</string>
+    <string name="editor_gamut_jzazbz">Jzazbz (perceptual, stable blues)</string>
+    <string name="editor_gamut_cam16ucs">CAM16 (perceptual, appearance model)</string>
     <string name="editor_gamut_spectral_locus">Spectral locus (tame saturated input)</string>
     <string name="editor_sim_input_gamut">Input gamut compression</string>
     <string name="editor_sim_saturation">Saturation</string>

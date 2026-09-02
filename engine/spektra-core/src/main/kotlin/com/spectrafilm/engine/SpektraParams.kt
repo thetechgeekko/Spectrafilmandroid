@@ -24,13 +24,17 @@ enum class ColorSpace { SRGB, ADOBE_RGB, PROPHOTO, REC2020, ACES2065_1, LINEAR_S
  *   OKLCH=3       — perceptual-hue-preserving chroma compression at constant Oklch (L, h):
  *                   a Reinhard knee on C / C_max(L, h), where the per-output-space gamut
  *                   boundary C_max is regenerated in-engine by bisection.
+ *   JZAZBZ=5      — the same chroma reduction in JzCzhz (Safdar 2017, Y_w=100 cd/m²):
+ *                   hue-stable across the blue/cyan arc where Oklch twists (#201).
+ *   CAM16UCS=6    — the same reduction in CIECAM16-UCS (Li 2017; L_A=64, Y_b=20, Average
+ *                   surround) — upstream 3bb2c2d's default algorithm, opt-in here (#201).
  *   OKLRAB=4      — the OKLCH reduction with the C_max lookup indexed by Ottosson's rebased
  *                   lightness Lr = f(L) (a monotonic remap of OkLab L toward CIELAB L*), for
  *                   a more perceptually uniform knee across light/dark. Same per-pixel cost.
  * The remaining perceptual algos (jzazbz/cam16ucs, C++ ordinals 5..6) are reserved upstream
  * and not yet ported, so they are intentionally absent here.
  */
-enum class OutputGamutCompress { LEGACY_CLIP, OFF, ACES_RGC, OKLCH, OKLRAB }
+enum class OutputGamutCompress { LEGACY_CLIP, OFF, ACES_RGC, OKLCH, OKLRAB, JZAZBZ, CAM16UCS }
 
 /**
  * Input gamut compression algorithm (opt-in, default-off). Ordinals MUST match the C++

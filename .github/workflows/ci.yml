@@ -532,6 +532,13 @@ jobs:
           # indexed by Ottosson's rebased lightness Lr. Gated bit-exact vs the oracle
           # golden; scanning defaults to kLegacyClip so every other golden is byte-identical.
           build_run test_gamut_out_oklrab tests/gamut_oklrab_cases.bin
+          # OPT-IN output gamut compression — JzCzhz (Safdar 2017) and CAM16-UCS
+          # (Li 2017) perceptual chroma reductions (#201): the remaining upstream
+          # algorithms, ported default-OFF exactly like oklch/oklrab and gated
+          # bit-exact vs 3bb2c2d-oracle goldens; scanning defaults to kLegacyClip so
+          # every other golden is byte-identical.
+          build_run test_gamut_out_jzazbz tests/gamut_jzazbz_cases.bin
+          build_run test_gamut_out_cam16ucs tests/gamut_cam16ucs_cases.bin
           # OPT-IN input gamut compression — radial xy compression toward the visible
           # spectral locus (model/gamut_compression.cpp::spectral_locus_xy +
           # compress_xy_radial, reusing the shared reinhard_knee) plus the tc_lut

@@ -71,6 +71,8 @@ TESTS=(
   "test_gamut_out_aces|tests/gamut_aces_cases.bin"
   "test_gamut_out_oklch|tests/gamut_oklch_cases.bin"
   "test_gamut_out_oklrab|tests/gamut_oklrab_cases.bin"
+  "test_gamut_out_jzazbz|tests/gamut_jzazbz_cases.bin"
+  "test_gamut_out_cam16ucs|tests/gamut_cam16ucs_cases.bin"
   "test_gamut_in_xy|tests/gamut_in_cases.bin"
   "test_lut_accel|$G"
   "test_lut_cache_e2e|$ASSET|tests/scan_portra_input_rgb.f64"

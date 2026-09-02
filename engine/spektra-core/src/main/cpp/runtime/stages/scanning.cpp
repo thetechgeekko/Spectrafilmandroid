@@ -362,6 +362,8 @@ void scan(const Profile& film, const ScanningParams& params,
         params.output_gamut_compress == OutputGamutCompress::kAcesRgc ||
         params.output_gamut_compress == OutputGamutCompress::kOklch ||
         params.output_gamut_compress == OutputGamutCompress::kOklrab ||
+        params.output_gamut_compress == OutputGamutCompress::kJzazbz ||
+        params.output_gamut_compress == OutputGamutCompress::kCam16ucs ||
         params.lens_blur > 0.0 || do_unsharp;
 
     // The profile's resolved viewing illuminant owns the spectral weighting,
@@ -777,6 +779,21 @@ void scan(const Profile& film, const ScanningParams& params,
                                    static_cast<int>(params.output_color_space),
                                    params.gamut_knee_threshold, params.gamut_knee_limit,
                                    params.gamut_knee_power);
+    } else if (params.output_gamut_compress == OutputGamutCompress::kJzazbz) {
+        // JzCzhz chroma reduction (Safdar 2017): hue-stable across the blue/cyan arc
+        // where OkLch twists. Same per-space selection (#201).
+        compress_rgb_jzazbz_chroma(lin_rgb, npix,
+                                   static_cast<int>(params.output_color_space),
+                                   params.gamut_knee_threshold, params.gamut_knee_limit,
+                                   params.gamut_knee_power);
+    } else if (params.output_gamut_compress == OutputGamutCompress::kCam16ucs) {
+        // CAM16-UCS chroma reduction (Li 2017) — the upstream 3bb2c2d default
+        // algorithm, here strictly opt-in. Same per-space selection (#201).
+        compress_rgb_cam16ucs_chroma(lin_rgb, npix,
+                                     static_cast<int>(params.output_color_space),
+                                     params.gamut_knee_threshold,
+                                     params.gamut_knee_limit,
+                                     params.gamut_knee_power);
     }
 
     // Scanner lens blur (scanner.lens_blur, in pixels): a per-channel 2D Gaussian

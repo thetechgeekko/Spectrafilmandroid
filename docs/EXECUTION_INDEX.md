@@ -75,7 +75,7 @@ executable source for direct review:
 | Native toolchain | NDK `27.0.12077973`, CMake `3.22.1` | Gradle + CI/release workflows |
 | Android build tools | `35.0.0` | app Gradle + CI/release workflows |
 | RAW decoder | authenticated, patched LibRaw `0.22.2`; X3F disabled pending qualification | `LibRawVendor.cmake` + domain record |
-| Engine gate | 40 cases at O2 and shipping `-O3 -ffast-math -fno-finite-math-only` | `.github/workflows/ci.yml` |
+| Engine gate | 42 cases at O2 and shipping `-O3 -ffast-math -fno-finite-math-only` | `.github/workflows/ci.yml` |
 | Public release | `v0.9.0`; current tree remains under release hold | release checklist + live production map |
 
 Target/compile SDK 34 is current-tree truth, not release approval. The owner has selected a free

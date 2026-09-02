@@ -568,6 +568,449 @@ void compress_pixel_oklrab(const double rgb_in[3], int space, const double* tabl
     mat3_mul(kXyzToRgb[space], xyz_new, out);
 }
 
+
+// ---------------------------------------------------------------------------
+// Jzazbz: JzCzhz perceptual chroma reduction (Safdar 2017, colour-science 0.4.7).
+// (gamut_compression.py::compress_rgb_jzazbz_chroma + the "jzazbz" branch of
+// _get_output_c_max_table.) Same algorithm shape as OkLch; the perceptual space is
+// JzAzBz at an absolute reference white of Y_w = 100 cd/m^2 (_JZAZBZ_Y_W_CDM2):
+// linear RGB=1 maps to Y=100 before the forward, undone after the inverse.
+// ---------------------------------------------------------------------------
+
+// colour.models.jzazbz constants (Safdar 2017) + the ST 2084 PQ constants with the
+// re-optimized m2 = 1.7 * 2523 / 2^5. Decimal literals match the colour source; the
+// inverse matrices are np.linalg.inv results captured as exact float64 hex.
+constexpr double kJzB = 1.15;
+constexpr double kJzG = 0.66;
+constexpr double kJzD = -0.56;
+constexpr double kJzD0 = 1.6295499532821566e-11;
+constexpr double kJzYw = 100.0;                       // _JZAZBZ_Y_W_CDM2
+constexpr double kPqM1 = 0x1.4640000000000p-3;        // 2610/4096/4
+constexpr double kPqM2Jz = 0x1.0c11999999999p+7;      // 1.7 * 2523/4096 * 128
+constexpr double kPqC1 = 0x1.ac00000000000p-1;        // 3424/4096
+constexpr double kPqC2 = 0x1.2da0000000000p+4;        // 2413/4096*32
+constexpr double kPqC3 = 0x1.2b00000000000p+4;        // 2392/4096*32
+constexpr double kJzMXyzToLms[3][3] = {
+    {0.41478972, 0.579999, 0.0146480},
+    {-0.2015100, 1.120649, 0.0531008},
+    {-0.0166008, 0.264800, 0.6684799},
+};
+constexpr double kJzMLmsToXyz[3][3] = {  // np.linalg.inv(kJzMXyzToLms), exact hex
+    {  0x1.ec9a1a8bce714p+0, -0x1.013a11a9de8acp+0,  0x1.3470b79eb8366p-5 },
+    {  0x1.66b96ff1c1292p-2,  0x1.73f557d230e47p-1, -0x1.0bd08963ad7e9p-4 },
+    { -0x1.74aa645ab6307p-4, -0x1.403bd8515285fp-2,  0x1.85d407843f9bep+0 },
+};
+constexpr double kJzMLmspToIzazbz[3][3] = {
+    {0.500000, 0.500000, 0.000000},
+    {3.524000, -4.066708, 0.542708},
+    {0.199076, 1.096799, -1.295875},
+};
+constexpr double kJzMIzazbzToLmsp[3][3] = {  // np.linalg.inv(kJzMLmspToIzazbz), exact hex
+    {  0x1.0000000000000p+0,  0x1.1bdcf5ff4b9ffp-3,  0x1.db860b905af43p-5 },
+    {  0x1.0000000000000p+0, -0x1.1bdcf5ff4b9fep-3, -0x1.db860b905af50p-5 },
+    {  0x1.0000000000000p+0, -0x1.894b7904a2cf8p-4, -0x1.9fb04b6ae56fdp-1 },
+};
+
+// The output color space's whitepoint as XYZ at Y = 1
+// (gamut_compression.py::_output_cs_whitepoint_xyz / _xy_to_xyz_unit_y), captured as
+// exact float64 hex from colour.RGB_COLOURSPACES[...].whitepoint. Indexed by
+// spk_color_space; [5] LINEAR_SRGB == [0] sRGB.
+constexpr double kWhitepointXyzUnitY[6][3] = {
+    {  0x1.e6a228c5f3dc7p-1,  0x1.0000000000000p+0,  0x1.16cc7d1ef8103p+0 },  // sRGB D65
+    {  0x1.e6a228c5f3dc7p-1,  0x1.0000000000000p+0,  0x1.16cc7d1ef8103p+0 },  // Adobe D65
+    {  0x1.edb829b3e0ddbp-1,  0x1.0000000000000p+0,  0x1.a6741c471f7dcp-1 },  // ProPhoto D50
+    {  0x1.e6a228c5f3dc7p-1,  0x1.0000000000000p+0,  0x1.16cc7d1ef8103p+0 },  // BT.2020 D65
+    {  0x1.e7c139ede16abp-1,  0x1.0000000000000p+0,  0x1.02425e062bd5ep+0 },  // ACES ~D60
+    {  0x1.e6a228c5f3dc7p-1,  0x1.0000000000000p+0,  0x1.16cc7d1ef8103p+0 },  // LINEAR_SRGB
+};
+
+// colour.eotf_inverse_ST2084 with the Jzazbz m2 (L_p = 10000).
+inline double pq_encode_jz(double c) {
+    const double y = spow(c / 10000.0, kPqM1);
+    return spow((kPqC1 + kPqC2 * y) / (kPqC3 * y + 1.0), kPqM2Jz);
+}
+
+// colour.eotf_ST2084 with the Jzazbz m2 (L_p = 10000).
+inline double pq_decode_jz(double n) {
+    const double v = spow(n, 1.0 / kPqM2Jz);
+    const double num = std::fmax(0.0, v - kPqC1);
+    return 10000.0 * spow(num / (kPqC2 - kPqC3 * v), 1.0 / kPqM1);
+}
+
+// colour.XYZ_to_Jzazbz (Safdar 2017). `xyz` is absolute (cd/m^2, i.e. unit XYZ * 100).
+inline void jzazbz_from_xyz(const double xyz[3], double jab[3]) {
+    const double xp = kJzB * xyz[0] - (kJzB - 1.0) * xyz[2];
+    const double yp = kJzG * xyz[1] - (kJzG - 1.0) * xyz[0];
+    const double xyz_p[3] = {xp, yp, xyz[2]};
+    double lms[3];
+    mat3_mul(kJzMXyzToLms, xyz_p, lms);
+    const double lms_p[3] = {pq_encode_jz(lms[0]), pq_encode_jz(lms[1]),
+                             pq_encode_jz(lms[2])};
+    double iab[3];
+    mat3_mul(kJzMLmspToIzazbz, lms_p, iab);
+    jab[0] = ((1.0 + kJzD) * iab[0]) / (1.0 + kJzD * iab[0]) - kJzD0;
+    jab[1] = iab[1];
+    jab[2] = iab[2];
+}
+
+// colour.Jzazbz_to_XYZ (Safdar 2017). Returns absolute XYZ (cd/m^2).
+inline void xyz_from_jzazbz(const double jab[3], double xyz[3]) {
+    const double jz = jab[0] + kJzD0;
+    const double iz = jz / (1.0 + kJzD - kJzD * jz);
+    const double iab[3] = {iz, jab[1], jab[2]};
+    double lms_p[3];
+    mat3_mul(kJzMIzazbzToLmsp, iab, lms_p);
+    const double lms[3] = {pq_decode_jz(lms_p[0]), pq_decode_jz(lms_p[1]),
+                           pq_decode_jz(lms_p[2])};
+    double xyz_p[3];
+    mat3_mul(kJzMLmsToXyz, lms, xyz_p);
+    const double x = (xyz_p[0] + (kJzB - 1.0) * xyz_p[2]) / kJzB;
+    const double y = (xyz_p[1] + (kJzG - 1.0) * x) / kJzG;
+    xyz[0] = x;
+    xyz[1] = y;
+    xyz[2] = xyz_p[2];
+}
+
+// gamut_compression.py::_jzazbz_white_Jz: Jz of the output whitepoint at Y_w cd/m^2.
+double jzazbz_white_Jz(int space) {
+    const double xyz_abs[3] = {kWhitepointXyzUnitY[space][0] * kJzYw,
+                               kWhitepointXyzUnitY[space][1] * kJzYw,
+                               kWhitepointXyzUnitY[space][2] * kJzYw};
+    double jab[3];
+    jzazbz_from_xyz(xyz_abs, jab);
+    return jab[0];
+}
+
+// _get_output_c_max_table("jzazbz", ...): Jz grid linspace(0.002, 0.18, 64) (endpoint
+// pinned), chroma upper 0.3, same 720-hue/18-bisection geometry, in-gamut iff every
+// native-RGB channel of Jzazbz_to_XYZ(jab)/Y_w is in [-1e-6, 1+1e-6].
+void build_jzazbz_cmax_table(int space, double* table, double* L_grid, double* h_grid) {
+    const double Lstart = 0.002;
+    const double Lend = 0.18;
+    const double Lstep = (Lend - Lstart) / static_cast<double>(kOklchNL - 1);
+    for (int i = 0; i < kOklchNL; ++i)
+        L_grid[i] = static_cast<double>(i) * Lstep + Lstart;
+    L_grid[kOklchNL - 1] = Lend;  // np.linspace endpoint override
+    const double hstart = -kPi;
+    const double hstep = (kPi - (-kPi)) / static_cast<double>(kOklchNH);
+    for (int j = 0; j < kOklchNH; ++j)
+        h_grid[j] = static_cast<double>(j) * hstep + hstart;
+
+    const double(*M)[3] = kXyzToRgb[space];
+    for (int i = 0; i < kOklchNL; ++i) {
+        const double Jz = L_grid[i];
+        for (int j = 0; j < kOklchNH; ++j) {
+            const double ch = std::cos(h_grid[j]);
+            const double sh = std::sin(h_grid[j]);
+            double lo = 0.0;
+            double hi = 0.3;
+            for (int it = 0; it < kOklchNBisect; ++it) {
+                const double mid = (lo + hi) * 0.5;
+                const double jab[3] = {Jz, mid * ch, mid * sh};
+                double xyz_abs[3];
+                xyz_from_jzazbz(jab, xyz_abs);
+                const double xyz[3] = {xyz_abs[0] / kJzYw, xyz_abs[1] / kJzYw,
+                                       xyz_abs[2] / kJzYw};
+                double rgb[3];
+                mat3_mul(M, xyz, rgb);
+                const bool in_gamut =
+                    rgb[0] >= -1e-6 && rgb[0] <= 1.0 + 1e-6 &&
+                    rgb[1] >= -1e-6 && rgb[1] <= 1.0 + 1e-6 &&
+                    rgb[2] >= -1e-6 && rgb[2] <= 1.0 + 1e-6;
+                if (in_gamut) lo = mid; else hi = mid;
+            }
+            table[static_cast<size_t>(i) * kOklchNH + j] = lo;
+        }
+    }
+}
+
+// compress_rgb_jzazbz_chroma per pixel (lightness_compression pinned (0.7,1.0,2.2),
+// L_white = the output whitepoint's Jz). `out` may alias `rgb_in`.
+void compress_pixel_jzazbz(const double rgb_in[3], int space, const double* table,
+                           const double* L_grid, const double* h_grid, double Jz_white,
+                           double threshold, double limit, double power, double out[3]) {
+    double xyz_unit[3];
+    mat3_mul(kRgbToXyz[space], rgb_in, xyz_unit);
+    const double xyz_abs[3] = {xyz_unit[0] * kJzYw, xyz_unit[1] * kJzYw,
+                               xyz_unit[2] * kJzYw};
+    double jab[3];
+    jzazbz_from_xyz(xyz_abs, jab);
+    const double az = jab[1];
+    const double bz = jab[2];
+
+    // _compress_lightness(Jz, (0.7,1.0,2.2), L_white=Jz_white): normalize, knee,
+    // denormalize. Black (Jz=0) passes through; C/h come from the ORIGINAL az,bz.
+    const double Jz = reinhard_knee(jab[0] / Jz_white, 0.7, 1.0, 2.2) * Jz_white;
+    const double Cz = std::hypot(az, bz);
+    const double hz = std::atan2(bz, az);
+
+    const double Cz_max = cmax_lookup(Jz, hz, table, L_grid, h_grid);
+    const double safe_Cz_max = std::fmax(Cz_max, 1e-9);
+    const double d_norm = Cz / safe_Cz_max;
+    const double d_comp = reinhard_knee(d_norm, threshold, limit, power);
+    const double Cz_new = d_comp * safe_Cz_max;
+
+    const double jab_new[3] = {Jz, Cz_new * std::cos(hz), Cz_new * std::sin(hz)};
+    double xyz_new_abs[3];
+    xyz_from_jzazbz(jab_new, xyz_new_abs);
+    const double xyz_new[3] = {xyz_new_abs[0] / kJzYw, xyz_new_abs[1] / kJzYw,
+                               xyz_new_abs[2] / kJzYw};
+    mat3_mul(kXyzToRgb[space], xyz_new, out);
+}
+
+// ---------------------------------------------------------------------------
+// CAM16-UCS: CIECAM16 Uniform Color Space chroma reduction (Li et al. 2017, via
+// colour-science 0.4.7). (gamut_compression.py::compress_rgb_cam16ucs_chroma + the
+// "cam16ucs" branch of _get_output_c_max_table.) The adapting whitepoint is the
+// output space's whitepoint at Y=1 (x100 inside the model); viewing conditions are
+// fixed at L_A = 64 cd/m^2, Y_b = 20, Average surround (F=1, c=0.69, N_c=1).
+// ---------------------------------------------------------------------------
+
+constexpr double kCam16LA = 64.0;   // _CAM16UCS_L_A
+constexpr double kCam16Yb = 20.0;   // _CAM16UCS_Y_B
+constexpr double kCam16SurroundF = 1.0;    // VIEWING_CONDITIONS "Average"
+constexpr double kCam16SurroundC = 0.69;
+constexpr double kCam16SurroundNc = 1.0;
+constexpr double kUcsC1 = 0.007;    // COEFFICIENTS_UCS_LUO2006["CAM02-UCS"]
+constexpr double kUcsC2 = 0.0228;
+constexpr double kNpEps = 2.220446049250313e-16;  // np.finfo(float64).eps
+
+constexpr double kCat16[3][3] = {  // colour.adaptation.CAT_CAT16 (MATRIX_16)
+    {0.401288, 0.650173, -0.051461},
+    {-0.250268, 1.204414, 0.045854},
+    {-0.002079, 0.048952, 0.953127},
+};
+constexpr double kCat16Inv[3][3] = {  // np.linalg.inv(CAT_CAT16), exact hex
+    {  0x1.dcb07a9c88540p+0, -0x1.02e1955e0fe8ep+0,  0x1.3188d60c3ca76p-3 },
+    {  0x1.8cd3c2161fe30p-2,  0x1.3e2e5bee8e9d8p-1, -0x1.260f3e67a3c0bp-7 },
+    { -0x1.038c0fde8f887p-6, -0x1.1788fcdc07728p-5,  0x1.0cca78265a79cp+0 },
+};
+
+// colour.algebra.sdiv under the default "Ignore Zero Conversion" mode: x/0 -> 0.
+inline double sdiv(double a, double b) { return b == 0.0 ? 0.0 : a / b; }
+
+// Everything about the viewing conditions + adapting white that is constant per
+// output space (XYZ_to_CAM16's step 0). Built once per image.
+struct Cam16Context {
+    double D_RGB[3];
+    double F_L;
+    double n;
+    double z;
+    double N_bb;  // == N_cb
+    double A_w;
+    double Jp_white;  // _cam16ucs_white_Jp for the lightness knee
+};
+
+// colour.appearance: post-adaptation non-linear response compression (forward).
+inline double cam16_pnrc_fwd(double v, double F_L) {
+    const double f = spow(F_L * std::fabs(v) / 100.0, 0.42);
+    return (400.0 * (v < 0.0 ? -1.0 : (v > 0.0 ? 1.0 : 0.0)) * f) / (27.13 + f) + 0.1;
+}
+
+// ...and its inverse (RGB here carries the +0.1 offset, exactly as in colour).
+inline double cam16_pnrc_inv(double v, double F_L) {
+    const double d = v - 0.1;
+    const double sign = d < 0.0 ? -1.0 : (d > 0.0 ? 1.0 : 0.0);
+    const double ratio = (27.13 * std::fabs(d)) / (400.0 - std::fabs(d));
+    return sign * 100.0 / F_L * spow(ratio, 1.0 / 0.42);
+}
+
+// Forward CAM16 -> UCS J'a'b' for one unit-XYZ triple (the XYZ_to_UCS_Li2017 wrapper
+// multiplies XYZ and XYZ_w by 100 under the reference domain-range scale).
+void cam16ucs_from_xyz_unit(const double xyz_unit[3], int space, const Cam16Context& vc,
+                            double jab[3]) {
+    const double xyz[3] = {xyz_unit[0] * 100.0, xyz_unit[1] * 100.0,
+                           xyz_unit[2] * 100.0};
+    double rgb[3];
+    mat3_mul(kCat16, xyz, rgb);
+    double rgb_a[3];
+    for (int k = 0; k < 3; ++k)
+        rgb_a[k] = cam16_pnrc_fwd(vc.D_RGB[k] * rgb[k], vc.F_L);
+    const double a = rgb_a[0] - 12.0 * rgb_a[1] / 11.0 + rgb_a[2] / 11.0;
+    const double b = (rgb_a[0] + rgb_a[1] - 2.0 * rgb_a[2]) / 9.0;
+    double h = std::atan2(b, a) * (180.0 / kPi);  // np.degrees(...) % 360
+    h = std::fmod(h, 360.0);
+    if (h < 0.0) h += 360.0;
+    const double e_t = 0.25 * (std::cos(2.0 + h * kPi / 180.0) + 3.8);
+    const double A =
+        (2.0 * rgb_a[0] + rgb_a[1] + rgb_a[2] / 20.0 - 0.305) * vc.N_bb;
+    const double J = 100.0 * spow(sdiv(A, vc.A_w), kCam16SurroundC * vc.z);
+    const double t = (50000.0 / 13.0) * kCam16SurroundNc * vc.N_bb *
+                     sdiv(e_t * std::sqrt(a * a + b * b),
+                          rgb_a[0] + rgb_a[1] + 21.0 * rgb_a[2] / 20.0);
+    const double C = spow(t, 0.9) * spow(J / 100.0, 0.5) *
+                     std::pow(1.64 - std::pow(0.29, vc.n), 0.73);
+    const double M = C * spow(vc.F_L, 0.25);
+    // JMh -> CAM16-UCS (Li 2017): J' = (1+100 c1) J / (1 + c1 J); M' = log1p(c2 M)/c2.
+    const double Jp = ((1.0 + 100.0 * kUcsC1) * J) / (1.0 + kUcsC1 * J);
+    const double Mp = std::log1p(kUcsC2 * M) / kUcsC2;
+    const double hr = h * (kPi / 180.0);
+    jab[0] = Jp;
+    jab[1] = Mp * std::cos(hr);
+    jab[2] = Mp * std::sin(hr);
+}
+
+// Inverse: UCS J'a'b' -> unit XYZ (the UCS_Li2017_to_XYZ wrapper divides by 100).
+void xyz_unit_from_cam16ucs(const double jab[3], int space, const Cam16Context& vc,
+                            double xyz_unit[3]) {
+    const double Jp = jab[0];
+    const double J = -Jp / (kUcsC1 * Jp - 1.0 - 100.0 * kUcsC1);
+    const double Mp = std::hypot(jab[2], jab[1]);
+    double h = std::atan2(jab[2], jab[1]) * (180.0 / kPi);
+    h = std::fmod(h, 360.0);
+    if (h < 0.0) h += 360.0;
+    const double M = std::expm1(Mp * kUcsC2) / kUcsC2;
+    const double C = M / spow(vc.F_L, 0.25);
+    // temporary_magnitude_quantity_inverse (J_prime = max(J, np.finfo eps)).
+    const double J_prime = std::fmax(J, kNpEps);
+    const double t = spow(
+        C / (std::sqrt(J_prime / 100.0) * std::pow(1.64 - std::pow(0.29, vc.n), 0.73)),
+        1.0 / 0.9);
+    const double e_t = 0.25 * (std::cos(2.0 + h * kPi / 180.0) + 3.8);
+    const double A = vc.A_w * spow(J / 100.0, 1.0 / (kCam16SurroundC * vc.z));
+    const double P_1 = sdiv((50000.0 / 13.0) * kCam16SurroundNc * vc.N_bb * e_t, t);
+    const double P_2 = A / vc.N_bb + 0.305;
+    const double P_3 = 21.0 / 20.0;
+    const double hr = h * (kPi / 180.0);
+    const double sin_hr = std::sin(hr);
+    const double cos_hr = std::cos(hr);
+    const double n_val = P_2 * (2.0 + P_3) * (460.0 / 1403.0);
+    double a = 0.0;
+    double b = 0.0;
+    if (std::fabs(sin_hr) >= std::fabs(cos_hr)) {
+        const double P_4 = sdiv(P_1, sin_hr);
+        b = n_val / (P_4 + (2.0 + P_3) * (220.0 / 1403.0) * sdiv(cos_hr, sin_hr) -
+                     (27.0 / 1403.0) + P_3 * (6300.0 / 1403.0));
+        a = b * sdiv(cos_hr, sin_hr);
+    } else {
+        const double P_5 = sdiv(P_1, cos_hr);
+        a = n_val / (P_5 + (2.0 + P_3) * (220.0 / 1403.0) -
+                     ((27.0 / 1403.0) - P_3 * (6300.0 / 1403.0)) * sdiv(sin_hr, cos_hr));
+        b = a * sdiv(sin_hr, cos_hr);
+    }
+    if (t == 0.0) { a = 0.0; b = 0.0; }
+    const double rgb_a[3] = {
+        (460.0 * P_2 + 451.0 * a + 288.0 * b) / 1403.0,
+        (460.0 * P_2 - 891.0 * a - 261.0 * b) / 1403.0,
+        (460.0 * P_2 - 220.0 * a - 6300.0 * b) / 1403.0,
+    };
+    double rgb[3];
+    for (int k = 0; k < 3; ++k)
+        rgb[k] = cam16_pnrc_inv(rgb_a[k], vc.F_L) / vc.D_RGB[k];
+    double xyz[3];
+    mat3_mul(kCat16Inv, rgb, xyz);
+    xyz_unit[0] = xyz[0] / 100.0;
+    xyz_unit[1] = xyz[1] / 100.0;
+    xyz_unit[2] = xyz[2] / 100.0;
+}
+
+// Step-0 context for `space` (XYZ_w = whitepoint at Y=1, x100 by the wrapper).
+Cam16Context build_cam16_context(int space) {
+    Cam16Context vc;
+    const double xyz_w[3] = {kWhitepointXyzUnitY[space][0] * 100.0,
+                             kWhitepointXyzUnitY[space][1] * 100.0,
+                             kWhitepointXyzUnitY[space][2] * 100.0};
+    const double Y_w = xyz_w[1];
+    double rgb_w[3];
+    mat3_mul(kCat16, xyz_w, rgb_w);
+    // degree_of_adaptation clipped to [0, 1] (discount_illuminant = False).
+    double D = kCam16SurroundF *
+               (1.0 - (1.0 / 3.6) * std::exp((-kCam16LA - 42.0) / 92.0));
+    if (D < 0.0) D = 0.0;
+    else if (D > 1.0) D = 1.0;
+    // viewing_conditions_dependent_parameters.
+    vc.n = kCam16Yb / Y_w;
+    const double k = 1.0 / (5.0 * kCam16LA + 1.0);
+    const double k4 = k * k * k * k;
+    vc.F_L = 0.2 * k4 * (5.0 * kCam16LA) +
+             0.1 * (1.0 - k4) * (1.0 - k4) * spow(5.0 * kCam16LA, 1.0 / 3.0);
+    vc.N_bb = 0.725 * spow(1.0 / vc.n, 0.2);
+    vc.z = 1.48 + std::sqrt(vc.n);
+    double rgb_aw[3];
+    for (int c = 0; c < 3; ++c) {
+        vc.D_RGB[c] = D * Y_w / rgb_w[c] + 1.0 - D;
+        rgb_aw[c] = cam16_pnrc_fwd(vc.D_RGB[c] * rgb_w[c], vc.F_L);
+    }
+    vc.A_w = (2.0 * rgb_aw[0] + rgb_aw[1] + rgb_aw[2] / 20.0 - 0.305) * vc.N_bb;
+    // _cam16ucs_white_Jp: the whitepoint through the very same forward path.
+    vc.Jp_white = 0.0;
+    double jab_w[3];
+    cam16ucs_from_xyz_unit(kWhitepointXyzUnitY[space], space, vc, jab_w);
+    vc.Jp_white = jab_w[0];
+    return vc;
+}
+
+// _get_output_c_max_table("cam16ucs", ...): Jp grid linspace(1, 110, 64) (endpoint
+// pinned), chroma upper 150, same 720-hue/18-bisection geometry.
+void build_cam16ucs_cmax_table(int space, const Cam16Context& vc, double* table,
+                               double* L_grid, double* h_grid) {
+    const double Lstart = 1.0;
+    const double Lend = 110.0;
+    const double Lstep = (Lend - Lstart) / static_cast<double>(kOklchNL - 1);
+    for (int i = 0; i < kOklchNL; ++i)
+        L_grid[i] = static_cast<double>(i) * Lstep + Lstart;
+    L_grid[kOklchNL - 1] = Lend;  // np.linspace endpoint override
+    const double hstart = -kPi;
+    const double hstep = (kPi - (-kPi)) / static_cast<double>(kOklchNH);
+    for (int j = 0; j < kOklchNH; ++j)
+        h_grid[j] = static_cast<double>(j) * hstep + hstart;
+
+    const double(*M)[3] = kXyzToRgb[space];
+    for (int i = 0; i < kOklchNL; ++i) {
+        const double Jp = L_grid[i];
+        for (int j = 0; j < kOklchNH; ++j) {
+            const double ch = std::cos(h_grid[j]);
+            const double sh = std::sin(h_grid[j]);
+            double lo = 0.0;
+            double hi = 150.0;
+            for (int it = 0; it < kOklchNBisect; ++it) {
+                const double mid = (lo + hi) * 0.5;
+                const double jab[3] = {Jp, mid * ch, mid * sh};
+                double xyz_unit[3];
+                xyz_unit_from_cam16ucs(jab, space, vc, xyz_unit);
+                double rgb[3];
+                mat3_mul(M, xyz_unit, rgb);
+                const bool in_gamut =
+                    rgb[0] >= -1e-6 && rgb[0] <= 1.0 + 1e-6 &&
+                    rgb[1] >= -1e-6 && rgb[1] <= 1.0 + 1e-6 &&
+                    rgb[2] >= -1e-6 && rgb[2] <= 1.0 + 1e-6;
+                if (in_gamut) lo = mid; else hi = mid;
+            }
+            table[static_cast<size_t>(i) * kOklchNH + j] = lo;
+        }
+    }
+}
+
+// compress_rgb_cam16ucs_chroma per pixel (lightness_compression pinned (0.7,1.0,2.2),
+// L_white = the whitepoint's Jp). `out` may alias `rgb_in`.
+void compress_pixel_cam16ucs(const double rgb_in[3], int space, const Cam16Context& vc,
+                             const double* table, const double* L_grid,
+                             const double* h_grid, double threshold, double limit,
+                             double power, double out[3]) {
+    double xyz_unit[3];
+    mat3_mul(kRgbToXyz[space], rgb_in, xyz_unit);
+    double jab[3];
+    cam16ucs_from_xyz_unit(xyz_unit, space, vc, jab);
+    const double ap = jab[1];
+    const double bp = jab[2];
+
+    const double Jp =
+        reinhard_knee(jab[0] / vc.Jp_white, 0.7, 1.0, 2.2) * vc.Jp_white;
+    const double Cp = std::hypot(ap, bp);
+    const double hp = std::atan2(bp, ap);
+
+    const double Cp_max = cmax_lookup(Jp, hp, table, L_grid, h_grid);
+    const double safe_Cp_max = std::fmax(Cp_max, 1e-9);
+    const double d_norm = Cp / safe_Cp_max;
+    const double d_comp = reinhard_knee(d_norm, threshold, limit, power);
+    const double Cp_new = d_comp * safe_Cp_max;
+
+    const double jab_new[3] = {Jp, Cp_new * std::cos(hp), Cp_new * std::sin(hp)};
+    double xyz_new[3];
+    xyz_unit_from_cam16ucs(jab_new, space, vc, xyz_new);
+    mat3_mul(kXyzToRgb[space], xyz_new, out);
+}
+
 }  // namespace
 
 void compress_rgb_oklch_chroma(double* rgb, int npix, int output_space, double threshold,
@@ -599,6 +1042,41 @@ void compress_rgb_oklrab_chroma(double* rgb, int npix, int output_space, double 
         const double in[3] = {px[0], px[1], px[2]};
         compress_pixel_oklrab(in, output_space, table.data(), L_grid, h_grid, threshold,
                               limit, power, px);
+    }
+}
+
+void compress_rgb_jzazbz_chroma(double* rgb, int npix, int output_space,
+                                double threshold, double limit, double power) {
+    // Build the per-space Cz_max(Jz,hz) table ONCE, locally (no static/global state ->
+    // thread-invariant and warm==cold). One build per image; this path is opt-in.
+    std::vector<double> table(static_cast<size_t>(kOklchNL) * kOklchNH);
+    double L_grid[kOklchNL];
+    double h_grid[kOklchNH];
+    build_jzazbz_cmax_table(output_space, table.data(), L_grid, h_grid);
+    const double Jz_white = jzazbz_white_Jz(output_space);
+    for (int p = 0; p < npix; ++p) {
+        double* px = rgb + static_cast<long>(p) * 3;
+        const double in[3] = {px[0], px[1], px[2]};
+        compress_pixel_jzazbz(in, output_space, table.data(), L_grid, h_grid, Jz_white,
+                              threshold, limit, power, px);
+    }
+}
+
+void compress_rgb_cam16ucs_chroma(double* rgb, int npix, int output_space,
+                                  double threshold, double limit, double power) {
+    // Build the viewing-conditions context + per-space Cp_max(Jp,hp) table ONCE,
+    // locally (no static/global state -> thread-invariant and warm==cold). The table
+    // build runs ~830k CAM16 inversions and is the dominant cost; this path is opt-in.
+    const Cam16Context vc = build_cam16_context(output_space);
+    std::vector<double> table(static_cast<size_t>(kOklchNL) * kOklchNH);
+    double L_grid[kOklchNL];
+    double h_grid[kOklchNH];
+    build_cam16ucs_cmax_table(output_space, vc, table.data(), L_grid, h_grid);
+    for (int p = 0; p < npix; ++p) {
+        double* px = rgb + static_cast<long>(p) * 3;
+        const double in[3] = {px[0], px[1], px[2]};
+        compress_pixel_cam16ucs(in, output_space, vc, table.data(), L_grid, h_grid,
+                                threshold, limit, power, px);
     }
 }
 

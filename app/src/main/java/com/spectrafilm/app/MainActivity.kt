@@ -5553,6 +5553,8 @@ class MainActivity : ComponentActivity() {
                             OutputGamutCompress.ACES_RGC,
                             OutputGamutCompress.OKLCH,
                             OutputGamutCompress.OKLRAB,
+                            OutputGamutCompress.JZAZBZ,
+                            OutputGamutCompress.CAM16UCS,
                         ),
                         {
                             when (it) {
@@ -5561,6 +5563,8 @@ class MainActivity : ComponentActivity() {
                                 OutputGamutCompress.ACES_RGC -> res.getString(R.string.editor_gamut_aces)
                                 OutputGamutCompress.OKLCH -> res.getString(R.string.editor_gamut_oklch)
                                 OutputGamutCompress.OKLRAB -> res.getString(R.string.editor_gamut_oklrab)
+                                OutputGamutCompress.JZAZBZ -> res.getString(R.string.editor_gamut_jzazbz)
+                                OutputGamutCompress.CAM16UCS -> res.getString(R.string.editor_gamut_cam16ucs)
                             }
                         },
                         { s.outputGamutCompress = it },
