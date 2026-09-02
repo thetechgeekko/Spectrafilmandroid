@@ -448,6 +448,37 @@ class SimResult private constructor(
     companion object {
         private const val CLOSED = Int.MIN_VALUE
 
+        /**
+         * Wrap an externally owned, already-rendered buffer as a result (issue #179).
+         *
+         * The idle pre-render writes the engine's float output to disk and the export maps it
+         * back instead of re-running the engine. That mapping is not a native engine
+         * allocation, so it must never be freed through [freeDirectBuffer]: [release] is
+         * invoked exactly once, when the last lease closes, and the caller owns whatever it
+         * releases.
+         *
+         * [data] must be direct, in native byte order, and hold at least width*height*3
+         * floats. `renderId` is 0 because a restored payload is not a native render: it has no
+         * stage timings to correlate with and reports no outcome.
+         */
+        @JvmStatic
+        fun fromExternalBuffer(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            colorSpace: ColorSpace,
+            release: (ByteBuffer) -> Unit,
+        ): SimResult {
+            val needed = width.toLong() * height.toLong() * 3L * 4L
+            require(data.capacity().toLong() >= needed) {
+                "payload holds ${data.capacity()} bytes, need $needed for ${width}x$height"
+            }
+            return SimResult(
+                data, width, height, colorSpace, 0L, 1L,
+                { buffer, _ -> release(buffer) },
+            )
+        }
+
         internal fun forTest(
             data: ByteBuffer,
             width: Int,

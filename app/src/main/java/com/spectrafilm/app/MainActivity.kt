@@ -154,6 +154,19 @@ private data class CachedSourceDecodeRequest(
 )
 
 /** Activity-free decoder used by previews and the process-owned export runtime. */
+/**
+ * The decode half of the #179 cache identity. Spelled out rather than taken from the request's
+ * own toString, which embeds a Context whose toString differs between two identical exports.
+ * Shared by the export and the idle pre-render: if these two ever disagreed, the pre-render
+ * would key its payload under a name the export never looks up, and would silently do nothing.
+ */
+private fun decodeIdentityOf(request: SourceDecodeRequest): String = with(request) {
+    "kind=$kind;rot=$rotation;rawWb=$rawWhiteBalance;" +
+        "rawTemp=$rawTemperature;rawTint=$rawTint;" +
+        "temp=$creativeTemp;tint=$creativeTint;" +
+        "balance=$balanceToFilmStock;film=$filmProfile"
+}
+
 private suspend fun decodeSourceRequest(
     request: SourceDecodeRequest,
     maxEdge: Int,
@@ -2912,6 +2925,92 @@ class MainActivity : ComponentActivity() {
             state.localAdjustments,
             state.saturation, state.vibrance, state.gamutCompress) { previewTick++ }
 
+        // --- #179: idle full-resolution pre-render ---
+        // Decode plus the engine are ~86% of a first export (BASE: 0.98 s decode + 5.02 s engine
+        // inside a 6.05 s JPEG export), and the editor is idle while the user looks at the
+        // preview. So do that work then, keep the engine's float output, and let the export run
+        // the real encoder on it — the published bytes come from the same encoder either way, so
+        // a pre-render can never make the exported file differ.
+        //
+        // Keyed on previewTick, which the effect above bumps for EVERY render-affecting edit:
+        // that avoids adding a fourth hand-maintained key list to the three this file already
+        // warns about, and Compose's own cancellation is the latest-wins rule for free.
+        var prerenderDigest by remember(sourceUri) { mutableStateOf<Pair<String, Long>?>(null) }
+        LaunchedEffect(
+            previewTick, sourceRenderAllowed, sourceUri, exportOptions,
+            state.outputColorSpace, state.savingCctfEncoding,
+        ) {
+            val activeEngine = engine ?: return@LaunchedEffect
+            val activeUri = sourceUri ?: return@LaunchedEffect
+            if (!sourceRenderAllowed || exportInFlight) return@LaunchedEffect
+            delay(RenderPayloads.IDLE_DEBOUNCE_MS)
+            if (previewBusy || exportInFlight) return@LaunchedEffect
+            val app = ctx.applicationContext
+            val descriptor = runCatching {
+                exportOptions.outputDescriptor(
+                    state.outputColorSpace, state.savingCctfEncoding, Build.VERSION.SDK_INT,
+                )
+            }.getOrNull() ?: return@LaunchedEffect
+            // Scene-linear exports the DECODE, not the engine output: nothing to pre-render.
+            if (descriptor.format == ExportFormat.SCENE_LINEAR_TIFF) return@LaunchedEffect
+            val params = if (descriptor.engineColorSpace == null) {
+                state.toParams()
+            } else {
+                descriptor.applyTo(state.toParams())
+            }
+            val request = runCatching { currentSourceDecodeRequest() }.getOrNull()
+                ?: return@LaunchedEffect
+            // The source cannot change under a stable Uri, so hash it once per source, not once
+            // per idle: it is a full read of the file (~37 MB on the bench corpus).
+            val digest = prerenderDigest ?: withContext(Dispatchers.IO) {
+                ExportCacheKey.digestSource { app.contentResolver.openInputStream(activeUri) }
+            }?.also { prerenderDigest = it } ?: return@LaunchedEffect
+            val store = RenderPayloads.of(app)
+            val key = RenderPayloads.key(
+                ExportCacheKey.Source(
+                    digest.first, digest.second, EXPORT_MAX_EDGE_PX, decodeIdentityOf(request),
+                ),
+                params,
+                descriptor.engineColorSpace,
+                ExportCaches.contractVersionOf(app),
+            )
+            if (store.holds(key) || !RenderPayloads.shouldPrerender(app)) return@LaunchedEffect
+            val startedMs = System.currentTimeMillis()
+            runCatching {
+                withContext(Dispatchers.Default) {
+                    val image = decodeSourceRequest(request, EXPORT_MAX_EDGE_PX).image
+                    val rendered = try {
+                        runCancellableNative(
+                            onLateResult = { late ->
+                                late.reportOutcome(AppRenderOutcome.CANCELLED)
+                                late.close()
+                            },
+                        ) { cancellation ->
+                            activeEngine.simulate(image, params, RenderKind.EXPORT, cancellation)
+                        }
+                    } finally {
+                        image.close()
+                    }
+                    rendered.use {
+                        val stored = store.put(key, it)
+                        // A stored payload WAS consumed — its bytes outlive the result. One that
+                        // could not be stored is a render nothing ever used.
+                        it.reportOutcome(
+                            if (stored) AppRenderOutcome.CONSUMED else AppRenderOutcome.FAILED,
+                        )
+                        stored
+                    }
+                }
+            }.onSuccess { stored ->
+                if (stored) {
+                    Diag.i("pre-rendered export in ${System.currentTimeMillis() - startedMs} ms")
+                }
+            }.onFailure { failure ->
+                if (failure is CancellationException) throw failure
+                Diag.w("pre-render skipped: $failure")
+            }
+        }
+
         // --- Non-destructive recipe: debounced auto-save ---
         // Grade fields included for the same reason as the render trigger above:
         // Presets.toJsonString already SERIALIZES them, so the recipe content was
@@ -3895,12 +3994,7 @@ class MainActivity : ComponentActivity() {
                             // #179 cache identity. The decode identity is spelled out rather
                             // than taken from exportDecodeRequest.toString(), which embeds a
                             // Context whose toString differs between two identical exports.
-                            val exportDecodeIdentity = with(exportDecodeRequest) {
-                                "kind=$kind;rot=$rotation;rawWb=$rawWhiteBalance;" +
-                                    "rawTemp=$rawTemperature;rawTint=$rawTint;" +
-                                    "temp=$creativeTemp;tint=$creativeTint;" +
-                                    "balance=$balanceToFilmStock;film=$filmProfile"
-                            }
+                            val exportDecodeIdentity = decodeIdentityOf(exportDecodeRequest)
                             val exportGradeKey = ExportCacheKey.Grade(
                                 exportCctf, exportSaturation, exportVibrance,
                                 exportGamutCompress, exportAdjustments,
@@ -3918,6 +4012,7 @@ class MainActivity : ComponentActivity() {
                                 var phGrade = 0L
                                 var phEnc = 0L
                                 var exportCacheKey: String? = null
+                                var exportPrerenderKey: String? = null
                                 var servedFromCache = false
                                 var renderId = 0L
                                 val destinationCommit = ExportCommitLinearization()
@@ -3944,27 +4039,43 @@ class MainActivity : ComponentActivity() {
                                         // previous export produced, skipping decode, engine,
                                         // grade and encode. Scene-linear TIFF bypasses the engine
                                         // on a separate path and is not cached.
-                                        exportCacheKey = if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
-                                            null
-                                        } else {
-                                            ExportCacheKey.digestSource {
-                                                exportSourceUri?.let {
-                                                    exportContext.contentResolver.openInputStream(it)
-                                                }
-                                            }?.let { (sha, bytes) ->
-                                                ExportCacheKey.compute(
+                                        val exportSource =
+                                            if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
+                                                null
+                                            } else {
+                                                ExportCacheKey.digestSource {
+                                                    exportSourceUri?.let {
+                                                        exportContext.contentResolver.openInputStream(it)
+                                                    }
+                                                }?.let { (sha, bytes) ->
                                                     ExportCacheKey.Source(
                                                         sha, bytes, EXPORT_MAX_EDGE_PX,
                                                         exportDecodeIdentity,
-                                                    ),
-                                                    exportParams,
-                                                    exportGradeKey,
-                                                    outputDescriptor,
-                                                    longEdge,
-                                                    exportJpegQuality,
-                                                    ExportCaches.contractVersionOf(exportContext),
-                                                )
+                                                    )
+                                                }
                                             }
+                                        val exportContract = ExportCaches.contractVersionOf(exportContext)
+                                        exportCacheKey = exportSource?.let {
+                                            ExportCacheKey.compute(
+                                                it,
+                                                exportParams,
+                                                exportGradeKey,
+                                                outputDescriptor,
+                                                longEdge,
+                                                exportJpegQuality,
+                                                exportContract,
+                                            )
+                                        }
+                                        // Pre-encode identity: the same payload serves every
+                                        // container, quality and resize of this edit, so it is keyed
+                                        // on the engine inputs alone (#179).
+                                        exportPrerenderKey = exportSource?.let {
+                                            RenderPayloads.key(
+                                                it,
+                                                exportParams,
+                                                outputDescriptor.engineColorSpace,
+                                                exportContract,
+                                            )
                                         }
                                         val cached = exportCacheKey?.let {
                                             ExportCaches.of(exportContext).get(it)
@@ -3985,10 +4096,19 @@ class MainActivity : ComponentActivity() {
                                             return@withContext null
                                         }
 
-                                        val image = decodeSourceRequest(
-                                            exportDecodeRequest,
-                                            EXPORT_MAX_EDGE_PX,
-                                        ).image
+                                        // #179: the idle pre-render stores the ENGINE output, so a
+                                        // hit skips decode and simulate (~6 s on BASE, ~14.5 s on
+                                        // HEAVY) while the export still runs the real encoder — the
+                                        // published bytes come from the same code either way.
+                                        val restored = exportPrerenderKey?.let {
+                                            RenderPayloads.of(exportContext).get(it)
+                                        }
+                                        val image = if (restored != null) null else {
+                                            decodeSourceRequest(
+                                                exportDecodeRequest,
+                                                EXPORT_MAX_EDGE_PX,
+                                            ).image
+                                        }
                                         phDecode = System.currentTimeMillis() - tDecode0
                                         if (exportFmt == ExportFormat.SCENE_LINEAR_TIFF) {
                                             // Export the decoded scene-linear INPUT (before the film
@@ -3998,14 +4118,17 @@ class MainActivity : ComponentActivity() {
                                                 publishedUri = withContext(Dispatchers.IO) {
                                                     saveLinearInputAsTiff32f(
                                                         exportContext,
-                                                        image,
+                                                        // Scene-linear exports the DECODE, never the
+                                                        // engine output, so they are never pre-rendered
+                                                        // and the image is always present here.
+                                                        requireNotNull(image) { "scene-linear needs a decode" },
                                                         outputDescriptor,
                                                         baseName,
                                                         onCommitted = destinationCommit::markPublished,
                                                     )
                                                 }
                                             } finally {
-                                                image.close()
+                                                image?.close()
                                             }
                                             phEnc = System.currentTimeMillis() - tEnc0
                                             null  // no rendered bitmap to preview
@@ -4024,7 +4147,7 @@ class MainActivity : ComponentActivity() {
                                             // additionally includes the input close below and dispatch
                                             // bookkeeping, so a small positive gap remains expected.
                                             val tSim0 = System.currentTimeMillis()
-                                            val res = try {
+                                            val res = restored ?: try {
                                                 runCancellableNative(
                                                     onLateResult = { late ->
                                                         late.reportOutcome(AppRenderOutcome.CANCELLED)
@@ -4032,16 +4155,19 @@ class MainActivity : ComponentActivity() {
                                                     },
                                                 ) { cancellation ->
                                                     e.simulate(
-                                                        image,
+                                                        requireNotNull(image) { "render needs a decode" },
                                                         exportParams,
                                                         RenderKind.EXPORT,
                                                         cancellation,
                                                     )
                                                 }.also { renderId = it.renderId }
                                             } finally {
-                                                image.close()
+                                                image?.close()
                                             }
                                             phSim = System.currentTimeMillis() - tSim0
+                                            if (restored != null) {
+                                                Diag.i("export used pre-rendered payload in $phSim ms")
+                                            }
                                             try {
                                                 check(res.colorSpace == outputDescriptor.engineColorSpace) {
                                                     "Engine result color space disagrees with output contract"

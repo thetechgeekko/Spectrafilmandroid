@@ -50,6 +50,7 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
     private static final String ARG_TICKET177_PHASE = "ticket177_phase";
     private static final String TICKET177_PHASE_BENCH = "bench";
     private static final String TICKET177_PHASE_PREVIEW = "preview";
+    private static final String TICKET177_PHASE_PRERENDER = "prerender";
     private static final String ARG_TICKET177_CORPUS = "ticket177_corpus";
     private static final String ARG_TICKET177_SOURCE = "ticket177_source";
     private static final String ARG_TICKET177_RUNS = "ticket177_runs";
@@ -217,6 +218,22 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                         arguments.getString(ARG_TICKET177_CELLS, ""), expectedApp);
                 results.putString("stream", stream);
                 if (!stream.contains("TICKET177_BENCH: PASS\n")) {
+                    finish(Activity.RESULT_CANCELED, results);
+                    return;
+                }
+            } else if (TICKET177_PHASE_PRERENDER.equals(ticket177Phase)) {
+                final String corpus = arguments.getString(ARG_TICKET177_CORPUS, "");
+                final String source = arguments.getString(ARG_TICKET177_SOURCE, "");
+                require(!corpus.isEmpty() && !source.isEmpty(),
+                        "ticket177_corpus and ticket177_source are required");
+                final String expectedApp = arguments.getString(
+                        ARG_TICKET177_EXPECT_APP_SHA256, "").trim().toLowerCase(Locale.ROOT);
+                require(isSha256(expectedApp),
+                        "ticket177_expect_app_sha256 must be exactly 64 hex digits");
+                final String stream = Ticket177BenchmarkChecks.prerender(
+                        getTargetContext(), corpus, source, expectedApp);
+                results.putString("stream", stream);
+                if (!stream.contains("TICKET179_PRERENDER: PASS\n")) {
                     finish(Activity.RESULT_CANCELED, results);
                     return;
                 }

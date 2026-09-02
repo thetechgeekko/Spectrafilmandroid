@@ -156,7 +156,7 @@ internal object ExportCacheKey {
     fun contractVersion(versionCode: Int, versionName: String, numericContract: String): String =
         "app$versionCode/$versionName/$numericContract"
 
-    private fun sha256Hex(bytes: ByteArray): String =
+    internal fun sha256Hex(bytes: ByteArray): String =
         ExportCache.hex(MessageDigest.getInstance("SHA-256").digest(bytes))
 
     /** Bumped if the layout of the key material itself changes. */

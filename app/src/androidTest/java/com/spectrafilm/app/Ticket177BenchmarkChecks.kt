@@ -19,6 +19,7 @@ import com.spectrafilm.engine.ColorSpace
 import com.spectrafilm.engine.RenderCancellation
 import com.spectrafilm.engine.RenderKind
 import com.spectrafilm.engine.SimResult
+import com.spectrafilm.engine.SpektraEngine
 import com.spectrafilm.app.masks.MaskCompositor
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -824,6 +825,160 @@ object Ticket177BenchmarkChecks {
      * a memoized result. Compose/present cost is deliberately outside this number and the
      * evidence says so.
      */
+    /**
+     * #179 pre-render fidelity, on the device, at release flags.
+     *
+     * The idle pre-render keeps the ENGINE's float output and lets the export encode it later.
+     * That is only safe if a payload written to disk and mapped back encodes to exactly the
+     * bytes the live result would have produced — so this renders once, encodes the live result,
+     * encodes the restored payload, and compares the containers. The clock is pinned because
+     * both containers carry an EXIF timestamp, which would otherwise differ for a legitimate
+     * reason and hide whether the PIXELS differ for an illegitimate one.
+     *
+     * The JVM tests prove the float round-trip; only a device can prove the native TIFF/PNG16
+     * writers read a MappedByteBuffer across JNI exactly as they read an engine allocation.
+     */
+    @JvmStatic
+    fun prerender(
+        context: Context,
+        corpusPath: String,
+        sourcePath: String,
+        expectedAppSha256: String,
+    ): String {
+        val corpus = JSONObject(String(readAllBytes(File(corpusPath)), Charsets.UTF_8))
+        require(corpus.optString("schema") == "spk.bench_corpus.v1") {
+            "unexpected corpus schema ${corpus.optString("schema")}"
+        }
+        appIdentity(context, expectedAppSha256)
+        verifiedSource(corpus, sourcePath)
+        val cell = selectedCells(corpus, "BASE")[0]
+        val state = stateFor(context, cell)
+        val params = state.toParams()
+        val engine = EngineHolder.get(context)
+        // A private store, so a check can never evict or corrupt the editor's own payload.
+        val store = RenderPayloadCache(
+            File(context.cacheDir, "prerender-check"), "ticket179-check",
+        )
+        val out = StringBuilder()
+        var failures = 0
+        for (formatId in arrayOf("JPEG_Q95", "PNG16", "TIFF16")) {
+            val format = FORMATS.getValue(formatId)
+            val descriptor = ExportOptions(
+                format = format,
+                jpegQuality = 95,
+                size = ExportSize.FULL,
+                customLongEdge = 0,
+                customName = "",
+            ).outputDescriptor(
+                state.outputColorSpace, state.savingCctfEncoding, Build.VERSION.SDK_INT,
+            )
+            val image = decodeToLinearProPhoto(
+                context, Uri.fromFile(File(sourcePath)), maxEdge = EXPORT_MAX_EDGE_PX,
+            )
+            val live = try {
+                engine.simulate(image, params, RenderKind.EXPORT, null)
+            } finally {
+                image.close()
+            }
+            val putStart = System.currentTimeMillis()
+            val stored = live.use { store.put("payload", it) }
+            val putMs = System.currentTimeMillis() - putStart
+            if (!stored) {
+                failures++
+                out.append("TICKET179_PRERENDER_$formatId: FAIL (payload not stored)\n")
+                continue
+            }
+            // Encode the live render and the restored payload through the same encoder. The
+            // live result was consumed by put() above, so it is re-rendered here rather than
+            // held: two 150 MB results alive at once is exactly the OOM this app avoids.
+            val liveSha = renderAndEncodeDigest(
+                context, engine, params, state, descriptor, format, sourcePath,
+                "spk-prerender-live-$formatId", restored = null,
+            )
+            val restoredStart = System.currentTimeMillis()
+            val payload = store.get("payload")
+            if (payload == null) {
+                failures++
+                out.append("TICKET179_PRERENDER_$formatId: FAIL (payload did not restore)\n")
+                continue
+            }
+            val restoredSha = renderAndEncodeDigest(
+                context, engine, params, state, descriptor, format, sourcePath,
+                "spk-prerender-restored-$formatId", restored = payload,
+            )
+            val restoredMs = System.currentTimeMillis() - restoredStart
+            val same = liveSha == restoredSha
+            if (!same) failures++
+            out.append("TICKET179_PRERENDER_$formatId: ")
+                .append(if (same) "PASS" else "FAIL")
+                .append(" live=").append(liveSha.take(12))
+                .append(" restored=").append(restoredSha.take(12))
+                .append(" put_ms=").append(putMs)
+                .append(" restore_encode_ms=").append(restoredMs)
+                .append(" payload_bytes=").append(store.sizeBytes())
+                .append('\n')
+        }
+        store.discard()
+        out.append(
+            if (failures == 0) "TICKET179_PRERENDER: PASS\n"
+            else "TICKET179_PRERENDER: FAIL ($failures)\n",
+        )
+        return out.toString()
+    }
+
+    /**
+     * Encode [restored], or a fresh render when it is null, and return the published container
+     * digest. The published row is deleted again: this is a fidelity check, not an export.
+     */
+    private fun renderAndEncodeDigest(
+        context: Context,
+        engine: SpektraEngine,
+        params: com.spectrafilm.engine.SpektraParams,
+        state: ParamsState,
+        descriptor: OutputDescriptor,
+        format: ExportFormat,
+        sourcePath: String,
+        name: String,
+        restored: SimResult?,
+    ): String {
+        val result = restored ?: run {
+            val image = decodeToLinearProPhoto(
+                context, Uri.fromFile(File(sourcePath)), maxEdge = EXPORT_MAX_EDGE_PX,
+            )
+            try {
+                engine.simulate(image, params, RenderKind.EXPORT, null)
+            } finally {
+                image.close()
+            }
+        }
+        return result.use {
+            val bitmap = gradedBitmapOrNull(it, descriptor, state)
+            if (bitmap != null && descriptor.metadata.hdrGainMap != null) {
+                attachRenderedGainmap(it, bitmap, descriptor)
+            }
+            val published = ExportClock.pinned(PINNED_CLOCK_MILLIS) {
+                runBlocking {
+                    when (descriptor.encoder) {
+                        OutputEncoder.NATIVE_TIFF_UINT16 ->
+                            saveSimResultAsTiff(context, it, descriptor, displayName = name)
+                        OutputEncoder.NATIVE_PNG16 ->
+                            saveSimResultAsPng16(context, it, descriptor, displayName = name)
+                        OutputEncoder.ANDROID_BITMAP_JPEG, OutputEncoder.ANDROID_BITMAP_PNG ->
+                            saveToGallery(
+                                context, requireNotNull(bitmap) { "bitmap encoder without bitmap" },
+                                descriptor, jpegQuality = 95, displayName = name,
+                            )
+                        else -> error("unsupported encoder ${descriptor.encoder}")
+                    }
+                }
+            }
+            val digests = publishedDigests(context, published, format)
+            context.contentResolver.delete(published, null, null)
+            bitmap?.recycle()
+            digests.getString("container_sha256")
+        }
+    }
+
     @JvmStatic
     fun preview(
         context: Context,
