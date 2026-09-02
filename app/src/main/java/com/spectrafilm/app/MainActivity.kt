@@ -4072,7 +4072,7 @@ class MainActivity : ComponentActivity() {
                                                     // Post-render downscale for Bitmap encoders only. Native
                                                     // high-bit writers consume the float buffer without ever
                                                     // materialising a full-resolution ARGB_8888 Bitmap.
-                                                    longEdge?.let { edge ->
+                                                    val sized = longEdge?.let { edge ->
                                                         scaleBitmapToLongEdge(full, edge).also { scaled ->
                                                             if (scaled !== full) {
                                                                 previewCandidate = scaled
@@ -4080,6 +4080,20 @@ class MainActivity : ComponentActivity() {
                                                             }
                                                         }
                                                     } ?: full
+                                                    // #140: derive the Ultra HDR gain map from the
+                                                    // render itself, here, while the engine's float
+                                                    // buffer is still alive — it holds the values
+                                                    // above SDR white that the 8-bit bitmap clamped
+                                                    // away, and they are the only honest HDR signal
+                                                    // this pipeline has.
+                                                    if (outputDescriptor.metadata.hdrGainMap != null) {
+                                                        runCatching {
+                                                            attachRenderedGainmap(res, sized, outputDescriptor)
+                                                        }.onFailure {
+                                                            Diag.w("gain map failed; exporting SDR base: $it")
+                                                        }
+                                                    }
+                                                    sized
                                                 } else {
                                                     // Preserve WYSIWYG grading in the writer's float source while
                                                     // avoiding the additional ~4 bytes/pixel full-res Bitmap.

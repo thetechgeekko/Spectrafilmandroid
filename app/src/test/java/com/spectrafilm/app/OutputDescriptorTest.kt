@@ -192,7 +192,7 @@ class OutputDescriptorTest {
     }
 
     @Test
-    fun ultraHdrPlaceholder_hasMeasuredMetadataAndIsReleaseBlocked() {
+    fun ultraHdr_declaresASpatialGainMapPolicyAndIsReleasable() {
         val descriptor = OutputDescriptor.rendered(
             ExportFormat.ULTRA_HDR,
             ColorSpace.SRGB,
@@ -201,21 +201,25 @@ class OutputDescriptorTest {
         )
         val gainMap = checkNotNull(descriptor.metadata.hdrGainMap)
 
-        assertEquals(1, gainMap.width)
-        assertEquals(1, gainMap.height)
-        assertEquals(false, gainMap.isSpatial)
+        // #140: the contract declares a POLICY. It deliberately carries no ratioMax, because the
+        // headroom a file may claim is measured from the render by HdrGainMap; baking a constant
+        // in here is exactly what made the old 1x1 placeholder an over-promise.
+        assertEquals(4, gainMap.downsample)
+        assertEquals(true, gainMap.isSpatial)
         assertEquals(1.0f, gainMap.ratioMin)
-        assertEquals(1.6f, gainMap.ratioMax)
+        assertEquals(8.0f, gainMap.ratioMaxCeiling)
         assertEquals(1.0f, gainMap.gamma)
         assertEquals(0.015625f, gainMap.epsilonSdr)
         assertEquals(0.015625f, gainMap.epsilonHdr)
-        assertEquals(1.6f, gainMap.displayRatioForFullHdr)
         assertEquals(1.0f, gainMap.minDisplayRatioForHdrTransition)
-        assertEquals(OutputReleaseStatus.BLOCKED_PENDING_HONEST_HDR, descriptor.releaseStatus)
+        assertEquals(OutputReleaseStatus.SHIPPED_CLASSIFIED, descriptor.releaseStatus)
         assertEquals(34, descriptor.minimumApi)
         assertTrue(runCatching { descriptor.requirePlatformApi(33) }.isFailure)
         assertEquals(descriptor, descriptor.requirePlatformApi(34))
-        assertTrue(runCatching { descriptor.requireExportable(34) }.isFailure)
+        // Releasable now that the map is derived per pixel from the render (#140).
+        assertEquals(descriptor, descriptor.requireExportable(34))
+        // The platform floor still stands: Gainmap is API 34.
+        assertTrue(runCatching { descriptor.requireExportable(33) }.isFailure)
     }
 
     @Test
@@ -249,7 +253,7 @@ class OutputDescriptorTest {
         val expected = mapOf(
             ExportFormat.PNG to ExistingExportClass.SDR_PNG8,
             ExportFormat.JPEG to ExistingExportClass.SDR_JPEG8,
-            ExportFormat.ULTRA_HDR to ExistingExportClass.ULTRA_HDR_UNIFORM_GAIN_MAP_PLACEHOLDER,
+            ExportFormat.ULTRA_HDR to ExistingExportClass.ULTRA_HDR_SPATIAL_GAIN_MAP,
             ExportFormat.TIFF to ExistingExportClass.RENDERED_TIFF16,
             ExportFormat.PNG16 to ExistingExportClass.RENDERED_PNG16,
             ExportFormat.TIFF32F to ExistingExportClass.RENDERED_TIFF32F,

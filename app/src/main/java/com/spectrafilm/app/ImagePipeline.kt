@@ -647,22 +647,56 @@ private fun writeExifToPath(
  * Bitmap.compress(JPEG, ...) is called. This is the documented Android 14 behaviour for
  * gainmap-bearing bitmaps. It has NOT been verified on a physical device in this environment.
  */
-private fun attachNeutralGainmap(base: Bitmap, contract: HdrGainMapContract) {
-    if (Build.VERSION.SDK_INT < 34) return
-    // A 1x1 uniform gain-map content bitmap: full (255) application of the configured ratios.
-    // eraseColor sets the ALPHA_8 channel to 0xFF — setPixel is unreliable on ALPHA_8.
-    val content = Bitmap.createBitmap(contract.width, contract.height, Bitmap.Config.ALPHA_8)
-    content.eraseColor(Color.argb(255, 0, 0, 0))
+internal fun attachRenderedGainmap(
+    result: SimResult,
+    base: Bitmap,
+    descriptor: OutputDescriptor,
+): HdrGainMap.Result? {
+    val contract = descriptor.metadata.hdrGainMap ?: return null
+    if (Build.VERSION.SDK_INT < 34) return null
+    val colorSpace = descriptor.engineColorSpace ?: return null
+    val cctf = descriptor.engineCctfEncoding ?: return null
+    val computed = result.acquireDataLease().use { lease ->
+        HdrGainMap.compute(
+            rgb = lease.data.order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer(),
+            width = result.width,
+            height = result.height,
+            colorSpace = colorSpace,
+            cctfEncoded = cctf,
+            downsample = contract.downsample,
+            ratioMaxCeiling = contract.ratioMaxCeiling,
+            epsilonSdr = contract.epsilonSdr,
+            epsilonHdr = contract.epsilonHdr,
+        )
+    }
+    val content = Bitmap.createBitmap(computed.width, computed.height, Bitmap.Config.ALPHA_8)
+    // ALPHA_8 rows can be padded, so copy row by row against the bitmap's own stride rather
+    // than assuming rowBytes == width.
+    val rowBytes = content.rowBytes
+    val staging = java.nio.ByteBuffer.allocate(rowBytes * computed.height)
+    for (y in 0 until computed.height) {
+        staging.position(y * rowBytes)
+        staging.put(computed.alpha, y * computed.width, computed.width)
+    }
+    staging.rewind()
+    content.copyPixelsFromBuffer(staging)
+
     val gainmap = Gainmap(content).apply {
         setRatioMin(contract.ratioMin, contract.ratioMin, contract.ratioMin)
-        setRatioMax(contract.ratioMax, contract.ratioMax, contract.ratioMax)
+        setRatioMax(computed.ratioMax, computed.ratioMax, computed.ratioMax)
         setGamma(contract.gamma, contract.gamma, contract.gamma)
         setEpsilonSdr(contract.epsilonSdr, contract.epsilonSdr, contract.epsilonSdr)
         setEpsilonHdr(contract.epsilonHdr, contract.epsilonHdr, contract.epsilonHdr)
-        setDisplayRatioForFullHdr(contract.displayRatioForFullHdr)
+        setDisplayRatioForFullHdr(computed.ratioMax)
         minDisplayRatioForHdrTransition = contract.minDisplayRatioForHdrTransition
     }
     base.setGainmap(gainmap)
+    Diag.i(
+        "gainmap ${computed.width}x${computed.height} ratioMax=${computed.ratioMax} " +
+            "trueMax=${computed.maxRatio} gained=${computed.gainedPixels} " +
+            "headroom=${computed.hasHeadroom}",
+    )
+    return computed
 }
 
 /**
@@ -726,7 +760,6 @@ suspend fun saveToGallery(
     // Ultra HDR: attach a near-neutral gain map so the platform JPEG encoder emits a valid
     // Ultra HDR JPEG (base SDR + gain map + MPF). No-op below API 34. setGainmap mutates
     // [bmp] IN PLACE (the input bitmap carries the gain map); its pixel data is untouched.
-    descriptor.metadata.hdrGainMap?.let { attachNeutralGainmap(bmp, it) }
 
     // EXIF is only writable (via androidx ExifInterface) for JPEG targets. The exported
     // dimensions are taken from the rendered bitmap (post crop/resize/rotate).

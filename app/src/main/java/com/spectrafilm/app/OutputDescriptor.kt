@@ -36,7 +36,7 @@ enum class OutputExifColorSpace(val value: Int) { SRGB(1), UNCALIBRATED(0xFFFF) 
 enum class ExistingExportClass(val id: String) {
     SDR_PNG8("sdr-png8-v1"),
     SDR_JPEG8("sdr-jpeg8-v1"),
-    ULTRA_HDR_UNIFORM_GAIN_MAP_PLACEHOLDER("ultrahdr-uniform-gainmap-placeholder-v1"),
+    ULTRA_HDR_SPATIAL_GAIN_MAP("ultrahdr-spatial-gainmap-v1"),
     RENDERED_TIFF16("rendered-tiff16-v1"),
     RENDERED_PNG16("rendered-png16-v1"),
     RENDERED_TIFF32F("rendered-tiff32f-v1"),
@@ -51,18 +51,23 @@ data class OutputMetadataPolicy(
     val hdrGainMap: HdrGainMapContract?,
 )
 
+/**
+ * The policy for building a spatial HDR gain map. It carries no ratioMax: the headroom a file may
+ * claim is a property of the RENDER, measured per image by [HdrGainMap], not a constant chosen in
+ * advance. Fixing it in advance is precisely what made the old 1x1 placeholder dishonest.
+ */
 data class HdrGainMapContract(
-    val width: Int,
-    val height: Int,
+    /** The map is the image divided by this; gain maps are low-frequency by nature. */
+    val downsample: Int,
     val ratioMin: Float,
-    val ratioMax: Float,
+    /** The most headroom this contract permits a file to claim, whatever the render contains. */
+    val ratioMaxCeiling: Float,
     val gamma: Float,
     val epsilonSdr: Float,
     val epsilonHdr: Float,
-    val displayRatioForFullHdr: Float,
     val minDisplayRatioForHdrTransition: Float,
 ) {
-    val isSpatial: Boolean get() = width > 1 || height > 1
+    val isSpatial: Boolean get() = downsample >= 1
 }
 
 /**
@@ -221,14 +226,17 @@ class OutputDescriptor private constructor(
                     copySourceExif = output.copySourceExif,
                     hdrGainMap = if (format == ExportFormat.ULTRA_HDR) {
                         HdrGainMapContract(
-                            width = 1,
-                            height = 1,
+                            // Quarter resolution: the ISO 21496-1 / Android encoders treat the map
+                            // as low-frequency, and a full-resolution one costs bytes for detail
+                            // no display reconstructs.
+                            downsample = 4,
                             ratioMin = 1.0f,
-                            ratioMax = 1.6f,
+                            // +3 stops. A handful of overshooting pixels must not be able to
+                            // stretch the whole map's scale and flatten the real detail.
+                            ratioMaxCeiling = 8.0f,
                             gamma = 1.0f,
                             epsilonSdr = 0.015625f,
                             epsilonHdr = 0.015625f,
-                            displayRatioForFullHdr = 1.6f,
                             minDisplayRatioForHdrTransition = 1.0f,
                         )
                     } else {
@@ -239,11 +247,9 @@ class OutputDescriptor private constructor(
                 engineColorSpace = colorSpace,
                 engineCctfEncoding = outputCctfEncoding,
                 minimumApi = minimumApi,
-                releaseStatus = if (format == ExportFormat.ULTRA_HDR) {
-                    OutputReleaseStatus.BLOCKED_PENDING_HONEST_HDR
-                } else {
-                    OutputReleaseStatus.SHIPPED_CLASSIFIED
-                },
+                // #140: the gain map is now derived per pixel from the render, so the format
+                // no longer over-promises and is releasable.
+                releaseStatus = OutputReleaseStatus.SHIPPED_CLASSIFIED,
             )
         }
 
@@ -331,7 +337,7 @@ class OutputDescriptor private constructor(
             ExportFormat.ULTRA_HDR -> FormatContract(
                 OutputBitDepth.UINT8, OutputEncoder.ANDROID_BITMAP_JPEG,
                 OutputQuantizer.ARGB8888_ROUND_CLAMP,
-                ExistingExportClass.ULTRA_HDR_UNIFORM_GAIN_MAP_PLACEHOLDER,
+                ExistingExportClass.ULTRA_HDR_SPATIAL_GAIN_MAP,
                 copySourceExif = true, embedsIccDirectly = false,
             )
             ExportFormat.TIFF -> FormatContract(

@@ -108,11 +108,18 @@ class ExportOptionsTest {
         )
         assertEquals(OutputReference.SCENE_REFERRED, scene.reference)
 
+        // Ultra HDR is exportable on API 34+ since #140 gave it a real, render-derived gain map.
+        val ultraHdr = opts(format = ExportFormat.ULTRA_HDR).outputDescriptor(
+            ColorSpace.SRGB,
+            outputCctfEncoding = true,
+            apiLevel = 34,
+        )
+        assertEquals(ExistingExportClass.ULTRA_HDR_SPATIAL_GAIN_MAP, ultraHdr.existingExportClass)
         assertTrue(runCatching {
             opts(format = ExportFormat.ULTRA_HDR).outputDescriptor(
                 ColorSpace.SRGB,
                 outputCctfEncoding = true,
-                apiLevel = 34,
+                apiLevel = 33,
             )
         }.isFailure)
     }
