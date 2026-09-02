@@ -160,6 +160,13 @@ private data class CachedSourceDecodeRequest(
  * Shared by the export and the idle pre-render: if these two ever disagreed, the pre-render
  * would key its payload under a name the export never looks up, and would silently do nothing.
  */
+/**
+ * True once the editor has restored in this process. Distinguishes a cold start (the first
+ * restore) from an Activity recreation (every later one), which is what decides whether a
+ * checkpointed export sheet comes back on screen — see [exportSheetVisibleAtRestore].
+ */
+private var editorRestoredInThisProcess = false
+
 private fun decodeIdentityOf(request: SourceDecodeRequest): String = with(request) {
     "kind=$kind;rot=$rotation;rawWb=$rawWhiteBalance;" +
         "rawTemp=$rawTemperature;rawTint=$rawTint;" +
@@ -1008,8 +1015,19 @@ class MainActivity : ComponentActivity() {
         var lastExportShare by remember { mutableStateOf<Pair<String, String>?>(null) }
         // Lightroom-style export sheet: per-export format / quality / size / colour / name, instead
         // of the global Settings defaults. Seeded from Settings and remembered back on export.
+        // Process-lifetime, not remember: the FIRST editor restore in a process is a cold start,
+        // every later one is an Activity recreation (which keeps the process).
+        val coldStart = remember {
+            val first = !editorRestoredInThisProcess
+            editorRestoredInThisProcess = true
+            first
+        }
         var showExportSheet by remember {
-            mutableStateOf(initialExportState.sheetOpen)
+            mutableStateOf(
+                exportSheetVisibleAtRestore(
+                    initialExportState.sheetOpen, initialExportState.phase, coldStart,
+                ),
+            )
         }
         var exportOptions by remember {
             mutableStateOf(

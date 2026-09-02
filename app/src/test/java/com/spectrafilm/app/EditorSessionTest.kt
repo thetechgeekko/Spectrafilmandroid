@@ -469,6 +469,20 @@ class EditorSessionTest {
     }
 
     @Test
+    fun coldStartDoesNotReopenAnIdleExportSheetOverThePhoto() {
+        // The whole point: a modal restored hours later reads as "the editor rendered nothing".
+        assertFalse(exportSheetVisibleAtRestore(true, EditorExportPhase.IDLE, coldStart = true))
+        // An Activity recreation (rotation) must not lose what the user was configuring.
+        assertTrue(exportSheetVisibleAtRestore(true, EditorExportPhase.IDLE, coldStart = false))
+        // A live export still comes back on screen after process death: the user needs it.
+        assertTrue(exportSheetVisibleAtRestore(true, EditorExportPhase.RUNNING, coldStart = true))
+        assertTrue(
+            exportSheetVisibleAtRestore(true, EditorExportPhase.RECONCILING, coldStart = true))
+        // A sheet that was never open stays shut whatever the phase.
+        assertFalse(exportSheetVisibleAtRestore(false, EditorExportPhase.RUNNING, coldStart = true))
+    }
+
+    @Test
     fun missingRuntimeTurnsRestoredRunningExportIntoReconciliationWithoutRetry() {
         val running = validDemoDocument().export.copy(
             phase = EditorExportPhase.RUNNING,

@@ -216,6 +216,21 @@ internal data class EditorExportState(
     val runtimeRunId: Long?,
 )
 
+/**
+ * Whether the checkpointed export sheet should be on screen after a restore.
+ *
+ * The sheet is journalled so an Activity recreation — a rotation, a theme change, a
+ * configuration change mid-export — does not throw away what the user was configuring. A COLD
+ * start is different: reopening a modal the user last saw hours ago hides the photo behind a
+ * sheet they did not open, which reads as "the editor rendered nothing". So on a cold start the
+ * sheet returns only when an export is actually live and the user needs to see its progress.
+ */
+internal fun exportSheetVisibleAtRestore(
+    checkpointed: Boolean,
+    phase: EditorExportPhase,
+    coldStart: Boolean,
+): Boolean = checkpointed && (!coldStart || phase != EditorExportPhase.IDLE)
+
 /** A process-owned export cannot still be running when its exact run id is absent after restore. */
 internal fun reconcileRestoredExport(
     saved: EditorExportState,
