@@ -37,7 +37,10 @@ The repository currently defines “bit-exact” as oracle tolerance (`max_abs <
 promise cross-architecture bytes, and release flags include floating-point reassociation.
 
 [Define “bit-identical” and pin the 1–2 s export SLO matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/126)
-must accept or reject each proposed level:
+**resolved this on 2026-09-01** — the approved contract is in
+[the section below](#the-approved-export-contract-issue-126). It accepted C0 and C3, rejected C1
+and C2, and scoped C4 to formats that can be made clock-deterministic. The level ladder it
+chose from:
 
 | Level | Proposed name | Question | Current guarantee |
 |---|---|---|---|
@@ -59,6 +62,62 @@ JPEG encoder can change both the codestream and decoded samples. Current TIFF ou
 wall-clock date, so a C4 test must inject a fixed clock and deterministic metadata order, compare a
 documented normalized representation, or mark C4 unsupported for that format. A tolerance pass is
 not a digest pass.
+
+## The approved export contract (issue #126)
+
+Owner-approved 2026-09-01. Every performance or identity claim in this repository must cite this
+section; a claim that does not name its level and cell is not evidence.
+
+### Identity: C0 + C3 accepted, C1 and C2 rejected
+
+| Level | Status | What is promised |
+|---|---|---|
+| C0 same-build deterministic | **Accepted, gated** | Same build, same device: byte-identical engine samples on repeat runs and at 1/2/4/8 workers. Already proven by the host parity suite and `test_parallel`. |
+| C3 decoded-output identity | **Accepted, gated** | Identical decoded samples plus normalized metadata across the export matrix, for a possibly different compressed stream. |
+| C4 container identity | **Scoped** | Complete-file SHA-256 gated only where the container can be made clock-deterministic (PNG16, TIFF16 with an injected fixed clock and pinned metadata order). JPEG is **C4-unsupported** and must be labelled so. |
+| C1 historical identity | **Rejected** | No promise that bytes match a previous release. It would freeze in-flight FFT/filter numerics for the rest of the roadmap. |
+| C2 portable identity | **Rejected** | No promise across compiler, ABI, CPU, device or OS. Shipping `-ffast-math` FMA contraction makes this a different engine, not a gate. |
+
+Every benchmark artifact still records the three digests separately (engine/sample payload;
+decoded samples + normalized metadata; complete container SHA-256 where C4 applies).
+
+### Performance: the SLO binds the warm path
+
+- **Gated:** the pre-rendered / cache-hit export path (issue #179), foreground, **p50 <= 2000 ms,
+  p95 <= 3000 ms** on the Tier A device for the BASE cell.
+- **Reported, never gating:** cold full-render time, published on every qualification run. The
+  arithmetic below shows cold 1–2 s needs a 4.4x–21.8x engine speedup — a research outcome, so it
+  does not block a release.
+
+### Tier A reference device and protocol
+
+Only one gating tier: **SM-S948W, Android 16 / API 36**, release R8-minified signed candidate,
+foreground, screen on, unplugged, battery > 50%, ambient thermal state, 60 s idle between runs,
+**11 runs with the first discarded**, p50/p95 taken from the remaining 10. Any other device is
+reported, never gating.
+
+### Workload cells
+
+Both cells run on every qualification pass; identity (C0/C3) is gated on both, the SLO on BASE.
+
+| Cell | Input | Route / preset | Effects | Outputs |
+|---|---|---|---|---|
+| BASE | pinned 4080x3060 sRGB JPEG (SHA-256 recorded in the manifest) | print route, preset `Portra 400 — Wedding Warm` | none | JPEG q95, PNG16, TIFF16 |
+| HEAVY | same input | same route/preset | grain + halation + DIR couplers on | same three |
+
+### Fast GPU (E3)
+
+The capability-gated **Fast GPU** route may become the *default* export once it passes its
+tolerance gate (approved max/RMS versus the Strict Exact CPU result, plus same-device
+repeatability) on Tier A — subject to all three conditions:
+
+1. the **Strict Exact CPU** route stays selectable;
+2. the UI names which route rendered a given file; and
+3. every C0/C3 claim, and every golden, references the **CPU** route only.
+
+GPU output is never presented as bit-identical. Per
+[research/gpu-bit-exact.md](research/gpu-bit-exact.md), byte identity with the CPU engine is not
+achievable without integer/soft-float arithmetic on both sides.
 
 ## What the existing measurements actually say
 
