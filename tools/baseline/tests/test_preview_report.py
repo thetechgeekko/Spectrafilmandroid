@@ -35,7 +35,18 @@ class RenderTests(unittest.TestCase):
         text = preview_report.render(capture())
         self.assertIn("| print | 12 | 100 |", text)
         self.assertIn("| scan | 12 | 80 |", text)
-        self.assertIn("Engine settle only", text)
+        self.assertIn("ARGB bitmap the editor draws", text)
+
+    def test_engine_and_bitmap_split_is_reported_when_present(self) -> None:
+        split = capture()
+        split["routes"][0]["engine_ms"] = [90] * 12
+        split["routes"][0]["bitmap_ms"] = [10] * 12
+        row = [r for r in preview_report.route_rows(split) if r.startswith("| print")][0]
+        self.assertTrue(row.rstrip().endswith("| 90 | 10 |"), row)
+
+    def test_missing_split_renders_dashes_rather_than_failing(self) -> None:
+        row = [r for r in preview_report.route_rows(capture()) if r.startswith("| scan")][0]
+        self.assertTrue(row.rstrip().endswith("| - | - |"), row)
 
     def test_unplugged_full_capture_passes_the_gate(self) -> None:
         self.assertEqual([], preview_report.gate_findings(capture()))

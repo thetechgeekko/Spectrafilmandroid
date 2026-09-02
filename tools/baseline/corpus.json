@@ -110,6 +110,8 @@
       "unplugged": true,
       "min_battery_pct": 50,
       "idle_between_runs_s": 60
-    }
+    },
+    "require_thermal_status": 0,
+    "max_thermal_wait_s": 300
   }
 }

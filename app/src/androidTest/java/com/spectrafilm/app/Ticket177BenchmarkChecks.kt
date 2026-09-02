@@ -102,8 +102,14 @@ object Ticket177BenchmarkChecks {
 
         // Protocol idle binds gate captures only (a smoke pass stays fast), and the
         // cool-down runs BEFORE each measured export so the previous one cannot heat it.
-        val idleMs =
-            if (runs >= gateRuns) protocol.optInt("idle_between_runs_s", 0) * 1000L else 0L
+        val gating = runs >= gateRuns
+        val idleMs = if (gating) protocol.optInt("idle_between_runs_s", 0) * 1000L else 0L
+        // A fixed idle does NOT keep a phone cool: a full matrix is ~45 min of sustained
+        // 12 MP work, which walks the SoC into thermal throttling no matter how long the
+        // gaps are, and a throttled sample runs materially slower than an unthrottled one.
+        // So the gate waits for the declared thermal state instead of merely waiting.
+        val requireThermal = if (gating) protocol.optInt("require_thermal_status", -1) else -1
+        val maxThermalWaitMs = protocol.optInt("max_thermal_wait_s", 300) * 1000L
         val samples = JSONArray()
         var firstRender = true
         // Runs outermost: samples of one cell/format never run back-to-back, so thermal
@@ -113,9 +119,10 @@ object Ticket177BenchmarkChecks {
                 for (entry in FORMATS.entries) {
                     if (!cellHasFormat(cell, entry.key)) continue
                     if (!firstRender && idleMs > 0) Thread.sleep(idleMs)
+                    val cooled = awaitThermal(context, requireThermal, maxThermalWaitMs)
                     val sample = measure(
                         context, cell, entry.value, entry.key, sourcePath, index,
-                        cold = firstRender,
+                        cold = firstRender, thermalWait = cooled,
                     )
                     firstRender = false
                     samples.put(sample)
@@ -149,15 +156,20 @@ object Ticket177BenchmarkChecks {
         sourcePath: String,
         index: Int,
         cold: Boolean,
+        thermalWait: JSONObject,
     ): JSONObject {
-        val params = paramsFor(context, cell)
+        val state = stateFor(context, cell)
+        val params = state.toParams()
         val descriptor = ExportOptions(
             format = format,
             jpegQuality = 95,
             size = ExportSize.FULL,
             customLongEdge = 0,
             customName = "",
-        ).outputDescriptor(ColorSpace.SRGB, outputCctfEncoding = true, Build.VERSION.SDK_INT)
+            // Output space and CCTF come from the same state the render used, like the
+            // editor's export -- a constant here would silently measure a different output
+            // contract than the preset asks for.
+        ).outputDescriptor(state.outputColorSpace, state.savingCctfEncoding, Build.VERSION.SDK_INT)
 
         // The engine owns System.loadLibrary for libspektra: decode allocates through that
         // native boundary, so the engine must exist before the first byte is decoded.
@@ -186,10 +198,10 @@ object Ticket177BenchmarkChecks {
         } finally {
             image.close()
         }
+        var totalMs: Long
         try {
-            engineDigest = digestOf(result)
             val gradeStart = System.currentTimeMillis()
-            val bitmap = gradedBitmapOrNull(result, descriptor)
+            val bitmap = gradedBitmapOrNull(result, descriptor, state)
             gradeMs = System.currentTimeMillis() - gradeStart
             val encodeStart = System.currentTimeMillis()
             published = ExportClock.pinned(PINNED_CLOCK_MILLIS) {
@@ -210,10 +222,15 @@ object Ticket177BenchmarkChecks {
             }
             encodeMs = System.currentTimeMillis() - encodeStart
             bitmap?.recycle()
+            // The export is finished here. Everything after this line is measurement:
+            // hashing the 150 MB float buffer costs ~120 ms of ARMv8 SHA-256 that no real
+            // export performs, and leaving it inside the total both inflates every number
+            // and shows up as an unaccountable stage-reconciliation gap.
+            totalMs = System.currentTimeMillis() - startMs
+            engineDigest = digestOf(result)
         } finally {
             result.close()
         }
-        val totalMs = System.currentTimeMillis() - startMs
 
         val digests = publishedDigests(context, published, format)
         context.contentResolver.delete(published, null, null)
@@ -224,6 +241,9 @@ object Ticket177BenchmarkChecks {
             .put("format", formatId)
             .put("run_index", index)
             .put("state", if (cold) "cold" else "warm")
+            // What the sample started from, and what it cost to get there: a reader can
+            // separate "measured cool" from "measured throttled" without inferring it.
+            .put("thermal_wait", thermalWait)
             // The SLO binds the pre-rendered/cache-hit path (#179). Nothing serves an export
             // from a content-addressed cache yet, so every sample here is a full re-render and
             // says so; the reporter refuses to read an SLO out of a full render.
@@ -238,6 +258,14 @@ object Ticket177BenchmarkChecks {
             // Stage reconciliation: the host checks the phases against the total, so an
             // unaccounted gap cannot hide inside a headline number.
             .put("phases_sum_ms", decodeMs + simulateMs + gradeMs + encodeMs)
+            // The post-engine grade is a no-op at neutral values: record what was actually
+            // asked for so no reader has to guess which path the grade number covers.
+            .put("grade_inputs", JSONObject()
+                .put("saturation", state.saturation)
+                .put("vibrance", state.vibrance)
+                .put("gamut_compress", state.gamutCompress)
+                .put("active", ColorGrade.isActive(state.saturation, state.vibrance) ||
+                    state.gamutCompress != 0f))
             .put("engine_sample_sha256", engineDigest)
             .put("decoded_sample_sha256", digests.getString("decoded_sample_sha256"))
             .put("normalized_metadata_sha256", digests.getString("normalized_metadata_sha256"))
@@ -252,20 +280,32 @@ object Ticket177BenchmarkChecks {
             .put("environment", environment(context))
     }
 
-    /** Bitmap encoders need a graded ARGB Bitmap; native writers grade the float buffer. */
-    private fun gradedBitmapOrNull(result: SimResult, descriptor: OutputDescriptor): Bitmap? =
+    /**
+     * Bitmap encoders need a graded ARGB Bitmap; native writers grade the float buffer.
+     *
+     * The grade values come from the SAME ParamsState the render used, exactly as the editor's
+     * export does (MainActivity passes state.saturation/vibrance/gamutCompress). Passing
+     * constants here would measure a different product: ColorGrade.applyInPlace returns
+     * immediately when all three are neutral, so a hard-coded non-zero saturation silently adds
+     * a full per-pixel Oklab round-trip that a default export never performs.
+     */
+    private fun gradedBitmapOrNull(
+        result: SimResult,
+        descriptor: OutputDescriptor,
+        state: ParamsState,
+    ): Bitmap? =
         when (descriptor.encoder) {
             OutputEncoder.ANDROID_BITMAP_JPEG, OutputEncoder.ANDROID_BITMAP_PNG ->
                 simResultToBitmapGraded(
-                    result, true, 1f, 0f, 0f,
+                    result, true, state.saturation, state.vibrance, state.gamutCompress,
                     java.util.Collections.emptyList(), null,
                 )
             else -> {
                 result.acquireDataLease().use { lease ->
                     ColorGrade.applyInPlace(
                         lease.data, result.width, result.height, result.colorSpace,
-                        cctfEncoded = true, saturation = 1f, vibrance = 0f,
-                        gamutCompress = 0f,
+                        cctfEncoded = true, saturation = state.saturation,
+                        vibrance = state.vibrance, gamutCompress = state.gamutCompress,
                     )
                     MaskCompositor.applyInPlace(
                         lease.data, result.width, result.height, result.colorSpace,
@@ -522,7 +562,8 @@ object Ticket177BenchmarkChecks {
         val results = JSONObject()
         results.put("cancellation", runCatching {
             EngineHolder.get(context)
-            val params = paramsFor(context, cell)
+            val state = stateFor(context, cell)
+            val params = state.toParams()
             val image = decodeToLinearProPhoto(
                 context, Uri.fromFile(File(sourcePath)), maxEdge = EXPORT_MAX_EDGE_PX,
             )
@@ -550,18 +591,20 @@ object Ticket177BenchmarkChecks {
         }.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE)
 
         results.put("reopen_published", runCatching {
-            val params = paramsFor(context, cell)
+            val state = stateFor(context, cell)
+            val params = state.toParams()
             val image = decodeToLinearProPhoto(
                 context, Uri.fromFile(File(sourcePath)), maxEdge = MAX_EDGE_PX,
             )
             val descriptor = ExportOptions(
                 format = ExportFormat.JPEG, jpegQuality = 95, size = ExportSize.FULL,
                 customLongEdge = 0, customName = "",
-            ).outputDescriptor(ColorSpace.SRGB, outputCctfEncoding = true, Build.VERSION.SDK_INT)
+            ).outputDescriptor(state.outputColorSpace, state.savingCctfEncoding, Build.VERSION.SDK_INT)
             val uri = image.use { source ->
                 EngineHolder.get(context).simulate(source, params, RenderKind.EXPORT, null)
                     .use { result ->
-                        val bitmap = requireNotNull(gradedBitmapOrNull(result, descriptor))
+                        val bitmap = requireNotNull(
+                            gradedBitmapOrNull(result, descriptor, state))
                         try {
                             runBlocking {
                                 saveToGallery(
@@ -631,6 +674,35 @@ object Ticket177BenchmarkChecks {
         return out.toString()
     }
 
+    /**
+     * Block until PowerManager reports [required] or better, or [maxWaitMs] elapses.
+     *
+     * [required] < 0 disables the wait (smoke captures stay fast). The returned object records
+     * the thermal status seen on entry, the status the sample actually starts at, how long the
+     * wait took, and whether the cap was hit -- so a capture that could not reach the declared
+     * state says so per sample instead of averaging a throttled run into the baseline.
+     */
+    private fun awaitThermal(context: Context, required: Int, maxWaitMs: Long): JSONObject {
+        val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (required < 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return JSONObject().put("required", required).put("waited_ms", 0L)
+                .put("timed_out", false)
+        }
+        val entry = power.currentThermalStatus
+        val start = System.currentTimeMillis()
+        var status = entry
+        while (status > required && System.currentTimeMillis() - start < maxWaitMs) {
+            Thread.sleep(5000L)
+            status = power.currentThermalStatus
+        }
+        return JSONObject()
+            .put("required", required)
+            .put("entry_status", entry)
+            .put("start_status", status)
+            .put("waited_ms", System.currentTimeMillis() - start)
+            .put("timed_out", status > required)
+    }
+
     /** Peak ("VmHWM:") / current ("VmRSS:") resident set from /proc/self/status, in kB. */
     @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
     private fun procStatusKb(prefix: String): Long {
@@ -695,21 +767,37 @@ object Ticket177BenchmarkChecks {
                     engine.simulatePreview(image, state.toParams(), RenderKind.PREVIEW, null)
                         .close()
                 }
-                val samplesMs = JSONArray()
+                // A slider drag is not settled when the engine returns: the editor still turns
+                // the float result into the ARGB bitmap it draws. Both halves are timed, and the
+                // settle total is what a user actually waits for.
+                val engineMs = JSONArray()
+                val bitmapMs = JSONArray()
+                val settleMs = JSONArray()
                 for (i in 0 until runs) {
                     state.exposureCompensationEv = if (i % 2 == 0) 0.1f else -0.1f
                     val params = state.toParams()
                     val start = System.nanoTime()
                     engine.simulatePreview(image, params, RenderKind.PREVIEW, null).use { res ->
                         require(res.width > 0 && res.height > 0) { "empty preview result" }
+                        val rendered = System.nanoTime()
+                        val bitmap = simResultToBitmapGraded(
+                            res, true, state.saturation, state.vibrance, state.gamutCompress,
+                            java.util.Collections.emptyList(), null,
+                        )
+                        val done = System.nanoTime()
+                        bitmap.recycle()
+                        engineMs.put((rendered - start) / 1000000L)
+                        bitmapMs.put((done - rendered) / 1000000L)
+                        settleMs.put((done - start) / 1000000L)
                     }
-                    samplesMs.put((System.nanoTime() - start) / 1000000L)
                 }
                 routes.put(JSONObject()
                     .put("route", routeId)
                     .put("preset", baseCell.getString("preset"))
                     .put("preview_max_size", 640)
-                    .put("samples_ms", samplesMs))
+                    .put("engine_ms", engineMs)
+                    .put("bitmap_ms", bitmapMs)
+                    .put("samples_ms", settleMs))
             }
         } finally {
             image.close()

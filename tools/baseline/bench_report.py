@@ -162,6 +162,14 @@ def environment_findings(capture: dict, corpus: dict) -> list[str]:
             findings.append(
                 f"thermal status {env['thermal_status']} during {sample['cell']}/"
                 f"{sample['format']} run {sample['run_index']}")
+        # A sample that could not reach the declared thermal state before starting is not
+        # comparable with one that did, however long the harness waited for it.
+        wait = sample.get("thermal_wait") or {}
+        if wait.get("timed_out"):
+            findings.append(
+                f"{sample['cell']}/{sample['format']} run {sample['run_index']} started at "
+                f"thermal {wait.get('start_status')} after waiting "
+                f"{int(wait.get('waited_ms', 0)) // 1000}s for {wait.get('required')}")
     return findings
 
 
@@ -217,6 +225,26 @@ def discard_first(samples: list[dict], count: int) -> list[dict]:
     return ordered[count:] if len(ordered) > count else ordered
 
 
+def grade_note(capture: dict) -> str:
+    """State whether the post-engine grade ran, in the report itself.
+
+    ColorGrade.applyInPlace returns immediately when saturation, vibrance and gamut
+    compression are all neutral, and the built-in presets leave them so — but a harness
+    that passes a non-neutral constant silently adds a full per-pixel Oklab round-trip
+    (~4.8 s at 12 MP) to every measurement. That cost is invisible in a wall-time table,
+    so the capture must say which path it measured rather than leave it to be inferred.
+    """
+    recorded = [s.get("grade_inputs") for s in capture["samples"] if s.get("grade_inputs")]
+    if not recorded:
+        return "- grade inputs: not recorded (capture predates the grade_inputs field)"
+    active = sorted({str(g) for g in recorded if g.get("active")})
+    if not active:
+        return ("- grade: neutral for every sample, so the post-engine Oklab pass is "
+                "skipped - as it is on a default export")
+    return ("- grade: **ACTIVE** on some samples " + ", ".join(active) +
+            " - these totals include the per-pixel Oklab pass a neutral export skips")
+
+
 def render(capture: dict, corpus: dict) -> str:
     lines = []
     app, device = capture["app"], capture["device"]
@@ -231,17 +259,22 @@ def render(capture: dict, corpus: dict) -> str:
     lines.append(f"- source `{str(capture['corpus'].get('source_sha256', ''))[:16]}...` "
                  f"{capture['corpus'].get('width')}x{capture['corpus'].get('height')}")
     lines.append("")
-    lines.append("| cell | format | n | p50 ms | p95 ms | mean +/- 95% CI | peak PSS MB |")
-    lines.append("|---|---|---:|---:|---:|---|---:|")
+    lines.append(grade_note(capture))
+    lines.append("")
+    lines.append("| cell | format | n | p50 ms | p95 ms | mean +/- 95% CI | "
+                 "peak PSS MB | peak RSS MB |")
+    lines.append("|---|---|---:|---:|---:|---|---:|---:|")
     for (cell, fmt), samples in sorted(group(capture).items()):
         warm = [s for s in samples if s["state"] == "warm"]
         kept = warm or discard_first(samples, corpus["protocol"]["gate_runs_discarded"])
         times = [float(s["total_ms"]) for s in kept]
         mean, half = mean_ci95(times)
         pss = max(int(s["memory"].get("total_pss_kb", 0)) for s in samples) / 1024.0
+        hwm = max(int(s["memory"].get("vm_hwm_kb", 0)) for s in samples) / 1024.0
         ci = "n/a" if math.isnan(half) else f"{mean:.0f} +/- {half:.0f}"
+        rss = f"{hwm:.0f}" if hwm > 0 else "-"
         lines.append(f"| {cell} | {fmt} | {len(times)} | {percentile(times, 50):.0f} | "
-                     f"{percentile(times, 95):.0f} | {ci} | {pss:.0f} |")
+                     f"{percentile(times, 95):.0f} | {ci} | {pss:.0f} | {rss} |")
     return "\n".join(lines) + "\n"
 
 

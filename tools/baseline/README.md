@@ -40,9 +40,15 @@ Automated counterpart to the wizard above: one command records the whole evidenc
 for the pinned corpus against the *exact* installed release candidate, and the host
 reporter decides everything statistical.
 
+Pass the APK **that was installed**, not the one Gradle emitted: an unsigned
+`app-release-unsigned.apk` is zipaligned and signed before `adb install`, so its bytes —
+and its SHA-256 — differ from the installed artifact, and the harness fails closed with
+`stale APK: installed <a> != pinned <b>`. That check is doing its job; hand it the signed
+file.
+
 ```bash
 # device attached, release candidate already installed (app + test APK)
-bash tools/baseline/run_bench.sh app/build/outputs/apk/release/app-release-unsigned.apk 11
+bash tools/baseline/run_bench.sh <the signed apk you installed> 11
 # smoke (2 runs, reports but is refused as a baseline)
 bash tools/baseline/run_bench.sh <app.apk> 2 BASE
 # unplugged gate over Wi-Fi adb: run detached on-device and poll, so a dropped

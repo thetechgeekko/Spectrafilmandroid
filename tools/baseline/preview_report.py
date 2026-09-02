@@ -30,12 +30,18 @@ def route_rows(capture: dict) -> list[str]:
     for route in capture.get("routes", []):
         ms = [float(v) for v in route.get("samples_ms", [])]
         if not ms:
-            rows.append(f"| {route.get('route', '?')} | 0 | - | - | - |")
+            rows.append(f"| {route.get('route', '?')} | 0 | - | - | - | - | - |")
             continue
         mean, ci = mean_ci95(ms)
+
+        def med(key: str) -> str:
+            values = [float(v) for v in route.get(key, [])]
+            return f"{percentile(values, 50):.0f}" if values else "-"
+
         rows.append(
             f"| {route.get('route', '?')} | {len(ms)} | {percentile(ms, 50):.0f} | "
-            f"{percentile(ms, 95):.0f} | {mean:.0f} +/- {ci:.0f} |")
+            f"{percentile(ms, 95):.0f} | {mean:.0f} +/- {ci:.0f} | "
+            f"{med('engine_ms')} | {med('bitmap_ms')} |")
     return rows
 
 
@@ -46,22 +52,23 @@ def render(capture: dict) -> str:
     lines = [
         "# Preview-latency capture (#119)",
         "",
-        f"- app `{str(app.get('apk_sha256', '?'))[:16]}…` "
+        f"- app `{str(app.get('apk_sha256', '?'))[:16]}...` "
         f"v{app.get('version_name', '?')} ({app.get('version_code', '?')})",
         f"- device {device.get('model', '?')} sdk {device.get('sdk_int', '?')} "
         f"`{device.get('build_fingerprint', '?')}`",
         f"- thermal {env.get('thermal_status', '?')}, battery {env.get('battery_pct', '?')}%, "
         f"plugged {env.get('plugged', '?')}, cpuset `{env.get('cpuset', '?')}`",
         f"- decode edge {capture.get('decode_max_edge', '?')} px, preview 640 px, "
-        f"source `{str(capture.get('source_sha256', '?'))[:16]}…`",
+        f"source `{str(capture.get('source_sha256', '?'))[:16]}...`",
         "",
-        "| route | n | p50 ms | p95 ms | mean +/- 95% CI |",
-        "|---|---|---|---|---|",
+        "| route | n | p50 ms | p95 ms | mean +/- 95% CI | engine p50 | bitmap p50 |",
+        "|---|---|---|---|---|---|---|",
         *route_rows(capture),
         "",
-        "Engine settle only: measured around `SpektraEngine.simulatePreview` on an",
-        "already-decoded source, which is what re-runs during a slider drag;",
-        "compose/present cost is additive UI overhead outside this number.",
+        "Settle = `SpektraEngine.simulatePreview` on an already-decoded source plus the",
+        "ARGB bitmap the editor draws, which is the pair a slider drag repeats; the",
+        "grade uses the preset's own values, so a neutral preset skips it. Compose",
+        "layout/present cost is additive UI overhead outside this number.",
         "",
     ]
     return "\n".join(lines)

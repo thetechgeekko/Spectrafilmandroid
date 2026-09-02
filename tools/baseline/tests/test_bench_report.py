@@ -64,6 +64,41 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(
             {"BASE", "HEAVY", "PRINT_GRAIN", "SCAN_CLEAN", "SCAN_GRAIN"}, ids)
 
+    def test_thermal_precondition_timeout_is_a_finding(self):
+        capture = load_fixture()
+        capture["samples"][0]["thermal_wait"] = {
+            "required": 0, "entry_status": 2, "start_status": 2,
+            "waited_ms": 300000, "timed_out": True,
+        }
+        findings = bench_report.environment_findings(capture, CORPUS)
+        self.assertTrue(any("started at thermal 2 after waiting 300s" in f
+                            for f in findings), findings)
+
+    def test_thermal_precondition_reached_is_not_a_finding(self):
+        capture = load_fixture()
+        for sample in capture["samples"]:
+            sample["thermal_wait"] = {
+                "required": 0, "entry_status": 1, "start_status": 0,
+                "waited_ms": 45000, "timed_out": False,
+            }
+        self.assertEqual([], [f for f in bench_report.environment_findings(capture, CORPUS)
+                              if "thermal" in f])
+
+    def test_grade_note_reports_which_path_was_measured(self):
+        capture = load_fixture()
+        for sample in capture["samples"]:
+            sample["grade_inputs"] = {"saturation": 0, "vibrance": 0,
+                                      "gamut_compress": 0, "active": False}
+        self.assertIn("neutral for every sample", bench_report.grade_note(capture))
+
+        capture["samples"][0]["grade_inputs"]["active"] = True
+        note = bench_report.grade_note(capture)
+        self.assertIn("ACTIVE", note)
+        self.assertIn("a neutral export skips", note)
+
+    def test_grade_note_survives_a_capture_without_the_field(self):
+        self.assertIn("not recorded", bench_report.grade_note(load_fixture()))
+
     def test_jpeg_container_identity_is_unsupported(self):
         # #126: a JPEG's container bytes are an encoder artifact, not a contract.
         self.assertEqual("unsupported", CORPUS["container_identity"]["JPEG_Q95"])
