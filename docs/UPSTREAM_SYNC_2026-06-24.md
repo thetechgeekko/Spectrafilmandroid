@@ -2,8 +2,8 @@
 
 > **Historical upstream snapshot.** Strategy A was executed, but this file does not prove parity
 > with latest upstream and its 38-gate references predate the current 39-case matrix. Current
-> upstream coverage is owned by the live parity-manifest ticket linked from
-> [EXECUTION_INDEX.md](EXECUTION_INDEX.md). Oklrab subsequently landed; the older “still open” list
+> upstream coverage is owned by the generated [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md)
+> (manifest: `tools/upstream/parity_manifest.json`, pin: `tools/upstream/upstream_pin.json`). Oklrab subsequently landed; the older “still open” list
 > below is preserved only as the dated plan's input.
 >
 > **STATUS 2026-07-02: Strategy A executed.** Shipped opt-in/default-OFF: output aces_rgc GC

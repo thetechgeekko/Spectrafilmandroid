@@ -667,6 +667,8 @@ jobs:
             tools/baseline/bench_report.py \
             tools/baseline/corpus/make_source.py \
             tools/baseline/tests/test_bench_report.py \
+            tools/upstream/gen_upstream_parity.py \
+            tools/upstream/tests/test_upstream_parity.py \
             tools/compliance/libraw_bundle.py \
             tools/compliance/tests/test_libraw_bundle.py \
             tools/release/app_spdx.py \
@@ -694,6 +696,14 @@ jobs:
           python -m unittest discover -s tools/baseline/tests -p 'test_*.py'
           python tools/baseline/bench_report.py \
             tools/baseline/tests/fixtures/capture-gate.json --gate
+
+      - name: Verify the upstream parity manifest, pin and generated doc (offline)
+        run: |
+          python -m unittest discover -s tools/upstream/tests -p 'test_*.py'
+          python tools/upstream/gen_upstream_parity.py --check
+
+      - name: Report newer upstream (read-only; never mutates the pin, never fails)
+        run: python tools/upstream/gen_upstream_parity.py --report-upstream
 
       - name: Check current documentation against repository facts
         run: python tools/docs/check_docs_consistency.py
