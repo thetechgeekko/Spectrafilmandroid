@@ -171,6 +171,23 @@ The storage contract is defined in [TRANSACTIONAL_STORAGE.md](TRANSACTIONAL_STOR
 These are process-recoverable guarantees, not a cross-provider database transaction. An
 indeterminate provider result blocks another export until reconciliation resolves ownership.
 
+### Two export caches (issue #179)
+
+Both are keyed by content, live in `cacheDir`, and treat any doubt as a miss:
+
+- **`ExportCache`** stores finished **container bytes** under a key covering the source digest,
+  every engine parameter, the grade, the whole `OutputDescriptor`, geometry, quality and the build
+  contract. A hit publishes the exact bytes a previous export produced — no decode, engine, grade
+  or encode. It pays off on a repeated export.
+- **`RenderPayloadCache`** stores the **engine's float output**, written by an idle pre-render
+  after the editor sits still for 5 s, keyed on the engine inputs only (so one payload serves
+  every container). A hit skips decode and the engine — ~86% of a first export — while the export
+  still runs the real encoder, which is what makes the published bytes identical to an uncached
+  export's.
+
+Neither may ever return a stale or partial entry: metadata is committed after the payload, the
+build contract folds in the install time, and a length or key mismatch discards the entry.
+
 ## Why native C++ remains the core
 
 | Driver | Reason |

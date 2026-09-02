@@ -2939,6 +2939,9 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(
             previewTick, sourceRenderAllowed, sourceUri, exportOptions,
             state.outputColorSpace, state.savingCctfEncoding,
+            // A real export must not compete with a speculative one for the same eight cores:
+            // as a key, this cancels any pre-render in flight the moment an export starts.
+            exportInFlight,
         ) {
             val activeEngine = engine ?: return@LaunchedEffect
             val activeUri = sourceUri ?: return@LaunchedEffect
