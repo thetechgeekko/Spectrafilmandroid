@@ -226,6 +226,35 @@ int main() {
         ok &= denied && untouched;
     }
 
+    // The transform SIZE is a cost decision, and it was measured (8 workers, -O2,
+    // best of two, tools in #160). Pin the decisions rather than the heuristic's
+    // internals: whoever changes the model has to re-measure and update these.
+    //
+    //   12 MP  ks=1725  N=2048 130 tiles 9909 ms | N=4096 4 tiles 1890 ms | N=8192 1 tile 3094 ms
+    //   1536   ks=651   N=1024  25 tiles  373 ms | N=2048 4 tiles  386 ms | N=4096 1 tile  767 ms
+    //
+    // Both directions matter: always taking the LARGEST admissible transform was
+    // 5.2x too slow at 12 MP and 2.1x too slow at 1536.
+    std::printf("\n-- transform-size choice (measured, not assumed) --\n");
+    {
+        struct Choice { int w, h, ks, cap, want; const char* why; };
+        const Choice choices[] = {
+            {4080, 3060, 1725, 4096, 4096, "12 MP Pro-Mist: 4 tiles beat 130"},
+            {4080, 3060, 1725, 8192, 4096, "8192 is one tile but measured slower"},
+            {1536, 1536,  651, 4096, 1024, "1536 px: many small tiles beat one big transform"},
+            { 640,  640,  273, 4096, 1024, "default preview fits a single 1024 transform"},
+            {4080, 3060, 1725, 2048, 2048, "a smaller ceiling is still honoured"},
+            { 200,  160,   15,   64,   32, "a tiny ceiling still leaves a valid block"},
+        };
+        for (const Choice& c : choices) {
+            const int got = spk::fft_convolve_transform_size(c.w, c.h, c.ks, c.cap);
+            const bool pass = got == c.want;
+            std::printf("[choice %dx%d ks=%d cap=%d] N=%d want=%d -> %s (%s)\n",
+                        c.w, c.h, c.ks, c.cap, got, c.want, pass ? "PASS" : "FAIL", c.why);
+            ok &= pass;
+        }
+    }
+
     std::printf("\n%s\n", ok ? "ALL PASS" : "FAILURES PRESENT");
     return ok ? 0 : 1;
 }

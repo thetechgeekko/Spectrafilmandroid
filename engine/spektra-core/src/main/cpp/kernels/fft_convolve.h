@@ -48,13 +48,24 @@ namespace spk {
 // to N x (N/2+1) columns. Measure from the assign() calls in fft_convolve_same,
 // not from this comment.
 //
-// Raising the cap makes large-kernel cases markedly faster (fewer, better-filled
-// tiles) at quadratic memory cost -- see fft_convolve.cpp's overlap-save notes.
+// This is a CEILING, not the size that gets used: fft_convolve_transform_size
+// picks the cheapest admissible transform below it, because the largest one is
+// often the slowest (a 12 MP Pro-Mist kernel wants N = 4096 and is 5.0x faster
+// there than at 2048, while a 1536 px one is 2x SLOWER at 4096 than at 1024).
+// The ceiling exists only to bound scratch: 100.7 MB at N = 2048, 402.8 MB at
+// N = 4096, and it grows 4x per doubling. 4096 is affordable because the r2c
+// change halved the spectra; 8192 (1.5 GB) is not, and measured slower than
+// 4096 anyway.
+//
+// Callers that must not risk that much scratch pass a smaller max_transform --
+// model/diffusion.cpp clamps this by the process memory budget's own headroom,
+// so a big transform can never turn a completing export into an OOM.
+//
 // READ THIS FIRST if you are tempted to raise it: scratch allocation failure is
 // a controlled std::bad_alloc denial. It must propagate to the render boundary;
 // callers must never replace it with the DIRECT O(w*h*ks^2) loop, which for
 // Black Pro-Mist at 12 MP is the ~10.9-hour path this file exists to remove.
-constexpr int kFftConvMaxTransform = 2048;
+constexpr int kFftConvMaxTransform = 4096;
 
 // `padded` is the reflect-padded plane, (h + ks - 1) rows by (w + ks - 1) cols
 // (i.e. padded by radius = (ks-1)/2 on every side), row-major, stride pw.

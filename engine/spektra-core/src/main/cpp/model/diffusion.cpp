@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "kernels/exponential_filter.h"
 #include "kernels/fft_convolve.h"
 #include "kernels/parallel.h"
+#include "runtime/memory_budget.h"
 #include "runtime/stage_timer.h"
 
 // M_PI is not in standard C++ <cmath>; some toolchains gate it behind
@@ -403,6 +405,12 @@ const char* tuning_knob(const char* env_name, const char* prop_name, char* buf,
     return nullptr;
 }
 
+// Scratch for one N x N transform: two r2c spectra plus one real plane.
+double fft_scratch_bytes(int n) {
+    const double nd = n;
+    return 2.0 * nd * (nd / 2.0 + 1.0) * 2.0 * 8.0 + nd * nd * 8.0;
+}
+
 int fft_max_transform() {
     char buf[92] = {0};
     if (const char* v0 = tuning_knob("SPK_DIFFUSION_FFT_MAX", "debug.spektra.fftmax",
@@ -413,6 +421,41 @@ int fft_max_transform() {
     return kFftConvMaxTransform;
 }
 
+// Admit the transform's scratch through the process memory budget, stepping the
+// ceiling down until one fits.
+//
+// N = 4096 is 5.2x faster than 2048 on a 12 MP Pro-Mist frame, but it wants
+// 402.8 MB, and a 12 MP export already peaks near 1.5 GB. Reserving it (rather
+// than guessing a fraction of the headroom) is what keeps that from turning a
+// completing render into a controlled OOM: if the budget cannot admit 4096 the
+// next candidate down is tried, and the render is slower instead of dead. It
+// also makes this scratch VISIBLE in spk.memory_budget.v1, which it was not.
+//
+// The reservation is held by the caller for exactly the convolution's lifetime,
+// so a second render sees the first one's bytes rather than the same headroom
+// twice.
+memory::MemoryReservation reserve_fft_scratch(int w, int h, int ks, int* chosen_cap) {
+    const int ceiling = fft_max_transform();
+    memory::MemoryBudget& budget = memory::process_memory_budget();
+    for (int cap = ceiling; cap >= 16; cap /= 2) {
+        const int n = fft_convolve_transform_size(w, h, ks, cap);
+        if (n < ks + 1) break;
+        memory::MemoryReservation reservation = budget.try_reserve(
+            static_cast<std::uint64_t>(fft_scratch_bytes(n)),
+            memory::MemoryDomain::NativeScratch, memory::MemoryStage::Spatial);
+        if (reservation) {
+            *chosen_cap = cap;
+            return reservation;
+        }
+        // The size the selector picked is independent of the ceiling below some
+        // point (it is already choosing the cheapest); once that happens, going
+        // lower cannot free anything, so stop rather than spin.
+        if (fft_convolve_transform_size(w, h, ks, cap / 2) == n) break;
+    }
+    *chosen_cap = 0;
+    return {};
+}
+
 bool use_fft(int w, int h, int ks) {
     char buf[92] = {0};
     if (const char* v0 = tuning_knob("SPK_DIFFUSION_FFT", "debug.spektra.fft",
@@ -420,6 +463,10 @@ bool use_fft(int w, int h, int ks) {
         if (v0[0] == '0') return false;
         if (v0[0] == '1') return true;
     }
+    // Estimated against the CEILING, not the transform the budget will actually
+    // admit. A clamped run picks a smaller N and is slower, but still orders of
+    // magnitude below the direct loop at the kernel sizes that get here, so the
+    // FFT-vs-direct verdict does not change.
     const int n = fft_convolve_transform_size(w, h, ks, fft_max_transform());
     if (n < ks + 1) return false;                 // no valid block -> direct
     const int block = n - ks + 1;
@@ -586,9 +633,18 @@ void apply_diffusion_filter_um(double* raw, int w, int h,
         // The direct loop stays reachable only when the cost model selects it for
         // a small kernel. Once FFT is selected, memory denial must fail closed.
         if (use_fft(w, h, ks)) {
+            int cap = 0;
+            const memory::MemoryReservation scratch =
+                reserve_fft_scratch(w, h, ks, &cap);
+            if (!scratch) {
+                // Every candidate was refused, so there is no affordable FFT. The
+                // direct loop is not a fallback here -- at 12 MP it is hours -- so
+                // this surfaces as OOM exactly like a failed allocation would.
+                throw std::bad_alloc{};
+            }
             if (!fft_convolve_same(padded.data(), pw, ph, kern.data(), ks, w, h,
                                    blurred.data(), /*out_stride=*/3, /*out_offset=*/c,
-                                   fft_max_transform())) {
+                                   cap)) {
                 // All dimensions above are constructed from the same validated
                 // image/kernel geometry. False therefore means an internal
                 // invariant bug, not a recoverable request for the direct path.

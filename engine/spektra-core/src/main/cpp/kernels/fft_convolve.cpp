@@ -49,6 +49,7 @@
 #include "kernels/fft_convolve.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <new>
 #include <vector>
@@ -118,7 +119,45 @@ int fft_convolve_transform_size(int w, int h, int ks, int max_transform) {
     const int floor_n = fft_next_pow2(ks + 1);
     int cap = fft_next_pow2(std::max(max_transform, 1));
     if (cap < floor_n) cap = floor_n;
-    return std::min(ideal, cap);
+    const int top = std::min(ideal, cap);
+
+    // Pick the CHEAPEST admissible transform, not the largest one. Taking the
+    // largest was wrong in both directions, measured on this operator (8 workers,
+    // -O2, times are the best of two):
+    //
+    //   1536 px, ks=651   N=1024  25 tiles   375 ms   <- cheapest
+    //                     N=2048   4 tiles   386 ms
+    //                     N=4096   1 tile    767 ms   <- what "largest" picked
+    //   12 MP,   ks=1725  N=2048 130 tiles  9298 ms   <- what the old cap picked
+    //                     N=4096   4 tiles  1861 ms   <- cheapest, 5.0x faster
+    //                     N=8192   1 tile   3094 ms
+    //
+    // A bigger transform buys a bigger usable block B = N - ks + 1 and so fewer
+    // tiles, but each transform costs more than N^2 log N in practice because the
+    // column pass is memory-bound: measured per-element cost roughly doubles per
+    // doubling of N, far faster than log2 N grows. kCostExponent captures that
+    // empirically -- it ranks all six measurements above correctly, where a pure
+    // N^2 log N model ranks two of them backwards.
+    //
+    // It is a heuristic over a discrete, tiny candidate set, so being a little off
+    // costs some speed and never a wrong answer: every candidate computes the same
+    // operator, and the choice stays a pure function of (w, h, ks, cap), which is
+    // what keeps output byte-identical across worker counts.
+    constexpr double kCostExponent = 2.8;
+    double best_cost = -1.0;
+    int best_n = top;
+    for (int n = floor_n; n <= top; n *= 2) {
+        const int block = n - ks + 1;
+        if (block <= 0) continue;
+        const double tiles = std::ceil(static_cast<double>(h) / block) *
+                             std::ceil(static_cast<double>(w) / block);
+        const double cost = tiles * std::pow(static_cast<double>(n), kCostExponent);
+        if (best_cost < 0.0 || cost < best_cost) {
+            best_cost = cost;
+            best_n = n;
+        }
+    }
+    return best_n;
 }
 
 static bool fft_convolve_same_impl(const double* padded, int pw, int ph,

@@ -1874,17 +1874,48 @@ eleven orders inside the 1e-4 bar — and both paths stay byte-identical across 
 counts. Gated by `tests/test_fft_convolve.cpp` (single transform, genuine overlap-save
 tiling with partial edge tiles, a kernel wider than the image, 1-vs-8 equality).
 
-**The transform-size cap is measurement-backed, and it survived the r2c change.** Bigger
-is not automatically better: at 1536px, cap 4096 is *slower* than cap 2048 — 16.1 s vs
-7.6 s on c2c, and still 5.8 s vs 2.3 s on r2c — because one 4096 transform costs the same
-flops as four 2048s but four times the memory traffic, and the column pass is
-memory-bound. `SPK_DIFFUSION_FFT=0/1` and `SPK_DIFFUSION_FFT_MAX` expose both knobs for
-on-device A/B.
+**Step 3 — choose the transform size by cost, not by size.** The cap was doing two jobs
+and getting one of them wrong. `fft_convolve_transform_size` always returned the LARGEST
+admissible transform, so the cap was also the choice, and both a low and a high cap were
+wrong for some image. Measured on the operator alone (8 workers, `-O2`, best of two):
 
-**What is left.** At 12 MP the kernel is `ks = 1725`, so a 2048 transform yields a usable
-block of only 324 and needs 130 tiles — the export is bounded by tiling efficiency, not by
-the transform. Packing two of the three channels into one complex transform (three channel
-passes → two) is the next cheap win.
+| case | N=1024 | N=2048 | N=4096 | N=8192 |
+|---|---|---|---|---|
+| 640 preview, `ks=273` | **28 ms** | (same N) | | |
+| 1536, `ks=651` | **373 ms** (25 tiles) | 386 (4) | 767 (1) | 739 (1) |
+| 4080×3060, `ks=1725` | — | 9909 (130) | **1890 (4)** | 3094 (1) |
+
+A bigger transform buys a bigger usable block `B = N - ks + 1` and so fewer tiles, but the
+per-element cost roughly *doubles* per doubling of `N` — far faster than `log2 N` grows —
+because the column pass is memory-bound. So the selector now minimises
+`tiles × N^2.8`, an empirical model that ranks all six measurements above correctly where
+`N² log N` ranks two of them backwards. It is a heuristic over a handful of candidates, so
+being wrong costs speed and never correctness: every candidate computes the same operator,
+and the choice stays a pure function of `(w, h, ks, cap)`, which is what keeps the output
+byte-identical across worker counts.
+
+With the choice separated from the ceiling, the ceiling could rise to 4096 (r2c had already
+halved the scratch to 402.8 MB):
+
+> **12 MP Black Pro-Mist: 9909 ms → 1890 ms. 5.2×.** And 1536 px, which the old code ran at
+> N=4096 whenever the cap allowed it, drops 767 ms → 373 ms, **2.1×**.
+
+8192 is *not* the next step: one tile, but measured slower than 4096 and 1.5 GB of scratch.
+
+Because 402.8 MB is real money on a phone mid-export, `model/diffusion.cpp` clamps the
+ceiling to half of the process memory budget's remaining headroom, so a large transform can
+never turn a completing export into a controlled OOM — it just picks a smaller `N` and runs
+slower. The scratch itself is not reserved through the budget, so two concurrent large
+diffusion renders would each see the same headroom; exports serialize through one runtime
+and a preview never reaches these sizes, so that is a documented limitation, not an observed
+one. The choices are pinned in `tests/test_fft_convolve.cpp` so a future model change has to
+re-measure rather than re-guess. `SPK_DIFFUSION_FFT=0/1` and `SPK_DIFFUSION_FFT_MAX`
+(`debug.spektra.fft`, `debug.spektra.fftmax`) still expose both knobs for on-device A/B.
+
+**What is left.** Packing two of the three channels into one complex transform (three
+channel passes → two) is the next cheap win. None of the numbers above is a device
+measurement: they are host times whose *ratios* transfer, and the on-device A/B is still
+owed.
 
 ### 20.4 It is a faithful port, which makes it a parity decision
 
