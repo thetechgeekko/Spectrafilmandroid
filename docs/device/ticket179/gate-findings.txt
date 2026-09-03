@@ -1,0 +1,4 @@
+bench-report: thermal status 2 during BASE/TIFF16 run 5
+bench-report: BASE/TIFF16 run 5 started at thermal 2 after waiting 300s for 0
+bench-report: BASE/ULTRA_HDR run 5 started at thermal 1 after waiting 300s for 0
+bench-report: battery fell to 28%, below the 50% floor

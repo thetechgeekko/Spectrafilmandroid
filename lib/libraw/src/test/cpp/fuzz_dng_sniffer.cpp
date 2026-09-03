@@ -3,8 +3,9 @@
  *
  * The sniffer (dngsniff::compressionOf / classifyUnpackFailure) is the part of the
  * RAW decoder that parses FULLY UNTRUSTED bytes (a malformed DNG/TIFF header + IFD
- * chain) before LibRaw is ever invoked, so it is the highest-value memory-safety
- * target in the lib. This harness drives both entry points on fuzzer-mutated input.
+ * chain) after a LibRaw unpack failure, so it remains a high-value memory-safety
+ * target in the fallback path. This harness drives both entry points on
+ * fuzzer-mutated input.
  *
  * Build (host, no Android, no LibRaw — the TU compiles with SFRAW_HAVE_LIBRAW=0):
  *   clang++ -std=c++17 -O1 -g -fsanitize=fuzzer,address,undefined \

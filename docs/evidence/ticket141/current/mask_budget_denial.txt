@@ -1,0 +1,2 @@
+﻿TICKET141_MASK_DENIAL: PASS width=4096 height=3052 masks=4 scratch_allocations=0 reserve_calls=1 release_calls=0 sha256=80dab22a2bbe88fd1076dc35aff3253b9e52736203b9bd5ea5af27a9535ce825
+

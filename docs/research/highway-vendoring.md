@@ -1,6 +1,10 @@
 # Research: Highway SIMD vendoring + determinism plan
 
-**Date:** 2026-08-26 · **Ticket:** [#124](https://github.com/thetechgeekko/Spektrafilm-android/issues/124) — facts for the "adopt [google/highway](https://github.com/google/highway)" decision.
+> **Outcome:** Highway is not a shipping dependency. Retain this qualification evidence and reopen
+> only for a narrow kernel whose current trace, digest gate, APK impact, and device A/B justify it.
+> Live dependency choices are in [../BIT_IDENTICAL_EXPORT_ROADMAP.md](../BIT_IDENTICAL_EXPORT_ROADMAP.md).
+
+**Date:** 2026-08-26 · **Ticket:** [Research: Highway SIMD vendoring + determinism plan](https://github.com/thetechgeekko/Spektrafilm-android/issues/124) — facts for the "adopt [google/highway](https://github.com/google/highway)" decision.
 
 **Question:** can Highway be vendored the way we vendor LibRaw (CMake 3.22.1 FetchContent +
 SHA256, NDK r27, three ABIs), and can it be pinned to one instruction set per ABI so the

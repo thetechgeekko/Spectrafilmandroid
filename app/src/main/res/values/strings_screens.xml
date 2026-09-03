@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spektrafilm for Android. GPLv3. -->
+<resources>
+    <!-- Shared across the secondary screens (Welcome, About, How-to, Settings, Diagnostics, Curves). -->
+    <string name="screen_back">Back</string>
+    <string name="screen_close">Close</string>
+    <string name="screen_report_issue">Report an issue</string>
+    <string name="screen_how_to_use_app">How to use this app</string>
+    <string name="screen_opens_in_browser">Opens in browser</string>
+    <string name="screen_dedication_pixls">Dedicated to the pixls.us community.</string>
+    <string name="screen_link_spektrafilm" translatable="false">spektrafilm</string>
+    <string name="screen_link_image_toolbox" translatable="false">Image Toolbox</string>
+    <string name="screen_link_colour_science" translatable="false">colour-science</string>
+    <string name="screen_link_libraw" translatable="false">LibRaw</string>
+    <string name="screen_link_pixls" translatable="false">pixls.us</string>
+    <string name="screen_link_source_code">Source code</string>
+
+    <!-- Welcome / onboarding -->
+    <string name="screen_welcome_page1_title">Spectral film simulation,\non your phone</string>
+    <string name="screen_welcome_page1_body">Spektrafilm renders your photos through a physically-modelled film stock and darkroom print — spectrum-accurate, not a preset filter.</string>
+    <string name="screen_welcome_page2_title">How it works</string>
+    <string name="screen_welcome_page2_body">Pick a photo or RAW/DNG → choose a film stock and a print paper → tune the look (grain, halation, couplers, glare) → export at full resolution.</string>
+    <string name="screen_welcome_page3_title">Under the hood</string>
+    <string name="screen_welcome_page3_body">A bit-exact port of the spektrafilm spectral pipeline, RAW decoding via LibRaw, and an Image-Toolbox-inspired Compose UI. Previews are downscaled for speed; exports render at full resolution.</string>
+    <string name="screen_welcome_page4_title">Credits</string>
+    <string name="screen_welcome_page4_body">Dedicated to the pixls.us community. Film modeling powered by spektrafilm (Andrea Volpato). Thanks to Image Toolbox (T8RIN), colour-science and LibRaw. Free software under the GPLv3.</string>
+    <string name="screen_welcome_skip">Skip</string>
+    <string name="screen_welcome_next">Next</string>
+    <string name="screen_welcome_get_started">Get started</string>
+    <string name="screen_welcome_page_indicator">Page %1$d of %2$d</string>
+    <string name="screen_welcome_author_links" translatable="false">Akshay · instagram.com/akshay.pool · youtube.com/@Akshayishere</string>
+    <string name="screen_welcome_open_settings">Settings</string>
+
+    <!-- About -->
+    <string name="screen_about_title">About</string>
+    <string name="screen_about_version">Version %1$s (%2$d)</string>
+    <string name="screen_about_tagline">Spectral film simulation on your phone — film modeling powered by spektrafilm.</string>
+    <string name="screen_about_dedication_heading">Dedication</string>
+    <string name="screen_about_thanks_heading">Thanks</string>
+    <string name="screen_about_thanks_body">Film modeling powered by spektrafilm (Andrea Volpato). UI inspired by Image Toolbox (T8RIN). Colour math from colour-science. RAW decoding via LibRaw.</string>
+    <string name="screen_about_author_heading">Author</string>
+    <string name="screen_about_author_name" translatable="false">Akshay</string>
+    <string name="screen_link_instagram" translatable="false">Instagram</string>
+    <string name="screen_link_youtube" translatable="false">YouTube</string>
+    <string name="screen_about_license_heading">License &amp; source</string>
+    <string name="screen_about_license_body">App code is free software released under GPL-3.0-only.</string>
+    <string name="screen_about_libraw_route_note">%1$s Both original license texts are bundled for offline review.</string>
+    <string name="screen_about_open_source_notices">Open-source notices</string>
+    <string name="screen_link_releases">Releases</string>
+    <string name="screen_link_gplv3" translatable="false">GPLv3</string>
+    <string name="screen_about_notices_app_heading" translatable="false">Spektrafilm Android</string>
+    <string name="screen_about_notices_app_body">The app source is distributed under GPL-3.0-only. Its complete license and project notices are available below without a network connection.</string>
+    <string name="screen_about_notices_libraw_heading" translatable="false">LibRaw 0.22.2</string>
+    <string name="screen_about_notices_libraw_body">Copyright (C) 2008-2025 LibRaw LLC. RAW/DNG decoding in this app statically includes the pinned and locally patched LibRaw source.</string>
+    <string name="screen_link_libraw_source">LibRaw source</string>
+    <string name="screen_link_libraw_archive">0.22.2 archive</string>
+    <string name="screen_link_app_source">App source</string>
+    <string name="screen_link_release_materials">Release materials</string>
+    <string name="screen_about_bundled_docs_heading">Bundled legal documents</string>
+    <string name="screen_about_doc_app_gpl">App GPLv3</string>
+    <string name="screen_about_doc_app_notices">App notices</string>
+    <string name="screen_about_doc_libraw_copyright">LibRaw copyright</string>
+    <string name="screen_about_doc_libraw_lgpl">LibRaw LGPL 2.1</string>
+    <string name="screen_about_doc_libraw_cddl">LibRaw CDDL 1.0</string>
+    <string name="screen_about_legal_text_unavailable">The bundled legal text could not be opened. See %1$s for the canonical source.</string>
+
+    <!-- How to use this app -->
+    <string name="screen_howto_title">How to use Spektrafilm</string>
+    <string name="screen_howto_step_number">Step %1$d</string>
+    <string name="screen_howto_s1_title">What Spektrafilm is</string>
+    <string name="screen_howto_s1_p1">Spektrafilm is a physically-based spectral film simulator. Unlike a simple filter or a look-up table, it models the real analog pipeline: a virtual negative is exposed to your photo\'s light, developed in a chemical bath, optionally enlarged onto print paper in a darkroom, and scanned back to a digital file — all driven by measured spectral data from real film stocks.</string>
+    <string name="screen_howto_s1_p2">The result is a faithful reproduction of color, grain, halation, and dye chemistry that matches what you would get in a real darkroom — not an approximation.</string>
+    <string name="screen_howto_attribution">Film modeling powered by spektrafilm (Andrea Volpato).</string>
+    <string name="screen_howto_s2_title">Getting a photo in</string>
+    <string name="screen_howto_s2_step1">Tap the open button (top-left of the editor) to pick an image.</string>
+    <string name="screen_howto_s2_step2">Choose a JPEG or HEIC from your gallery for quick results.</string>
+    <string name="screen_howto_s2_step3">For the truest film rendering, open a RAW or DNG file. The app decodes RAW files through LibRaw to a linear, scene-referred image — the same starting point real film would have.</string>
+    <string name="screen_howto_s2_step4">If you don\'t have a photo handy, tap \"Demo image\" to load the built-in test image.</string>
+    <string name="screen_howto_s2_p1">EXIF orientation is read automatically: portrait shots and rotated RAW files will appear upright in the preview without you doing anything.</string>
+    <string name="screen_howto_s3_title">The editing screen layout</string>
+    <string name="screen_howto_s3_p1">The editor is designed like a professional photo editing app. From top to bottom:</string>
+    <string name="screen_howto_s3_step1">Pinned preview — your photo, rendered live with the current settings, fills the top portion of the screen. A status pill in the corner shows when a render is in progress and how long the last render took.</string>
+    <string name="screen_howto_s3_step2">Histogram — displayed over the preview so you can judge exposure and clipping.</string>
+    <string name="screen_howto_s3_step3">Scrollable category bar — a row of icons at the bottom. Swipe left/right to reach all 13 categories. Tap any icon to open that category\'s adjustment panel.</string>
+    <string name="screen_howto_s3_p2">The categories are:</string>
+    <string name="screen_howto_s3_p3">Tap a category icon to open its panel below the preview. Swipe the panel downward to dismiss it and return to the full preview.</string>
+    <string name="screen_howto_category_line">" — %1$s"</string>
+    <string name="screen_howto_cat_source">Source</string>
+    <string name="screen_howto_cat_source_desc">open / close a photo, demo image, before/after compare</string>
+    <string name="screen_howto_cat_presets">Presets</string>
+    <string name="screen_howto_cat_presets_desc">load a built-in or saved parameter set</string>
+    <string name="screen_howto_cat_simulation">Simulation</string>
+    <string name="screen_howto_cat_simulation_desc">film stock, print paper, exposure, Auto-exposure</string>
+    <string name="screen_howto_cat_input">Input</string>
+    <string name="screen_howto_cat_input_desc">crop, resize, upscale factor</string>
+    <string name="screen_howto_cat_raw_wb">RAW WB</string>
+    <string name="screen_howto_cat_raw_wb_desc">temperature, tint, white-balance mode (RAW/DNG only)</string>
+    <string name="screen_howto_cat_grain">Grain</string>
+    <string name="screen_howto_cat_grain_desc" formatted="false">grain amount, scale, sublayer mixing, 100% magnifier</string>
+    <string name="screen_howto_cat_halation">Halation</string>
+    <string name="screen_howto_cat_halation_desc">halation glow radius and strength</string>
+    <string name="screen_howto_cat_glare">Glare</string>
+    <string name="screen_howto_cat_glare_desc">lens flare / glare (print path, off by default)</string>
+    <string name="screen_howto_cat_couplers">Couplers</string>
+    <string name="screen_howto_cat_couplers_desc">DIR dye-coupler diffusion</string>
+    <string name="screen_howto_cat_preflash">Preflash</string>
+    <string name="screen_howto_cat_preflash_desc">base-fog preflash amount</string>
+    <string name="screen_howto_cat_experimental">Experimental</string>
+    <string name="screen_howto_cat_experimental_desc">developer options and advanced engine flags</string>
+    <string name="screen_howto_cat_display">Display</string>
+    <string name="screen_howto_cat_display_desc">output color space (sRGB, Adobe RGB, ProPhoto, Rec.2020, etc.)</string>
+    <string name="screen_howto_cat_settings">Settings / About</string>
+    <string name="screen_howto_cat_settings_desc">app settings and this guide</string>
+    <string name="screen_howto_s4_title">Choosing a look</string>
+    <string name="screen_howto_s4_p1">Start here to find the right film character for your photo:</string>
+    <string name="screen_howto_s4_step1">Open the Simulation category. Choose a film stock from the Film picker — 28 profiles are available, grouped as color negative, slide, motion-picture, and print film. Each profile shows the film\'s ISO, color balance, and era.</string>
+    <string name="screen_howto_s4_step2">If you want a printed look (negative→enlarger→paper), also select a print paper in the Print picker within Simulation. Leave it at its default for a direct scan-of-the-negative result.</string>
+    <string name="screen_howto_s4_step3">Adjust the exposure slider to brighten or darken the simulated exposure. Alternatively, tap Auto to let the app meter the scene for you. Auto-exposure meters to a mid-grey target and offers 7 metering patterns (center-weighted, matrix, spot, and more) in a pop-up list.</string>
+    <string name="screen_howto_s4_step4">For a fast starting point, open the Presets category. 20 built-in, researched film-to-print looks are available. Tap a preset to load its full parameter set, then fine-tune from there.</string>
+    <string name="screen_howto_s5_title">Key tools</string>
+    <string name="screen_howto_s5_p1">Several tools are available directly in the editor:</string>
+    <string name="screen_howto_s5_step1">90° rotate — the rotate button (top bar) rotates your photo 90° clockwise. The rotation applies to the preview, the export, and the grain magnifier.</string>
+    <string name="screen_howto_s5_step2">Crop — the Input category contains an interactive crop overlay. Drag the corner and edge handles to crop freely, or tap one of the aspect ratio presets (1:1, 4:3, 3:2, 16:9, etc.) to lock the ratio.</string>
+    <string name="screen_howto_s5_step3">Before / after compare — available in the Source category. Lets you flick between the original and the simulated result to judge the effect.</string>
+    <string name="screen_howto_s5_step4" formatted="false">100% grain magnifier — accessible from the Grain category. Shows a 1:1 crop of the grain texture so you can check the grain scale and character before exporting at full resolution.</string>
+    <string name="screen_howto_s5_step5">Profile curve browser — in the Simulation category, tap the film or paper name to open the curve browser. It shows that stock\'s spectral sensitivity, characteristic (H-D) density curves, and dye density spectra.</string>
+    <string name="screen_howto_s6_title">RAW white balance</string>
+    <string name="screen_howto_s6_p1">When a RAW or DNG file is loaded, the RAW WB category becomes active. It gives you control over how LibRaw interprets the raw sensor data:</string>
+    <string name="screen_howto_s6_step1">Mode — choose As-shot (uses the camera\'s recorded white balance), Daylight, or Tungsten for a preset. Select Custom to enter your own values.</string>
+    <string name="screen_howto_s6_step2">Temperature and Tint sliders — available in Custom mode to dial in a precise white balance. Changing either slider re-decodes the RAW preview automatically.</string>
+    <string name="screen_howto_s6_step3">Reset — returns the white balance to the camera\'s as-shot setting.</string>
+    <string name="screen_howto_s6_p2">For JPEG or HEIC sources the RAW WB category is hidden, since the white balance is already baked into those files.</string>
+    <string name="screen_howto_s7_title">Non-destructive editing</string>
+    <string name="screen_howto_s7_p1">All edits are non-destructive. Here is what that means in practice:</string>
+    <string name="screen_howto_s7_step1">Your original file is never changed. The app only reads it.</string>
+    <string name="screen_howto_s7_step2">Every adjustment is stored as a recipe (a small JSON sidecar) keyed to that specific source image.</string>
+    <string name="screen_howto_s7_step3">When you reopen the same image later, the recipe is loaded automatically and the simulation re-renders exactly where you left off.</string>
+    <string name="screen_howto_s7_step4">The recipe is re-applied at full resolution when you export, so your preview at a smaller size and the exported file at full resolution are the same look.</string>
+    <string name="screen_howto_s8_title">Exporting</string>
+    <string name="screen_howto_s8_p1">When you are happy with the look, tap the export button (top bar) to save the result.</string>
+    <string name="screen_howto_s8_p2">Export settings (in the Settings screen):</string>
+    <string name="screen_howto_s8_step1">Format — choose from 8-bit JPEG, 8-bit PNG, 16-bit TIFF, 16-bit PNG, or Google Ultra HDR (gain-map JPEG, on supported devices). 16-bit TIFF and 16-bit PNG preserve the full dynamic range of the simulation.</string>
+    <string name="screen_howto_s8_step2">JPEG quality — a 0–100 slider for JPEG exports.</string>
+    <string name="screen_howto_s8_step3">Keep GPS / location — OFF by default for privacy. Turn it on if you want GPS coordinates copied from the source EXIF into the exported file.</string>
+    <string name="screen_howto_s8_p3">The exported file is saved to Pictures/Spektrafilm on your device. Camera metadata (make, model, lens, exposure settings) from the source image is copied into the exported file\'s EXIF automatically.</string>
+    <string name="screen_howto_s9_title">Tips for best results</string>
+    <string name="screen_howto_s9_step1">Judge film looks in a darkened room. Film character is subtle and ambient light on the screen will flatten your perception of it.</string>
+    <string name="screen_howto_s9_step2">Use RAW input for the most accurate result. JPEG files have already been processed by the camera\'s tone curve, white balance, and sharpening, which changes how the simulation perceives the scene.</string>
+    <string name="screen_howto_s9_step3">Export to 16-bit TIFF or 16-bit PNG when you plan to do further editing. This keeps the full precision of the simulation for later adjustments.</string>
+    <string name="screen_howto_s9_step4">Auto-exposure meters to mid-grey. If your subject is lighter or darker than mid-grey you may want to nudge the exposure slider manually afterward.</string>
+    <string name="screen_howto_s9_step5">Grain is stochastic (random). The preview may look slightly different each time you render; the export is always the definitive full-resolution version.</string>
+    <string name="screen_howto_s10_title">Credits</string>
+    <string name="screen_howto_s10_p1">Film modeling powered by spektrafilm (Andrea Volpato). The science, the film-stock profiles, and the spectral LUTs are Andrea\'s work — Spektrafilm is a native Android port of that engine, verified bit-exact against the original.</string>
+    <string name="screen_howto_s10_p2">UI inspired by Image Toolbox (T8RIN). Colour math from colour-science. RAW decoding via LibRaw. Free software under the GPLv3.</string>
+
+    <!-- Settings -->
+    <string name="screen_settings_title">Settings</string>
+    <string name="screen_settings_appearance">Appearance</string>
+    <string name="screen_settings_theme">Theme</string>
+    <string name="screen_settings_render_defaults">Render defaults</string>
+    <string name="screen_settings_render_defaults_note">Applied when the app starts. Per-image edits and presets still override these.</string>
+    <string name="screen_settings_default_output_cs">Default output color space</string>
+    <string name="screen_settings_preview_max_size">Preview max size</string>
+    <string name="screen_settings_preview_max_size_tip">Long edge of the interactive preview, in pixels.</string>
+    <string name="screen_settings_draft_size">Draft render size</string>
+    <string name="screen_settings_draft_size_tip">Long edge of the fast frame drawn while a slider is being dragged, before the crisp render lands. Lower tracks your finger more closely; higher previews the final result more faithfully.</string>
+    <string name="screen_settings_default_film">Default film profile</string>
+    <string name="screen_settings_default_print">Default print profile</string>
+    <string name="screen_settings_export">Export</string>
+    <string name="screen_settings_export_format">Export format</string>
+    <string name="screen_settings_jpeg_quality">JPEG quality</string>
+    <string name="screen_settings_keep_gps">Preserve location (GPS)</string>
+    <string name="screen_settings_keep_gps_note">Off: strip GPS from exports (recommended). Other EXIF (camera, exposure, date) is always kept.</string>
+    <string name="screen_settings_experimental">Experimental</string>
+    <string name="screen_settings_gpu_preview">GPU preview (experimental)</string>
+    <string name="screen_settings_gpu_preview_note">Render the fit preview instantly on the GPU (a 3D LUT of the current look) instead of a ~1s CPU render per edit. Export is always the exact CPU engine. Off by default: the current surface can stutter or overlap the controls while panels animate — being reworked.</string>
+    <string name="screen_settings_gpu_engine">GPU engine (Vulkan, experimental)</string>
+    <string name="screen_settings_gpu_engine_note">Run the film simulation\'s scan stage on the GPU for interactive previews — more accurate than the preview LUT and verified against the CPU engine on this device at first use, with automatic CPU fallback. Export always uses the exact CPU engine. Applies on the next return to the editor.</string>
+    <string name="screen_settings_gpu_export">GPU export (Vulkan, experimental)</string>
+    <string name="screen_settings_gpu_export_note">Also run the scan stage on the GPU for full-resolution exports — \"oracle-verified on your device\": the result is checked against the CPU engine on this device and falls back to CPU automatically if it ever drifts. Off by default. Independent of the preview toggle.</string>
+    <string name="screen_settings_updates_heading">Updates &amp; diagnostics</string>
+    <string name="screen_settings_checking">Checking…</string>
+    <string name="screen_settings_update_check_failed">Couldn\'t check (no connection?).</string>
+    <string name="screen_settings_update_available_tag">Update available: %1$s</string>
+    <string name="screen_settings_up_to_date">Up to date (%1$s).</string>
+    <string name="screen_settings_check_updates">Check for updates</string>
+    <string name="screen_settings_diagnostics_logs">Diagnostics &amp; logs</string>
+    <string name="screen_settings_update_available">Update available</string>
+    <string name="screen_settings_update_dialog_body">A newer version (%1$s) is available. You\'re on %2$s. Open the canonical GitHub release page in your browser? Spektrafilm does not download, install, or verify an APK.</string>
+    <string name="screen_settings_open_release">Open release</string>
+    <string name="screen_settings_later">Later</string>
+    <string name="screen_settings_help_heading">Help &amp; feedback</string>
+    <string name="screen_settings_view_issues">View issues</string>
+    <string name="screen_settings_source">Source</string>
+    <string name="screen_settings_show_onboarding">Show onboarding again</string>
+
+    <!-- Diagnostics -->
+    <string name="screen_diag_app_version">App: %1$s</string>
+    <string name="screen_diag_privacy_note">Nothing is uploaded automatically. Reports include app/device version, redact paths, URIs and image metadata, and keep the last crash for at most 7 days. Copy or Share is always an explicit action.</string>
+    <string name="screen_diag_last_crash">Last crash</string>
+    <string name="screen_diag_no_crash">No crash recorded.</string>
+    <string name="screen_diag_copy">Copy</string>
+    <string name="screen_diag_copy_crash_desc">Copy last crash record to clipboard</string>
+    <string name="screen_diag_clear">Clear</string>
+    <string name="screen_diag_clear_crash_desc">Clear last crash record</string>
+    <string name="screen_diag_cache_heading">Filming tc_lut cache</string>
+    <string name="screen_diag_cache_note">Pinned defaults and the parameter-keyed LRU. cache_held_bytes excludes evicted LUTs still leased by an active render; those remain in the process memory-budget counter until released.</string>
+    <string name="screen_diag_cache_loading">Loading cache diagnostics...</string>
+    <string name="screen_diag_refresh_cache">Refresh cache stats</string>
+    <string name="screen_diag_logcat_heading">Logcat snapshot</string>
+    <string name="screen_diag_capture_logcat">Capture logcat</string>
+    <string name="screen_diag_recapture_logcat">Re-capture logcat</string>
+    <string name="screen_diag_share_report">Share diagnostics report</string>
+
+    <!-- Profile curve browser -->
+    <string name="screen_curves_title">Curves · %1$s</string>
+    <string name="screen_curves_loading">Loading profile curves</string>
+    <string name="screen_curves_error">Error loading profile: %1$s</string>
+    <string name="screen_curves_not_found">Profile data not found for \'%1$s\'</string>
+    <string name="screen_curves_chart_desc">%1$s chart for %2$s: %3$s. Series: %4$s.</string>
+    <string name="screen_curves_sensitivity_title">Spectral Sensitivity</string>
+    <string name="screen_curves_sensitivity_subtitle">log sensitivity vs wavelength (nm)</string>
+    <string name="screen_curves_sensitivity_missing">Spectral sensitivity data not available for this profile.</string>
+    <string name="screen_curves_hd_title">Characteristic (H-D) Curves</string>
+    <string name="screen_curves_hd_subtitle">density vs log exposure</string>
+    <string name="screen_curves_hd_missing">Density curve data not available for this profile.</string>
+    <string name="screen_curves_dye_title">Dye Density Spectra</string>
+    <string name="screen_curves_dye_subtitle">dye density vs wavelength (nm)</string>
+    <string name="screen_curves_dye_missing">Dye density spectra not available for this profile.</string>
+    <string name="screen_curves_legend_r_layer">R layer</string>
+    <string name="screen_curves_legend_g_layer">G layer</string>
+    <string name="screen_curves_legend_b_layer">B layer</string>
+    <string name="screen_curves_legend_r">R</string>
+    <string name="screen_curves_legend_g">G</string>
+    <string name="screen_curves_legend_b">B</string>
+    <string name="screen_curves_legend_c_dye">C dye (R layer)</string>
+    <string name="screen_curves_legend_m_dye">M dye (G layer)</string>
+    <string name="screen_curves_legend_y_dye">Y dye (B layer)</string>
+    <string name="screen_curves_axis_wavelength">Wavelength (nm)</string>
+    <string name="screen_curves_axis_log_s">log S</string>
+    <string name="screen_curves_axis_log_e">log E</string>
+    <string name="screen_curves_axis_density">Density</string>
+</resources>

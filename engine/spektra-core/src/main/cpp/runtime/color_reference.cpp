@@ -23,8 +23,8 @@ namespace spk {
 
 namespace {
 
-// CIE Y at a single CMY density triple, on the given profile's dyes + D50 scan
-// illuminant. Mirrors scanning.py::cmy_to_log_xyz for the Y channel only, then
+// CIE Y at a single CMY density triple, on the given profile's dyes + resolved
+// viewing illuminant. Mirrors scanning.py::cmy_to_log_xyz for the Y channel only, then
 // the (10**log_xyz)[Y] round-trip the references take:
 //   spectral[l] = sum_k cmy[k]*channel_density[l,k] + base_density[l]
 //   light[l]    = 10^-spectral[l] * illum[l]   (NaN -> 0)
@@ -33,8 +33,11 @@ namespace {
 // (The black/white references only use the Y channel, so X/Z are skipped.)
 double cmy_to_y(const Profile& prof, const double cmy[3]) {
     const int S = prof.n_samples;
-    const float* illum = kIlluminantD50;
-    const double inv_norm = 1.0 / kNormD50;
+    const ViewingIlluminant& viewing = prof.resolved_viewing_illuminant
+        ? *prof.resolved_viewing_illuminant
+        : require_viewing_illuminant(prof.viewing_illuminant);
+    const float* illum = viewing.spectrum;
+    const double inv_norm = 1.0 / viewing.normalization;
     double Y = 0.0;
     for (int l = 0; l < S; ++l) {
         const float* cd = prof.channel_density.data() + static_cast<size_t>(l) * 3;

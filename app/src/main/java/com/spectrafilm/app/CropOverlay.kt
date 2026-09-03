@@ -26,6 +26,7 @@
 package com.spectrafilm.app
 
 import android.graphics.Bitmap
+import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +46,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,6 +62,15 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selectableGroup
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -68,13 +79,13 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /** Aspect-ratio presets for the crop overlay. `ratio == null` means free / unconstrained. */
-private enum class CropAspect(val label: String, val ratio: Float?) {
-    FREE("Free", null),
-    ORIGINAL("Original", null),  // resolved at runtime to the image aspect
-    SQUARE("1:1", 1f),
-    R4_3("4:3", 4f / 3f),
-    R3_2("3:2", 3f / 2f),
-    R16_9("16:9", 16f / 9f),
+private enum class CropAspect(@StringRes val labelRes: Int, val ratio: Float?) {
+    FREE(R.string.tool_crop_aspect_free, null),
+    ORIGINAL(R.string.tool_crop_aspect_original, null),  // resolved at runtime to the image aspect
+    SQUARE(R.string.tool_crop_aspect_square, 1f),
+    R4_3(R.string.tool_crop_aspect_4_3, 4f / 3f),
+    R3_2(R.string.tool_crop_aspect_3_2, 3f / 2f),
+    R16_9(R.string.tool_crop_aspect_16_9, 16f / 9f),
 }
 
 /**
@@ -125,6 +136,22 @@ fun CropOverlay(
 
     var aspect by remember { mutableStateOf(CropAspect.FREE) }
 
+    // Fixed #139 evidence is gated inside the bridge and is a no-op for normal app sessions. The
+    // effect runs only after this actual overlay instance has initialized its remembered draft.
+    LaunchedEffect(Unit) {
+        Ticket139EditorProbe.publishCropDraftInitialized(
+            bitmapWidth = bitmap.width,
+            bitmapHeight = bitmap.height,
+            initialCrop = initialCrop,
+            initialCenter = initialCenter,
+            initialSize = initialSize,
+            actualLeft = rect.left,
+            actualTop = rect.top,
+            actualRight = rect.right,
+            actualBottom = rect.bottom,
+        )
+    }
+
     // Pixel size of the laid-out image inside the canvas (set by onSizeChanged on
     // the image Box). Used to convert drag pixels <-> normalized coords.
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
@@ -147,23 +174,26 @@ fun CropOverlay(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextTooltip("Cancel crop") {
+                val cancelLabel = stringResource(R.string.tool_crop_cancel)
+                TextTooltip(cancelLabel) {
                     androidx.compose.material3.IconButton(onClick = onCancel) {
-                        Icon(SpectraIcons.Cancel, contentDescription = "Cancel crop", tint = Color.White)
+                        Icon(SpectraIcons.Cancel, contentDescription = cancelLabel, tint = Color.White)
                     }
                 }
                 Text(
-                    "Crop", color = Color.White,
+                    stringResource(R.string.tool_crop_title), color = Color.White,
                     style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(start = 4.dp),
+                    modifier = Modifier.padding(start = 4.dp).semantics { heading() },
                 )
                 androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
-                TextTooltip("Rotate 90°") {
+                val rotateLabel = stringResource(R.string.tool_crop_rotate)
+                TextTooltip(rotateLabel) {
                     androidx.compose.material3.IconButton(onClick = onRotate) {
-                        Icon(SpectraIcons.Rotate, contentDescription = "Rotate 90°", tint = Color.White)
+                        Icon(SpectraIcons.Rotate, contentDescription = rotateLabel, tint = Color.White)
                     }
                 }
-                TextTooltip("Apply crop") {
+                val applyLabel = stringResource(R.string.tool_crop_apply)
+                TextTooltip(applyLabel) {
                     androidx.compose.material3.IconButton(
                         onClick = {
                             val r = rect
@@ -184,12 +214,14 @@ fun CropOverlay(
                             }
                         },
                     ) {
-                        Icon(SpectraIcons.Confirm, contentDescription = "Apply crop", tint = Color.White)
+                        Icon(SpectraIcons.Confirm, contentDescription = applyLabel, tint = Color.White)
                     }
                 }
             }
 
             // --- the image + crop rectangle ---
+            val canvasDesc = stringResource(R.string.tool_crop_canvas_desc)
+            val resetLabel = stringResource(R.string.tool_crop_reset)
             Box(
                 Modifier
                     .weight(1f)
@@ -202,6 +234,14 @@ fun CropOverlay(
                         .aspectRatio(imageAspect)
                         .fillMaxWidth()
                         .onSizeChanged { canvasSize = it }
+                        // Drag-only canvas: a screen reader can at least reset to the full frame;
+                        // the aspect chips below remain the accessible way to constrain it.
+                        .semantics {
+                            contentDescription = canvasDesc
+                            customActions = listOf(
+                                CustomAccessibilityAction(resetLabel) { rect = Rect(0f, 0f, 1f, 1f); true },
+                            )
+                        }
                         .pointerInput(aspect, canvasSize) {
                             detectDragGestures(
                                 onDragStart = { pos ->
@@ -231,12 +271,14 @@ fun CropOverlay(
                 }
             }
 
-            // --- aspect-ratio preset chips ---
+            // --- aspect-ratio preset chips (one exclusive choice => radio group) ---
+            val aspectGroupDesc = stringResource(R.string.tool_crop_aspect_group)
             Row(
                 Modifier
                     .fillMaxWidth()
                     .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .semantics { contentDescription = aspectGroupDesc; selectableGroup() },
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 CropAspect.entries.forEach { a ->
@@ -249,7 +291,8 @@ fun CropOverlay(
                                 rect = constrainToAspect(rect, locked, imgW, imgH)
                             }
                         },
-                        label = { Text(a.label) },
+                        label = { Text(stringResource(a.labelRes)) },
+                        modifier = Modifier.semantics { role = Role.RadioButton },
                     )
                 }
             }

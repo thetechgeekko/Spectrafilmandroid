@@ -1,0 +1,258 @@
+{
+  "schema": "spk.upstream_parity.v1",
+  "oracle_sha": "c1d0e44b962d80a51ea096d33faea346e4f3836c",
+  "reviewed_sha": "3bb2c2d2801ff68b92019cf1dbcbb133d60832bc",
+  "assets": {
+    "tree_sha256": "f7ae37537ae503444cd8e445c036759dc5729a4a45669a1119ff957e0b70737a",
+    "files": 216
+  },
+  "items": [
+    {
+      "id": "stage-filming",
+      "area": "stages",
+      "upstream": "Filming stage (RGB → spectral via Hanatos2025 LUT → camera raw → film density CMY, DIR couplers, exposure)",
+      "status": "matched",
+      "evidence": "runtime/stages/filming.cpp; gates `filming`, `simulate_e2e` (both film-density memos), `highlight_boost_e2e`, `provia_couplers_e2e`"
+    },
+    {
+      "id": "stage-printing",
+      "area": "stages",
+      "upstream": "Printing stage (film CMY → enlarger dichroic Y/M/C → print paper density)",
+      "status": "matched",
+      "evidence": "runtime/stages/printing.cpp; gates `simulate_e2e` (print-density memo), `enlarger_lut_e2e`, `print_evcomp_e2e`, `print_spatial_e2e`"
+    },
+    {
+      "id": "stage-scanning",
+      "area": "stages",
+      "upstream": "Scanning stage (density → spectral radiance → CIE XYZ → output RGB, viewing illuminants incl. K75P, NaN profile-null propagation)",
+      "status": "matched",
+      "evidence": "runtime/stages/scanning.cpp; gates `simulate_e2e`, `scanner_lut_e2e`, `output_spaces`, `scanner_bwcorr_e2e`; -fno-finite-math-only preserved for NaN semantics"
+    },
+    {
+      "id": "stage-geometry",
+      "area": "stages",
+      "upstream": "Crop/resize and auto-exposure metering stages",
+      "status": "matched",
+      "evidence": "runtime/stages/crop_resize.cpp, autoexposure.cpp; gates `crop_resize`, `downscale`, `autoexposure`, `small_preview_aa`"
+    },
+    {
+      "id": "stage-diffusion",
+      "area": "stages",
+      "upstream": "Diffusion (halation + in-emulsion scatter) and lens blur, incl. FFT convolution path",
+      "status": "matched",
+      "evidence": "model/diffusion.cpp; gates `diffusion`, `diffusion_e2e`, `fft_convolve`, `lensblur`, `spatial`, `spatial_decouple_e2e`"
+    },
+    {
+      "id": "stage-grain",
+      "area": "stages",
+      "upstream": "Grain (Poisson-binomial particle model, sublayers, micro-structure)",
+      "status": "matched",
+      "evidence": "model/grain.cpp; statistical gates `test_grain`, `test_grain_sublayer`, `test_binomial_shortcircuit` (std::mt19937 can never byte-match numpy, so the gate is mean/std vs committed oracle references)"
+    },
+    {
+      "id": "stage-taps",
+      "area": "stages",
+      "upstream": "Runtime tap inject/collect (`topology.py`) and `lut_mode` deterministic bake regime",
+      "status": "adapted",
+      "evidence": "Equivalent mechanism, different plumbing: `spk_simulate_tap` for named taps, `spk_bake_cube_lut` for the LUT-bake regime; gates `bake_lut`, `params_passthrough`, per-tap goldens"
+    },
+    {
+      "id": "params-manifest",
+      "area": "parameters",
+      "upstream": "Full parameter surface and defaults of oracle c1d0e44 (camera, film, enlarger, print, scanner, grain, couplers, diffusion, glare, tone curves)",
+      "status": "matched",
+      "evidence": "runtime/params_manifest.h; gate `params_passthrough` plus `simulate_e2e` per-param key completeness (every key perturbs the memo)"
+    },
+    {
+      "id": "params-optin-wiring",
+      "area": "parameters",
+      "upstream": "Spektral opt-in controls (spectral gaussian blur, Hanatos surface, camera UV/IR band-pass, preflash, print EV compensation, scanner B/W correction)",
+      "status": "matched",
+      "evidence": "Gates `spectral_blur_e2e`, `hanatos_surface_e2e`, `camera_uvir_e2e`, `preflash_e2e`, `print_evcomp_e2e`, `scanner_bwcorr_e2e`"
+    },
+    {
+      "id": "params-np-interp",
+      "area": "parameters",
+      "upstream": "np.interp semantics on the non-monotonic DIR-coupler axis",
+      "status": "matched",
+      "evidence": "Gate `np_interp` (verbatim upstream semantics)"
+    },
+    {
+      "id": "params-inert-controls",
+      "area": "parameters",
+      "upstream": "GUI-selectable RGB→raw method Mallett2019; film-side glare quartet; enlarger lens blur",
+      "status": "missing",
+      "evidence": "Marshalled but inert on Android: `SPK_RGB2RAW_MALLETT2019` has no dispatch (memo-key change only), film `glare_*` has no film-side consumer, `enlarger_lens_blur` has no call site",
+      "ticket": "https://github.com/thetechgeekko/Spektrafilm-android/issues/143"
+    },
+    {
+      "id": "profiles-28",
+      "area": "profiles-assets",
+      "upstream": "All 28 film/paper profiles, spectral LUTs and neutral print filters at oracle c1d0e44",
+      "status": "matched",
+      "evidence": "Bundled under engine/spektra-core/src/main/assets/spektra (tree digest pinned in upstream_pin.json); loaders io/npy_lut.cpp + profiles/; docs-consistency counts 28 presets"
+    },
+    {
+      "id": "profiles-refit",
+      "area": "profiles-assets",
+      "upstream": "Profile JSON refit of 28/29 stocks + neutral_print_filters.json (commit ad5c8d2, deltas to 0.43 ≈ 570× parity tolerance)",
+      "status": "inapplicable",
+      "rationale": "Changes the default rendered look of every existing photo; adopting it is the deliberate Strategy-B rebaseline (docs/UPSTREAM_SYNC_2026-06-24.md §5), not a piecemeal port. The default render stays byte-pinned to oracle c1d0e44 per the owner-approved #126 contract",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md §5"
+    },
+    {
+      "id": "gui-editor",
+      "area": "gui",
+      "upstream": "napari desktop GUI (sliders/param tiers per param_manifest.py)",
+      "status": "adapted",
+      "evidence": "Jetpack Compose Lightroom-style editor: category tabs, sliders with value semantics, presets/recipes, profile-curve browser, crop/masks; accessibility-gated (#181). Param coverage proven by `params_passthrough`, not by mirroring the desktop layout"
+    },
+    {
+      "id": "gui-preview-scale",
+      "area": "gui",
+      "upstream": "Desktop preview-max slider clamp (removed upstream in 83278a5)",
+      "status": "adapted",
+      "evidence": "Android owns its independent two-regime preview: 640 px interactive preview vs full-res scan export; upstream's desktop clamp does not apply"
+    },
+    {
+      "id": "lut-bake-cube",
+      "area": "lut-formats",
+      "upstream": "Deterministic LUT bake of the film look (lut_mode)",
+      "status": "matched",
+      "evidence": "`spk_bake_cube_lut`; gate `bake_lut`"
+    },
+    {
+      "id": "lut-clf-export",
+      "area": "lut-formats",
+      "upstream": "LUT export for external tools",
+      "status": "adapted",
+      "evidence": "Android exports .cube and CLF (app ClfWriter.kt, lutFileName); scope limited to the two formats with Android consumers"
+    },
+    {
+      "id": "lut-creator-suite",
+      "area": "lut-formats",
+      "upstream": "spektrafilm_lut_creator (~15k LOC: 3dl, HaldCLUT, lumix builders, ocio_emit, QA suite)",
+      "status": "inapplicable",
+      "rationale": "Desktop LUT/OCIO authoring tooling with zero engine math and no Android consumer (docs/UPSTREAM_SYNC_2026-06-24.md §6)",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md §6"
+    },
+    {
+      "id": "ext-raw",
+      "area": "android-extensions",
+      "upstream": "—",
+      "status": "extension",
+      "evidence": "RAW/DNG import via patched LibRaw 0.22.2 through an ACES intermediate → linear ProPhoto (lib:libraw, oracle-locked CAT02 white balance #192), hostile-corpus sanitizer/fuzz gates (#165)"
+    },
+    {
+      "id": "ext-output",
+      "area": "android-extensions",
+      "upstream": "—",
+      "status": "extension",
+      "evidence": "Fail-closed OutputDescriptor export matrix (#174): JPEG, PNG, PNG16, TIFF16, TIFF32F, scene-linear TIFF32F; Ultra HDR explicit and release-blocked (#140); 16-bit native writers lib:tiffwriter/lib:pngwriter"
+    },
+    {
+      "id": "ext-editor-state",
+      "area": "android-extensions",
+      "upstream": "—",
+      "status": "extension",
+      "evidence": "Masks/local adjustments, presets/recipes with versioned transactional storage (#170), process-death recovery (#139), foreground export service, render-local stage timing `spk.stage_timings.v1` (#163)"
+    },
+    {
+      "id": "ext-gpu",
+      "area": "android-extensions",
+      "upstream": "—",
+      "status": "extension",
+      "evidence": "Capability-gated Fast GPU Vulkan route (pointwise resident chain) separate from the Strict Exact CPU route; tolerance-qualified, never presented as bit-identical (#126 contract, docs/research/gpu-bit-exact.md)"
+    },
+    {
+      "id": "ext-caches",
+      "area": "android-extensions",
+      "upstream": "—",
+      "status": "extension",
+      "evidence": "Spectral 3D-LUT memo + byte-budgeted tc_lut_cache LRU (#142); gates `lut_cache_e2e`, `lut_accel`, `tc-lut` stats surface"
+    },
+    {
+      "id": "delta-gc-output-shipped",
+      "area": "upstream-delta",
+      "upstream": "Output gamut compression, algorithms aces_rgc / oklch / oklrab (default-ON upstream at 3bb2c2d)",
+      "status": "adapted",
+      "evidence": "Ported as default-OFF opt-ins so the c1d0e44 default render stays byte-identical; gates `gamut_out_aces`, `gamut_out_oklch`, `gamut_out_oklrab` with newer-oracle goldens"
+    },
+    {
+      "id": "delta-gc-output-remaining",
+      "area": "upstream-delta",
+      "upstream": "Output gamut compression, remaining perceptual algorithms jzazbz / cam16ucs (cam16ucs is the upstream default)",
+      "status": "matched",
+      "evidence": "Ported default-OFF as opt-ins with 3bb2c2d-oracle goldens (#201); gates `gamut_out_jzazbz`, `gamut_out_cam16ucs`; upstream's fixed one-sided _compress_lightness applied"
+    },
+    {
+      "id": "delta-gc-input",
+      "area": "upstream-delta",
+      "upstream": "Input gamut compression: xy locus bake portion",
+      "status": "adapted",
+      "evidence": "Ported default-OFF; gate `gamut_in_xy`"
+    },
+    {
+      "id": "delta-gc-input-cat16",
+      "area": "upstream-delta",
+      "upstream": "Input-side CAT02→CAT16 swap + lrgb/xy hard-clip removal; color_reference and spectral_upsampling/calibration_targets CAT16 rework",
+      "status": "inapplicable",
+      "rationale": "Default-path changes whose 3bb2c2d goldens cannot be isolated from the ad5c8d2 profile refit and the a9bccd6 raw-scaling drift without new profile-injection tooling; tractable only under the Strategy-B rebaseline (docs/UPSTREAM_SYNC_2026-06-24.md §4/§5)",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md §4"
+    },
+    {
+      "id": "delta-print-morph",
+      "area": "upstream-delta",
+      "upstream": "Print density-curve morph (morph_curves.py / develop_print_morph)",
+      "status": "adapted",
+      "evidence": "Ported default-OFF (upstream replaces the tabulated print interp on the default path); gate `print_curves_morph` (opt-in s023 morph)"
+    },
+    {
+      "id": "delta-grain-refit",
+      "area": "upstream-delta",
+      "upstream": "Grain default-value refit (particle_scale/density_min/uniformity tuples) + agx_* → particle_* rename",
+      "status": "inapplicable",
+      "rationale": "Math already 1:1 (rename only); adopting the refit VALUES changes the default grain look of every render — a default-look change reserved for the deliberate rebaseline. docs/UPSTREAM_SYNC_2026-06-24.md §4 calls skipping it defensible (purely aesthetic)",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md §4 (grain refit)"
+    },
+    {
+      "id": "delta-guards",
+      "area": "upstream-delta",
+      "upstream": "DIR-coupler None-guard and diffusion sigma_um<=0 guard",
+      "status": "matched",
+      "evidence": "Python None-division guards; impossible/already short-circuited in C++ (couplers.cpp:211, filming.cpp lens-blur gate)"
+    },
+    {
+      "id": "delta-bwref-gamma",
+      "area": "upstream-delta",
+      "upstream": "color_reference gamma_factor → 1.0 in the negative-print B/W reference measurement",
+      "status": "inapplicable",
+      "rationale": "Deliberately NOT applied: the shipped bwcorr path byte-matches oracle c1d0e44 (which used gamma_factor=pg) and its golden pins that; applying the fix would break `scanner_bwcorr_e2e` without a newer-oracle golden. Carried on the rebaseline list; default print_density_curve_gamma=1.0 makes it a no-op in practice",
+      "evidence": "spektra.cpp measure_print_references call; gate `scanner_bwcorr_e2e`"
+    },
+    {
+      "id": "delta-targeted-fixes",
+      "area": "upstream-delta",
+      "upstream": "vlog midgray fix (3bb2c2d), GC black-level fix (6ec371b), preview-max removal (83278a5)",
+      "status": "inapplicable",
+      "rationale": "vlog hunk lives only in desktop lut_mode/deactivate_spatial branches absent from the port; the GC black-level fix targets code that does not exist at c1d0e44 (it is folded into #201's acceptance); preview-max is a desktop GUI clamp",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md §6"
+    },
+    {
+      "id": "delta-desktop-refactors",
+      "area": "upstream-delta",
+      "upstream": "params_schema/params_builder/pipeline/profiles-io refactors, param_manifest.py GUI metadata, OCIO configs",
+      "status": "inapplicable",
+      "rationale": "Python-internal restructuring and desktop color-management emit with no engine math and no Android consumer; the profile-metadata GPLv3→CC BY-SA relicense is recorded in upstream_pin.json",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md §6"
+    },
+    {
+      "id": "expbranch-nchannel",
+      "area": "experimental-branches",
+      "upstream": "N-channel/B&W rework, kodak_trix/doublex/2302, parametric density_curves_model, convert stage, grain overhaul, Langmuir couplers, taking filters, WB normalization, new upsampling methods (dev/experimental/couplers-tuning-iterations)",
+      "status": "inapplicable",
+      "rationale": "Unmerged, actively iterating author R&D whose own defaults are in flux; several studies ship as opaque baked LUTs with no generator code. Track-only per docs/UPSTREAM_SYNC_2026-06-24.md Part B; branch SHAs pinned in upstream_pin.json. Revisit only after upstream merges to main and defaults stabilize",
+      "evidence": "docs/UPSTREAM_SYNC_2026-06-24.md Part B; upstream_pin.json track_only_branches"
+    }
+  ]
+}

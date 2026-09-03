@@ -1,0 +1,40 @@
+diff --git a/src/decoders/load_mfbacks.cpp b/src/decoders/load_mfbacks.cpp
+--- a/src/decoders/load_mfbacks.cpp
++++ b/src/decoders/load_mfbacks.cpp
+@@ -726,6 +726,9 @@ void LibRaw::hasselblad_load_raw()
+   unsigned upix, urow, ucol;
+   ushort *ip;
+ 
++  if (raw_width < 2 || (raw_width & 1))
++    throw LIBRAW_EXCEPTION_IO_CORRUPT;
++
+   if (!ljpeg_start(&jh, 0))
+     return;
+   order = 0x4949;
+@@ -744,7 +747,12 @@ void LibRaw::hasselblad_load_raw()
+       {
+         for (s = 0; s < tiff_samples * 2; s += 2)
+         {
+-          FORC(2) len[c] = ph1_huff(jh.huff[0]);
++          FORC(2)
++          {
++            len[c] = ph1_huff(jh.huff[0]);
++            if ((unsigned)len[c] > 16)
++              throw LIBRAW_EXCEPTION_IO_CORRUPT;
++          }
+           FORC(2)
+           {
+             diff[s + c] = ph1_bits(len[c]);
+@@ -777,9 +785,11 @@ void LibRaw::hasselblad_load_raw()
+             {
+               urow = row - top_margin + (c & 1);
+               ucol = col - left_margin - ((c >> 1) & 1);
+-              ip = &image[urow * width + ucol][f];
+               if (urow < height && ucol < width)
++              {
++                ip = &image[urow * width + ucol][f];
+                 *ip = c < 4 ? upix : (*ip + upix) >> 1;
++              }
+             }
+           }
+           back[2][s] = pred;

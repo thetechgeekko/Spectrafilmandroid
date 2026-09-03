@@ -15,18 +15,27 @@
 #include <jni.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef __ANDROID__
 #include <android/asset_manager_jni.h>
 #include <android/log.h>
+#include <sys/system_properties.h>   // debug.spektra.dumpparams (dump_marshalled_params)
 #endif
 
+#include <atomic>
+
+#include "jni_safety.h"
+#include "runtime/params_manifest.h"
+#include "runtime/stage_timer.h"
 #include "spektra.h"
 
 #define JNI(ret, name) extern "C" JNIEXPORT ret JNICALL \
@@ -34,12 +43,25 @@
 
 namespace {
 
+spk::jni::AllocationRegistry g_allocations;
+spk::jni::ExternalReservationRegistry g_jvm_reservations(
+    spk::memory::MemoryDomain::Jvm);
+
+bool free_registered_allocation(void* base, std::size_t size,
+                                std::uint64_t token) {
+    auto owned = g_allocations.take(base, size, token);
+    if (!owned) return false;
+    std::free(owned.base());
+    // `owned` releases budget accounting only after free() has completed.
+    return true;
+}
+
 // Throw a java.lang.RuntimeException carrying `msg` so a real, specific failure
 // reaches Kotlin instead of collapsing to a bare null return (which the facade
 // previously surfaced as a misleading "not implemented yet" error). Safe to call
 // even if a pending exception already exists (ThrowNew is a no-op then). Returns
 // after queuing the throw; the caller must return promptly to the JVM.
-void throw_runtime(JNIEnv* env, const char* msg) {
+void throw_runtime(JNIEnv* env, const char* msg) noexcept {
     if (env->ExceptionCheck()) return;  // don't mask an already-pending exception
     jclass cls = env->FindClass("java/lang/RuntimeException");
     if (cls) {
@@ -50,10 +72,52 @@ void throw_runtime(JNIEnv* env, const char* msg) {
 
 // Throw a RuntimeException describing an spk_status failure (e.g.
 // "spektra: profile not found"). No-op for SPK_OK.
-void throw_status(JNIEnv* env, spk_status st) {
+void throw_status(JNIEnv* env, spk_status st) noexcept {
     if (st == SPK_OK) return;
-    std::string msg = std::string("spektra: ") + spk_status_str(st);
-    throw_runtime(env, msg.c_str());
+    char msg[768];
+    const int prefix = std::snprintf(msg, sizeof(msg), "spektra: %s",
+                                      spk_status_str(st));
+    if (prefix < 0) return;
+    size_t used = static_cast<size_t>(prefix);
+    if (used >= sizeof(msg)) used = sizeof(msg) - 1;
+    const char* detail = spk_last_error_message();
+    if (detail && detail[0] != '\0') {
+        const int n = std::snprintf(msg + used, sizeof(msg) - used,
+                                    ": %s", detail);
+        if (n > 0) used += static_cast<size_t>(n);
+        if (used >= sizeof(msg)) msg[sizeof(msg) - 1] = '\0';
+    }
+    if (st == SPK_ERR_CANCELLED && !env->ExceptionCheck()) {
+        jclass cls = env->FindClass("java/util/concurrent/CancellationException");
+        if (cls) {
+            env->ThrowNew(cls, msg);
+            env->DeleteLocalRef(cls);
+            return;
+        }
+        env->ExceptionClear();
+    }
+    throw_runtime(env, msg);
+}
+
+void throw_illegal_argument(JNIEnv* env, const char* msg) noexcept {
+    if (env->ExceptionCheck()) return;
+    jclass cls = env->FindClass("java/lang/IllegalArgumentException");
+    if (cls) {
+        env->ThrowNew(cls, msg);
+        env->DeleteLocalRef(cls);
+    } else {
+        throw_runtime(env, msg);
+    }
+}
+
+bool memory_stage_from_code(jint code,
+                            spk::memory::MemoryStage* stage) noexcept {
+    if (!stage || code < 0 ||
+        code >= static_cast<jint>(spk::memory::MemoryStage::Count)) {
+        return false;
+    }
+    *stage = static_cast<spk::memory::MemoryStage>(code);
+    return true;
 }
 
 // A C++ exception must NEVER unwind through the extern "C" JNI boundary — that
@@ -63,7 +127,7 @@ void throw_status(JNIEnv* env, spk_status st) {
 // std::vector allocations failing on a low-memory device) becomes
 // java.lang.OutOfMemoryError — catchable, matching the existing output-buffer
 // OOM path — and anything else becomes a RuntimeException.
-void throw_native_oom(JNIEnv* env) {
+void throw_native_oom(JNIEnv* env) noexcept {
     if (env->ExceptionCheck()) return;
     jclass oom = env->FindClass("java/lang/OutOfMemoryError");
     if (oom) {
@@ -75,10 +139,192 @@ void throw_native_oom(JNIEnv* env) {
     }
 }
 
-void throw_cpp_exception(JNIEnv* env, const std::exception& e) {
-    std::string msg = std::string("spektra: native error: ") + e.what();
-    throw_runtime(env, msg.c_str());
+void throw_cpp_exception(JNIEnv* env, const std::exception& e) noexcept {
+    char msg[768];
+    const char* what = e.what();
+    std::snprintf(msg, sizeof(msg), "spektra: native error: %s",
+                  what ? what : "unknown std::exception");
+    throw_runtime(env, msg);
 }
+
+void throw_unknown_cpp_exception(JNIEnv* env) noexcept {
+    throw_runtime(env, "spektra: unknown native exception");
+}
+
+// Resolve the caller-visible range of a direct ByteBuffer. JNI's raw address and
+// capacity alone do not enforce Buffer.position()/limit(), so accepting only those
+// would let native code read outside a sliced/logically bounded input.
+bool direct_float_input(JNIEnv* env, jobject buffer, jint width, jint height,
+                        float** out) {
+    if (!buffer || !out) return false;
+    *out = nullptr;
+
+    std::uint64_t required = 0;
+    if (!spk::jni::checked_rgb_f32_bytes(width, height, &required) ||
+        required > static_cast<std::uint64_t>(INT32_MAX)) {
+        throw_runtime(env, "spektra: invalid or oversized image dimensions");
+        return false;
+    }
+    void* base = env->GetDirectBufferAddress(buffer);
+    const jlong capacity = env->GetDirectBufferCapacity(buffer);
+    if (!base || capacity < 0) {
+        throw_runtime(env, "spektra: input ByteBuffer is not direct");
+        return false;
+    }
+
+    jclass cls = env->GetObjectClass(buffer);
+    if (!cls) return false;
+    jmethodID position_method = env->GetMethodID(cls, "position", "()I");
+    jmethodID limit_method = env->GetMethodID(cls, "limit", "()I");
+    env->DeleteLocalRef(cls);
+    if (!position_method || !limit_method) {
+        env->ExceptionClear();
+        throw_runtime(env, "spektra: cannot inspect input ByteBuffer range");
+        return false;
+    }
+    const jint position = env->CallIntMethod(buffer, position_method);
+    const jint limit = env->CallIntMethod(buffer, limit_method);
+    if (env->ExceptionCheck()) return false;
+    std::uintptr_t address = 0;
+    if (!spk::jni::checked_float_buffer_range(
+            static_cast<std::int64_t>(capacity), position, limit, required,
+            reinterpret_cast<std::uintptr_t>(base), &address)) {
+        throw_runtime(env,
+            "spektra: input ByteBuffer range is invalid, too small, or unaligned");
+        return false;
+    }
+    *out = reinterpret_cast<float*>(address);
+    return true;
+}
+
+class JniCancellation {
+public:
+    JniCancellation(JNIEnv* env, jobject token) : env_(env), token_(token) {}
+
+    bool initialize() {
+        if (!token_) return true;
+        jclass cls = env_->GetObjectClass(token_);
+        if (!cls) return false;
+        method_ = env_->GetMethodID(cls, "isCancellationRequested", "()Z");
+        env_->DeleteLocalRef(cls);
+        if (!method_) {
+            env_->ExceptionClear();
+            throw_runtime(env_, "spektra: invalid cancellation token");
+            return false;
+        }
+        return true;
+    }
+
+    spk_cancel_check callback() const noexcept {
+        return token_ ? &JniCancellation::check : nullptr;
+    }
+
+    void* context() noexcept { return this; }
+
+private:
+    static int check(void* opaque) noexcept {
+        auto* self = static_cast<JniCancellation*>(opaque);
+        if (!self || !self->token_ || !self->method_) return 0;
+        if (self->env_->ExceptionCheck()) return 1;
+        const jboolean requested = self->env_->CallBooleanMethod(
+            self->token_, self->method_);
+        return self->env_->ExceptionCheck() || requested == JNI_TRUE ? 1 : 0;
+    }
+
+    JNIEnv* env_;
+    jobject token_;
+    jmethodID method_ = nullptr;
+};
+
+bool timing_automation_enabled() {
+#ifdef __ANDROID__
+    if (ATrace_isEnabled()) return true;
+    char on[PROP_VALUE_MAX] = {0};
+    return __system_property_get("debug.spektra.timingjson", on) > 0 &&
+           on[0] != '0' && on[0] != '\0';
+#else
+    return false;
+#endif
+}
+
+bool render_kind_from_jni(jint code, jboolean preview,
+                          spk::RenderTimingKind* out) {
+    if (!out) return false;
+    switch (code) {
+        case 1:
+            if (preview) return false;
+            *out = spk::RTK_EXPORT;
+            return true;
+        case 2:
+            if (!preview) return false;
+            *out = spk::RTK_PREVIEW;
+            return true;
+        case 3:
+            if (preview) return false;
+            *out = spk::RTK_MAGNIFIER;
+            return true;
+        case 4:
+            if (!preview) return false;
+            *out = spk::RTK_ROI;
+            return true;
+        case 5:
+            if (preview) return false;
+            *out = spk::RTK_EXACT_RENDER;
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Must run only after ScopedRenderTiming publishes. The guard below is declared
+// first, then the timing scope, so reverse destruction order makes that true on
+// success, every early return, and C++ exception unwinding.
+void log_completed_stage_timing(uint64_t expected_render_id) noexcept {
+#ifdef __ANDROID__
+    if (expected_render_id == 0 ||
+        spk_stage_timing_render_id() != expected_render_id) {
+        return;
+    }
+    const spk::StageTimingSnapshot& snapshot = spk::stage_timing_snapshot();
+    char timings[512];
+    if (spk_stage_timings(timings, sizeof(timings)) > 0) {
+        const bool diffusion_ran =
+            std::strstr(timings, "camera_diffusion") != nullptr;
+        char fallback[48] = {0};
+        if (diffusion_ran) {
+            std::snprintf(fallback, sizeof(fallback), " fft_fallbacks=%llu",
+                          snapshot.fft_fallbacks);
+        }
+        __android_log_print(ANDROID_LOG_INFO, "Spektra",
+                            "stage timings ms [%s id=%llu]: %s%s",
+                            spk::render_timing_kind_name(snapshot.kind),
+                            static_cast<unsigned long long>(snapshot.render_id),
+                            timings, fallback);
+    }
+    if (timing_automation_enabled()) {
+        char json[2048];
+        if (spk_stage_timings_json(json, sizeof(json)) > 0) {
+            __android_log_print(ANDROID_LOG_INFO, "Spektra",
+                                "stage timings json: %s", json);
+        }
+    }
+#else
+    (void)expected_render_id;
+#endif
+}
+
+class StageTimingLogGuard {
+public:
+    StageTimingLogGuard() = default;
+    void expect(uint64_t render_id) { expected_render_id_ = render_id; }
+    ~StageTimingLogGuard() { log_completed_stage_timing(expected_render_id_); }
+
+    StageTimingLogGuard(const StageTimingLogGuard&) = delete;
+    StageTimingLogGuard& operator=(const StageTimingLogGuard&) = delete;
+
+private:
+    uint64_t expected_render_id_ = 0;
+};
 
 // Read a jstring into a std::string (empty on null).
 std::string jstr(JNIEnv* env, jstring s) {
@@ -93,75 +339,151 @@ std::string jstr(JNIEnv* env, jstring s) {
 jobject call_obj(JNIEnv* env, jobject obj, const char* getter, const char* sig) {
     if (!obj) return nullptr;
     jclass cls = env->GetObjectClass(obj);
+    if (!cls) return nullptr;
     jmethodID m = env->GetMethodID(cls, getter, sig);
     env->DeleteLocalRef(cls);
     if (!m) { env->ExceptionClear(); return nullptr; }
     return env->CallObjectMethod(obj, m);
 }
 
-float call_float(JNIEnv* env, jobject obj, const char* getter) {
-    if (!obj) return 0.0f;
+bool read_float(JNIEnv* env, jobject obj, const char* getter, float* out) {
+    if (!obj || !out) return false;
     jclass cls = env->GetObjectClass(obj);
+    if (!cls) return false;
     jmethodID m = env->GetMethodID(cls, getter, "()F");
     env->DeleteLocalRef(cls);
-    if (!m) { env->ExceptionClear(); return 0.0f; }
-    return env->CallFloatMethod(obj, m);
+    if (!m) { env->ExceptionClear(); return false; }
+    const jfloat value = env->CallFloatMethod(obj, m);
+    if (env->ExceptionCheck()) return false;
+    *out = value;
+    return true;
 }
 
-bool call_bool(JNIEnv* env, jobject obj, const char* getter) {
-    if (!obj) return false;
+bool read_bool_i32(JNIEnv* env, jobject obj, const char* getter, int32_t* out) {
+    if (!obj || !out) return false;
     jclass cls = env->GetObjectClass(obj);
+    if (!cls) return false;
     jmethodID m = env->GetMethodID(cls, getter, "()Z");
     env->DeleteLocalRef(cls);
     if (!m) { env->ExceptionClear(); return false; }
-    return env->CallBooleanMethod(obj, m) == JNI_TRUE;
+    const jboolean value = env->CallBooleanMethod(obj, m);
+    if (env->ExceptionCheck()) return false;
+    *out = value == JNI_TRUE ? 1 : 0;
+    return true;
 }
 
-int call_int(JNIEnv* env, jobject obj, const char* getter) {
-    if (!obj) return 0;
+bool read_int(JNIEnv* env, jobject obj, const char* getter, int32_t* out) {
+    if (!obj || !out) return false;
     jclass cls = env->GetObjectClass(obj);
+    if (!cls) return false;
     jmethodID m = env->GetMethodID(cls, getter, "()I");
     env->DeleteLocalRef(cls);
-    if (!m) { env->ExceptionClear(); return 0; }
-    return env->CallIntMethod(obj, m);
+    if (!m) { env->ExceptionClear(); return false; }
+    const jint value = env->CallIntMethod(obj, m);
+    if (env->ExceptionCheck()) return false;
+    *out = value;
+    return true;
 }
 
 // Unbox a java.lang.Float (or Number) into a float.
 float unbox_float(JNIEnv* env, jobject boxed) {
     if (!boxed) return 0.0f;
     jclass cls = env->GetObjectClass(boxed);
+    if (!cls) return 0.0f;
     jmethodID m = env->GetMethodID(cls, "floatValue", "()F");
     env->DeleteLocalRef(cls);
     if (!m) { env->ExceptionClear(); return 0.0f; }
     return env->CallFloatMethod(boxed, m);
 }
 
-// Read a kotlin.Triple<Float,Float,Float> via getFirst/getSecond/getThird (each
-// returns java.lang.Object -> java.lang.Float). Writes the three components to
-// out[3]. Leaves out untouched on null (keeps the default already there).
+// Read one component of a kotlin.Triple/Pair.
+//
+// THE BUG THIS EXISTS FOR. R8 REMOVES kotlin.Triple.getFirst/getSecond/getThird
+// and kotlin.Pair.getFirst/getSecond from the release dex. proguard-rules.pro
+// keeps com.spectrafilm.engine.** so GrainParams.getAgxParticleScale() survives
+// and returns a real Triple -- but `kotlin.**` was not kept, and NO BYTECODE
+// anywhere calls Triple.getFirst. The only caller is this file, by literal
+// string, which R8 cannot see. So it shrank them as unreachable.
+//
+// `-dontobfuscate` does not save you: it prevents RENAMING, not REMOVAL. That
+// distinction shipped 19 wrong parameters in every release APK -- every
+// Triple/Pair-valued param (grain particle scale, density min, uniformity,
+// halation scatter/strength, all four coupler gammas, camera UV/IR filters,
+// scanner unsharp, AND crop centre/size) marshalled as 0.0.
+//
+// Two independent defects made that silent, and both are fixed here:
+//   1. the getter vanished  -> fall back to the BACKING FIELD, which R8 keeps
+//      (dexdump shows `fields: first, second, third` intact). JNI GetFieldID
+//      reaches private fields, so this works without any keep rule.
+//   2. failure OVERWROTE the caller's value with 0.0 -- unbox_float(nullptr)
+//      returns 0.0f, so a failed read did not leave spk_default_params' seed in
+//      place, it destroyed it. Now a component that cannot be read leaves `out`
+//      alone and reports, so the default survives and the failure is visible.
+jobject tuple_component(JNIEnv* env, jobject t, const char* getter,
+                        const char* field) {
+    jobject v = call_obj(env, t, getter, "()Ljava/lang/Object;");
+    if (v) return v;
+    if (env->ExceptionCheck()) return nullptr;
+    jclass cls = env->GetObjectClass(t);
+    if (!cls) return nullptr;
+    jfieldID f = env->GetFieldID(cls, field, "Ljava/lang/Object;");
+    env->DeleteLocalRef(cls);
+    if (!f) { env->ExceptionClear(); return nullptr; }
+    return env->GetObjectField(t, f);
+}
+
+// One-time complaint that a tuple could not be read. Rate-limited to once per
+// process: this runs per param per render, and a silent wrong number is exactly
+// what went unnoticed before -- but a log line per render per param would be its
+// own kind of unreadable.
+void warn_tuple_unreadable_once(const char* getter) {
+#if defined(__ANDROID__)
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (!warned.compare_exchange_strong(expected, true)) return;
+    __android_log_print(ANDROID_LOG_ERROR, "Spektra",
+        "PARAM MARSHALLING BROKEN: could not read the components of '%s' by "
+        "getter OR by field. Every Triple/Pair-valued param is therefore at its "
+        "built-in default, not the value you set. This is what R8 shrinking "
+        "kotlin.Triple/kotlin.Pair looks like -- check the keep rules.", getter);
+#else
+    (void)getter;
+#endif
+}
+
+// Read a kotlin.Triple<Float,Float,Float> into out[3]. Leaves `out` UNTOUCHED if
+// the tuple or any component cannot be read, so the caller's default survives.
 void read_triple_f(JNIEnv* env, jobject obj, const char* getter, float out[3]) {
     jobject t = call_obj(env, obj, getter, "()Lkotlin/Triple;");
     if (!t) return;
-    jobject a = call_obj(env, t, "getFirst", "()Ljava/lang/Object;");
-    jobject b = call_obj(env, t, "getSecond", "()Ljava/lang/Object;");
-    jobject c = call_obj(env, t, "getThird", "()Ljava/lang/Object;");
-    out[0] = unbox_float(env, a);
-    out[1] = unbox_float(env, b);
-    out[2] = unbox_float(env, c);
+    jobject a = tuple_component(env, t, "getFirst", "first");
+    jobject b = tuple_component(env, t, "getSecond", "second");
+    jobject c = tuple_component(env, t, "getThird", "third");
+    if (a && b && c) {
+        out[0] = unbox_float(env, a);
+        out[1] = unbox_float(env, b);
+        out[2] = unbox_float(env, c);
+    } else {
+        warn_tuple_unreadable_once(getter);   // out keeps its default
+    }
     if (a) env->DeleteLocalRef(a);
     if (b) env->DeleteLocalRef(b);
     if (c) env->DeleteLocalRef(c);
     env->DeleteLocalRef(t);
 }
 
-// Read a kotlin.Pair<Float,Float> via getFirst/getSecond. Writes to out[2].
+// Read a kotlin.Pair<Float,Float> into out[2]. Same contract as read_triple_f.
 void read_pair_f(JNIEnv* env, jobject obj, const char* getter, float out[2]) {
     jobject t = call_obj(env, obj, getter, "()Lkotlin/Pair;");
     if (!t) return;
-    jobject a = call_obj(env, t, "getFirst", "()Ljava/lang/Object;");
-    jobject b = call_obj(env, t, "getSecond", "()Ljava/lang/Object;");
-    out[0] = unbox_float(env, a);
-    out[1] = unbox_float(env, b);
+    jobject a = tuple_component(env, t, "getFirst", "first");
+    jobject b = tuple_component(env, t, "getSecond", "second");
+    if (a && b) {
+        out[0] = unbox_float(env, a);
+        out[1] = unbox_float(env, b);
+    } else {
+        warn_tuple_unreadable_once(getter);   // out keeps its default
+    }
     if (a) env->DeleteLocalRef(a);
     if (b) env->DeleteLocalRef(b);
     env->DeleteLocalRef(t);
@@ -193,27 +515,53 @@ struct ParamStorage {
     std::string film_profile;
     std::string print_profile;
     std::string auto_exposure_method;
+    std::string enlarger_illuminant;
+    std::string input_color_space;
 };
+
+bool read_diffusion_family(JNIEnv* env, jobject df, int32_t* out) {
+    if (!df || !out) return true;
+    jobject value = call_obj(env, df, "getFilterFamily", "()Ljava/lang/String;");
+    if (!value) return !env->ExceptionCheck();
+    std::string family = jstr(env, static_cast<jstring>(value));
+    env->DeleteLocalRef(value);
+    if (family.empty()) return true;
+    if (family == "glimmerglass") {
+        *out = SPK_DIFFUSION_GLIMMERGLASS;
+    } else if (family == "black_pro_mist") {
+        *out = SPK_DIFFUSION_BLACK_PRO_MIST;
+    } else if (family == "pro_mist") {
+        *out = SPK_DIFFUSION_PRO_MIST;
+    } else if (family == "cinebloom") {
+        *out = SPK_DIFFUSION_CINEBLOOM;
+    } else {
+        throw_runtime(env, "spektra: unsupported diffusion filter family");
+        return false;
+    }
+    return true;
+}
 
 // Read a DiffusionFilterParams jobject into the spk_params diffusion-filter
 // fields (camera/enlarger share the same struct). `set` writes through a small
 // lambda so the same reader serves both prefixes.
-void read_diffusion_filter(JNIEnv* env, jobject df,
+bool read_diffusion_filter(JNIEnv* env, jobject df, int32_t* family,
                            int32_t* active, float* strength, float* spatial_scale,
                            float* halo_warmth, float* core_intensity,
                            float* core_size, float* halo_intensity, float* halo_size,
                            float* bloom_intensity, float* bloom_size) {
-    if (!df) return;
-    *active = call_bool(env, df, "getActive") ? 1 : 0;
-    *strength = call_float(env, df, "getStrength");
-    *spatial_scale = call_float(env, df, "getSpatialScale");
-    *halo_warmth = call_float(env, df, "getHaloWarmth");
-    *core_intensity = call_float(env, df, "getCoreIntensity");
-    *core_size = call_float(env, df, "getCoreSize");
-    *halo_intensity = call_float(env, df, "getHaloIntensity");
-    *halo_size = call_float(env, df, "getHaloSize");
-    *bloom_intensity = call_float(env, df, "getBloomIntensity");
-    *bloom_size = call_float(env, df, "getBloomSize");
+    if (!df) return true;
+    if (!read_diffusion_family(env, df, family)) return false;
+    read_bool_i32(env, df, "getActive", active);
+    read_float(env, df, "getStrength", strength);
+    read_float(env, df, "getSpatialScale", spatial_scale);
+    read_float(env, df, "getHaloWarmth", halo_warmth);
+    read_float(env, df, "getCoreIntensity", core_intensity);
+    read_float(env, df, "getCoreSize", core_size);
+    read_float(env, df, "getHaloIntensity", halo_intensity);
+    read_float(env, df, "getHaloSize", halo_size);
+    read_float(env, df, "getBloomIntensity", bloom_intensity);
+    read_float(env, df, "getBloomSize", bloom_size);
+    return !env->ExceptionCheck();
 }
 
 // Read the packed tone-curve float[] from SpektraParams.toneCurvePacked() into the
@@ -222,7 +570,7 @@ void read_diffusion_filter(JNIEnv* env, jobject df,
 // tone curve OFF (the spk_default_params value), so this is a strict no-op by default.
 void read_tone_curve(JNIEnv* env, jobject params, spk_params* out) {
     jobject arrObj = call_obj(env, params, "toneCurvePacked", "()[F");
-    if (!arrObj) { env->ExceptionClear(); return; }
+    if (!arrObj) return;
     jfloatArray arr = static_cast<jfloatArray>(arrObj);
     jsize len = env->GetArrayLength(arr);
     if (len < 1) { env->DeleteLocalRef(arrObj); return; }
@@ -264,6 +612,57 @@ int enum_ordinal_int(JNIEnv* env, jobject e, int def) {
     return static_cast<int>(env->CallIntMethod(e, m));
 }
 
+// One-shot-per-render dump of the marshalled spk_params, gated on a system
+// property so it is inert in a normal release build. See the call site at the end
+// of marshal_params for why this exists.
+void dump_marshalled_params(const spk_params* p) {
+#if defined(__ANDROID__)
+    char on[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.spektra.dumpparams", on) <= 0 || on[0] == '0')
+        return;
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params route: scan_film=%d grain_active=%d halation_active=%d "
+        "dir_couplers_active=%d glare_active=%d auto_exposure=%d ev_comp=%.4f",
+        p->scan_film, p->grain_active, p->halation_active, p->dir_couplers_active,
+        p->glare_active, p->auto_exposure, (double)p->exposure_compensation_ev);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params grain: sublayers=%d n_sub=%d area_um2=%.5f blur=%.5f "
+        "density_min=[%.5f %.5f %.5f] uniformity=[%.5f %.5f %.5f]",
+        p->grain_sublayers_active, p->grain_n_sub_layers,
+        (double)p->grain_particle_area_um2, (double)p->grain_blur,
+        (double)p->grain_density_min[0], (double)p->grain_density_min[1],
+        (double)p->grain_density_min[2],
+        (double)p->grain_uniformity[0], (double)p->grain_uniformity[1],
+        (double)p->grain_uniformity[2]);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params grain2: particle_scale=[%.5f %.5f %.5f] scale_layers=[%.5f %.5f %.5f] "
+        "micro=[%.5f %.5f] blur_dye_um=%.5f",
+        (double)p->grain_particle_scale[0], (double)p->grain_particle_scale[1],
+        (double)p->grain_particle_scale[2],
+        (double)p->grain_particle_scale_layers[0],
+        (double)p->grain_particle_scale_layers[1],
+        (double)p->grain_particle_scale_layers[2],
+        (double)p->grain_micro_structure[0], (double)p->grain_micro_structure[1],
+        (double)p->grain_blur_dye_clouds_um);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params scanner: white_corr=%d black_corr=%d white_level=%.5f "
+        "black_level=%.5f use_scanner_lut=%d use_enlarger_lut=%d lut_res=%d",
+        p->scanner_white_correction, p->scanner_black_correction,
+        (double)p->scanner_white_level, (double)p->scanner_black_level,
+        p->use_scanner_lut, p->use_enlarger_lut, p->lut_resolution);
+    __android_log_print(ANDROID_LOG_INFO, "Spektra",
+        "params misc: film=%s print=%s out_cs=%d cctf=%d gamma=%.5f "
+        "preview_max=%d gpu_preview=%d gpu_export=%d",
+        p->film_profile ? p->film_profile : "(null)",
+        p->print_profile ? p->print_profile : "(null)",
+        (int)p->output_color_space, p->output_cctf_encoding,
+        (double)p->density_curve_gamma, p->preview_max_size,
+        p->gpu_preview, p->gpu_export);
+#else
+    (void)p;
+#endif
+}
+
 bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* store) {
     // Top-level: filmProfile / printProfile (String), and the nested objects.
     store->film_profile = jstr(env,
@@ -297,8 +696,9 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
 
     // ---- camera ----
     if (camera) {
-        out->exposure_compensation_ev = call_float(env, camera, "getExposureCompensationEv");
-        out->auto_exposure = call_bool(env, camera, "getAutoExposure") ? 1 : 0;
+        read_float(env, camera, "getExposureCompensationEv",
+                   &out->exposure_compensation_ev);
+        read_bool_i32(env, camera, "getAutoExposure", &out->auto_exposure);
         // Forward the metering method string (e.g. "center_weighted"). The owned
         // copy in `store` keeps the pointer valid for the duration of the call;
         // empty/null leaves the spk_default_params value (engine -> center_weighted).
@@ -307,61 +707,76 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
                                           "()Ljava/lang/String;")));
         out->auto_exposure_method = store->auto_exposure_method.empty()
             ? nullptr : store->auto_exposure_method.c_str();
-        out->lens_blur_um = call_float(env, camera, "getLensBlurUm");
-        out->film_format_mm = call_float(env, camera, "getFilmFormatMm");
+        read_float(env, camera, "getLensBlurUm", &out->lens_blur_um);
+        read_float(env, camera, "getFilmFormatMm", &out->film_format_mm);
         read_triple_f(env, camera, "getFilterUv", out->camera_filter_uv);
         read_triple_f(env, camera, "getFilterIr", out->camera_filter_ir);
         jobject df = call_obj(env, camera, "getDiffusionFilter",
             "()Lcom/spectrafilm/engine/DiffusionFilterParams;");
-        read_diffusion_filter(env, df, &out->camera_diffusion_active,
+        if (!read_diffusion_filter(env, df, &out->camera_diffusion_family,
+            &out->camera_diffusion_active,
             &out->camera_diffusion_strength, &out->camera_diffusion_spatial_scale,
             &out->camera_diffusion_halo_warmth, &out->camera_diffusion_core_intensity,
             &out->camera_diffusion_core_size, &out->camera_diffusion_halo_intensity,
             &out->camera_diffusion_halo_size, &out->camera_diffusion_bloom_intensity,
-            &out->camera_diffusion_bloom_size);
+            &out->camera_diffusion_bloom_size)) return false;
         if (df) env->DeleteLocalRef(df);
     }
 
     // ---- enlarger ----
     if (enlarger) {
-        out->print_exposure = call_float(env, enlarger, "getPrintExposure");
-        out->print_exposure_compensation =
-            call_bool(env, enlarger, "getPrintExposureCompensation") ? 1 : 0;
-        out->normalize_print_exposure =
-            call_bool(env, enlarger, "getNormalizePrintExposure") ? 1 : 0;
-        out->y_filter_shift = call_float(env, enlarger, "getYFilterShift");
-        out->m_filter_shift = call_float(env, enlarger, "getMFilterShift");
-        out->y_filter_neutral = call_float(env, enlarger, "getYFilterNeutral");
-        out->m_filter_neutral = call_float(env, enlarger, "getMFilterNeutral");
-        out->c_filter_neutral = call_float(env, enlarger, "getCFilterNeutral");
-        out->enlarger_lens_blur = call_float(env, enlarger, "getLensBlur");
-        out->preflash_exposure = call_float(env, enlarger, "getPreflashExposure");
-        out->preflash_y_filter_shift = call_float(env, enlarger, "getPreflashYFilterShift");
-        out->preflash_m_filter_shift = call_float(env, enlarger, "getPreflashMFilterShift");
+        jobject illum = call_obj(env, enlarger, "getIlluminant",
+            "()Ljava/lang/String;");
+        if (illum) {
+            store->enlarger_illuminant = jstr(env, static_cast<jstring>(illum));
+            env->DeleteLocalRef(illum);
+            if (!store->enlarger_illuminant.empty()) {
+                out->enlarger_illuminant = store->enlarger_illuminant.c_str();
+            }
+        }
+        read_float(env, enlarger, "getPrintExposure", &out->print_exposure);
+        read_bool_i32(env, enlarger, "getPrintExposureCompensation",
+                      &out->print_exposure_compensation);
+        read_bool_i32(env, enlarger, "getNormalizePrintExposure",
+                      &out->normalize_print_exposure);
+        read_float(env, enlarger, "getYFilterShift", &out->y_filter_shift);
+        read_float(env, enlarger, "getMFilterShift", &out->m_filter_shift);
+        read_float(env, enlarger, "getYFilterNeutral", &out->y_filter_neutral);
+        read_float(env, enlarger, "getMFilterNeutral", &out->m_filter_neutral);
+        read_float(env, enlarger, "getCFilterNeutral", &out->c_filter_neutral);
+        read_float(env, enlarger, "getLensBlur", &out->enlarger_lens_blur);
+        read_float(env, enlarger, "getPreflashExposure", &out->preflash_exposure);
+        read_float(env, enlarger, "getPreflashYFilterShift",
+                   &out->preflash_y_filter_shift);
+        read_float(env, enlarger, "getPreflashMFilterShift",
+                   &out->preflash_m_filter_shift);
         jobject df = call_obj(env, enlarger, "getDiffusionFilter",
             "()Lcom/spectrafilm/engine/DiffusionFilterParams;");
-        read_diffusion_filter(env, df, &out->enlarger_diffusion_active,
+        if (!read_diffusion_filter(env, df, &out->enlarger_diffusion_family,
+            &out->enlarger_diffusion_active,
             &out->enlarger_diffusion_strength, &out->enlarger_diffusion_spatial_scale,
             &out->enlarger_diffusion_halo_warmth, &out->enlarger_diffusion_core_intensity,
             &out->enlarger_diffusion_core_size, &out->enlarger_diffusion_halo_intensity,
             &out->enlarger_diffusion_halo_size, &out->enlarger_diffusion_bloom_intensity,
-            &out->enlarger_diffusion_bloom_size);
+            &out->enlarger_diffusion_bloom_size)) return false;
         if (df) env->DeleteLocalRef(df);
     }
 
     // ---- scanner ----
     if (scanner) {
-        out->scanner_lens_blur = call_float(env, scanner, "getLensBlur");
-        out->scanner_white_correction = call_bool(env, scanner, "getWhiteCorrection") ? 1 : 0;
-        out->scanner_black_correction = call_bool(env, scanner, "getBlackCorrection") ? 1 : 0;
-        out->scanner_white_level = call_float(env, scanner, "getWhiteLevel");
-        out->scanner_black_level = call_float(env, scanner, "getBlackLevel");
+        read_float(env, scanner, "getLensBlur", &out->scanner_lens_blur);
+        read_bool_i32(env, scanner, "getWhiteCorrection",
+                      &out->scanner_white_correction);
+        read_bool_i32(env, scanner, "getBlackCorrection",
+                      &out->scanner_black_correction);
+        read_float(env, scanner, "getWhiteLevel", &out->scanner_white_level);
+        read_float(env, scanner, "getBlackLevel", &out->scanner_black_level);
         read_pair_f(env, scanner, "getUnsharpMask", out->scanner_unsharp);
     }
 
     // ---- film rendering ----
     if (filmR) {
-        out->density_curve_gamma = call_float(env, filmR, "getDensityCurveGamma");
+        read_float(env, filmR, "getDensityCurveGamma", &out->density_curve_gamma);
         jobject grain = call_obj(env, filmR, "getGrain",
             "()Lcom/spectrafilm/engine/GrainParams;");
         jobject halation = call_obj(env, filmR, "getHalation",
@@ -372,71 +787,85 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
             "()Lcom/spectrafilm/engine/GlareParams;");
 
         if (grain) {
-            out->grain_active = call_bool(env, grain, "getActive") ? 1 : 0;
-            out->grain_sublayers_active = call_bool(env, grain, "getSublayersActive") ? 1 : 0;
-            out->grain_particle_area_um2 = call_float(env, grain, "getAgxParticleAreaUm2");
+            read_bool_i32(env, grain, "getActive", &out->grain_active);
+            read_bool_i32(env, grain, "getSublayersActive",
+                          &out->grain_sublayers_active);
+            read_float(env, grain, "getAgxParticleAreaUm2",
+                       &out->grain_particle_area_um2);
             read_triple_f(env, grain, "getAgxParticleScale", out->grain_particle_scale);
             read_triple_f(env, grain, "getAgxParticleScaleLayers", out->grain_particle_scale_layers);
             read_triple_f(env, grain, "getDensityMin", out->grain_density_min);
             read_triple_f(env, grain, "getUniformity", out->grain_uniformity);
-            out->grain_blur = call_float(env, grain, "getBlur");
-            out->grain_blur_dye_clouds_um = call_float(env, grain, "getBlurDyeCloudsUm");
+            read_float(env, grain, "getBlur", &out->grain_blur);
+            read_float(env, grain, "getBlurDyeCloudsUm",
+                       &out->grain_blur_dye_clouds_um);
             read_pair_f(env, grain, "getMicroStructure", out->grain_micro_structure);
-            out->grain_n_sub_layers = call_int(env, grain, "getNSubLayers");
+            read_int(env, grain, "getNSubLayers", &out->grain_n_sub_layers);
             env->DeleteLocalRef(grain);
         }
         if (halation) {
-            out->halation_active = call_bool(env, halation, "getActive") ? 1 : 0;
-            out->halation_scatter_amount = call_float(env, halation, "getScatterAmount");
-            out->halation_scatter_spatial_scale = call_float(env, halation, "getScatterSpatialScale");
-            out->halation_halation_amount = call_float(env, halation, "getHalationAmount");
-            out->halation_halation_spatial_scale = call_float(env, halation, "getHalationSpatialScale");
+            read_bool_i32(env, halation, "getActive", &out->halation_active);
+            read_float(env, halation, "getScatterAmount",
+                       &out->halation_scatter_amount);
+            read_float(env, halation, "getScatterSpatialScale",
+                       &out->halation_scatter_spatial_scale);
+            read_float(env, halation, "getHalationAmount",
+                       &out->halation_halation_amount);
+            read_float(env, halation, "getHalationSpatialScale",
+                       &out->halation_halation_spatial_scale);
             read_triple_f(env, halation, "getScatterCoreUm", out->halation_scatter_core_um);
             read_triple_f(env, halation, "getScatterTailUm", out->halation_scatter_tail_um);
             read_triple_f(env, halation, "getScatterTailWeight", out->halation_scatter_tail_weight);
-            out->halation_boost_ev = call_float(env, halation, "getBoostEv");
-            out->halation_boost_range = call_float(env, halation, "getBoostRange");
-            out->halation_protect_ev = call_float(env, halation, "getProtectEv");
+            read_float(env, halation, "getBoostEv", &out->halation_boost_ev);
+            read_float(env, halation, "getBoostRange", &out->halation_boost_range);
+            read_float(env, halation, "getProtectEv", &out->halation_protect_ev);
             read_triple_f(env, halation, "getHalationStrength", out->halation_strength);
             read_triple_f(env, halation, "getHalationFirstSigmaUm", out->halation_first_sigma_um);
-            out->halation_n_bounces = call_int(env, halation, "getHalationNBounces");
-            out->halation_bounce_decay = call_float(env, halation, "getHalationBounceDecay");
-            out->halation_renormalize = call_bool(env, halation, "getHalationRenormalize") ? 1 : 0;
+            read_int(env, halation, "getHalationNBounces",
+                     &out->halation_n_bounces);
+            read_float(env, halation, "getHalationBounceDecay",
+                       &out->halation_bounce_decay);
+            read_bool_i32(env, halation, "getHalationRenormalize",
+                          &out->halation_renormalize);
             env->DeleteLocalRef(halation);
         }
         if (dir) {
-            out->dir_couplers_active = call_bool(env, dir, "getActive") ? 1 : 0;
-            out->dir_amount = call_float(env, dir, "getAmount");
-            out->dir_inhibition_samelayer = call_float(env, dir, "getInhibitionSamelayer");
-            out->dir_inhibition_interlayer = call_float(env, dir, "getInhibitionInterlayer");
+            read_bool_i32(env, dir, "getActive", &out->dir_couplers_active);
+            read_float(env, dir, "getAmount", &out->dir_amount);
+            read_float(env, dir, "getInhibitionSamelayer",
+                       &out->dir_inhibition_samelayer);
+            read_float(env, dir, "getInhibitionInterlayer",
+                       &out->dir_inhibition_interlayer);
             read_triple_f(env, dir, "getGammaSamelayerRgb", out->dir_gamma_samelayer_rgb);
             read_pair_f(env, dir, "getGammaInterlayerRToGb", out->dir_gamma_interlayer_r_to_gb);
             read_pair_f(env, dir, "getGammaInterlayerGToRb", out->dir_gamma_interlayer_g_to_rb);
             read_pair_f(env, dir, "getGammaInterlayerBToRg", out->dir_gamma_interlayer_b_to_rg);
-            out->dir_diffusion_size_um = call_float(env, dir, "getDiffusionSizeUm");
-            out->dir_diffusion_tail_um = call_float(env, dir, "getDiffusionTailUm");
-            out->dir_diffusion_tail_weight = call_float(env, dir, "getDiffusionTailWeight");
+            read_float(env, dir, "getDiffusionSizeUm", &out->dir_diffusion_size_um);
+            read_float(env, dir, "getDiffusionTailUm", &out->dir_diffusion_tail_um);
+            read_float(env, dir, "getDiffusionTailWeight",
+                       &out->dir_diffusion_tail_weight);
             env->DeleteLocalRef(dir);
         }
         if (glare) {
-            out->glare_active = call_bool(env, glare, "getActive") ? 1 : 0;
-            out->glare_percent = call_float(env, glare, "getPercent");
-            out->glare_roughness = call_float(env, glare, "getRoughness");
-            out->glare_blur = call_float(env, glare, "getBlur");
+            read_bool_i32(env, glare, "getActive", &out->glare_active);
+            read_float(env, glare, "getPercent", &out->glare_percent);
+            read_float(env, glare, "getRoughness", &out->glare_roughness);
+            read_float(env, glare, "getBlur", &out->glare_blur);
             env->DeleteLocalRef(glare);
         }
     }
 
     // ---- print rendering ----
     if (printR) {
-        out->print_density_curve_gamma = call_float(env, printR, "getDensityCurveGamma");
+        read_float(env, printR, "getDensityCurveGamma",
+                   &out->print_density_curve_gamma);
         jobject pglare = call_obj(env, printR, "getGlare",
             "()Lcom/spectrafilm/engine/GlareParams;");
         if (pglare) {
-            out->print_glare_active = call_bool(env, pglare, "getActive") ? 1 : 0;
-            out->print_glare_percent = call_float(env, pglare, "getPercent");
-            out->print_glare_roughness = call_float(env, pglare, "getRoughness");
-            out->print_glare_blur = call_float(env, pglare, "getBlur");
+            read_bool_i32(env, pglare, "getActive", &out->print_glare_active);
+            read_float(env, pglare, "getPercent", &out->print_glare_percent);
+            read_float(env, pglare, "getRoughness", &out->print_glare_roughness);
+            read_float(env, pglare, "getBlur", &out->print_glare_blur);
             env->DeleteLocalRef(pglare);
         }
         // OPT-IN s023 print density-curve morph. Absent / active=false -> the
@@ -444,25 +873,42 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
         jobject pmorph = call_obj(env, printR, "getDensityCurvesMorph",
             "()Lcom/spectrafilm/engine/PrintCurvesMorphParams;");
         if (pmorph) {
-            out->print_morph_active = call_bool(env, pmorph, "getActive") ? 1 : 0;
-            out->print_morph_gamma_factor = call_float(env, pmorph, "getGammaFactor");
-            out->print_morph_gamma_factor_fast = call_float(env, pmorph, "getGammaFactorFast");
-            out->print_morph_gamma_factor_slow = call_float(env, pmorph, "getGammaFactorSlow");
-            out->print_morph_gamma_factor_red = call_float(env, pmorph, "getGammaFactorRed");
-            out->print_morph_gamma_factor_green = call_float(env, pmorph, "getGammaFactorGreen");
-            out->print_morph_gamma_factor_blue = call_float(env, pmorph, "getGammaFactorBlue");
-            out->print_morph_developer_exhaustion = call_float(env, pmorph, "getDeveloperExhaustion");
+            read_bool_i32(env, pmorph, "getActive", &out->print_morph_active);
+            read_float(env, pmorph, "getGammaFactor", &out->print_morph_gamma_factor);
+            read_float(env, pmorph, "getGammaFactorFast",
+                       &out->print_morph_gamma_factor_fast);
+            read_float(env, pmorph, "getGammaFactorSlow",
+                       &out->print_morph_gamma_factor_slow);
+            read_float(env, pmorph, "getGammaFactorRed",
+                       &out->print_morph_gamma_factor_red);
+            read_float(env, pmorph, "getGammaFactorGreen",
+                       &out->print_morph_gamma_factor_green);
+            read_float(env, pmorph, "getGammaFactorBlue",
+                       &out->print_morph_gamma_factor_blue);
+            read_float(env, pmorph, "getDeveloperExhaustion",
+                       &out->print_morph_developer_exhaustion);
             env->DeleteLocalRef(pmorph);
         }
     }
 
     // ---- io ----
     if (io) {
-        out->scan_film = call_bool(env, io, "getScanFilm") ? 1 : 0;
-        out->output_cctf_encoding = call_bool(env, io, "getOutputCctfEncoding") ? 1 : 0;
-        out->input_cctf_decoding = call_bool(env, io, "getInputCctfDecoding") ? 1 : 0;
-        out->crop = call_bool(env, io, "getCrop") ? 1 : 0;
-        out->upscale_factor = call_float(env, io, "getUpscaleFactor");
+        jobject ics = call_obj(env, io, "getInputColorSpace",
+            "()Ljava/lang/String;");
+        if (ics) {
+            store->input_color_space = jstr(env, static_cast<jstring>(ics));
+            env->DeleteLocalRef(ics);
+            if (!store->input_color_space.empty()) {
+                out->input_color_space = store->input_color_space.c_str();
+            }
+        }
+        read_bool_i32(env, io, "getScanFilm", &out->scan_film);
+        read_bool_i32(env, io, "getOutputCctfEncoding",
+                      &out->output_cctf_encoding);
+        read_bool_i32(env, io, "getInputCctfDecoding",
+                      &out->input_cctf_decoding);
+        read_bool_i32(env, io, "getCrop", &out->crop);
+        read_float(env, io, "getUpscaleFactor", &out->upscale_factor);
         read_pair_f(env, io, "getCropCenter", out->crop_center);
         read_pair_f(env, io, "getCropSize", out->crop_size);
         jobject ocs = call_obj(env, io, "getOutputColorSpace",
@@ -488,27 +934,44 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
             "()Lcom/spectrafilm/engine/Rgb2Raw;");
         out->rgb_to_raw_method = enum_ordinal_rgb2raw(env, m);
         if (m) env->DeleteLocalRef(m);
-        out->apply_hanatos_window =
-            call_bool(env, settings, "getApplyHanatos2025AdaptationWindow") ? 1 : 0;
-        out->apply_hanatos_surface =
-            call_bool(env, settings, "getApplyHanatos2025AdaptationSurface") ? 1 : 0;
-        out->spectral_gaussian_blur = call_float(env, settings, "getSpectralGaussianBlur");
-        out->use_enlarger_lut = call_bool(env, settings, "getUseEnlargerLut") ? 1 : 0;
-        out->use_scanner_lut = call_bool(env, settings, "getUseScannerLut") ? 1 : 0;
+        read_bool_i32(env, settings, "getApplyHanatos2025AdaptationWindow",
+                      &out->apply_hanatos_window);
+        read_bool_i32(env, settings, "getApplyHanatos2025AdaptationSurface",
+                      &out->apply_hanatos_surface);
+        read_float(env, settings, "getSpectralGaussianBlur",
+                   &out->spectral_gaussian_blur);
+        read_bool_i32(env, settings, "getUseEnlargerLut", &out->use_enlarger_lut);
+        read_bool_i32(env, settings, "getUseScannerLut", &out->use_scanner_lut);
         // GPU preview fast-path toggle (GPU M1, #146; default false). Consulted
         // only by spk_simulate_preview — export renders ignore it by design.
-        out->gpu_preview = call_bool(env, settings, "getGpuPreview") ? 1 : 0;
+        read_bool_i32(env, settings, "getGpuPreview", &out->gpu_preview);
         // Experimental GPU export toggle (#154; default false). Consulted only by
         // spk_simulate (export); preview clears it, tap/bake hard-zero the latch.
-        out->gpu_export = call_bool(env, settings, "getGpuExport") ? 1 : 0;
-        out->lut_resolution = call_int(env, settings, "getLutResolution");
-        out->preview_max_size = call_int(env, settings, "getPreviewMaxSize");
-        out->neutral_print_filters_from_database =
-            call_bool(env, settings, "getNeutralPrintFiltersFromDatabase") ? 1 : 0;
+        read_bool_i32(env, settings, "getGpuExport", &out->gpu_export);
+        read_int(env, settings, "getLutResolution", &out->lut_resolution);
+        read_int(env, settings, "getPreviewMaxSize", &out->preview_max_size);
+        read_bool_i32(env, settings, "getNeutralPrintFiltersFromDatabase",
+                      &out->neutral_print_filters_from_database);
     }
 
     // Tone curve (top-level packed float[]); OFF by default => no-op.
     read_tone_curve(env, params, out);
+
+    // DIAGNOSTIC: dump what actually crossed the boundary.
+    //
+    // Exists because a whole route was reported rendering a flat constant and the
+    // params were read off the UI, which is not the same thing -- #143 is an entire
+    // batch of "params that lie", i.e. controls whose displayed value and marshalled
+    // value disagree. Reading a slider is evidence about the slider. This is evidence
+    // about the engine's input, which is what a repro needs.
+    //
+    // Off unless the system property is set, so it costs a getprop per render and
+    // nothing else:  adb shell setprop debug.spektra.dumpparams 1
+    // Deliberately covers the values a repro has to match: route, the stochastic and
+    // spatial gates, grain (whose density_min feeds the GRAIN MODEL at
+    // spektra.cpp:763, not only the opt-in LUT domain), the scanner corrections and
+    // their levels, and the profiles.
+    dump_marshalled_params(out);
 
     if (camera) env->DeleteLocalRef(camera);
     if (enlarger) env->DeleteLocalRef(enlarger);
@@ -517,7 +980,7 @@ bool marshal_params(JNIEnv* env, jobject params, spk_params* out, ParamStorage* 
     if (printR) env->DeleteLocalRef(printR);
     if (io) env->DeleteLocalRef(io);
     if (settings) env->DeleteLocalRef(settings);
-    return true;
+    return !env->ExceptionCheck();
 }
 
 }  // namespace
@@ -539,6 +1002,9 @@ JNI(jlong, nativeCreate)(JNIEnv* env, jobject /*thiz*/, jstring assetDir) try {
     return 0;
 } catch (const std::exception& e) {
     throw_cpp_exception(env, e);
+    return 0;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
     return 0;
 }
 
@@ -578,21 +1044,43 @@ JNI(jlong, nativeCreateFromAssets)(JNIEnv* env, jobject /*thiz*/,
 } catch (const std::exception& e) {
     throw_cpp_exception(env, e);
     return 0;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return 0;
 }
 
-JNI(void, nativeDestroy)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+JNI(void, nativeDestroy)(JNIEnv* env, jobject /*thiz*/, jlong handle) try {
     spk_engine_destroy(reinterpret_cast<spk_engine*>(handle));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+} catch (...) {
+    throw_unknown_cpp_exception(env);
 }
 
 JNI(jstring, nativeListProfiles)(JNIEnv* env, jobject /*thiz*/, jlong handle) try {
     spk_engine* eng = reinterpret_cast<spk_engine*>(handle);
-    if (!eng) return env->NewStringUTF("");
+    if (!eng) {
+        throw_runtime(env, "spektra: engine handle is null");
+        return nullptr;
+    }
     size_t needed = 0;
-    spk_engine_list_profiles(eng, nullptr, 0, &needed);
-    if (needed == 0) return env->NewStringUTF("");
+    spk_status st = spk_engine_list_profiles(eng, nullptr, 0, &needed);
+    if (st != SPK_OK) {
+        throw_status(env, st);
+        return nullptr;
+    }
+    if (needed == 0) {
+        throw_runtime(env, "spektra: profile list returned an invalid size");
+        return nullptr;
+    }
     std::vector<char> buf(needed);
-    if (spk_engine_list_profiles(eng, buf.data(), buf.size(), &needed) != SPK_OK)
-        return env->NewStringUTF("");
+    st = spk_engine_list_profiles(eng, buf.data(), buf.size(), &needed);
+    if (st != SPK_OK) {
+        throw_status(env, st);
+        return nullptr;
+    }
     return env->NewStringUTF(buf.data());
 } catch (const std::bad_alloc&) {
     throw_native_oom(env);
@@ -600,17 +1088,65 @@ JNI(jstring, nativeListProfiles)(JNIEnv* env, jobject /*thiz*/, jlong handle) tr
 } catch (const std::exception& e) {
     throw_cpp_exception(env, e);
     return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
+}
+
+JNI(jstring, nativeTcLutCacheStatsJson)(JNIEnv* env, jobject /*thiz*/,
+                                        jlong handle) try {
+    spk_engine* eng = reinterpret_cast<spk_engine*>(handle);
+    if (!eng) {
+        throw_runtime(env, "spektra: engine handle is null");
+        return nullptr;
+    }
+    char json[2048]{};
+    if (spk_engine_tc_lut_cache_stats_json(
+            eng, json, static_cast<int>(sizeof(json))) <= 0) {
+        throw_runtime(env, "spektra: failed to format tc_lut cache diagnostics");
+        return nullptr;
+    }
+    jstring result = env->NewStringUTF(json);
+    if (!result && !env->ExceptionCheck()) {
+        throw_runtime(env, "spektra: failed to create tc_lut cache diagnostics");
+    }
+    return result;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return nullptr;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
 }
 
 /*
- * nativeSimulate(handle, inBuf, w, h, inCs, paramsObj, preview) -> SimResult.
+ * nativeSimulate(handle, inBuf, w, h, inCs, paramsObj, preview, renderKind,
+ *                cancellation)
+ *     -> SimResult(data, width, height, colorSpace, renderId).
  * Reads a direct float ByteBuffer of w*h*3 floats, marshals the params, runs
  * spk_simulate(_preview), and wraps the result into a SimResult with a fresh
  * direct float ByteBuffer.
  */
 JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
                              jobject inBuf, jint w, jint h, jstring inCs,
-                             jobject paramsObj, jboolean preview) try {
+                             jobject paramsObj, jboolean preview,
+                             jint renderKind, jobject cancellation) try {
+    StageTimingLogGuard timing_log;
+    spk::RenderTimingKind logical_kind = spk::RTK_UNKNOWN;
+    const bool valid_kind = render_kind_from_jni(renderKind, preview, &logical_kind);
+    spk::ScopedRenderTiming timing(valid_kind ? logical_kind : spk::RTK_UNKNOWN);
+    const uint64_t render_id = timing.render_id();
+    timing_log.expect(render_id);
+    spk_diffusion_reset_fft_fallbacks();
+    if (!valid_kind) {
+        timing.finish(SPK_ERR_BAD_ARGS);
+        throw_runtime(env, "spektra: invalid render kind for preview/exact route");
+        return nullptr;
+    }
+
     spk_engine* eng = reinterpret_cast<spk_engine*>(handle);
     if (!eng) { throw_runtime(env, "spektra: engine handle is null"); return nullptr; }
     if (!inBuf) { throw_runtime(env, "spektra: input ByteBuffer is null"); return nullptr; }
@@ -619,21 +1155,8 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         return nullptr;
     }
 
-    float* in_data = static_cast<float*>(env->GetDirectBufferAddress(inBuf));
-    if (!in_data) {
-        throw_runtime(env, "spektra: input ByteBuffer is not direct");
-        return nullptr;
-    }
-    // Reject buffers too small for w*h*3 float32 to avoid out-of-bounds reads.
-    // The required byte count is computed in 64-bit to avoid overflow.
-    const jlong cap = env->GetDirectBufferCapacity(inBuf);
-    const int64_t need_bytes =
-        static_cast<int64_t>(w) * h * 3 * static_cast<int64_t>(sizeof(float));
-    if (cap < 0 || static_cast<int64_t>(cap) < need_bytes) {
-        throw_runtime(env, "spektra: input ByteBuffer capacity too small for "
-                           "width*height*3*4 bytes");
-        return nullptr;
-    }
+    float* in_data = nullptr;
+    if (!direct_float_input(env, inBuf, w, h, &in_data)) return nullptr;
 
     // Honor the buffer's colour-space tag. The engine ingests linear ProPhoto RGB
     // only (runtime InputColorSpace has a single value, kProPhotoRGB); every decode
@@ -659,6 +1182,8 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         throw_runtime(env, "spektra: failed to marshal params");
         return nullptr;
     }
+    JniCancellation cancellation_probe(env, cancellation);
+    if (!cancellation_probe.initialize()) return nullptr;
 
     // Input is linear ProPhoto RGB (validated above); the engine's filming stage
     // interprets it as such (FilmingParams::input_color_space == kProPhotoRGB).
@@ -672,8 +1197,13 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     // change output pixels. Preview renders keep the memos — that is what
     // they exist for.
     if (!preview) params.disable_buffer_memos = 1;
-    spk_status st = preview ? spk_simulate_preview(eng, &in_img, &params, &out)
-                            : spk_simulate(eng, &in_img, &params, &out);
+    spk_status st = preview
+        ? spk_simulate_preview_cancellable(
+              eng, &in_img, &params, &out, cancellation_probe.callback(),
+              cancellation_probe.context())
+        : spk_simulate_cancellable(
+              eng, &in_img, &params, &out, cancellation_probe.callback(),
+              cancellation_probe.context());
 #ifdef __ANDROID__
     // One-time diagnostic when the GPU preview self-check failed (state 2): the
     // preview silently stays on the CPU path for this process (#146 mandate —
@@ -682,10 +1212,10 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         // One-time logs so the toggle is externally verifiable from logcat
         // (#146 on-device validation found silence was ambiguous: only the
         // failure case logged, so "passed" and "never ran" looked identical).
-        static bool gpu_state_logged = false;
+        static std::atomic<bool> gpu_state_logged{false};
         const int gpu_state = spk_gpu_scan_state();
-        if (!gpu_state_logged && gpu_state != 0) {
-            gpu_state_logged = true;
+        if (gpu_state != 0 &&
+            !gpu_state_logged.exchange(true, std::memory_order_relaxed)) {
             if (gpu_state == 1) {
                 __android_log_print(ANDROID_LOG_INFO, "Spektra",
                                     "gpu preview self-check PASSED on this device/driver");
@@ -695,26 +1225,43 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
                                     "previews stay on the CPU path this session");
             }
         }
-        static bool gpu_engaged_logged = false;
-        if (!gpu_engaged_logged && spk_gpu_scan_frames() > 0) {
-            gpu_engaged_logged = true;
+        static std::atomic<bool> gpu_engaged_logged{false};
+        if (spk_gpu_scan_frames() > 0 &&
+            !gpu_engaged_logged.exchange(true, std::memory_order_relaxed)) {
             __android_log_print(ANDROID_LOG_INFO, "Spektra",
                                 "gpu scan path ACTIVE (eligible preview frames render on the GPU)");
         }
-    }
-    // Per-stage/per-filter timing of this render (#146/#152): one line so the
-    // owner can see where the latency goes (grain/halation/filming vs scan, and
-    // the cold-start LUT bakes). Empty only if nothing ran.
-    {
-        char tbuf[512];
-        if (spk_stage_timings(tbuf, sizeof(tbuf)) > 0) {
+        // Same pair for the PRINT-EXPOSE offload (perf lab). It is a separate
+        // kernel dispatch with its own self-check, and it only runs on the print
+        // route, so "scan ACTIVE" says nothing about it — without these two the
+        // print offload would be exactly the ambiguous silence #146 called out.
+        static std::atomic<bool> gpu_print_state_logged{false};
+        const int gpu_print = spk_gpu_print_state();
+        if (gpu_print != 0 &&
+            !gpu_print_state_logged.exchange(true, std::memory_order_relaxed)) {
+            if (gpu_print == 1) {
+                __android_log_print(ANDROID_LOG_INFO, "Spektra",
+                                    "gpu print-expose self-check PASSED on this device/driver");
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, "Spektra",
+                                    "gpu print-expose self-check FAILED on this device/driver; "
+                                    "the print integral stays on the CPU path this session");
+            }
+        }
+        static std::atomic<bool> gpu_print_engaged_logged{false};
+        if (spk_gpu_print_frames() > 0 &&
+            !gpu_print_engaged_logged.exchange(true, std::memory_order_relaxed)) {
             __android_log_print(ANDROID_LOG_INFO, "Spektra",
-                                "stage timings ms [%s]: %s",
-                                preview ? "preview" : "export", tbuf);
+                                "gpu print-expose path ACTIVE (print-route frames render "
+                                "their spectral integral on the GPU)");
         }
     }
 #endif
-    if (st != SPK_OK) { throw_status(env, st); return nullptr; }
+    if (st != SPK_OK) {
+        timing.finish(st);
+        throw_status(env, st);
+        return nullptr;
+    }
     if (!out.data) { throw_runtime(env, "spektra: engine returned no data"); return nullptr; }
 
     // Hand the output back as a NATIVE (off-heap) direct ByteBuffer rather than a
@@ -724,20 +1271,27 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     // (OutOfMemoryError). Adobe Lightroom's native engine keeps full-res pixels in
     // native memory and never crosses them to the Java heap; we mirror that here by
     // malloc'ing the result and wrapping it with NewDirectByteBuffer. The Kotlin
-    // SimResult owns it and frees it via SimResult.freeDirectBuffer (below).
-    const size_t n = static_cast<size_t>(out.width) * out.height * 3;
-
-    // Guard against >2 GiB: NewDirectByteBuffer takes a jlong capacity, but the Kotlin
-    // side reads it through a jint-indexed FloatBuffer, so keep the existing 2 GiB cap.
-    // Computed in int64 to avoid its own overflow. (Security review F2.)
-    const int64_t out_bytes = static_cast<int64_t>(n) * static_cast<int64_t>(sizeof(float));
-    if (out_bytes > static_cast<int64_t>(INT32_MAX)) {
+    // SimResult owns it with the registry-issued token and releases it through
+    // the token-aware private JNI bridge below.
+    std::uint64_t out_bytes64 = 0;
+    if (!spk::jni::checked_rgb_f32_bytes(out.width, out.height, &out_bytes64) ||
+        out_bytes64 > static_cast<std::uint64_t>(INT32_MAX) ||
+        out_bytes64 > static_cast<std::uint64_t>(
+                          std::numeric_limits<std::size_t>::max())) {
         spk_image_free(&out);
-        throw_runtime(env, "spektra: output image too large for a direct ByteBuffer (>2 GiB)");
+        throw_runtime(env, "spektra: invalid or oversized engine output dimensions");
         return nullptr;
     }
+    const size_t out_bytes = static_cast<size_t>(out_bytes64);
 
-    void* native_buf = std::malloc(static_cast<size_t>(out_bytes));
+    auto native_reservation = g_allocations.reserve(
+        out_bytes, spk::memory::MemoryStage::JniSimResult);
+    if (!native_reservation) {
+        spk_image_free(&out);
+        throw_native_oom(env);
+        return nullptr;
+    }
+    void* native_buf = std::malloc(out_bytes);
     if (!native_buf) {
         spk_image_free(&out);
         jclass oom = env->FindClass("java/lang/OutOfMemoryError");
@@ -745,13 +1299,22 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         else throw_runtime(env, "spektra: failed to allocate native output buffer");
         return nullptr;
     }
-    std::memcpy(native_buf, out.data, static_cast<size_t>(out_bytes));
+    if (!spk::jni::copy_bytes_cancellable(
+            native_buf, out.data, out_bytes, cancellation_probe.callback(),
+            cancellation_probe.context())) {
+        std::free(native_buf);
+        spk_image_free(&out);
+        timing.finish(SPK_ERR_CANCELLED);
+        if (!env->ExceptionCheck()) throw_status(env, SPK_ERR_CANCELLED);
+        return nullptr;
+    }
 
     // Capture dims BEFORE freeing the engine-side image.
     int out_w = out.width, out_h = out.height, out_cs = out.color_space;
     spk_image_free(&out);  // engine-side copy no longer needed
 
-    jobject outBuf = env->NewDirectByteBuffer(native_buf, out_bytes);
+    jobject outBuf = env->NewDirectByteBuffer(
+        native_buf, static_cast<jlong>(out_bytes));
     if (env->ExceptionCheck() || !outBuf) {
         std::free(native_buf);
         if (!env->ExceptionCheck())
@@ -759,7 +1322,27 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         return nullptr;
     }
 
-    // Build the SimResult(data: ByteBuffer, width: Int, height: Int, colorSpace: ColorSpace).
+    // Register before constructing Kotlin ownership so a constructor failure can
+    // release through the same opaque token without a double-free race.
+    std::uint64_t allocation_token = 0;
+    bool registered = false;
+    try {
+        registered = g_allocations.add_reserved(
+            native_buf, out_bytes, &allocation_token,
+            native_reservation);
+    } catch (...) {
+        std::free(native_buf);
+        throw;
+    }
+    if (!registered || allocation_token == 0) {
+        std::free(native_buf);
+        throw_runtime(env, "spektra: failed to register native output buffer");
+        return nullptr;
+    }
+
+    // Build SimResult(data, width, height, colorSpace, renderId, allocationToken). Capture the id
+    // from the LIVE outer scope above; the public completed-snapshot getter still
+    // points at the previous render until declaration-order RAII publishes us.
     // NOTE: NewDirectByteBuffer does NOT take ownership — if SimResult is never
     // constructed below, the Kotlin side can't free native_buf, so every failure
     // path from here on must std::free(native_buf) to avoid leaking the result.
@@ -767,7 +1350,7 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     if (!csCls) {
         env->ExceptionClear();
         env->DeleteLocalRef(outBuf);
-        std::free(native_buf);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         throw_runtime(env, "spektra: ColorSpace class not found");
         return nullptr;
     }
@@ -793,15 +1376,17 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         if (csArr) env->DeleteLocalRef(csArr);
         if (csObj) env->DeleteLocalRef(csObj);
         env->DeleteLocalRef(outBuf);
-        std::free(native_buf);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         throw_runtime(env, "spektra: SimResult class not found");
         return nullptr;
     }
     jmethodID resCtor = env->GetMethodID(resCls, "<init>",
-        "(Ljava/nio/ByteBuffer;IILcom/spectrafilm/engine/ColorSpace;)V");
+        "(Ljava/nio/ByteBuffer;IILcom/spectrafilm/engine/ColorSpace;JJ)V");
     jobject result = nullptr;
     if (resCtor) {
-        result = env->NewObject(resCls, resCtor, outBuf, out_w, out_h, csObj);
+        result = env->NewObject(resCls, resCtor, outBuf, out_w, out_h, csObj,
+                                static_cast<jlong>(render_id),
+                                static_cast<jlong>(allocation_token));
         if (env->ExceptionCheck()) { env->ExceptionClear(); result = nullptr; }
     } else {
         env->ExceptionClear();
@@ -812,12 +1397,26 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
     env->DeleteLocalRef(resCls);
     env->DeleteLocalRef(outBuf);
     if (!result) {
-        // SimResult construction failed: nothing on the Kotlin side will free the
-        // native result buffer, so release it here.
-        std::free(native_buf);
+        // Kotlin init may already have token-released the buffer; `take` makes
+        // this constructor rollback exact-once either way.
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
         throw_runtime(env, "spektra: failed to construct SimResult");
         return nullptr;
     }
+    // Object construction and allocation registration happen after the chunked
+    // copy. Poll once more at the publication boundary so cancellation arriving
+    // during that JNI work cannot return a stale successful SimResult. A request
+    // after this poll is ordered after the native operation's commit point.
+    const spk_cancel_check final_cancel_check = cancellation_probe.callback();
+    if (final_cancel_check &&
+        final_cancel_check(cancellation_probe.context()) != 0) {
+        env->DeleteLocalRef(result);
+        (void)free_registered_allocation(native_buf, out_bytes, allocation_token);
+        timing.finish(SPK_ERR_CANCELLED);
+        if (!env->ExceptionCheck()) throw_status(env, SPK_ERR_CANCELLED);
+        return nullptr;
+    }
+    timing.finish(SPK_OK);
     return result;
 } catch (const std::bad_alloc&) {
     throw_native_oom(env);
@@ -825,44 +1424,165 @@ JNI(jobject, nativeSimulate)(JNIEnv* env, jobject /*thiz*/, jlong handle,
 } catch (const std::exception& e) {
     throw_cpp_exception(env, e);
     return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
 }
 
 /*
  * SimResult.freeDirectBuffer(buf) — release a native (malloc + NewDirectByteBuffer)
- * engine-output buffer. Called from SimResult.close(). Named to match the Kotlin
+ * engine-output buffer only when its opaque allocation token matches. The JNI ABI is
+ * `(ByteBuffer, long token)`. Called from
+ * SimResult.close(). Named to match the Kotlin
  * @JvmStatic companion method (Java_com_spectrafilm_engine_SimResult_freeDirectBuffer),
- * NOT the SpektraEngine JNI() macro. free(nullptr) is a no-op, and freeing a buffer
- * whose address can't be resolved is skipped.
+ * NOT the SpektraEngine JNI() macro. Foreign, duplicate, stale-token, and wrong-token
+ * release attempts are skipped.
  */
 extern "C" JNIEXPORT void JNICALL
 Java_com_spectrafilm_engine_SimResult_freeDirectBuffer(JNIEnv* env, jclass /*clazz*/,
-                                                       jobject buf) {
-    if (!buf) return;
+                                                       jobject buf, jlong token) try {
+    if (!buf || token <= 0) return;
     void* p = env->GetDirectBufferAddress(buf);
-    if (p) std::free(p);
+    const jlong capacity = env->GetDirectBufferCapacity(buf);
+    if (!p || capacity <= 0 ||
+        static_cast<std::uint64_t>(capacity) >
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        return;
+    }
+    const size_t size = static_cast<size_t>(capacity);
+    (void)free_registered_allocation(
+        p, size, static_cast<std::uint64_t>(token));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+} catch (...) {
+    throw_unknown_cpp_exception(env);
 }
 
 /*
- * SimResult.allocDirectBuffer(size) -> ByteBuffer (malloc + NewDirectByteBuffer) or null.
+ * SimResult.nativeReportRenderOutcome(renderId, outcome) — keyed app-level
+ * disposition emitted after native completion. A successful native render may
+ * still be superseded/cancelled before Compose publishes it; release benchmark
+ * consumers fold the latest event per renderId and exclude discarded work.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_spectrafilm_engine_SimResult_nativeReportRenderOutcome(
+    JNIEnv* env, jclass /*clazz*/, jlong render_id, jint outcome_code) try {
+    if (render_id <= 0 || !timing_automation_enabled()) return;
+    if (outcome_code < static_cast<jint>(spk::ARO_CONSUMED) ||
+        outcome_code > static_cast<jint>(spk::ARO_FAILED)) {
+        return;
+    }
+    const auto outcome = static_cast<spk::AppRenderOutcome>(outcome_code);
+#ifdef __ANDROID__
+    char json[256];
+    if (spk::stage_timing_outcome_json_format(
+            json, sizeof(json), static_cast<uint64_t>(render_id), outcome) > 0) {
+        __android_log_print(ANDROID_LOG_INFO, "Spektra",
+                            "render outcome json: %s", json);
+    }
+    if (ATrace_isEnabled()) {
+        char trace_name[96];
+        std::snprintf(trace_name, sizeof(trace_name),
+                      "spk.render_outcome.%s#%llu",
+                      spk::app_render_outcome_name(outcome),
+                      static_cast<unsigned long long>(render_id));
+        ATrace_beginSection(trace_name);
+        ATrace_endSection();
+    }
+#else
+    (void)outcome;
+#endif
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+}
+
+/*
+ * SimResult.allocDirectBuffer(size) -> NativeBufferAllocation or null.
  * An OFF-HEAP direct buffer of `size` bytes, NOT on the ART managed heap (unlike
  * ByteBuffer.allocateDirect, which on Android is a non-movable byte[] counting against the
  * ~256 MB heap-growth limit). Used for large export staging buffers (e.g. the 16-bit
- * TIFF/PNG quantise buffer, ~600 MB at 100 MP). The caller MUST free it with
- * freeDirectBuffer(). Returns null on bad size or OOM (caller falls back to managed).
+ * TIFF/PNG quantise buffer, ~600 MB at 100 MP). The returned opaque token is
+ * required for release. Returns null on bad size or OOM (caller falls back to managed).
  */
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_spectrafilm_engine_SimResult_allocDirectBuffer(JNIEnv* env, jclass /*clazz*/,
-                                                        jlong size) {
-    if (size <= 0) return nullptr;
+                                                        jlong size) try {
+    if (size <= 0 || size > static_cast<jlong>(INT32_MAX) ||
+        static_cast<std::uint64_t>(size) >
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        return nullptr;
+    }
+    auto native_reservation = g_allocations.reserve(
+        static_cast<size_t>(size),
+        spk::memory::MemoryStage::JniDirectBuffer);
+    if (!native_reservation) {
+        throw_native_oom(env);
+        return nullptr;
+    }
     void* p = std::malloc(static_cast<size_t>(size));
-    if (!p) return nullptr;
+    if (!p) {
+        throw_native_oom(env);
+        return nullptr;
+    }
     jobject buf = env->NewDirectByteBuffer(p, size);
     if (!buf) { std::free(p); return nullptr; }  // wrap failed -> don't leak
-    return buf;
+    std::uint64_t allocation_token = 0;
+    bool registered = false;
+    try {
+        registered = g_allocations.add_reserved(
+            p, static_cast<size_t>(size), &allocation_token,
+            native_reservation);
+    } catch (...) {
+        std::free(p);
+        throw;
+    }
+    if (!registered || allocation_token == 0) {
+        std::free(p);
+        throw_native_oom(env);
+        return nullptr;
+    }
+    jclass allocation_cls = env->FindClass("com/spectrafilm/engine/NativeBufferAllocation");
+    if (!allocation_cls) {
+        env->ExceptionClear();
+        (void)free_registered_allocation(
+            p, static_cast<size_t>(size), allocation_token);
+        return nullptr;
+    }
+    jmethodID allocation_ctor = env->GetMethodID(
+        allocation_cls, "<init>", "(Ljava/nio/ByteBuffer;J)V");
+    jobject allocation = nullptr;
+    if (allocation_ctor) {
+        allocation = env->NewObject(allocation_cls, allocation_ctor, buf,
+                                    static_cast<jlong>(allocation_token));
+    }
+    env->DeleteLocalRef(allocation_cls);
+    env->DeleteLocalRef(buf);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!allocation) {
+        (void)free_registered_allocation(
+            p, static_cast<size_t>(size), allocation_token);
+        return nullptr;
+    }
+    return allocation;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return nullptr;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
 }
 
 /*
- * nativeMeterExposureEv(handle, inBuf, w, h, paramsObj) -> double EV.
+ * nativeMeterExposureEv(handle, inBuf, w, h, paramsObj, cancellation) -> double EV.
  * Meters the image the way a render would and returns the auto-exposure
  * compensation in EV (linear gain = 2**ev), without rendering. Used by the LUT
  * preview paths, which must supply the exposure gain themselves because a baked
@@ -870,7 +1590,9 @@ Java_com_spectrafilm_engine_SimResult_allocDirectBuffer(JNIEnv* env, jclass /*cl
  */
 JNI(jdouble, nativeMeterExposureEv)(JNIEnv* env, jobject /*thiz*/, jlong handle,
                                     jobject inBuf, jint w, jint h,
-                                    jobject paramsObj) try {
+                                    jstring inCs,
+                                    jobject paramsObj,
+                                    jobject cancellation) try {
     spk_engine* eng = reinterpret_cast<spk_engine*>(handle);
     if (!eng) { throw_runtime(env, "spektra: engine handle is null"); return 0.0; }
     if (!inBuf) { throw_runtime(env, "spektra: input ByteBuffer is null"); return 0.0; }
@@ -878,19 +1600,17 @@ JNI(jdouble, nativeMeterExposureEv)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         throw_runtime(env, "spektra: invalid image dimensions");
         return 0.0;
     }
-    float* in_data = static_cast<float*>(env->GetDirectBufferAddress(inBuf));
-    if (!in_data) {
-        throw_runtime(env, "spektra: input ByteBuffer is not direct");
-        return 0.0;
-    }
-    // Same 64-bit capacity guard as nativeSimulate: reject anything too small for
-    // w*h*3 float32 rather than reading out of bounds.
-    const jlong cap = env->GetDirectBufferCapacity(inBuf);
-    const int64_t need_bytes =
-        static_cast<int64_t>(w) * h * 3 * static_cast<int64_t>(sizeof(float));
-    if (cap < 0 || static_cast<int64_t>(cap) < need_bytes) {
-        throw_runtime(env, "spektra: input ByteBuffer capacity too small for "
-                           "width*height*3*4 bytes");
+    float* in_data = nullptr;
+    if (!direct_float_input(env, inBuf, w, h, &in_data)) return 0.0;
+
+    // Match nativeSimulate's input contract. Metering feeds the same ProPhoto
+    // luminance transform as rendering, so silently dropping LinearImage's tag
+    // would produce a plausible but physically wrong exposure value.
+    const std::string in_cs = jstr(env, inCs);
+    if (!in_cs.empty() && in_cs != "ProPhoto RGB") {
+        throw_runtime(env,
+            ("spektra: unsupported input color space '" + in_cs +
+             "' (the engine accepts linear ProPhoto RGB only)").c_str());
         return 0.0;
     }
 
@@ -900,10 +1620,14 @@ JNI(jdouble, nativeMeterExposureEv)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         throw_runtime(env, "spektra: failed to marshal params");
         return 0.0;
     }
+    JniCancellation cancellation_probe(env, cancellation);
+    if (!cancellation_probe.initialize()) return 0.0;
 
     spk_image img{in_data, w, h, static_cast<int32_t>(SPK_CS_PROPHOTO)};
     double ev = 0.0;
-    spk_status st = spk_meter_exposure_ev(eng, &img, &params, &ev);
+    spk_status st = spk_meter_exposure_ev_cancellable(
+        eng, &img, &params, &ev, cancellation_probe.callback(),
+        cancellation_probe.context());
     if (st != SPK_OK) { throw_status(env, st); return 0.0; }
     return static_cast<jdouble>(ev);
 } catch (const std::bad_alloc&) {
@@ -912,17 +1636,29 @@ JNI(jdouble, nativeMeterExposureEv)(JNIEnv* env, jobject /*thiz*/, jlong handle,
 } catch (const std::exception& e) {
     throw_cpp_exception(env, e);
     return 0.0;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return 0.0;
 }
 
 /*
- * nativeBakeCubeLut(handle, paramsObj, size) -> String (.cube text) or null.
+ * nativeBakeCubeLut(handle, paramsObj, size, shaper, cancellation)
+ *     -> LutBakeResult or null.
  * Marshals the params (reusing marshal_params), bakes a size^3 3D LUT of the
- * current film look, and returns the .cube text. The bake forces all spatial /
+ * current film look, and returns its text plus the logical render id. The bake
+ * forces all spatial /
  * stochastic effects off (see spk_bake_cube_lut). Sized in two passes: first to
- * learn the required buffer length, then to fill it.
+ * learn the required buffer length, then to fill it. Both passes are nested in
+ * one outer timing/log context, and the sizing query is successful.
  */
-JNI(jstring, nativeBakeCubeLut)(JNIEnv* env, jobject /*thiz*/, jlong handle,
-                                jobject paramsObj, jint size, jint shaper) try {
+JNI(jobject, nativeBakeCubeLut)(JNIEnv* env, jobject /*thiz*/, jlong handle,
+                                jobject paramsObj, jint size, jint shaper,
+                                jobject cancellation) try {
+    StageTimingLogGuard timing_log;
+    spk::ScopedRenderTiming timing(spk::RTK_LUT_BAKE);
+    const uint64_t render_id = timing.render_id();
+    timing_log.expect(render_id);
+
     spk_engine* eng = reinterpret_cast<spk_engine*>(handle);
     if (!eng) { throw_runtime(env, "spektra: engine handle is null"); return nullptr; }
 
@@ -932,27 +1668,220 @@ JNI(jstring, nativeBakeCubeLut)(JNIEnv* env, jobject /*thiz*/, jlong handle,
         throw_runtime(env, "spektra: failed to marshal params");
         return nullptr;
     }
+    JniCancellation cancellation_probe(env, cancellation);
+    if (!cancellation_probe.initialize()) return nullptr;
 
     size_t needed = 0;
-    spk_bake_cube_lut(eng, &params, size, shaper, nullptr, 0, &needed);
-    // The sizing pass returns SPK_ERR_BAD_ARGS (null buffer) but still sets
-    // `needed`; needed==0 means a real failure (bad profile, internal) — surface it.
-    if (needed == 0) {
-        // Re-run to capture the actual status for a meaningful message.
-        spk_status probe = spk_bake_cube_lut(eng, &params, size, shaper, nullptr, 0, &needed);
-        throw_status(env, probe == SPK_OK ? SPK_ERR_INTERNAL : probe);
+    spk_status st = spk_bake_cube_lut_cancellable(
+        eng, &params, size, shaper, nullptr, 0, &needed,
+        cancellation_probe.callback(), cancellation_probe.context());
+    if (st != SPK_OK || needed == 0) {
+        const spk_status failure = st == SPK_OK ? SPK_ERR_INTERNAL : st;
+        timing.finish(failure);
+        throw_status(env, failure);
         return nullptr;
     }
 
     std::vector<char> buf(needed);
-    spk_status st = spk_bake_cube_lut(eng, &params, size, shaper, buf.data(), buf.size(),
-                                      &needed);
-    if (st != SPK_OK) { throw_status(env, st); return nullptr; }
-    return env->NewStringUTF(buf.data());
+    st = spk_bake_cube_lut_cancellable(
+        eng, &params, size, shaper, buf.data(), buf.size(), &needed,
+        cancellation_probe.callback(), cancellation_probe.context());
+    if (st != SPK_OK) {
+        timing.finish(st);
+        throw_status(env, st);
+        return nullptr;
+    }
+
+    jstring text = env->NewStringUTF(buf.data());
+    if (!text) {
+        if (!env->ExceptionCheck()) {
+            throw_runtime(env, "spektra: failed to construct LUT text");
+        }
+        return nullptr;
+    }
+    jclass result_cls =
+        env->FindClass("com/spectrafilm/engine/LutBakeResult");
+    if (!result_cls) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(text);
+        throw_runtime(env, "spektra: LutBakeResult class not found");
+        return nullptr;
+    }
+    jmethodID ctor = env->GetMethodID(
+        result_cls, "<init>", "(Ljava/lang/String;J)V");
+    jobject result = nullptr;
+    if (ctor) {
+        result = env->NewObject(result_cls, ctor, text,
+                                static_cast<jlong>(render_id));
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            result = nullptr;
+        }
+    } else {
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(result_cls);
+    env->DeleteLocalRef(text);
+    if (!result) {
+        throw_runtime(env, "spektra: failed to construct LutBakeResult");
+        return nullptr;
+    }
+    timing.finish(SPK_OK);
+    return result;
 } catch (const std::bad_alloc&) {
     throw_native_oom(env);
     return nullptr;
 } catch (const std::exception& e) {
     throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
+}
+
+/*
+ * Process-wide memory-budget control. External JVM reservations account bytes
+ * owned by ART/Bitmap callers without giving native code permission to free
+ * them; opaque tokens release only the diagnostic/admission reservation.
+ */
+JNI(void, nativeConfigureMemoryBudget)(JNIEnv* env, jclass /*clazz*/,
+                                       jlong limit_bytes) try {
+    if (limit_bytes <= 0) {
+        throw_illegal_argument(env, "memory budget limit must be positive");
+        return;
+    }
+    spk::memory::process_memory_budget().set_limit_bytes(
+        static_cast<std::uint64_t>(limit_bytes));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+}
+
+JNI(jlong, nativeReserveJvmMemory)(JNIEnv* env, jclass /*clazz*/,
+                                   jlong bytes, jint stage_code) try {
+    spk::memory::MemoryStage stage = spk::memory::MemoryStage::Unknown;
+    if (bytes <= 0 ||
+        static_cast<std::uint64_t>(bytes) >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max()) ||
+        !memory_stage_from_code(stage_code, &stage)) {
+        throw_illegal_argument(
+            env, "invalid external JVM memory reservation request");
+        return 0;
+    }
+    return static_cast<jlong>(g_jvm_reservations.reserve(
+        static_cast<std::size_t>(bytes), stage));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return 0;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return 0;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return 0;
+}
+
+JNI(jboolean, nativeReleaseJvmMemory)(JNIEnv* env, jclass /*clazz*/,
+                                      jlong token) try {
+    if (token <= 0) return JNI_FALSE;
+    return g_jvm_reservations.release(static_cast<std::uint64_t>(token))
+               ? JNI_TRUE
+               : JNI_FALSE;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return JNI_FALSE;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return JNI_FALSE;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return JNI_FALSE;
+}
+
+JNI(jstring, nativeMemoryBudgetSnapshotJson)(JNIEnv* env,
+                                              jclass /*clazz*/) try {
+    const std::string json = spk::memory::memory_budget_snapshot_json(
+        spk::memory::process_memory_budget().snapshot());
+    jstring result = env->NewStringUTF(json.c_str());
+    if (!result && !env->ExceptionCheck()) {
+        throw_runtime(env, "spektra: failed to create memory budget snapshot");
+    }
+    return result;
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return nullptr;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return nullptr;
+}
+
+/*
+ * Big-core pinning (perf-lab, issue #117). The engine gates this on the
+ * SPK_BIG_CORES env var, which an Android app cannot set for its own process —
+ * the JVM is already up by the time any Kotlin runs. These two forward the
+ * setting so the win is reachable from the shipping build.
+ *
+ * Instance-less (@JvmStatic in the companion): pinning is a process-wide policy
+ * for the render pool, not per-engine state.
+ */
+JNI(void, nativeSetBigCores)(JNIEnv* env, jclass /*clazz*/, jint mode) try {
+    spk_set_big_cores(static_cast<int>(mode));
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+}
+
+JNI(jint, nativeBigCoreCount)(JNIEnv* env, jclass /*clazz*/) try {
+    return static_cast<jint>(spk_big_core_count());
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return 0;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return 0;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
+    return 0;
+}
+
+// Instrumentation seam for the actual jobject -> spk_params bridge. Keeping the
+// observation behind JNI catches getter names/signatures and tuple/member loss.
+// The engine instrumentation APK is not R8-minified; shipping-R8 reachability is
+// covered separately by the release integration gate. It also catches
+// appended selector wiring, and default survival—coverage a direct spk_params
+// host test cannot provide.
+JNI(jstring, nativeDebugMarshalledParams)(JNIEnv* env, jclass /*clazz*/,
+                                          jobject paramsObj) try {
+    spk_params params;
+    ParamStorage store;
+    if (!marshal_params(env, paramsObj, &params, &store)) {
+        if (!env->ExceptionCheck()) {
+            throw_runtime(env, "spektra: failed to marshal params");
+        }
+        return nullptr;
+    }
+    // Full named inventory, deliberately independent of ABI layout/padding.
+    // The device test builds expected values from the Kotlin tree, not from an
+    // observed JNI digest, so a getter already missing today cannot be blessed.
+    const std::string manifest = spk::params_manifest::named_inventory(params);
+    return env->NewStringUTF(manifest.c_str());
+} catch (const std::bad_alloc&) {
+    throw_native_oom(env);
+    return nullptr;
+} catch (const std::exception& e) {
+    throw_cpp_exception(env, e);
+    return nullptr;
+} catch (...) {
+    throw_unknown_cpp_exception(env);
     return nullptr;
 }

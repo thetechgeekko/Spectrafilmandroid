@@ -8,6 +8,16 @@
 #
 # Usage:  tools/parity/run_engine_parity.sh [build_dir]
 # Env:    JOBS=<n>   parallel compile jobs (default: CPU count)
+#
+# NOTE: a plain run reproduces the workflow's -O2 leg only. CI runs the same 40
+# tests TWICE, the second at the flags the engine actually ships with. To
+# reproduce that leg locally (measured green, and 20% larger codegen, so it is a
+# genuinely different binary rather than a no-op):
+#
+#   SPK_PARITY_EXTRA_FLAGS="-O3 -ffast-math -fno-finite-math-only" \
+#     bash tools/parity/run_engine_parity.sh
+#
+# The flags land after this script's own -O2, and the last -O wins.
 set -uo pipefail
 shopt -s nullglob
 
@@ -24,6 +34,19 @@ cd "$CPP"
 SRC=(spektra.cpp gpu/*.cpp kernels/*.cpp io/*.cpp model/*.cpp profiles/*.cpp runtime/*.cpp runtime/stages/*.cpp)
 DEF=(-DSPK_TEST_DIR="\"$CPP/tests\"")
 
+# Optional extra compile flags + sources, so an OPT-IN build variant can be gated
+# against the SAME table CI runs rather than a hand-picked subset. The default is
+# empty, so a plain invocation is byte-for-byte the CI build.
+#
+#   SPK_PARITY_EXTRA_FLAGS="-DSPK_ENABLE_HIGHWAY -I/path/to/highway ..." \
+#   SPK_PARITY_EXTRA_SRC="/path/to/highway/hwy/*.cc" \
+#     bash tools/parity/run_engine_parity.sh
+#
+# This does not touch the (test, argv) table, so the CI drift check above still
+# compares like for like.
+read -r -a EXTRA_FLAGS <<< "${SPK_PARITY_EXTRA_FLAGS:-}"
+read -r -a EXTRA_SRC <<< "${SPK_PARITY_EXTRA_SRC:-}"
+
 # The (test, argv) table, mirroring the workflow's build_run calls in order.
 TESTS=(
   "test_simulate_e2e|$ASSET|$G/scan_portra|tests/scan_portra_input_rgb.f64|$G"
@@ -35,6 +58,7 @@ TESTS=(
   "test_small_preview_aa|$ASSET|$G/small_preview_aa|tests/small_preview_aa_input_rgb.f64|$G"
   "test_diffusion|$G"
   "test_diffusion_e2e|$ASSET|$G/scan_diffusion|tests/scan_portra_input_rgb.f64|$G"
+  "test_fft_convolve"
   "test_spectral_blur_e2e|$ASSET|$G/scan_spectral_blur|tests/scan_portra_input_rgb.f64|$G"
   "test_hanatos_surface_e2e|$ASSET|$G/scan_portra_surface|tests/scan_portra_input_rgb.f64|$G"
   "test_camera_uvir_e2e|$ASSET|$G/scan_portra_uvir|tests/scan_portra_input_rgb.f64|$G"
@@ -47,6 +71,8 @@ TESTS=(
   "test_gamut_out_aces|tests/gamut_aces_cases.bin"
   "test_gamut_out_oklch|tests/gamut_oklch_cases.bin"
   "test_gamut_out_oklrab|tests/gamut_oklrab_cases.bin"
+  "test_gamut_out_jzazbz|tests/gamut_jzazbz_cases.bin"
+  "test_gamut_out_cam16ucs|tests/gamut_cam16ucs_cases.bin"
   "test_gamut_in_xy|tests/gamut_in_cases.bin"
   "test_lut_accel|$G"
   "test_lut_cache_e2e|$ASSET|tests/scan_portra_input_rgb.f64"
@@ -64,6 +90,7 @@ TESTS=(
   "test_print_spatial_e2e|$ASSET|$G/print_portra_spatial|tests/scan_portra_input_rgb.f64|$G"
   "test_grain|$G/scan_portra/film_density_cmy.spkvec|tests/grain_ref_density.spkvec"
   "test_grain_sublayer|$G/scan_portra/film_density_cmy.spkvec|tests/grain_sublayer_ref_density.spkvec|$ASSET/profiles/kodak_portra_400.json"
+  "test_binomial_shortcircuit"
 )
 
 echo "engine-parity: ${#TESTS[@]} tests -> $OUT (jobs=$JOBS)"
@@ -85,8 +112,15 @@ fi
 pids=()
 for entry in "${TESTS[@]}"; do
   name="${entry%%|*}"
+  test_defs=()
+  if [ "$name" = "test_fft_convolve" ]; then
+    test_defs=(-DSPK_FFT_CONVOLVE_TEST_HOOKS=1)
+  fi
   ( g++ -std=c++17 -O2 -pthread -I. -I"$ROOT/tools/parity" "${DEF[@]}" \
-      "tests/$name.cpp" "${SRC[@]}" -o "$OUT/$name" 2> "$OUT/$name.build" ) &
+      "${test_defs[@]}" \
+      ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+      "tests/$name.cpp" "${SRC[@]}" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} \
+      -o "$OUT/$name" 2> "$OUT/$name.build" ) &
   pids+=($!)
   # Throttle without `wait -n` (absent from the bash 3.2 shipped on macOS).
   while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.2; done

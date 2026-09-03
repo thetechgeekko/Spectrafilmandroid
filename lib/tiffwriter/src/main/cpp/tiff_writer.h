@@ -65,8 +65,16 @@ struct TiffMetadata {
 
 struct TiffWriteResult {
     bool ok = false;
+    bool cancelled = false;
     std::string error;       // populated when ok == false
     size_t bytesWritten = 0; // size of the produced file / buffer
+};
+
+// Optional cooperative cancellation. The callback runs synchronously on the
+// writer thread and must not throw. A null callback means "not cancellable".
+struct TiffCancellation {
+    void* context = nullptr;
+    bool (*isCancelled)(void* context) noexcept = nullptr;
 };
 
 // --- Core writer: 16-bit/sample interleaved RGB -----------------------------
@@ -79,12 +87,14 @@ struct TiffWriteResult {
 // Encode to an in-memory byte vector (host-test friendly; no filesystem).
 TiffWriteResult writeTiff16ToMemory(const uint16_t* rgb16, int width, int height,
                                     const TiffMetadata& meta, TiffCompression compression,
-                                    std::vector<uint8_t>& outBytes);
+                                    std::vector<uint8_t>& outBytes,
+                                    const TiffCancellation* cancellation = nullptr);
 
 // Encode and write to a filesystem path.
 TiffWriteResult writeTiff16ToFile(const uint16_t* rgb16, int width, int height,
                                   const TiffMetadata& meta, TiffCompression compression,
-                                  const std::string& path);
+                                  const std::string& path,
+                                  const TiffCancellation* cancellation = nullptr);
 
 // --- True 32-bit IEEE-float writer (SampleFormat=3, BitsPerSample=32) ---------
 //
@@ -94,11 +104,13 @@ TiffWriteResult writeTiff16ToFile(const uint16_t* rgb16, int width, int height,
 // as the 16-bit writer; round-trips through libtiff / Photoshop / darktable / Resolve.
 TiffWriteResult writeTiff32fToMemory(const float* rgbFloat, int width, int height,
                                      const TiffMetadata& meta, TiffCompression compression,
-                                     std::vector<uint8_t>& outBytes);
+                                     std::vector<uint8_t>& outBytes,
+                                     const TiffCancellation* cancellation = nullptr);
 
 TiffWriteResult writeTiff32fToFile(const float* rgbFloat, int width, int height,
                                    const TiffMetadata& meta, TiffCompression compression,
-                                   const std::string& path);
+                                   const std::string& path,
+                                   const TiffCancellation* cancellation = nullptr);
 
 // --- Convenience: quantise a linear/encoded float RGB buffer to 16-bit --------
 //
@@ -108,7 +120,8 @@ TiffWriteResult writeTiff32fToFile(const float* rgbFloat, int width, int height,
 // directly without an intermediate copy step in Kotlin.
 TiffWriteResult writeTiffFloatToFile(const float* rgbFloat, int width, int height,
                                      const TiffMetadata& meta, TiffCompression compression,
-                                     const std::string& path);
+                                     const std::string& path,
+                                     const TiffCancellation* cancellation = nullptr);
 
 }  // namespace spectrafilm
 

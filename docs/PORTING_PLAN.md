@@ -1,8 +1,9 @@
 # Porting Plan — spektrafilm (Python) → spektra-core (C++/Kotlin)
 
-> **STATUS 2026-07-02: DONE** — the full engine is ported and parity-gated (38 host gates, see
-> CLAUDE.md / ci.yml). Kept as the historical porting map; for current state see docs/AUDIT.md +
-> HANDOFF.md.
+> **STATUS 2026-07-02: DONE FOR THE ENUMERATED PINNED BASELINE** — that reviewed engine surface was
+> ported and parity-gated (38 host gates, see
+> CLAUDE.md / ci.yml at that snapshot). Kept as the historical porting map; for current state see
+> [EXECUTION_INDEX.md](EXECUTION_INDEX.md). The current CI matrix has 39 cases.
 
 This maps every spektrafilm module to its Android target, with effort and strategy. LOC are
 approximate (from the source map). "→ C++" means it becomes part of `libspektra.so`; "→ Kotlin"

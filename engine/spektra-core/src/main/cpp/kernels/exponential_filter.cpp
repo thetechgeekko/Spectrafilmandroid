@@ -256,25 +256,71 @@ void exponential_filter_per_channel_d(const double* img, int w, int h, int chann
                                       const double* decay, double* out,
                                       double truncate) {
     if (w <= 0 || h <= 0 || channels <= 0) return;
-    const int total = w * h * channels;
+    const int plane = w * h;
     // result = sum_k amplitude_k * fast_gaussian_filter(img, ratio_k * decay)
+    //
+    // PLANAR, ONE CHANNEL AT A TIME. The obvious shape — loop over the three
+    // mixture components, each copying the whole interleaved image and calling
+    // gaussian_blur_per_channel_d — makes the image cross the interleaved/planar
+    // boundary far more often than the math needs. gaussian_blur_per_channel_d
+    // deinterleaves and reinterleaves internally, per channel, on every call, so
+    // three components x three channels is NINE strided gathers and NINE strided
+    // scatters, plus three full interleaved copies and three interleaved axpy
+    // passes. Deinterleaving ONCE per channel and doing all three components in
+    // planar space cuts that to three gathers and three scatters, and turns every
+    // remaining pass into a contiguous one.
+    //
+    // Measured on the host at 12.5 MP (4096x3052), release flags, with internal
+    // timers whose parts sum to the directly measured total (an earlier attempt
+    // reported 2799 ms for this filter and a 65% zero/copy/axpy share; both were
+    // process-state artifacts and are wrong — the reconciled figures are these):
+    //
+    //   old total                     1293.2 ms
+    //     zero out                      20.1    1.6%
+    //     3x copy img -> comp           58.2    4.5%
+    //     3x gaussian_blur_per_channel 958.5   74.1%
+    //     3x axpy                       52.2    4.0%
+    //     residual (the 300 MB comp)   204.2   15.8%
+    //
+    // The cost is inside the blur calls, and inside those the de/re-interleave
+    // is 56.5% at the IIR sigmas this filter uses (157.5 ms of 279.1 ms at
+    // sigma 34.68) — roughly 42% of the whole filter, spent moving data rather
+    // than blurring it, and flat across sigma because it is pure movement.
+    //
+    // BYTE-IDENTICAL, and that is the whole constraint here. Each component is
+    // still gaussian_blur_plane_d over exactly img[:, c] at ratio_k * decay[c],
+    // and the accumulation still runs k ascending with the same operands in the
+    // same order, so every sum is formed identically. Only the order in which
+    // memory is visited changed. Halation and the DIR couplers both call this,
+    // so the two heaviest spatial stages share the result.
+    //
     // The init / copy / axpy passes are per-element maps -> deterministic
     // parallel chunks (each element's arithmetic is chunk-independent).
-    parallel_for(0, total, [&](int lo, int hi) {
-        for (int i = lo; i < hi; ++i) out[i] = 0.0;
-    });
-    std::vector<double> sigmas(channels);
-    std::vector<double> comp(static_cast<size_t>(total));
-    for (int k = 0; k < kExpN; ++k) {
-        for (int c = 0; c < channels; ++c) sigmas[c] = kExpSigmaRatio[k] * decay[c];
-        parallel_for(0, total, [&](int lo, int hi) {
-            for (int i = lo; i < hi; ++i) comp[i] = img[i];
+    std::vector<double> src(static_cast<size_t>(plane));
+    std::vector<double> comp(static_cast<size_t>(plane));
+    std::vector<double> acc(static_cast<size_t>(plane));
+    for (int c = 0; c < channels; ++c) {
+        parallel_for(0, plane, [&](int lo, int hi) {
+            for (int p = lo; p < hi; ++p)
+                src[p] = img[static_cast<size_t>(p) * channels + c];
         });
-        gaussian_blur_per_channel_d(comp.data(), w, h, channels, sigmas.data(),
-                                    truncate);
-        double a = kExpAmplitude[k];
-        parallel_for(0, total, [&](int lo, int hi) {
-            for (int i = lo; i < hi; ++i) out[i] += a * comp[i];
+        parallel_for(0, plane, [&](int lo, int hi) {
+            for (int p = lo; p < hi; ++p) acc[p] = 0.0;
+        });
+        for (int k = 0; k < kExpN; ++k) {
+            parallel_for(0, plane, [&](int lo, int hi) {
+                for (int p = lo; p < hi; ++p) comp[p] = src[p];
+            });
+            gaussian_blur_plane_d(comp.data(), w, h, kExpSigmaRatio[k] * decay[c],
+                                  truncate);
+            const double a = kExpAmplitude[k];
+            parallel_for(0, plane, [&](int lo, int hi) {
+                for (int p = lo; p < hi; ++p) acc[p] += a * comp[p];
+            });
+        }
+        parallel_for(0, plane, [&](int lo, int hi) {
+            for (int p = lo; p < hi; ++p)
+                out[static_cast<size_t>(p) * channels + c] = acc[p];
         });
     }
 }

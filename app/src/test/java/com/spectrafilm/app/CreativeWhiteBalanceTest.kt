@@ -9,9 +9,12 @@ package com.spectrafilm.app
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicInteger
 
 class CreativeWhiteBalanceTest {
 
@@ -78,5 +81,27 @@ class CreativeWhiteBalanceTest {
             assertTrue("G reduced", g.get(p * 3 + 1) < 0.4f)
             assertEquals("B unchanged", 0.4f, g.get(p * 3 + 2), 1e-6f)
         }
+    }
+
+    @Test
+    fun applyInPlace_pollsCancellationDuringLongLoop() {
+        val pixels = 5_000
+        val data = ByteBuffer.allocateDirect(pixels * 3 * Float.SIZE_BYTES)
+            .order(ByteOrder.nativeOrder())
+        val checks = AtomicInteger(0)
+
+        try {
+            CreativeWhiteBalance.applyInPlace(
+                data,
+                pixels,
+                CreativeWhiteBalance.matrix(20f, 10f),
+                isCancelled = { checks.incrementAndGet() >= 3 },
+            )
+            fail("creative white-balance loop must observe cancellation")
+        } catch (_: CancellationException) {
+            // Expected.
+        }
+
+        assertTrue("long loop must poll repeatedly", checks.get() >= 3)
     }
 }

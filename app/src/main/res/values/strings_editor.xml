@@ -1,0 +1,506 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spektrafilm for Android. GPLv3. -->
+<resources>
+
+    <!-- Adjustment categories (bottom bar / panel titles) -->
+    <string name="editor_category_source">Source</string>
+    <string name="editor_category_presets">Presets</string>
+    <string name="editor_category_simulation">Simulation</string>
+    <string name="editor_category_input">Input</string>
+    <string name="editor_category_raw_wb">White Bal</string>
+    <string name="editor_category_grain">Grain</string>
+    <string name="editor_category_halation">Halation</string>
+    <string name="editor_category_glare">Glare</string>
+    <string name="editor_category_couplers">Couplers</string>
+    <string name="editor_category_preflash">Preflash</string>
+    <string name="editor_category_experimental">Experimental</string>
+    <string name="editor_category_tone_curve">Tone Curve</string>
+    <string name="editor_category_masks">Masks</string>
+    <string name="editor_category_display">Display</string>
+
+    <!-- App root, navigation and editor-session restore notices -->
+    <string name="editor_loading">Loading editor</string>
+    <string name="editor_session_source_changed">The durable source changed; its saved recipe will be restored</string>
+    <string name="editor_session_access_expired">Source access expired; choose the same file to continue this edit</string>
+    <string name="editor_session_quarantined">Damaged editor session was quarantined; source and saved recipe will be restored</string>
+    <string name="editor_session_newer_version">Editor session is from a newer app version and was left untouched</string>
+    <string name="editor_session_unavailable">Editor session is unavailable; source and saved recipe will be restored</string>
+    <string name="editor_session_recovered">Editor session storage recovered; new edits will now be saved</string>
+
+    <!-- Top bar actions (fixed keys resolved by instrumentation) and sub-screen navigation -->
+    <string name="editor_action_export">Export</string>
+    <string name="editor_action_undo">Undo</string>
+    <string name="editor_action_redo">Redo</string>
+    <string name="editor_action_settings">Settings</string>
+    <string name="editor_action_about">About</string>
+    <string name="editor_nav_diagnostics">Diagnostics</string>
+    <string name="editor_nav_back">Back</string>
+
+    <!-- Editor status line (SourcePanel live text) -->
+    <string name="editor_status_initializing">initializing…</string>
+    <string name="editor_status_resuming_export">resuming export…</string>
+    <string name="editor_status_prev_export_saved">previous export saved to Pictures/Spektrafilm</string>
+    <string name="editor_status_prev_export_failed">previous export failed</string>
+    <string name="editor_status_prev_export_cancelled">previous export cancelled</string>
+    <string name="editor_status_prev_export_reconciling">previous export interrupted · storage reconciliation is running</string>
+    <string name="editor_status_rendering_full">rendering full resolution…</string>
+    <string name="editor_status_saved_to_gallery">saved to Pictures/Spektrafilm</string>
+    <string name="editor_status_export_complete_retrying_save">export complete · retrying editor session save</string>
+    <string name="editor_status_export_complete_save_waiting">export complete · editor session save is waiting</string>
+    <string name="editor_status_export_stale_source">export completed for a previous or unauthorized source</string>
+    <string name="editor_status_export_pending_reconciliation">export outcome pending reconciliation · restart before retry</string>
+    <string name="editor_toast_export_reconciling">Export outcome is being reconciled. Restart before retrying.</string>
+    <string name="editor_status_export_failed">export failed: %1$s</string>
+    <string name="editor_toast_export_failed">Export failed: %1$s</string>
+    <string name="editor_status_export_cancelled">export cancelled</string>
+    <string name="editor_status_undo">undo</string>
+    <string name="editor_status_redo">redo</string>
+    <string name="editor_status_session_migrated">restored session migrated to available profiles</string>
+    <string name="editor_status_ready_profiles">ready · %1$d profiles</string>
+    <string name="editor_status_session_restored_profiles">editor session restored · %1$d profiles</string>
+
+    <!-- Saved-recipe restore notices -->
+    <string name="editor_snack_recipe_restored">Restored saved edit for this image</string>
+    <string name="editor_snack_recipe_quarantined">Damaged saved edit was quarantined; defaults restored</string>
+    <string name="editor_status_recipe_newer_version">saved edit uses newer recipe version %1$s</string>
+    <string name="editor_snack_recipe_newer_version">Saved edit is from a newer app version; it was left untouched</string>
+    <string name="editor_status_recipe_unavailable">saved edit unavailable; writes paused</string>
+    <string name="editor_snack_recipe_unavailable">Saved edit could not be safely opened; reset it explicitly to continue saving</string>
+    <string name="editor_snack_dng_fallback">DNG imported via system decoder (display-referred)</string>
+
+    <!-- Source selection -->
+    <string name="editor_status_storage_permission_required">storage permission required to export on this Android version</string>
+    <string name="editor_toast_storage_permission">Allow Photos and media access to save exports.</string>
+    <string name="editor_source_demo_name">synthetic demo image</string>
+    <string name="editor_status_demo_image">demo image</string>
+    <string name="editor_status_selection_failed_restored">selection failed · previous source restored</string>
+    <string name="editor_status_selection_failed_auth">selection failed · previous source needs authorization</string>
+    <string name="editor_status_source_unavailable_demo">source unavailable · using demo image</string>
+    <string name="editor_status_source_state_unavailable">source state unavailable · choose the file again</string>
+    <string name="editor_status_access_temporary">%1$s · access is temporary</string>
+    <string name="editor_snack_source_open_failed">Could not open that source. The previous source state was restored.</string>
+    <string name="editor_source_picked_photo_name">picked photo</string>
+    <string name="editor_status_photo_selected">photo selected</string>
+    <string name="editor_status_mcraw_unsupported">MotionCam .mcraw clips aren\'t supported yet (RAW-video import in progress)</string>
+    <string name="editor_snack_mcraw_coming">MotionCam .mcraw import is coming — single RAW/DNG works today</string>
+    <string name="editor_source_raw_name">RAW: %1$s</string>
+    <string name="editor_status_raw_selected">RAW selected</string>
+    <string name="editor_status_shared_image_unsupported">couldn\'t open the shared image (unsupported source)</string>
+    <string name="editor_snack_source_expired">Source access expired or the file moved</string>
+    <string name="editor_snack_choose_again">Choose again</string>
+
+    <!-- Preset import / export / LUT status -->
+    <string name="editor_status_preset_import_failed">import failed</string>
+    <string name="editor_status_preset_imported">preset imported</string>
+    <string name="editor_status_preset_import_failed_reason">import failed: %1$s</string>
+    <string name="editor_status_preset_export_failed">export failed</string>
+    <string name="editor_status_preset_exported">preset exported</string>
+    <string name="editor_status_preset_export_failed_reason">export failed: %1$s</string>
+    <string name="editor_status_lut_saved">LUT saved</string>
+    <string name="editor_status_lut_save_failed">LUT save failed: %1$s</string>
+    <string name="editor_status_applied_builtin">applied built-in \'%1$s\'</string>
+    <string name="editor_status_preset_saved">saved preset \'%1$s\'</string>
+    <string name="editor_status_preset_apply_failed">apply failed</string>
+    <string name="editor_status_preset_applied">applied \'%1$s\'</string>
+    <string name="editor_status_preset_apply_failed_reason">apply failed: %1$s</string>
+    <string name="editor_status_preset_deleted">deleted \'%1$s\'</string>
+    <string name="editor_status_settings_copied">settings copied</string>
+    <string name="editor_status_copy_failed">copy failed</string>
+    <string name="editor_status_settings_pasted">settings pasted</string>
+    <string name="editor_status_paste_failed">paste failed: %1$s</string>
+    <string name="editor_status_baking_lut">baking %1$s LUT…</string>
+    <string name="editor_status_save_dialog_failed">could not open save dialog: %1$s</string>
+    <string name="editor_status_lut_bake_failed">LUT bake failed: %1$s</string>
+
+    <!-- Preview render status, magnifier, stock-switch suggestions -->
+    <string name="editor_magnifier_edit_changed">edit changed · tap preview again</string>
+    <string name="editor_magnifier_rendering" formatted="false">rendering 100% crop…</string>
+    <string name="editor_magnifier_done">%1$d×%2$dpx · 1:1 full-res render</string>
+    <string name="editor_magnifier_failed">crop render failed: %1$s</string>
+    <string name="editor_status_rendering_preview">rendering preview…</string>
+    <string name="editor_status_preview_ready">preview ready</string>
+    <string name="editor_render_error_auth_required">source authorization required</string>
+    <string name="editor_status_source_expired">source access expired or file moved · choose it again</string>
+    <string name="editor_status_preview_error">preview error: %1$s</string>
+    <string name="editor_status_recipe_clear_failed">could not clear saved recipe</string>
+    <string name="editor_snack_back_again">Press back again to exit</string>
+    <string name="editor_snack_slide_film">%1$s is a slide film — view it as a positive?</string>
+    <string name="editor_snack_slide_mode">Slide mode</string>
+    <string name="editor_snack_switched_to">Switched to %1$s</string>
+    <string name="editor_snack_use_defaults">Use its defaults</string>
+
+    <!-- Demo source, reset edits, white-balance eyedropper, share -->
+    <string name="editor_snack_demo_failed">Could not select the demo; the previous source was restored.</string>
+    <string name="editor_snack_recipe_clear_failed">Saved recipe could not be cleared; edits were not reset</string>
+    <string name="editor_status_edits_reset">edits reset · recipe cleared</string>
+    <string name="editor_snack_edits_reset">Edits reset; saved recipe cleared</string>
+    <string name="editor_sample_title_wb">Tap a neutral (grey / white)</string>
+    <string name="editor_sample_title_tone">Tap to pick a tone</string>
+    <string name="editor_sample_title_color">Tap to pick a color</string>
+    <string name="editor_sample_hint_wb">Tap something that should be neutral grey or white — white balance is set to make it neutral.</string>
+    <string name="editor_sample_hint_tone">Tap a tone (a highlight or a shadow) to target it, then apply.</string>
+    <string name="editor_sample_hint_color">Tap the color you want the mask to target (e.g. a red), then apply.</string>
+    <string name="editor_status_wb_set">white balance set from neutral</string>
+    <string name="editor_toast_wb_sample_failed">Couldn\'t sample for white balance: %1$s</string>
+    <string name="editor_share_export_title">Share export</string>
+    <string name="editor_status_no_share_target">no installed app can receive this image</string>
+    <string name="editor_status_cancelling_export">cancelling export</string>
+    <string name="editor_status_source_access_required">source access required before export</string>
+    <string name="editor_status_grant_storage">grant storage access, then tap Export again</string>
+    <string name="editor_status_unsupported_export">unsupported export combination</string>
+    <string name="editor_status_export_running">an export is already running</string>
+
+    <!-- Editor top bar -->
+    <string name="editor_open_photo">Open photo</string>
+    <string name="editor_tooltip_export_gallery">Export to gallery</string>
+    <string name="editor_exporting">Exporting…</string>
+
+    <!-- Preview region -->
+    <string name="editor_preview_desc_empty">Preview canvas. No image loaded yet.</string>
+    <string name="editor_preview_desc_compare">Before and after comparison. Drag the divider to compare.</string>
+    <string name="editor_preview_desc_film" formatted="false">Film preview. Pinch or double-tap to zoom, drag while zoomed to render that region at full resolution, tap a point to open the 100% grain magnifier.</string>
+    <string name="editor_preview_action_magnifier" formatted="false">Open 100% grain magnifier at centre</string>
+    <string name="editor_preview_none">No preview yet</string>
+    <string name="editor_histogram">Histogram</string>
+    <string name="editor_toggle_histogram">Toggle histogram</string>
+    <string name="editor_compare">Before / after compare</string>
+    <string name="editor_crop_transform_tooltip">Crop &amp; transform</string>
+    <string name="editor_crop_transform">Crop and transform</string>
+    <string name="editor_rotate_90">Rotate 90°</string>
+
+    <!-- Status pill -->
+    <string name="editor_decoding">Decoding…</string>
+    <string name="editor_rendering">Rendering…</string>
+    <string name="editor_pill_render_error">Render error: %1$s</string>
+    <string name="editor_pill_rendered_in">Rendered in %1$d ms</string>
+    <string name="editor_pill_rendered_in_text">Rendered in %1$d ms</string>
+    <string name="editor_pill_error">Error: %1$s</string>
+
+    <!-- Toggle state announced by circular scrim buttons -->
+    <string name="editor_state_on">On</string>
+    <string name="editor_state_off">Off</string>
+
+    <!-- Adjustment panels (narrow bottom sheet + wide side panel) -->
+    <string name="editor_panel_title">%1$s panel</string>
+    <string name="editor_close_panel_named">Close %1$s panel</string>
+    <string name="editor_close">Close</string>
+    <string name="editor_close_panel">Close panel</string>
+
+    <!-- Category bar tooltips -->
+    <string name="editor_hint_source">Pick a photo / RAW, demo image, histogram &amp; reset edits</string>
+    <string name="editor_hint_presets">Built-in looks and your saved presets; import/export &amp; LUT</string>
+    <string name="editor_hint_simulation">Film stock, print paper, exposure &amp; auto-exposure metering</string>
+    <string name="editor_hint_input">Input colour space, spectral upsampling, filters, crop &amp; upscale</string>
+    <string name="editor_hint_raw_wb">White balance — eyedropper + warmth/tint (all sources), and RAW Kelvin</string>
+    <string name="editor_hint_grain">Film grain structure, size and blur</string>
+    <string name="editor_hint_halation">Halation glow and in-emulsion light scatter</string>
+    <string name="editor_hint_glare">Print glare (stochastic; off by default)</string>
+    <string name="editor_hint_couplers">Film color character — DIR couplers (chemical color crosstalk). Plain saturation lives in Output.</string>
+    <string name="editor_hint_preflash">Enlarger pre-flash exposure and filtration</string>
+    <string name="editor_hint_experimental">Film and print density-curve gamma factors</string>
+    <string name="editor_hint_tone_curve">Point tone curve on the final RGB — master + per-channel</string>
+    <string name="editor_hint_masks">Local adjustments — limit Exposure/Saturation/Contrast to a radial area</string>
+    <string name="editor_hint_display">Output colour space, CCTF encoding and preview size</string>
+
+    <!-- Presets panel -->
+    <string name="editor_preset_builtin_heading">Built-in looks</string>
+    <string name="editor_preset_builtin_label">Built-in preset</string>
+    <string name="editor_preset_apply_builtin">Apply built-in preset</string>
+    <string name="editor_preset_yours_heading">Your presets</string>
+    <string name="editor_preset_amount">Preset amount</string>
+    <string name="editor_preset_amount_tooltip" formatted="false">Mix the applied preset over the previous look (0% = before, 100% = full).</string>
+    <string name="editor_preset_name">Preset name</string>
+    <string name="editor_preset_save">Save current as preset</string>
+    <string name="editor_preset_saved">Saved presets</string>
+    <string name="editor_preset_apply">Apply</string>
+    <string name="editor_preset_delete">Delete</string>
+    <string name="editor_preset_import_json">Import .json</string>
+    <string name="editor_preset_export_share">Export / share</string>
+    <string name="editor_preset_copy_settings">Copy settings</string>
+    <string name="editor_preset_paste_settings">Paste settings</string>
+    <string name="editor_lut_size">Size</string>
+    <string name="editor_lut_format">Format</string>
+    <string name="editor_lut_baking">Baking LUT…</string>
+    <string name="editor_lut_export">Export LUT (%1$s, %2$d³)</string>
+    <string name="editor_lut_explainer">Bakes the current film + print look into a 3D LUT. .cube imports into most apps; .clf (Common LUT Format) imports into DaVinci Resolve / OpenColorIO 2.3+. Spatial/stochastic effects (grain, halation, diffusion, glare) can\'t be captured in a 3D LUT and are omitted from the bake.</string>
+
+    <!-- Source panel -->
+    <string name="editor_source_label">Source: %1$s</string>
+    <string name="editor_source_choose_again">Choose source again</string>
+    <string name="editor_source_permission_expired">The previous permission expired, was revoked, or the file moved. Your recipe is kept.</string>
+    <string name="editor_source_pick_photo">Pick photo</string>
+    <string name="editor_source_open_raw">Open RAW/DNG</string>
+    <string name="editor_source_use_demo">Use demo image</string>
+    <string name="editor_source_histogram_help">Shows a live RGB histogram over the top of the preview.</string>
+    <string name="editor_source_autosaved">Edits auto-saved for this image (original never modified).</string>
+    <string name="editor_source_reset_edits">Reset edits / clear recipe</string>
+    <string name="editor_source_tip" formatted="false">Tip: pinch to zoom · double-tap for 2x · tap a point for a 100% grain crop · use the rotate button under the preview to rotate the image (preview + export).</string>
+
+    <!-- Export overlay -->
+    <string name="editor_export_cancel">Cancel export</string>
+    <string name="editor_export_rendering">Rendering at full resolution…</string>
+    <string name="editor_export_saved">Saved to gallery</string>
+    <string name="editor_export_view_result">View result</string>
+    <string name="editor_export_share">Share</string>
+
+    <!-- Input section -->
+    <string name="editor_input_title">Input</string>
+    <string name="editor_input_gated_colorspace">The engine renders every input as linear ProPhoto RGB — other input color spaces aren\'t wired yet.</string>
+    <string name="editor_input_color_space">Input color space</string>
+    <string name="editor_input_cctf">Apply CCTF decoding</string>
+    <string name="editor_input_cctf_tooltip">Apply the inverse cctf transfer function of the color space</string>
+    <string name="editor_input_creative_wb_heading">Creative white balance</string>
+    <string name="editor_input_creative_wb_desc">A warm/cool + green/magenta grade on the image going into the film — works on every source (RAW, JPEG, HEIC). Separate from the RAW white balance; 0 = off.</string>
+    <string name="editor_input_creative_warmth">Creative warmth</string>
+    <string name="editor_input_creative_warmth_tooltip">Warm/cool the scene before the film sees it (Bradford adaptation in linear ProPhoto). Positive = warmer. 0 = no change.</string>
+    <string name="editor_input_creative_tint">Creative tint</string>
+    <string name="editor_input_creative_tint_tooltip">Green ↔ magenta shift. Positive = magenta, negative = green. 0 = no change.</string>
+    <string name="editor_wb_eyedropper">Eyedropper — tap a neutral to set white balance</string>
+    <string name="editor_input_gated_upsampling">MALLETT2019 isn\'t implemented yet — both options currently render as HANATOS2025.</string>
+    <string name="editor_input_spectral_upsampling">Spectral upsampling</string>
+    <string name="editor_input_adaptation_window">hanatos2025 adaptation window</string>
+    <string name="editor_input_adaptation_window_tooltip">Apply the hanatos2025 bandpass adaptation window when reconstructing spectra.</string>
+    <string name="editor_input_adaptation_surface">hanatos2025 adaptation surface</string>
+    <string name="editor_input_adaptation_surface_tooltip">Apply the hanatos2025 surface adaptation polynomial when reconstructing spectra.</string>
+    <string name="editor_input_spectral_blur">Spectral gaussian blur</string>
+    <string name="editor_input_spectral_blur_tooltip">Gaussian blur sigma applied to the reconstructed spectra (spectral-axis samples; each sample is 5 nm). 0 = off.</string>
+    <string name="editor_input_uv_filter">UV filter</string>
+    <string name="editor_input_uv_filter_tooltip">Filter UV light (amplitude, wavelength cutoff nm, sigma nm).</string>
+    <string name="editor_input_ir_filter">IR filter</string>
+    <string name="editor_input_ir_filter_tooltip">Filter IR light (amplitude, wavelength cutoff nm, sigma nm).</string>
+    <string name="editor_input_upscale">Upscale factor</string>
+    <string name="editor_input_upscale_tooltip">Scale image size up to increase resolution</string>
+    <string name="editor_input_crop_enabled">Crop: enabled (use the crop tool to adjust)</string>
+    <string name="editor_input_crop_off">Crop: off (full frame)</string>
+    <string name="editor_input_edit_crop">Edit crop</string>
+    <string name="editor_input_clear_crop">Clear</string>
+    <string name="editor_input_reset_geometry">Reset crop &amp; geometry</string>
+
+    <!-- White balance section -->
+    <string name="editor_wb_title">White balance</string>
+    <string name="editor_wb_eyedropper_desc">Tap a grey or white area in your photo and the white balance is set to neutralize it. Works on every source — or use the sliders below.</string>
+    <string name="editor_wb_warmth">Warmth</string>
+    <string name="editor_wb_warmth_tooltip">Warm / cool the image. Positive = warmer; 0 = off. Works on every source.</string>
+    <string name="editor_wb_tint">Tint</string>
+    <string name="editor_wb_tint_tooltip">Green ↔ magenta. Positive = magenta, negative = green; 0 = off.</string>
+    <string name="editor_wb_balance_to_stock">Balance to film stock</string>
+    <string name="editor_wb_balance_tungsten">This is a tungsten-balanced stock, so it renders a daylight scene blue — that\'s authentic film behaviour. Turn this on to warm the input to the film\'s reference light and render neutral, like an 85 filter on the lens.</string>
+    <string name="editor_wb_balance_daylight">The virtual 85 filter — warms the input to a tungsten stock\'s reference light so it renders neutral. This stock is daylight-balanced (already neutral), so it has no effect here.</string>
+    <string name="editor_wb_raw_heading">RAW camera white balance (re-decodes the file):</string>
+    <string name="editor_wb_camera">Camera white balance</string>
+    <string name="editor_wb_reset_as_shot">Reset to camera / as-shot WB</string>
+    <string name="editor_wb_custom_only">Temperature and Tint are used only when \"custom\" is selected above.</string>
+    <string name="editor_wb_temperature">Temperature (K)</string>
+    <string name="editor_wb_temperature_tooltip">Colour temperature in Kelvin for Custom white balance (1000 K – 12000 K).</string>
+    <string name="editor_wb_tint_multiplier">Tint multiplier</string>
+    <string name="editor_wb_tint_multiplier_tooltip">Green/magenta tint multiplier for Custom white balance (1.0 = neutral).</string>
+
+    <!-- Simulation section (Film / Print / Scanner / Output tabs) -->
+    <string name="editor_sim_title">Simulation</string>
+    <string name="editor_sim_tab_film">Film</string>
+    <string name="editor_sim_tab_print">Print</string>
+    <string name="editor_sim_tab_scanner">Scanner</string>
+    <string name="editor_sim_tab_output">Output</string>
+    <string name="editor_sim_film_profile">Film profile</string>
+    <string name="editor_sim_view_film_curves">View film profile curves</string>
+    <string name="editor_sim_camera_ev">Camera compensation EV</string>
+    <string name="editor_sim_camera_ev_tooltip">Add a bias to the auto-exposure of the camera</string>
+    <string name="editor_sim_film_format">Film format mm</string>
+    <string name="editor_sim_film_format_tooltip">Long edge of the film format in mm (8, 16, 35, 60, 120)</string>
+    <string name="editor_sim_camera_lens_blur">Camera lens blur um</string>
+    <string name="editor_sim_camera_lens_blur_tooltip">Sigma of gaussian filter in um for the camera lens blur. Spatial effect — applied only when Halation is enabled (the spatial branch).</string>
+    <string name="editor_sim_camera_diffusion">Camera diffusion filter</string>
+    <string name="editor_sim_print_profile">Print profile</string>
+    <string name="editor_sim_view_print_curves">View print profile curves</string>
+    <string name="editor_sim_print_exposure">Print exposure</string>
+    <string name="editor_sim_print_exposure_tooltip">Changes the exposure time set in the virtual enlarger</string>
+    <string name="editor_sim_print_auto_comp">Print auto compensation</string>
+    <string name="editor_sim_print_auto_comp_tooltip">Auto adjust the print exposure for the camera exposure compensation ev</string>
+    <string name="editor_sim_print_y_shift">Print Y filter shift</string>
+    <string name="editor_sim_print_y_shift_tooltip">Y filter shift from neutral, in Kodak CC units</string>
+    <string name="editor_sim_print_m_shift">Print M filter shift</string>
+    <string name="editor_sim_print_m_shift_tooltip">M filter shift from neutral, in Kodak CC units</string>
+    <string name="editor_sim_gated_enlarger_blur">Enlarger lens blur is not applicable to the enlarger stage (no engine call site).</string>
+    <string name="editor_sim_enlarger_lens_blur">Enlarger lens blur</string>
+    <string name="editor_sim_enlarger_lens_blur_tooltip">Sigma of gaussian filter for the enlarger lens blur</string>
+    <string name="editor_sim_print_diffusion">Print diffusion filter</string>
+    <string name="editor_sim_scan_lens_blur">Scan lens blur</string>
+    <string name="editor_sim_scan_lens_blur_tooltip">Sigma of gaussian filter in pixel for the scanner lens blur. Spatial effect — applied only when Halation is enabled (the spatial branch).</string>
+    <string name="editor_sim_scan_correction_noop">Scan white/black correction has no effect in Slide mode on a negative stock — it applies only to a slide/positive film, or in print mode. Matches the spektrafilm engine.</string>
+    <string name="editor_sim_scan_white_correction">Scan white correction</string>
+    <string name="editor_sim_scan_white_correction_tooltip">Pin the scan\'s white point to the target white level below. Subtle at the default 0.98 — lower the white level to see it pull the highlights down.</string>
+    <string name="editor_sim_scan_white_level">Scan white level</string>
+    <string name="editor_sim_scan_white_level_tooltip">Target white level when white correction is enabled</string>
+    <string name="editor_sim_scan_black_correction">Scan black correction</string>
+    <string name="editor_sim_scan_black_correction_tooltip">Pin the scan\'s black point to the target black level below. Subtle at the default 0.01 — raise the black level to see it lift the shadows.</string>
+    <string name="editor_sim_scan_black_level">Scan black level</string>
+    <string name="editor_sim_scan_black_level_tooltip">Target black level when black correction is enabled</string>
+    <string name="editor_sim_scan_unsharp">Scan unsharp mask</string>
+    <string name="editor_sim_scan_unsharp_tooltip">[sigma in pixel, amount]</string>
+    <string name="editor_sim_output_color_space">Output color space</string>
+    <string name="editor_sim_output_gamut">Output gamut compression</string>
+    <string name="editor_gamut_off">Off</string>
+    <string name="editor_gamut_off_no_clip">Off (no clip)</string>
+    <string name="editor_gamut_aces">ACES (tame out-of-gamut)</string>
+    <string name="editor_gamut_oklch">Oklch (perceptual, keep hue)</string>
+    <string name="editor_gamut_oklrab">Oklrab (perceptual, even lightness)</string>
+    <string name="editor_gamut_jzazbz">Jzazbz (perceptual, stable blues)</string>
+    <string name="editor_gamut_cam16ucs">CAM16 (perceptual, appearance model)</string>
+    <string name="editor_gamut_spectral_locus">Spectral locus (tame saturated input)</string>
+    <string name="editor_sim_input_gamut">Input gamut compression</string>
+    <string name="editor_sim_saturation">Saturation</string>
+    <string name="editor_sim_saturation_tooltip">Overall colorfulness of the output. Negative = softer/more muted (tame a too-punchy look); positive = more vivid. Applied after the film render.</string>
+    <string name="editor_sim_vibrance">Vibrance</string>
+    <string name="editor_sim_vibrance_tooltip">Like Saturation but weighted to muted colors, so already-saturated tones (and skin) shift less. Applied after the film render.</string>
+    <string name="editor_sim_gamut_compression">Gamut compression</string>
+    <string name="editor_sim_gamut_compression_tooltip">ACES-style: softens the harsh cyan/edge fringe on very saturated colors by pulling them toward neutral. 0 = off. Helps when saturated highlights look unnatural.</string>
+    <string name="editor_sim_saving_cctf">Saving CCTF encoding</string>
+    <string name="editor_sim_saving_cctf_tooltip">Add or not the CCTF to the saved image file</string>
+    <string name="editor_sim_slide_mode">Slide mode (skip print)</string>
+    <string name="editor_sim_slide_mode_tooltip">Show the scanned film directly instead of a print — the natural view for slide/reversal stocks (a positive). For negative stocks this shows the raw orange negative.</string>
+
+    <!-- Diffusion filter group -->
+    <string name="editor_diff_toggle_tooltip">Toggle the diffusion filter on this stage.</string>
+    <string name="editor_diff_hide_details">Hide diffusion details</string>
+    <string name="editor_diff_show_details">Show diffusion details</string>
+    <string name="editor_diff_family">Diffusion family</string>
+    <string name="editor_diff_strength">Diffusion strength</string>
+    <string name="editor_diff_strength_tooltip">Commercial filter stop: 0, 1/8, 1/4, 1/2, 1, 2.</string>
+    <string name="editor_diff_spatial_scale">Spatial scale</string>
+    <string name="editor_diff_spatial_scale_tooltip">Multiplier on the image-plane PSF widths.</string>
+    <string name="editor_diff_halo_warmth">Halo warmth</string>
+    <string name="editor_diff_halo_warmth_tooltip">Additive offset on the halo warmth axis.</string>
+    <string name="editor_diff_core_intensity">Core intensity</string>
+    <string name="editor_diff_core_size">Core size</string>
+    <string name="editor_diff_halo_intensity">Halo intensity</string>
+    <string name="editor_diff_halo_size">Halo size</string>
+    <string name="editor_diff_bloom_intensity">Bloom intensity</string>
+    <string name="editor_diff_bloom_size">Bloom size</string>
+
+    <!-- Grain section -->
+    <string name="editor_grain_title">Grain</string>
+    <string name="editor_grain_particle_area">Particle area um2</string>
+    <string name="editor_grain_particle_area_tooltip">Area of particles in um2, relates to ISO.</string>
+    <string name="editor_grain_blur">Blur</string>
+    <string name="editor_grain_blur_tooltip">Sigma of gaussian blur in pixels for the grain.</string>
+    <string name="editor_grain_sublayers_active">Sublayers active</string>
+    <string name="editor_grain_particle_scale">Particle scale</string>
+    <string name="editor_grain_particle_scale_tooltip">Scale of particle area for the RGB layers.</string>
+    <string name="editor_grain_particle_scale_layers">Particle scale layers</string>
+    <string name="editor_grain_particle_scale_layers_tooltip">Scale of particle area for the sublayers in each color layer.</string>
+    <string name="editor_grain_density_min">Density min</string>
+    <string name="editor_grain_density_min_tooltip">Minimum density of the grain (0.03-0.06).</string>
+    <string name="editor_grain_uniformity">Uniformity</string>
+    <string name="editor_grain_uniformity_tooltip">Uniformity of the grain (0.94-0.98).</string>
+    <string name="editor_grain_blur_dye_clouds">Blur dye clouds um</string>
+    <string name="editor_grain_blur_dye_clouds_tooltip">Scale the sigma of gaussian blur in um for the dye clouds.</string>
+    <string name="editor_grain_micro_structure">Micro structure</string>
+    <string name="editor_grain_micro_structure_tooltip">[sigma blur um, molecular clump size nm]</string>
+    <string name="editor_grain_sublayers">Sublayers</string>
+    <string name="editor_grain_reset">Reset grain to defaults</string>
+
+    <!-- Preflash section -->
+    <string name="editor_preflash_title">Preflash</string>
+    <string name="editor_preflash_exposure">Exposure</string>
+    <string name="editor_preflash_exposure_tooltip">Preflash exposure value in ev for the print</string>
+    <string name="editor_preflash_y_shift">Y filter shift</string>
+    <string name="editor_preflash_y_shift_tooltip">Shift the Y filter from neutral for the preflash (Kodak CC)</string>
+    <string name="editor_preflash_m_shift">M filter shift</string>
+    <string name="editor_preflash_m_shift_tooltip">Shift the M filter from neutral for the preflash (Kodak CC)</string>
+
+    <!-- Halation section -->
+    <string name="editor_hal_title">Halation</string>
+    <string name="editor_hal_amount">Halation amount</string>
+    <string name="editor_hal_amount_tooltip">High-level halation strength multiplier.</string>
+    <string name="editor_hal_spatial_scale">Halation spatial scale</string>
+    <string name="editor_hal_spatial_scale_tooltip">High-level halation size multiplier.</string>
+    <string name="editor_hal_scatter_amount">Scatter amount</string>
+    <string name="editor_hal_scatter_amount_tooltip">High-level scatter strength. 1.0 = full physical scatter.</string>
+    <string name="editor_hal_boost_ev">Boost EV</string>
+    <string name="editor_hal_boost_ev_tooltip">Maximum highlight boost in stops.</string>
+    <string name="editor_hal_scatter_spatial_scale">Scatter spatial scale</string>
+    <string name="editor_hal_scatter_spatial_scale_tooltip">High-level scatter size multiplier (1.0 = physical defaults).</string>
+    <string name="editor_hal_protect_ev">Protect EV</string>
+    <string name="editor_hal_protect_ev_tooltip">Protected range above midgray for the boost onset in stops.</string>
+    <string name="editor_hal_boost_range">Boost range</string>
+    <string name="editor_hal_boost_range_tooltip">How quickly the highlight boost ramps in (0-1).</string>
+    <string name="editor_hal_scatter_core">Scatter core um</string>
+    <string name="editor_hal_scatter_core_tooltip">Sigma of the scatter core Gaussian per channel, in um.</string>
+    <string name="editor_hal_scatter_tail">Scatter tail um</string>
+    <string name="editor_hal_scatter_tail_tooltip">Decay constant of the scatter exponential tail per channel, in um.</string>
+    <string name="editor_hal_scatter_tail_weight" formatted="false">Scatter tail weight %</string>
+    <string name="editor_hal_scatter_tail_weight_tooltip" formatted="false">Weight of the scatter tail Gaussian per channel (0-100%).</string>
+    <string name="editor_hal_strength" formatted="false">Halation strength %</string>
+    <string name="editor_hal_strength_tooltip" formatted="false">Total back-reflection halation amplitude per channel (0-100%).</string>
+    <string name="editor_hal_first_sigma">First sigma um</string>
+    <string name="editor_hal_first_sigma_tooltip">Sigma of the first halation bounce per channel, in um.</string>
+    <string name="editor_hal_n_bounces">N bounces</string>
+    <string name="editor_hal_n_bounces_tooltip">Number of multi-bounce Gaussians summed (typical 2-3).</string>
+    <string name="editor_hal_bounce_decay">Bounce decay</string>
+    <string name="editor_hal_bounce_decay_tooltip">Per-bounce amplitude decay ratio (0.3-0.7).</string>
+    <string name="editor_hal_renormalize">Renormalize</string>
+    <string name="editor_hal_renormalize_tooltip">Divide by (1 + sum of bounce amplitudes) so mid-grey is preserved.</string>
+
+    <!-- Couplers section -->
+    <string name="editor_coup_title">Film color character (couplers)</string>
+    <string name="editor_coup_desc">Models film\'s chemical color crosstalk (DIR couplers) — the cause of film\'s characteristic color separation and edge effects. Looking for a plain saturation control? Use Saturation / Vibrance in Simulation → Output.</string>
+    <string name="editor_coup_amount">Effect strength</string>
+    <string name="editor_coup_amount_tooltip">Global multiplier on the DIR coupler inhibition matrix.</string>
+    <string name="editor_coup_samelayer">Within-layer strength</string>
+    <string name="editor_coup_samelayer_tooltip">Same-layer (diagonal) inhibition — within-channel contrast/acutance.</string>
+    <string name="editor_coup_interlayer">Cross-color strength</string>
+    <string name="editor_coup_interlayer_tooltip">Cross-layer (off-diagonal) inhibition — how much each dye layer bleeds into the others.</string>
+    <string name="editor_coup_gated_gamma">The DIR gamma matrix is set per film stock by the engine (each stock overwrites these) — adjusting them has no effect.</string>
+    <string name="editor_coup_gamma_samelayer">Within-layer curve (R, G, B)</string>
+    <string name="editor_coup_gamma_samelayer_tooltip">Per-channel same-layer DIR gamma (R, G, B).</string>
+    <string name="editor_coup_mix_r">Color mix R→G/B</string>
+    <string name="editor_coup_mix_r_tooltip">Cross-channel DIR inhibition (a color-mixing matrix term): from R onto G and B.</string>
+    <string name="editor_coup_mix_g">Color mix G→R/B</string>
+    <string name="editor_coup_mix_g_tooltip">Cross-channel DIR inhibition (a color-mixing matrix term): from G onto R and B.</string>
+    <string name="editor_coup_mix_b">Color mix B→R/G</string>
+    <string name="editor_coup_mix_b_tooltip">Cross-channel DIR inhibition (a color-mixing matrix term): from B onto R and G.</string>
+    <string name="editor_coup_bleed_radius">Color bleed radius (µm)</string>
+    <string name="editor_coup_bleed_radius_tooltip">Sigma in µm for the diffusion of the couplers (5-20 µm).</string>
+    <string name="editor_coup_bleed_tail">Color bleed tail (µm)</string>
+    <string name="editor_coup_bleed_tail_tooltip">Long-range tail sigma in µm for the coupler diffusion.</string>
+    <string name="editor_coup_bleed_tail_weight">Color bleed tail weight</string>
+    <string name="editor_coup_bleed_tail_weight_tooltip">Weight of the long-range diffusion tail.</string>
+
+    <!-- Glare section -->
+    <string name="editor_glare_title">Glare</string>
+    <string name="editor_glare_desc">Glare applies on the print route only (no effect in Slide mode / scan-film).</string>
+    <string name="editor_glare_percent">Percent</string>
+    <string name="editor_glare_percent_tooltip">Percentage of the glare light (typically 0.1-0.25)</string>
+    <string name="editor_glare_roughness">Roughness</string>
+    <string name="editor_glare_roughness_tooltip">Roughness of the glare light (0-1)</string>
+    <string name="editor_glare_blur">Blur</string>
+    <string name="editor_glare_blur_tooltip">Sigma of gaussian blur in pixels for the glare</string>
+
+    <!-- Experimental section -->
+    <string name="editor_exp_title">Experimental</string>
+    <string name="editor_exp_film_gamma">Film gamma factor</string>
+    <string name="editor_exp_film_gamma_tooltip">Gamma factor of the negative density curves.</string>
+    <string name="editor_exp_print_gamma">Print gamma factor</string>
+    <string name="editor_exp_print_gamma_tooltip">Gamma factor of the print paper.</string>
+    <string name="editor_exp_morph">Print curve morph (s023)</string>
+    <string name="editor_exp_morph_tooltip">Re-develop the print from the paper\'s parametric density-curve model with a coupled-gamma + developer-exhaustion morph. Off = the stock\'s measured curves.</string>
+    <string name="editor_exp_morph_gamma">Morph · overall gamma</string>
+    <string name="editor_exp_morph_gamma_tooltip">Global coupled gamma applied to all print curves.</string>
+    <string name="editor_exp_morph_fast">Morph · fast band</string>
+    <string name="editor_exp_morph_fast_tooltip">Gamma of the fast (low-threshold) sub-layer.</string>
+    <string name="editor_exp_morph_slow">Morph · slow band</string>
+    <string name="editor_exp_morph_slow_tooltip">Gamma of the slow (high-threshold) sub-layers.</string>
+    <string name="editor_exp_morph_red">Morph · red gamma</string>
+    <string name="editor_exp_morph_red_tooltip">Per-channel gamma (red).</string>
+    <string name="editor_exp_morph_green">Morph · green gamma</string>
+    <string name="editor_exp_morph_green_tooltip">Per-channel gamma (green).</string>
+    <string name="editor_exp_morph_blue">Morph · blue gamma</string>
+    <string name="editor_exp_morph_blue_tooltip">Per-channel gamma (blue).</string>
+    <string name="editor_exp_morph_exhaustion">Morph · developer exhaustion</string>
+    <string name="editor_exp_morph_exhaustion_tooltip">Blend toward a Gumbel-matched curve shape (shoulder roll-off); preserves midgray.</string>
+
+    <!-- Display section -->
+    <string name="editor_display_title">Display</string>
+    <string name="editor_display_preview_max_size">Preview max size</string>
+    <string name="editor_display_preview_max_size_tooltip">Max size of the long edge of the preview image, in pixels.</string>
+</resources>

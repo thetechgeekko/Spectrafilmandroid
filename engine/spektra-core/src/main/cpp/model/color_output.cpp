@@ -13,6 +13,8 @@
 #include "color_output.h"
 
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 #include "spektra.h"
 
@@ -43,8 +45,33 @@ const float kIlluminantD50[81] = {
 // sum(illuminant * ybar) over the working shape (the XYZ denominator).
 const double kNormD50 = 24.451263183234168;
 
+// standard_illuminant("K75P") -> colour SDS_LIGHT_SOURCES["Kinoton 75P"],
+// SpectralShape(380,780,5), normalized to mean 1. Extracted from the pinned
+// c1d0e44 oracle with colour-science 0.4.7.
+const float kIlluminantK75P[81] = {
+    2.003553510e-01f, 3.026585281e-01f, 4.125533104e-01f, 5.589481592e-01f, 6.999984980e-01f,
+    8.502194285e-01f, 9.967964292e-01f, 1.103016973e+00f, 1.148383856e+00f, 1.166451573e+00f,
+    1.217982888e+00f, 1.306287289e+00f, 1.415362239e+00f, 1.476124763e+00f, 1.581829071e+00f,
+    1.637459755e+00f, 1.741797447e+00f, 1.919135332e+00f, 1.996872425e+00f, 1.818016291e+00f,
+    1.703293324e+00f, 1.714619756e+00f, 1.665760875e+00f, 1.679213047e+00f, 1.599137664e+00f,
+    1.568923473e+00f, 1.550551891e+00f, 1.537160516e+00f, 1.531421304e+00f, 1.520914674e+00f,
+    1.520914793e+00f, 1.510681391e+00f, 1.510286570e+00f, 1.501693010e+00f, 1.486175895e+00f,
+    1.473999143e+00f, 1.465162635e+00f, 1.462004542e+00f, 1.478948712e+00f, 1.483959198e+00f,
+    1.479130983e+00f, 1.471721768e+00f, 1.435768247e+00f, 1.385360599e+00f, 1.338779092e+00f,
+    1.322563648e+00f, 1.322927952e+00f, 1.341663837e+00f, 1.348678350e+00f, 1.326784492e+00f,
+    1.275982022e+00f, 1.203164220e+00f, 1.124758959e+00f, 1.082459211e+00f, 1.067731500e+00f,
+    1.041282654e+00f, 1.049633384e+00f, 1.049542308e+00f, 9.857431650e-01f, 8.214324117e-01f,
+    6.165525913e-01f, 4.288598597e-01f, 2.650957406e-01f, 1.552313268e-01f, 8.982282132e-02f,
+    6.249336153e-02f, 4.571307451e-02f, 3.847076744e-02f, 2.714726143e-02f, 2.576256916e-02f,
+    2.350333333e-02f, 2.138530090e-02f, 2.095258422e-02f, 2.241015621e-02f, 2.179068886e-02f,
+    1.802833192e-02f, 1.590574533e-02f, 2.681019902e-02f, 2.732945792e-02f, 3.086406924e-02f,
+    2.568969131e-02f,
+};
+
+const double kNormK75P = 31.24235608016079;
+
 // colour.XYZ_to_RGB(eye, 'sRGB', illuminant=D50_xy) effective matrix, row-major.
-// rgb = M . xyz. Bradford CAT D50->D65 + sRGB primaries baked in.
+// rgb = M . xyz. CAT02 D50->D65 adaptation + sRGB primaries baked in.
 const float kXYZ_to_sRGB_D50[9] = {
      3.142560531830132e+00f, -1.632613796187014e+00f, -4.818555764518727e-01f,
     -9.697409102368959e-01f,  1.902220529621061e+00f,  3.987257349273618e-02f,
@@ -139,6 +166,64 @@ const double kXYZ_to_RGB[6][9] = {
         1.3860495993494377
     },
 };
+
+// colour.XYZ_to_RGB(..., illuminant=K75P_xy), where K75P_xy is the chromaticity
+// of the same normalized Kinoton 75P SPD. CAT02 + output primaries are baked in,
+// exactly as for the D50 table above. Indexed by spk_color_space.
+const double kXYZ_to_RGB_K75P[6][9] = {
+    {  // [0] SRGB
+        3.232236500809162, -1.5349109384947712, -0.49798421014519223,
+        -0.9667543480014241, 1.8719375025543321, 0.04139730241485097,
+        0.055708159972140604, -0.20309720958383254, 1.0881780404577015
+    },
+    {  // [1] ADOBE_RGB
+        2.036219858460815, -0.5644732114888867, -0.3443178249335176,
+        -0.967093471845468, 1.8721072465127848, 0.04145748574692734,
+        0.013536361703599623, -0.11765341732215541, 1.0450591469911041
+    },
+    {  // [2] PROPHOTO
+        1.393986409970918, -0.2142761265310886, -0.10005299419877167,
+        -0.5332668351636909, 1.4909560841243228, 0.01329440105882937,
+        -0.0013131091840827228, -0.0037290267141805605, 0.9508668289291261
+    },
+    {  // [3] REC2020
+        1.7121104808394825, -0.35546726732876277, -0.25166249001372737,
+        -0.6652883893205055, 1.613097728625932, 0.01607100894694128,
+        0.01769914428783694, -0.04226456558667562, 0.970026030975556
+    },
+    {  // [4] ACES2065_1
+        1.0595148542431525, 0.008089687979870253, -0.010920824077060002,
+        -0.49294121653555606, 1.3682539960189533, 0.09327139857999221,
+        -0.00023965011624595432, -0.0006287366848202698, 0.9467131181608147
+    },
+    {  // [5] LINEAR_SRGB (== SRGB)
+        3.232236500809162, -1.5349109384947712, -0.49798421014519223,
+        -0.9667543480014241, 1.8719375025543321, 0.04139730241485097,
+        0.055708159972140604, -0.20309720958383254, 1.0881780404577015
+    },
+};
+
+const ViewingIlluminant* find_viewing_illuminant(
+    std::string_view identifier) noexcept {
+    static const ViewingIlluminant kD50{
+        "D50", kIlluminantD50, kNormD50, kXYZ_to_RGB};
+    static const ViewingIlluminant kK75P{
+        "K75P", kIlluminantK75P, kNormK75P, kXYZ_to_RGB_K75P};
+    if (identifier == kD50.identifier) return &kD50;
+    if (identifier == kK75P.identifier) return &kK75P;
+    return nullptr;
+}
+
+const ViewingIlluminant& require_viewing_illuminant(
+    std::string_view identifier) {
+    if (const ViewingIlluminant* illuminant =
+            find_viewing_illuminant(identifier)) {
+        return *illuminant;
+    }
+    throw std::runtime_error(
+        "Profile: unsupported viewing_illuminant '" + std::string(identifier) +
+        "' (expected exact identifier D50 or K75P)");
+}
 
 // Near-identity RGB->RGB matrices colour applies (matrix_RGB_to_RGB(cs, cs,
 // "CAT02")) inside _apply_cctf_encoding_and_clip, before the CCTF encode, when

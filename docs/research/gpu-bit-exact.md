@@ -1,4 +1,11 @@
-# Can the GPU produce *exact* results? — CPU↔GPU bit-exactness research (#135)
+# Can the GPU produce *exact* results? — [Research: can the GPU produce exact (byte-identical) results vs the CPU C++ engine?](https://github.com/thetechgeekko/Spektrafilm-android/issues/135)
+
+> **Historical research outcome, not current product policy.** The original preview-only
+> recommendation in the closing section was superseded after the device probe and resident Vulkan
+> pointwise product-route gates passed. Current policy is two named routes: parity-bearing **Strict
+> Exact CPU**, and capability-gated **Fast GPU** within oracle tolerance plus same-device
+> repeatability. Spatial/stochastic coverage and fleet qualification remain open. See
+> [../BIT_IDENTICAL_EXPORT_ROADMAP.md](../BIT_IDENTICAL_EXPORT_ROADMAP.md).
 
 **Question (owner, 2026-08-27):** can we run the engine's processing on the GPU and get the
 *exact same result* as the CPU path — not an approximation?
@@ -12,7 +19,9 @@ question has two useful positive answers: (1) *exactness by construction* is ach
 sides compute in integer/soft-float or correctly-rounded arithmetic — at a cost that makes it a
 research project, not a ticket; and (2) the parity bar we actually ship (**within oracle
 tolerance + deterministic**) is plausibly achievable on GPU and is exactly what should be
-measured on device. The recommendation for #127 is at the end.
+measured on device. The recommendation for
+[Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127)
+is at the end.
 
 *Method: 13-agent verified research run (six primary-source investigations, each claim
 re-opened and adversarially checked against its cited source: 122 confirmed, 4 refuted — the
@@ -36,10 +45,11 @@ So "exact result par GPU pe" decomposes into:
   construction (integer emulation or correctly-rounded math on both sides, §6) — this would
   actually make the CPU cross-architecture byte-stable too, which today it is not. Cost: large
   (§6); it also means abandoning `-ffast-math` on CPU, whose own cost is unmeasured.
-- **E3 — GPU within the oracle tolerance, deterministically.** The same bar every shipped
-  approximation already meets (the opt-in spectral LUTs are "within ~5e-5 of the direct path
-  (NOT bit-exact by design)", `spektra.h`). Plausible in fp32; the deciding number (81-band
-  fp32 accumulation error vs `1e-4`) is unmeasured and needs device hardware (§9).
+- **E3 — GPU within the oracle tolerance, deterministically.** The opt-in spectral LUT
+  precedent is approximate by design, although scanner LUT error is profile/domain dependent
+  (LUT17: locked D50 <=5e-5; K75P 2383/2393 about 0.0040/0.0073 vs direct). Plausible in
+  fp32; the deciding number (81-band fp32 accumulation error vs `1e-4`) is unmeasured and
+  needs device hardware (§9).
 
 ## 2. What the Vulkan/SPIR-V specs actually guarantee (very little)
 
@@ -266,21 +276,22 @@ claims exactness, and its author never tried to.
 
 | # | Option | Delivers | Cost / risk | Verdict |
 |---|---|---|---|---|
-| A | **Status quo policy + fp32 Vulkan preview (vkdt-seeded)** — keep "proxy approximate, export exact" (PERF_ROADMAP, adopted); build the #127 preview tier as fp32 compute, using vkdt filmsim as reference/seed; export stays on the parity-gated CPU engine | The Lightroom experience (fast interactive), zero risk to the parity promise | The port effort we already planned; preview≠export difference bounded by a measured tolerance, not bytes | **Recommended now** |
+| A | **Status quo policy + fp32 Vulkan preview (vkdt-seeded)** — keep "proxy approximate, export exact" (PERF_ROADMAP, adopted); build the preview tier from [Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127) as fp32 compute, using vkdt filmsim as reference/seed; export stays on the parity-gated CPU engine | The Lightroom experience (fast interactive), zero risk to the parity promise | The port effort we already planned; preview≠export difference bounded by a measured tolerance, not bytes | **Recommended now** |
 | B | **GPU export *within oracle tolerance*** (E3) — after A exists, measure fp32-GPU vs oracle on device (`max_abs`, `rms`, plus same-device determinism per Invariance Rule 4/7); if it fits inside `1e-4`/`1e-5` with margin, offer GPU export as an owner decision, with CPU as the always-available exact path and per-device digest tests instead of universal goldens | GPU-speed export on capable devices, still oracle-verified | The deciding number (81-band fp32 accumulation + synthesized exp10 error) is **unmeasured**; CI can't cover every handset — validation becomes on-device self-test; NaN semantics need explicit shader handling | **Measure after A; owner decision** |
 | C | **Deterministic-math rewrite (E2-lite)** — correctly-rounded libm (CORE-MATH/LLVM-libc, incl. exp10/log10) + no fast-math + pinned op order on CPU *and* integer-precise ports of the same algorithms in GLSL | One defined byte stream: CPU==GPU==every-arch bit-identical, forever; also fixes today's cross-arch CPU drift | Re-bless all goldens (stays within oracle tolerance); unmeasured CPU cost of dropping `-ffast-math`; large, engine-wide numerics surgery; GPU-side correctly-rounded transcendentals in fp32-integer GLSL is novel engineering | Long-term option; not a ticket |
 | D | **Soft-f64 GPU (Mesa float64.glsl route)** — emulate binary64 in integer shaders + bit-exact transcendental ports | True byte-identity with a (non-fast-math) f64 CPU build | ~67k-instruction shaders, ~1/32–1/64 throughput, vendor emulators disclaim conformance, likely **slower than the NEON CPU path** for our compute-bound integrals; mobile driver limits untested | Rejected as impractical |
 | E | **Fixed-point respec (H.264 model)** — redefine the integrals in exact integer arithmetic | The most robust exactness money can buy | A numerics research project; redefines the oracle relationship itself | Out of scope; noted for completeness |
 
-## 10. Recommendation for #127, and what must be measured first
+## 10. Recommendation for [Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127), and what must be measured first
 
 1. **Keep the adopted law for now**: GPU preview-only; export exact on CPU. Nothing found in
    this research weakens it — everything found (spec, fleet data, industry practice) confirms
    the reasoning behind it.
-2. **Build the #127 preview tier as fp32 Vulkan compute with vkdt/filmsim as the seed** —
+2. **Build the preview tier from [Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127) as fp32 Vulkan compute with vkdt/filmsim as the seed** —
    the existence proof, the performance ceiling, and GPL-compatible source all say this is the
    fastest safe path to Lightroom-class interactivity.
-3. **Then measure E3 on device** (needs #119 hardware anyway): port one integral (scan) to
+3. **Then measure E3 on device** (the hardware session is owned by
+   [Record the canonical release/R8 export baseline and digest matrix](https://github.com/thetechgeekko/Spektrafilm-android/issues/119)): port one integral (scan) to
    fp32 compute, compare against the CPU/oracle on real Adreno/Mali across a param sweep —
    `max_abs`/`rms`, same-device run-to-run stability, NaN handling. If it sits comfortably
    inside the oracle tolerance, **GPU export becomes a legitimate owner decision** (option B)
@@ -298,5 +309,5 @@ strategy on GPU (the CPU fork-join's role); Android-fleet coverage of
 
 ---
 
-*Research for [#135](https://github.com/thetechgeekko/Spektrafilm-android/issues/135), part of
-map #117. Film modeling powered by spektrafilm (GPLv3).*
+*Research for [Research: can the GPU produce exact (byte-identical) results vs the CPU C++ engine?](https://github.com/thetechgeekko/Spektrafilm-android/issues/135), part of
+[Wayfinder workstream: 1–2 s exact export + fast interactive preview](https://github.com/thetechgeekko/Spektrafilm-android/issues/117). Film modeling powered by spektrafilm (GPLv3).*

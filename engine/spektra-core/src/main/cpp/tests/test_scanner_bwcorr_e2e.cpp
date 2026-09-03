@@ -29,6 +29,12 @@
  * changes the output, proving they are genuinely active end to end. Both cases use
  * the c1d0e44 goldens (max_abs <= 1e-4, rms <= 1e-5).
  *
+ *   CASES C/D — Kodak 2383 and 2393 print routes. Their committed no-correction
+ *   K75P goldens anchor the input/baseline; enabling both corrections must change
+ *   print density and final RGB, stay finite, and be exactly deterministic. This
+ *   exercises the K75P reference-measurement seam without inventing a new oracle
+ *   for corrected pixels.
+ *
  * Build (host) — full source set, run from the cpp root:
  *   g++ -std=c++17 -O2 -pthread -I <cpp_root> -I <tools/parity> \
  *     tests/test_scanner_bwcorr_e2e.cpp spektra.cpp \
@@ -47,6 +53,9 @@
 #include <vector>
 
 #include "spkvec_io.h"
+#include "model/color_output.h"
+#include "profiles/profile.h"
+#include "runtime/color_reference.h"
 #include "spektra.h"
 
 namespace {
@@ -83,6 +92,13 @@ double max_abs_diff(const float* a, const float* b, size_t n) {
         if (d > m) m = d;
     }
     return m;
+}
+
+bool all_finite(const float* a, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(a[i])) return false;
+    }
+    return true;
 }
 
 void set_base(spk_params* p, const char* film, const char* print, int scan_film) {
@@ -139,6 +155,10 @@ int main(int argc, char** argv) {
     const std::string print_dir = goldens_root + "/print_portra_bwcorr";
     const std::string print_ref_dir = goldens_root + "/print_portra";  // corr OFF
     const std::string scan_dir = goldens_root + "/scan_provia_bwcorr";
+    const std::string print_2383_dir =
+        goldens_root + "/print_kodak_2383_k75p";
+    const std::string print_2393_dir =
+        goldens_root + "/print_kodak_2393_k75p";
 
     spk_engine* eng = nullptr;
     spk_status st = spk_engine_create(asset_dir.c_str(), &eng);
@@ -148,6 +168,41 @@ int main(int argc, char** argv) {
     }
 
     bool all = true;
+
+    // Reference-service discriminator: hold every profile table and reference
+    // log-raw sample fixed, changing only the resolved viewing illuminant. This
+    // fails if measure_print_references silently substitutes D50 for K75P.
+    auto check_reference_illuminant = [&](const char* stock) {
+        spk::Profile k75p = spk::load_profile_file(
+            asset_dir + "/profiles/" + stock + ".json");
+        spk::Profile d50 = k75p;
+        d50.viewing_illuminant = "D50";
+        d50.resolved_viewing_illuminant =
+            spk::find_viewing_illuminant("D50");
+        const double log_raw_black[3] = {2.0, 2.0, 2.0};
+        const double log_raw_white[3] = {-4.0, -4.0, -4.0};
+        double kb = 0.0, kw = 0.0, kb_repeat = 0.0, kw_repeat = 0.0;
+        double db = 0.0, dw = 0.0;
+        spk::measure_print_references(k75p, log_raw_black, log_raw_white,
+                                      1.0f, &kb, &kw);
+        spk::measure_print_references(k75p, log_raw_black, log_raw_white,
+                                      1.0f, &kb_repeat, &kw_repeat);
+        spk::measure_print_references(d50, log_raw_black, log_raw_white,
+                                      1.0f, &db, &dw);
+        const double delta = std::fmax(std::fabs(kb - db), std::fabs(kw - dw));
+        const bool repeat = kb == kb_repeat && kw == kw_repeat;
+        const bool finite = std::isfinite(kb) && std::isfinite(kw) &&
+                            std::isfinite(db) && std::isfinite(dw);
+        const bool discriminating = delta > 1e-4;
+        std::printf("[%s reference viewing-only K75P vs D50] max_delta=%.6e "
+                    "repeat=%s finite=%s -> %s\n",
+                    stock, delta, repeat ? "yes" : "NO",
+                    finite ? "yes" : "NO",
+                    (repeat && finite && discriminating) ? "PASS" : "FAIL");
+        return repeat && finite && discriminating;
+    };
+    all &= check_reference_illuminant("kodak_2383");
+    all &= check_reference_illuminant("kodak_2393");
 
     // =======================================================================
     // CASE A — PRINT route (portra -> endura), corrections ON.
@@ -270,6 +325,134 @@ int main(int argc, char** argv) {
             spk_image_free(&out);
         }
     }
+
+    // =======================================================================
+    // CASES C/D — K75P print-reference measurement on Kodak 2383 and 2393.
+    // =======================================================================
+    auto check_k75p_reference = [&](const char* case_label, const char* stock,
+                                    const std::string& golden_dir) {
+        spkvec::Array gold_rgb =
+            spkvec::read(golden_dir + "/final_rgb.spkvec");
+        spkvec::Array gold_pcmy =
+            spkvec::read(golden_dir + "/print_density_cmy.spkvec");
+        const int height = static_cast<int>(gold_rgb.shape[0]);
+        const int width = static_cast<int>(gold_rgb.shape[1]);
+        const int npix = width * height;
+        const size_t n = static_cast<size_t>(npix) * 3;
+        if (gold_rgb.data.size() != n || gold_pcmy.data.size() != n ||
+            gold_pcmy.shape != gold_rgb.shape) {
+            std::fprintf(stderr, "%s K75P golden shape mismatch\n", case_label);
+            return false;
+        }
+        std::printf("CASE %s (print route %s / K75P) %dx%dx3\n", case_label,
+                    stock, width, height);
+        std::vector<double> rgb64 = load_input(input_path, npix);
+        std::vector<float> rgb32(rgb64.begin(), rgb64.end());
+        spk_image in_img{rgb32.data(), width, height, SPK_CS_PROPHOTO};
+
+        spk_params p_off{};
+        set_base(&p_off, "kodak_portra_400", stock, /*scan_film=*/0);
+
+        bool ok = true;
+        spk_image pcmy_off{};
+        if (spk_simulate_tap(eng, &in_img, &p_off, "print_density_cmy",
+                             &pcmy_off) == SPK_OK) {
+            if (pcmy_off.width != width || pcmy_off.height != height) {
+                spk_image_free(&pcmy_off);
+                return false;
+            }
+            std::string label =
+                std::string(case_label) + " no-correction print_density_cmy";
+            ok &= check(label.c_str(), pcmy_off.data, gold_pcmy.data);
+            spk_image_free(&pcmy_off);
+        } else {
+            std::fprintf(stderr, "%s baseline print-density render failed\n",
+                         case_label);
+            ok = false;
+        }
+
+        spk_image rgb_off{};
+        if (spk_simulate(eng, &in_img, &p_off, &rgb_off) == SPK_OK) {
+            if (rgb_off.width != width || rgb_off.height != height) {
+                spk_image_free(&rgb_off);
+                return false;
+            }
+            std::string label =
+                std::string(case_label) + " no-correction K75P final_rgb";
+            ok &= check(label.c_str(), rgb_off.data, gold_rgb.data);
+        } else {
+            std::fprintf(stderr, "%s baseline RGB render failed\n", case_label);
+            return false;
+        }
+
+        spk_params p_on = p_off;
+        p_on.scanner_white_correction = 1;
+        p_on.scanner_black_correction = 1;
+        p_on.scanner_white_level = 0.98f;
+        p_on.scanner_black_level = 0.01f;
+
+        spk_image pcmy_on{};
+        if (spk_simulate_tap(eng, &in_img, &p_on, "print_density_cmy",
+                             &pcmy_on) == SPK_OK) {
+            if (pcmy_on.width != width || pcmy_on.height != height) {
+                spk_image_free(&pcmy_on);
+                spk_image_free(&rgb_off);
+                return false;
+            }
+            const double d =
+                max_abs_diff(pcmy_on.data, gold_pcmy.data.data(), n);
+            const bool active = d > 1e-4;
+            const bool finite = all_finite(pcmy_on.data, n);
+            std::printf("[%s K75P reference print exposure] max_abs vs "
+                        "no-correction golden=%.6e finite=%s -> %s\n",
+                        case_label, d, finite ? "yes" : "NO",
+                        (active && finite) ? "ACTIVE" : "FAIL");
+            ok &= active && finite;
+            spk_image_free(&pcmy_on);
+        } else {
+            std::fprintf(stderr, "%s corrected print-density render failed\n",
+                         case_label);
+            ok = false;
+        }
+
+        spk_image rgb_on_a{}, rgb_on_b{};
+        if (spk_simulate(eng, &in_img, &p_on, &rgb_on_a) == SPK_OK &&
+            spk_simulate(eng, &in_img, &p_on, &rgb_on_b) == SPK_OK) {
+            if (rgb_on_a.width != width || rgb_on_a.height != height ||
+                rgb_on_b.width != width || rgb_on_b.height != height) {
+                spk_image_free(&rgb_on_a);
+                spk_image_free(&rgb_on_b);
+                spk_image_free(&rgb_off);
+                return false;
+            }
+            const double active_delta =
+                max_abs_diff(rgb_on_a.data, rgb_off.data, n);
+            const double repeat_delta =
+                max_abs_diff(rgb_on_a.data, rgb_on_b.data, n);
+            const bool active = active_delta > 1e-4;
+            const bool finite = all_finite(rgb_on_a.data, n) &&
+                                all_finite(rgb_on_b.data, n);
+            const bool deterministic = repeat_delta == 0.0;
+            std::printf("[%s K75P reference final RGB] on-vs-off=%.6e "
+                        "repeat=%.6e finite=%s -> %s\n",
+                        case_label, active_delta, repeat_delta,
+                        finite ? "yes" : "NO",
+                        (active && finite && deterministic) ? "ACTIVE" : "FAIL");
+            ok &= active && finite && deterministic;
+            spk_image_free(&rgb_on_a);
+            spk_image_free(&rgb_on_b);
+        } else {
+            std::fprintf(stderr, "%s corrected RGB render failed\n", case_label);
+            if (rgb_on_a.data) spk_image_free(&rgb_on_a);
+            if (rgb_on_b.data) spk_image_free(&rgb_on_b);
+            ok = false;
+        }
+        spk_image_free(&rgb_off);
+        return ok;
+    };
+
+    all &= check_k75p_reference("C", "kodak_2383", print_2383_dir);
+    all &= check_k75p_reference("D", "kodak_2393", print_2393_dir);
 
     spk_engine_destroy(eng);
     std::printf("%s\n", all ? "ALL PASS" : "FAIL");

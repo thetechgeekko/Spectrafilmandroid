@@ -31,14 +31,19 @@
  *     [goldens_root]
  */
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "spkvec_io.h"
+#include "profiles/profile.h"
 #include "spektra.h"
 
 // Host-only accessors for the print-route film_density_cmy cache counters. Defined
@@ -67,6 +72,10 @@ const char* kPrintGoldenDir =
 // the print_ektar golden was generated from.
 const char* kPrintEktarGoldenDir =
     "/home/user/Spectrafilmandroid/tools/parity/goldens/print_ektar";
+const char* kPrint2383GoldenDir =
+    "/home/user/Spectrafilmandroid/tools/parity/goldens/print_kodak_2383_k75p";
+const char* kPrint2393GoldenDir =
+    "/home/user/Spectrafilmandroid/tools/parity/goldens/print_kodak_2393_k75p";
 const char* kInputF64   =
     "/home/user/Spectrafilmandroid/engine/spektra-core/src/main/cpp/tests/"
     "scan_portra_input_rgb.f64";
@@ -103,11 +112,61 @@ int main(int argc, char** argv) {
     // lets the test run from a git worktree before the goldens land in the repo.
     std::string print_portra_dir = kPrintGoldenDir;
     std::string print_ektar_dir  = kPrintEktarGoldenDir;
+    std::string print_2383_dir   = kPrint2383GoldenDir;
+    std::string print_2393_dir   = kPrint2393GoldenDir;
     if (argc > 4) {
         std::string root = argv[4];
         print_portra_dir = root + "/print_portra";
         print_ektar_dir  = root + "/print_ektar";
+        print_2383_dir   = root + "/print_kodak_2383_k75p";
+        print_2393_dir   = root + "/print_kodak_2393_k75p";
     }
+
+    // Profile-loader seam: viewing-illuminant identifiers are exact registry
+    // keys. Unknown names and superficially similar malformed names must fail
+    // before any render, with the rejected identifier in the diagnostic.
+    auto rejects_illuminant = [](const char* id) {
+        const std::string json =
+            std::string("{\"info\":{\"type\":\"negative\",\"") +
+            "viewing_illuminant\":\"" + id +
+            "\"},\"data\":{\"wavelengths\":[],\"channel_density\":[]," +
+            "\"base_density\":[],\"density_curves\":[]}}";
+        try {
+            (void)spk::load_profile_string(json);
+        } catch (const std::exception& e) {
+            const std::string diagnostic = e.what();
+            const std::string rejected = std::string("'") + id + "'";
+            return diagnostic.find("viewing_illuminant") != std::string::npos &&
+                   diagnostic.find(rejected) != std::string::npos;
+        }
+        return false;
+    };
+    auto rejects_shape = [](const char* viewing_member,
+                            const char* rejected_marker) {
+        const std::string json =
+            std::string("{\"info\":{\"type\":\"negative\"") +
+            viewing_member +
+            "},\"data\":{\"wavelengths\":[],\"channel_density\":[]," +
+            "\"base_density\":[],\"density_curves\":[]}}";
+        try {
+            (void)spk::load_profile_string(json);
+        } catch (const std::exception& e) {
+            const std::string diagnostic = e.what();
+            return diagnostic.find("viewing_illuminant") != std::string::npos &&
+                   diagnostic.find(rejected_marker) != std::string::npos;
+        }
+        return false;
+    };
+    const bool pass_illuminant_diagnostic =
+        rejects_illuminant("LED-RGB1") && rejects_illuminant("D50 ") &&
+        rejects_illuminant("d50") && rejects_illuminant("") &&
+        rejects_shape("", "<missing>") &&
+        rejects_shape(",\"viewing_illuminant\":null", "<non-string>") &&
+        rejects_shape(",\"viewing_illuminant\":75", "<non-string>");
+    // The parity runner treats any literal "FAIL" in stdout as a failure, even
+    // inside a passing label, so keep the label semantically neutral.
+    std::printf("[viewing illuminant rejection diagnostic] -> %s\n",
+                pass_illuminant_diagnostic ? "PASS" : "FAIL");
 
     spk_engine* eng = nullptr;
     spk_status st = spk_engine_create(asset_dir.c_str(), &eng);
@@ -115,6 +174,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "engine create failed: %s\n", spk_status_str(st));
         return 2;
     }
+    size_t profile_list_needed = 0;
+    const spk_status profile_list_status =
+        spk_engine_list_profiles(eng, nullptr, 0, &profile_list_needed);
+    const bool pass_profile_list_status =
+        profile_list_status == SPK_OK && profile_list_needed > 1;
+    std::printf("[profile-list sizing status] -> %s\n",
+                pass_profile_list_status ? "PASS" : "FAIL");
 
     spkvec::Array gold = spkvec::read(golden_dir + "/final_rgb.spkvec");
     const int height = static_cast<int>(gold.shape[0]);
@@ -161,6 +227,23 @@ int main(int argc, char** argv) {
     p.rgb_to_raw_method = SPK_RGB2RAW_HANATOS2025;
     p.preview_max_size = 640;
 
+    // Cooperative cancellation must not publish a partial image.  Countdown
+    // cancellation crosses several setup stages (preprocess/profile/tc-LUT) so
+    // this also exercises RAII cleanup beyond the immediate-entry check.
+    struct CancelAfter { int remaining; } cancel_after{6};
+    auto cancel_check = [](void* opaque) -> int {
+        auto* state = static_cast<CancelAfter*>(opaque);
+        return --state->remaining <= 0 ? 1 : 0;
+    };
+    spk_image cancelled_out{reinterpret_cast<float*>(1), 7, 9, SPK_CS_SRGB};
+    const spk_status cancelled_status = spk_simulate_cancellable(
+        eng, &in_img, &p, &cancelled_out, cancel_check, &cancel_after);
+    const bool pass_cancellation_cleanup =
+        cancelled_status == SPK_ERR_CANCELLED && cancelled_out.data == nullptr &&
+        cancelled_out.width == 0 && cancelled_out.height == 0;
+    std::printf("[cooperative cancellation cleanup] -> %s\n",
+                pass_cancellation_cleanup ? "PASS" : "FAIL");
+
     spk_image out{};
     st = spk_simulate(eng, &in_img, &p, &out);
     if (st != SPK_OK) {
@@ -176,6 +259,70 @@ int main(int argc, char** argv) {
         spk_engine_destroy(eng);
         return 2;
     }
+
+    // A null callback is exactly the legacy path: no reordered arithmetic and
+    // therefore byte-identical output, including the warm-cache path.
+    spk_image uncancelled{};
+    const spk_status uncancelled_status = spk_simulate_cancellable(
+        eng, &in_img, &p, &uncancelled, nullptr, nullptr);
+    const bool pass_uncancelled_parity =
+        uncancelled_status == SPK_OK && uncancelled.data != nullptr &&
+        uncancelled.width == out.width && uncancelled.height == out.height &&
+        std::memcmp(uncancelled.data, out.data, n * sizeof(float)) == 0;
+    std::printf("[cancellable null-callback parity] -> %s\n",
+                pass_uncancelled_parity ? "PASS (byte-identical)" : "FAIL");
+    if (uncancelled.data) spk_image_free(&uncancelled);
+
+    // A non-null callback must be sampled *within* the long per-pixel work, not
+    // only at orchestration boundaries.  Keep buffer memos out of this probe so
+    // a warm engine cannot legitimately skip expose/develop.  All callbacks
+    // must stay on the invoking thread: the Android JNI adapter owns a
+    // caller-thread JNIEnv and is deliberately not worker-thread safe.
+    struct MidStageCancelProbe {
+        int polls = 0;
+        int cancel_on = 0;
+        std::thread::id owner;
+        bool wrong_thread = false;
+    };
+    auto mid_stage_cancel_check = [](void* opaque) -> int {
+        auto* state = static_cast<MidStageCancelProbe*>(opaque);
+        state->wrong_thread = state->wrong_thread ||
+                              std::this_thread::get_id() != state->owner;
+        ++state->polls;
+        return state->cancel_on > 0 && state->polls >= state->cancel_on ? 1 : 0;
+    };
+    spk_params probe_params = p;
+    probe_params.disable_buffer_memos = 1;
+    MidStageCancelProbe polling_probe{0, 0, std::this_thread::get_id(), false};
+    spk_image polled_out{};
+    const spk_status polling_status = spk_simulate_cancellable(
+        eng, &in_img, &probe_params, &polled_out, mid_stage_cancel_check,
+        &polling_probe);
+    const bool pass_mid_stage_polling =
+        polling_status == SPK_OK && !polling_probe.wrong_thread &&
+        polling_probe.polls >= 20 && polled_out.data != nullptr &&
+        polled_out.width == out.width && polled_out.height == out.height &&
+        std::memcmp(polled_out.data, out.data, n * sizeof(float)) == 0;
+    std::printf("[mid-stage caller-thread polling + output parity] polls=%d -> %s\n",
+                polling_probe.polls,
+                pass_mid_stage_polling ? "PASS (byte-identical)" : "FAIL");
+    if (polled_out.data) spk_image_free(&polled_out);
+
+    constexpr int kDeterministicMidStagePoll = 20;
+    MidStageCancelProbe mid_stage_probe{
+        0, kDeterministicMidStagePoll, std::this_thread::get_id(), false};
+    spk_image mid_stage_out{reinterpret_cast<float*>(1), 7, 9, SPK_CS_SRGB};
+    const spk_status mid_stage_status = spk_simulate_cancellable(
+        eng, &in_img, &probe_params, &mid_stage_out, mid_stage_cancel_check,
+        &mid_stage_probe);
+    const bool pass_mid_stage_cancellation =
+        mid_stage_status == SPK_ERR_CANCELLED && !mid_stage_probe.wrong_thread &&
+        mid_stage_probe.polls == kDeterministicMidStagePoll &&
+        mid_stage_out.data == nullptr && mid_stage_out.width == 0 &&
+        mid_stage_out.height == 0;
+    std::printf("[deterministic mid-stage cancellation cleanup] polls=%d -> %s\n",
+                mid_stage_probe.polls,
+                pass_mid_stage_cancellation ? "PASS" : "FAIL");
 
     double max_abs = 0.0, sse = 0.0;
     size_t argmax = 0;
@@ -281,6 +428,45 @@ int main(int argc, char** argv) {
                                gold_ektar_rgb.data);
         spk_image_free(&ektar_out);
     }
+
+    // --- Kodak cinema-print K75P viewing-illuminant oracle fixtures -------
+    // Both bundled cinema print stocks declare info.viewing_illuminant=K75P.
+    // Their final scan must therefore match the pinned upstream Kinoton 75P
+    // spectral integral + K75P-to-sRGB adaptation, never the legacy D50 path.
+    auto check_k75p_print = [&](const char* stock, const std::string& dir) {
+        spkvec::Array golden_cmy =
+            spkvec::read(dir + "/print_density_cmy.spkvec");
+        spkvec::Array golden_rgb = spkvec::read(dir + "/final_rgb.spkvec");
+        spk_params q = p;
+        q.scan_film = 0;
+        q.print_profile = stock;
+
+        bool cmy_ok = false, rgb_ok = false;
+        spk_image cmy{}, rgb{};
+        spk_status sc =
+            spk_simulate_tap(eng, &in_img, &q, "print_density_cmy", &cmy);
+        if (sc == SPK_OK && cmy.data) {
+            std::string label = std::string(stock) + " print_density_cmy";
+            cmy_ok = check(label.c_str(), cmy.data, golden_cmy.data);
+            spk_image_free(&cmy);
+        } else {
+            std::fprintf(stderr, "%s CMY render failed: %s\n", stock,
+                         spk_status_str(sc));
+        }
+
+        sc = spk_simulate(eng, &in_img, &q, &rgb);
+        if (sc == SPK_OK && rgb.data) {
+            std::string label = std::string(stock) + " K75P final_rgb";
+            rgb_ok = check(label.c_str(), rgb.data, golden_rgb.data);
+            spk_image_free(&rgb);
+        } else {
+            std::fprintf(stderr, "%s RGB render failed: %s\n", stock,
+                         spk_status_str(sc));
+        }
+        return cmy_ok && rgb_ok;
+    };
+    const bool pass_2383_k75p = check_k75p_print("kodak_2383", print_2383_dir);
+    const bool pass_2393_k75p = check_k75p_print("kodak_2393", print_2393_dir);
 
     // --- Cache-hit correctness (engine profile/tc_lut PERF caches) -----------
     // A scan_portra render on the SAME, now warm-cached engine (kodak_portra_400
@@ -785,9 +971,63 @@ int main(int argc, char** argv) {
         }
     }
 
+    // C ABI seam: an invalid bundled profile must retain the exact validation
+    // diagnostic across the status boundary, while the next status-returning
+    // call clears it (no stale message reuse). JNI appends this same TLS detail.
+    bool pass_illuminant_c_api = false;
+    try {
+        const auto nonce = std::chrono::steady_clock::now()
+                               .time_since_epoch().count();
+        const std::filesystem::path temp_root =
+            std::filesystem::temp_directory_path() /
+            ("spk_ticket169_invalid_" + std::to_string(nonce));
+        std::filesystem::create_directories(temp_root / "profiles");
+        {
+            std::ofstream bad(temp_root / "profiles" / "bad_white.json");
+            bad << "{\"info\":{\"type\":\"negative\","
+                   "\"viewing_illuminant\":\"LED-RGB1\"},"
+                   "\"data\":{\"wavelengths\":[],\"channel_density\":[],"
+                   "\"base_density\":[],\"density_curves\":[]}}";
+        }
+        spk_engine* bad_eng = nullptr;
+        const spk_status create_status =
+            spk_engine_create(temp_root.string().c_str(), &bad_eng);
+        spk_params bad_params{};
+        bad_params.film_profile = "bad_white";
+        bad_params.print_profile = "bad_white";
+        spk_default_params(&bad_params);
+        bad_params.scan_film = 1;
+        spk_image ignored{};
+        const spk_status invalid_status = create_status == SPK_OK
+            ? spk_simulate(bad_eng, &in_img, &bad_params, &ignored)
+            : create_status;
+        const std::string detail = spk_last_error_message();
+        const bool exact_detail =
+            detail.find("profile 'bad_white'") != std::string::npos &&
+            detail.find("viewing_illuminant") != std::string::npos &&
+            detail.find("'LED-RGB1'") != std::string::npos;
+        size_t unused = 0;
+        (void)spk_engine_list_profiles(nullptr, nullptr, 0, &unused);
+        const bool cleared = spk_last_error_message()[0] == '\0';
+        pass_illuminant_c_api =
+            invalid_status == SPK_ERR_PROFILE_INVALID && exact_detail && cleared;
+        if (ignored.data) spk_image_free(&ignored);
+        spk_engine_destroy(bad_eng);
+        std::filesystem::remove_all(temp_root);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "invalid-profile C API fixture failed: %s\n", e.what());
+    }
+    std::printf("[viewing illuminant C API status/detail/TLS clear] -> %s\n",
+                pass_illuminant_c_api ? "PASS" : "FAIL");
+
     spk_engine_destroy(eng);
-    bool all = pass && pass_print_cmy && pass_print_rgb &&
-               pass_ektar_cmy && pass_ektar_rgb && pass_cache && pass_film_cache;
+    bool all = pass && pass_profile_list_status && pass_cancellation_cleanup &&
+               pass_uncancelled_parity && pass_mid_stage_polling &&
+               pass_mid_stage_cancellation &&
+               pass_print_cmy && pass_print_rgb &&
+               pass_ektar_cmy && pass_ektar_rgb && pass_2383_k75p &&
+               pass_2393_k75p && pass_illuminant_diagnostic &&
+               pass_illuminant_c_api && pass_cache && pass_film_cache;
     std::printf("%s\n", all ? "ALL PASS" : "FAIL");
     return all ? 0 : 1;
 }

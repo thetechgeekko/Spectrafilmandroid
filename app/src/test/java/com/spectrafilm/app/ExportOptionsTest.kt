@@ -7,8 +7,10 @@
  */
 package com.spectrafilm.app
 
+import com.spectrafilm.engine.ColorSpace
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ExportOptionsTest {
@@ -74,5 +76,51 @@ class ExportOptionsTest {
         assertEquals("Roll_12_frame", exportBaseName("Roll 12 — frame", 1))
         assertEquals("abc", exportBaseName("a/b\\c", 1))
         assertEquals("keep-this_1", exportBaseName("keep-this_1", 1))
+    }
+
+    @Test
+    fun outputDescriptor_rejectsIllegalChoicesBeforeRender() {
+        val jpeg = opts(format = ExportFormat.JPEG)
+        assertEquals(
+            ExistingExportClass.SDR_JPEG8,
+            jpeg.outputDescriptor(ColorSpace.SRGB, outputCctfEncoding = true, apiLevel = 24)
+                .existingExportClass,
+        )
+        assertTrue(runCatching {
+            jpeg.outputDescriptor(ColorSpace.SRGB, outputCctfEncoding = false, apiLevel = 34)
+        }.isFailure)
+        assertTrue(runCatching {
+            jpeg.outputDescriptor(ColorSpace.ACES2065_1, outputCctfEncoding = true, apiLevel = 34)
+        }.isFailure)
+
+        val adobeJpeg = jpeg.outputDescriptor(
+            ColorSpace.ADOBE_RGB,
+            outputCctfEncoding = true,
+            apiLevel = 26,
+        )
+        assertEquals(26, adobeJpeg.minimumApi)
+        assertTrue(runCatching { adobeJpeg.requirePlatformApi(25) }.isFailure)
+
+        val scene = opts(format = ExportFormat.SCENE_LINEAR_TIFF).outputDescriptor(
+            ColorSpace.ADOBE_RGB,
+            outputCctfEncoding = true,
+            apiLevel = 24,
+        )
+        assertEquals(OutputReference.SCENE_REFERRED, scene.reference)
+
+        // Ultra HDR is exportable on API 34+ since #140 gave it a real, render-derived gain map.
+        val ultraHdr = opts(format = ExportFormat.ULTRA_HDR).outputDescriptor(
+            ColorSpace.SRGB,
+            outputCctfEncoding = true,
+            apiLevel = 34,
+        )
+        assertEquals(ExistingExportClass.ULTRA_HDR_SPATIAL_GAIN_MAP, ultraHdr.existingExportClass)
+        assertTrue(runCatching {
+            opts(format = ExportFormat.ULTRA_HDR).outputDescriptor(
+                ColorSpace.SRGB,
+                outputCctfEncoding = true,
+                apiLevel = 33,
+            )
+        }.isFailure)
     }
 }

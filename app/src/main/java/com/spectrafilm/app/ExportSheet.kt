@@ -9,6 +9,7 @@
  */
 package com.spectrafilm.app
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +28,10 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.spectrafilm.engine.ColorSpace
@@ -45,6 +50,8 @@ fun ExportSheet(
     onDismiss: () -> Unit,
     onExport: () -> Unit,
 ) {
+    // Dropdown's `display` is a plain (non-composable) lambda, so resolve via the context.
+    val context = LocalContext.current
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -53,20 +60,24 @@ fun ExportSheet(
                 .padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Text("Export", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                stringResource(R.string.tool_export_title),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.semantics { heading() },
+            )
             val isSceneLinear = options.format == ExportFormat.SCENE_LINEAR_TIFF
 
             // --- Format (+ format-specific quality) ---
             Dropdown(
-                label = "Format",
+                label = stringResource(R.string.tool_export_format),
                 selected = options.format,
                 options = ExportFormat.entries.toList(),
-                display = { it.display },
+                display = { context.getString(it.labelRes()) },
                 onSelect = { onOptionsChange(options.copy(format = it)) },
             )
             if (options.format == ExportFormat.JPEG || options.format == ExportFormat.ULTRA_HDR) {
                 IntSlider(
-                    label = "Quality",
+                    label = stringResource(R.string.tool_export_quality),
                     value = options.jpegQuality,
                     range = 10..100,
                     default = 90,
@@ -75,9 +86,7 @@ fun ExportSheet(
             }
             if (isSceneLinear) {
                 Text(
-                    "Exports the decoded scene-linear input — the linear RGB before the film " +
-                        "simulation — as an untagged 32-bit float TIFF, for grading in another app. " +
-                        "Colour space and metadata options don't apply.",
+                    stringResource(R.string.tool_export_scene_linear_note),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -86,19 +95,23 @@ fun ExportSheet(
             HorizontalDivider()
 
             // --- Dimensions (post-render downscale, like Lightroom) ---
-            Text("Size", style = MaterialTheme.typography.titleSmall)
+            Text(
+                stringResource(R.string.tool_export_size_heading),
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.semantics { heading() },
+            )
             if (options.format.isHighBitDepth()) {
                 Text(
-                    "High-bit-depth formats export at full resolution.",
+                    stringResource(R.string.tool_export_high_bit_depth_note),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
                 Dropdown(
-                    label = "Dimensions",
+                    label = stringResource(R.string.tool_export_dimensions),
                     selected = options.size,
                     options = ExportSize.entries.toList(),
-                    display = { it.label },
+                    display = { context.getString(it.labelRes) },
                     onSelect = { onOptionsChange(options.copy(size = it)) },
                 )
                 if (options.size == ExportSize.CUSTOM) {
@@ -107,13 +120,17 @@ fun ExportSheet(
                         onValueChange = { v ->
                             onOptionsChange(options.copy(customLongEdge = v.filter(Char::isDigit).take(5).toIntOrNull() ?: 0))
                         },
-                        label = { Text("Long edge (px)") },
+                        label = { Text(stringResource(R.string.tool_export_long_edge)) },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Text(
-                        "Clamped to ${ExportOptions.MIN_CUSTOM_EDGE}–${ExportOptions.MAX_CUSTOM_EDGE} px; the photo is never enlarged.",
+                        stringResource(
+                            R.string.tool_export_custom_clamp,
+                            ExportOptions.MIN_CUSTOM_EDGE,
+                            ExportOptions.MAX_CUSTOM_EDGE,
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -125,17 +142,17 @@ fun ExportSheet(
 
                 // --- Colour ---
                 Dropdown(
-                    label = "Color space",
+                    label = stringResource(R.string.tool_export_color_space),
                     selected = colorSpace,
                     options = ColorSpace.entries.toList(),
-                    display = { it.label() },
+                    display = { context.getString(it.labelRes()) },
                     onSelect = onColorSpaceChange,
                 )
                 SwitchRow(
-                    label = "Encode color transfer (CCTF)",
+                    label = stringResource(R.string.tool_export_cctf),
                     checked = cctf,
                     onCheckedChange = onCctfChange,
-                    tooltip = "On for normal viewing. Off writes scene-linear values (for further grading).",
+                    tooltip = stringResource(R.string.tool_export_cctf_help),
                 )
             }
 
@@ -145,28 +162,32 @@ fun ExportSheet(
             OutlinedTextField(
                 value = options.customName,
                 onValueChange = { onOptionsChange(options.copy(customName = it)) },
-                label = { Text("File name (optional)") },
-                placeholder = { Text("Spektrafilm_<timestamp>") },
+                label = { Text(stringResource(R.string.tool_export_file_name)) },
+                placeholder = { Text(stringResource(R.string.tool_export_file_name_placeholder)) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             if (!isSceneLinear) {
                 SwitchRow(
-                    label = "Include location (GPS)",
+                    label = stringResource(R.string.tool_export_include_gps),
                     checked = keepGps,
                     onCheckedChange = onKeepGpsChange,
-                    tooltip = "Copy GPS coordinates from the source photo into the exported file.",
+                    tooltip = stringResource(R.string.tool_export_include_gps_help),
                 )
             }
 
             // --- Actions ---
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) { Text("Cancel") }
-                Button(onClick = onExport, modifier = Modifier.weight(1f)) { Text("Export") }
+                OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) {
+                    Text(stringResource(R.string.tool_cancel))
+                }
+                Button(onClick = onExport, modifier = Modifier.weight(1f)) {
+                    Text(stringResource(R.string.tool_export_action))
+                }
             }
 
             Text(
-                "Film modeling powered by spektrafilm",
+                stringResource(R.string.tool_export_attribution),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
             )
@@ -174,12 +195,25 @@ fun ExportSheet(
     }
 }
 
+/** Localised display name for an [ExportFormat] (the enum's `display` stays as the log/diagnostic id). */
+@StringRes
+private fun ExportFormat.labelRes(): Int = when (this) {
+    ExportFormat.PNG -> R.string.tool_export_format_png
+    ExportFormat.JPEG -> R.string.tool_export_format_jpeg
+    ExportFormat.ULTRA_HDR -> R.string.tool_export_format_ultra_hdr
+    ExportFormat.TIFF -> R.string.tool_export_format_tiff
+    ExportFormat.PNG16 -> R.string.tool_export_format_png16
+    ExportFormat.TIFF32F -> R.string.tool_export_format_tiff32f
+    ExportFormat.SCENE_LINEAR_TIFF -> R.string.tool_export_format_scene_linear_tiff
+}
+
 /** Friendly label for an output [ColorSpace] in the export sheet. */
-private fun ColorSpace.label(): String = when (this) {
-    ColorSpace.SRGB -> "sRGB"
-    ColorSpace.ADOBE_RGB -> "Adobe RGB (1998)"
-    ColorSpace.PROPHOTO -> "ProPhoto RGB"
-    ColorSpace.REC2020 -> "Rec. 2020"
-    ColorSpace.ACES2065_1 -> "ACES2065-1"
-    ColorSpace.LINEAR_SRGB -> "Linear sRGB"
+@StringRes
+private fun ColorSpace.labelRes(): Int = when (this) {
+    ColorSpace.SRGB -> R.string.tool_color_space_srgb
+    ColorSpace.ADOBE_RGB -> R.string.tool_color_space_adobe_rgb
+    ColorSpace.PROPHOTO -> R.string.tool_color_space_prophoto
+    ColorSpace.REC2020 -> R.string.tool_color_space_rec2020
+    ColorSpace.ACES2065_1 -> R.string.tool_color_space_aces2065_1
+    ColorSpace.LINEAR_SRGB -> R.string.tool_color_space_linear_srgb
 }

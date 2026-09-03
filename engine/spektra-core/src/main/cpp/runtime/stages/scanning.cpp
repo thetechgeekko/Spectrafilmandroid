@@ -101,25 +101,26 @@ struct GpuScanTables {
     std::vector<float> dye;   // NB*3 band-major (c,m,y)
     std::vector<float> icmf;  // NB*3 band-major (X,Y,Z), illum+base+norm folded
     float m_engine[9];        // Mc.M: CAT02 round-trip composed with XYZ->sRGB (fused kernel)
-    float m_space[9];         // plain kXYZ_to_RGB[space] (linear kernel; Mc stays in encode)
+    float m_space[9];         // resolved XYZ->RGB[space] (linear kernel; Mc stays in encode)
 };
 
 // Fold the profile tables into the gpu/vulkan_compute.h contract. KEEP IN SYNC
 // with tools/gpu_probe/probe_main.cpp::build_tables — the probe validated
 // exactly this fold on device (PR #145, fold-vs-engine <= 1.02e-7 in f64):
 //   dye[b][k]  = channel_density[b][k]                        (fp32, verbatim)
-//   icmf[b][k] = 10^-base_density[b] * illumD50[b] * cmf[b][k] / normD50
+//   icmf[b][k] = 10^-base_density[b] * viewing[b] * cmf[b][k] / viewing_norm
 // Bands with NaN channel/base density contribute w = NaN -> 0 in the CPU engine
 // for EVERY pixel, so both table rows are zeroed. The matrix is Mc.M (the
 // engine's CAT02 round-trip composed with XYZ->sRGB, an exact linear
 // composition): the raw XYZ->sRGB matrix alone differs from the engine's
 // default output path by up to ~1.5e-4 near black — outside tolerance.
-bool build_gpu_scan_tables(const Profile& film, spk_color_space space,
-                           GpuScanTables* t) {
+bool build_gpu_scan_tables(const Profile& film,
+                           const ViewingIlluminant& viewing,
+                           spk_color_space space, GpuScanTables* t) {
     if (film.n_samples != kGpuNB) return false;
     t->dye.assign(kGpuNB * 3, 0.0f);
     t->icmf.assign(kGpuNB * 3, 0.0f);
-    const double inv_norm = 1.0 / kNormD50;
+    const double inv_norm = 1.0 / viewing.normalization;
     for (int l = 0; l < kGpuNB; ++l) {
         const float* cd = film.channel_density.data() + static_cast<size_t>(l) * 3;
         const float base = film.base_density[static_cast<size_t>(l)];
@@ -130,7 +131,7 @@ bool build_gpu_scan_tables(const Profile& film, spk_color_space space,
         t->dye[l * 3 + 1] = cd[1];
         t->dye[l * 3 + 2] = cd[2];
         const double w = std::pow(10.0, -static_cast<double>(base)) *
-                         static_cast<double>(kIlluminantD50[l]) * inv_norm;
+                         static_cast<double>(viewing.spectrum[l]) * inv_norm;
         for (int k = 0; k < 3; ++k)
             t->icmf[l * 3 + k] =
                 static_cast<float>(w * static_cast<double>(kCieCmf1931[l][k]));
@@ -140,11 +141,11 @@ bool build_gpu_scan_tables(const Profile& film, spk_color_space space,
             double acc = 0.0;
             for (int k = 0; k < 3; ++k)
                 acc += kRGB_to_RGB_CCTF[SPK_CS_SRGB][r * 3 + k] *
-                       kXYZ_to_RGB[SPK_CS_SRGB][k * 3 + c];
+                       viewing.xyz_to_rgb[SPK_CS_SRGB][k * 3 + c];
             t->m_engine[r * 3 + c] = static_cast<float>(acc);
         }
     for (int k = 0; k < 9; ++k)
-        t->m_space[k] = static_cast<float>(kXYZ_to_RGB[space][k]);
+        t->m_space[k] = static_cast<float>(viewing.xyz_to_rgb[space][k]);
     return true;
 }
 
@@ -183,7 +184,8 @@ std::atomic<int> g_gpu_scan_state{0};  // 0 unchecked, 1 passed, 2 failed
 // path ever ENGAGED — silence was indistinguishable from "never ran").
 std::atomic<uint64_t> g_gpu_scan_frames{0};
 
-bool gpu_scan_self_check(const Profile& film) {
+bool gpu_scan_self_check(const Profile& film,
+                         const ViewingIlluminant& viewing) {
     int st = g_gpu_scan_state.load(std::memory_order_acquire);
     if (st != 0) return st == 1;
     static std::mutex m;
@@ -194,7 +196,7 @@ bool gpu_scan_self_check(const Profile& film) {
     bool ok = false;
     do {
         GpuScanTables t;
-        if (!build_gpu_scan_tables(film, SPK_CS_SRGB, &t)) break;
+        if (!build_gpu_scan_tables(film, viewing, SPK_CS_SRGB, &t)) break;
 
         // 8x8x8 lattice over [-0.1, nanmax(density_curves)] per channel (the
         // probe's sweep domain, coarser) + one NaN pixel for the guard.
@@ -305,19 +307,26 @@ void scan(const Profile& film, const ScanningParams& params,
     ScopedStage _t_scan(STG_SCAN);  // whole stage (diagnostic; #146/#152)
     const int npix = width * height;
     const int S = film.n_samples;  // == kSpectralSamples (81) for bundled profiles
+    const ViewingIlluminant& viewing = film.resolved_viewing_illuminant
+        ? *film.resolved_viewing_illuminant
+        : require_viewing_illuminant(film.viewing_illuminant);
+    const float* const illum = viewing.spectrum;
+    const double norm = viewing.normalization;
+    const double* const output_matrix =
+        viewing.xyz_to_rgb[params.output_color_space];
 
     // GPU preview fast-path (#146; law revision #149: preview-only until option-B
     // ships). Placed before the LUT build so an engaged GPU frame skips the LUT
     // entirely — the fp32 direct integral (~2e-6 vs the CPU chain, PR #145) is
-    // both faster and tighter than the preview's PCHIP LUT (~5e-5). allow_gpu is
+    // both faster and tighter than every locked preview PCHIP LUT17 case. allow_gpu is
     // default-false: every parity test and every export render never reaches
     // this block, so the CPU path below stays byte-identical. Any failure
     // (ineligible frame, no device, failed self-check, failed dispatch) falls
     // through to the unchanged CPU path for this frame.
     if (params.allow_gpu && S == kGpuNB && gpu_scan_eligible(params) &&
-        spk::gpu::available() && gpu_scan_self_check(film)) {
+        spk::gpu::available() && gpu_scan_self_check(film, viewing)) {
         GpuScanTables t;
-        if (build_gpu_scan_tables(film, SPK_CS_SRGB, &t) &&
+        if (build_gpu_scan_tables(film, viewing, SPK_CS_SRGB, &t) &&
             spk::gpu::scan_spectral(density_cmy, rgb_out,
                                     static_cast<uint32_t>(npix), t.dye.data(),
                                     t.icmf.data(), t.m_engine)) {
@@ -353,13 +362,12 @@ void scan(const Profile& film, const ScanningParams& params,
         params.output_gamut_compress == OutputGamutCompress::kAcesRgc ||
         params.output_gamut_compress == OutputGamutCompress::kOklch ||
         params.output_gamut_compress == OutputGamutCompress::kOklrab ||
+        params.output_gamut_compress == OutputGamutCompress::kJzazbz ||
+        params.output_gamut_compress == OutputGamutCompress::kCam16ucs ||
         params.lens_blur > 0.0 || do_unsharp;
 
-    // Scan illuminant + constants. For the scan_film route the scan illuminant is
-    // the film's viewing illuminant (D50 here). These mirror scanning.py:
-    //   normalization = sum(scan_illuminant * ybar)
-    const float* illum = kIlluminantD50;
-    const double norm = kNormD50;
+    // The profile's resolved viewing illuminant owns the spectral weighting,
+    // normalization, glare white and source-white CAT for this whole call.
 
     // Viewing glare (print route only). scanning.py::_density_to_rgb adds
     //   xyz += glare_amount[:,:,None] * illuminant_xyz[None,None,:]
@@ -381,6 +389,13 @@ void scan(const Profile& film, const ScanningParams& params,
             illuminant_xyz[2] += w * kCieCmf1931[l][2];
         }
         glare_field.assign(static_cast<size_t>(npix), 0.0f);
+        // The field build is glare's expensive half — a stochastic full-resolution
+        // field plus a blur. The per-pixel add below is folded into the scan loops and
+        // is not separable from them, so this slot measures the build only. Like
+        // scan_spatial it is NESTED inside the STG_SCAN bracket, so it must not be
+        // added to a stage total. Until now glare had no slot at all and so cost
+        // nothing visible even when switched on (perf-lab §18).
+        ScopedStage _tg(STG_GLARE);
         compute_random_glare_amount(params.glare_percent, params.glare_roughness,
                                     params.glare_blur, width, height,
                                     params.glare_seed, glare_field.data());
@@ -395,13 +410,13 @@ void scan(const Profile& film, const ScanningParams& params,
     // integral: the linear kernel fills the same lin plane compute_pixel would
     // have produced (fp32-quantized), and the UNCHANGED CPU plane ops + encode
     // tail run on it. On success the scanner LUT below is skipped entirely (the
-    // direct fp32 integral, ~2e-6, is tighter than the LUT's ~5e-5). Any
+    // direct fp32 integral, ~2e-6, is tighter than every locked LUT17 case). Any
     // failure falls through to the CPU path for this frame.
     std::unique_ptr<double[]> lin_buf;
     if (params.allow_gpu && S == kGpuNB && gpu_scan_frame_ok(params) &&
-        spk::gpu::available() && gpu_scan_self_check(film)) {
+        spk::gpu::available() && gpu_scan_self_check(film, viewing)) {
         GpuScanTables t;
-        if (build_gpu_scan_tables(film, params.output_color_space, &t)) {
+        if (build_gpu_scan_tables(film, viewing, params.output_color_space, &t)) {
             std::vector<float> gpu_lin(static_cast<size_t>(npix) * 3);
             if (spk::gpu::scan_spectral_linear(density_cmy, gpu_lin.data(),
                                                static_cast<uint32_t>(npix),
@@ -420,7 +435,7 @@ void scan(const Profile& film, const ScanningParams& params,
                 // preview (grain on -> glare on) lands here.
                 double gI[3] = {0.0, 0.0, 0.0};
                 if (do_glare) {
-                    const double* M = kXYZ_to_RGB[params.output_color_space];
+                    const double* M = output_matrix;
                     for (int r = 0; r < 3; ++r)
                         gI[r] = M[r * 3 + 0] * illuminant_xyz[0] +
                                 M[r * 3 + 1] * illuminant_xyz[1] +
@@ -457,7 +472,8 @@ void scan(const Profile& film, const ScanningParams& params,
     // apply_lut_3d default) instead of evaluating the spectral integral per pixel.
     // The LUT covers EXACTLY the density_cmy -> log_xyz step; everything after
     // (10^log_xyz, glare, XYZ->RGB) is shared with the direct path. Interpolation is
-    // NOT bit-exact vs the direct evaluation (documented ~5e-5), so it is OPT-IN and
+    // NOT bit-exact vs direct and its error is profile/domain dependent (LUT17:
+    // locked D50 <=5e-5; K75P 2383/2393 about 0.0040/0.0073), so it is OPT-IN and
     // the default path (use_lut == false) never even constructs the LUT.
     //
     // Domain bounds (scanning.py::_density_to_rgb):
@@ -520,10 +536,10 @@ void scan(const Profile& film, const ScanningParams& params,
         //     density_curves and params.grain_density_min,
         //   - the clamped step count.
         // scan_film itself is folded too, so the two routes can never share a slot
-        // even if their bounds coincided. ctx.illum (kIlluminantD50), ctx.cmf
-        // (kCieCmf1931) and ctx.inv_norm (1/kNormD50) are compile-time constants —
-        // they cannot differ between calls, so they need no fold. Anything added to
-        // CmyToLogXyzCtx later MUST be added here as well.
+        // even if their bounds coincided. The selected viewing spectrum and its
+        // normalization are also folded: profiles that differ only by viewing
+        // white must never share a scanner LUT. kCieCmf1931 remains immutable.
+        // Anything added to CmyToLogXyzCtx later MUST be added here as well.
         std::shared_ptr<const PreparedLut3D> prepared;
         if (params.lut_cache) {
             std::string key;
@@ -535,6 +551,8 @@ void scan(const Profile& film, const ScanningParams& params,
                            film.channel_density.size());
             lut_key_append(&key, film.base_density.data(),
                            film.base_density.size());
+            lut_key_append(&key, viewing.spectrum, S);
+            lut_key_append(&key, viewing.normalization);
             lut_key_append(&key, xmin, 3);
             lut_key_append(&key, xmax, 3);
             lut_key_append(&key, steps);
@@ -659,10 +677,10 @@ void scan(const Profile& film, const ScanningParams& params,
             xyz[2] += g * illuminant_xyz[2];
         }
 
-        // 5. XYZ -> output RGB (linear, in io.output_color_space), with CAT02
-        //    from the D50 scan whitepoint to the space whitepoint baked into the
-        //    matrix (colour.XYZ_to_RGB(..., illuminant=D50_xy)).
-        const double* M = kXYZ_to_RGB[params.output_color_space];
+        // 5. XYZ -> output RGB (linear, in io.output_color_space), with exactly
+        //    one CAT02 from the resolved viewing white to the output white baked
+        //    into this matrix. No earlier step chromatically adapts XYZ.
+        const double* M = output_matrix;
         for (int c = 0; c < 3; ++c) {
             lin[c] = M[c * 3 + 0] * xyz[0] +
                      M[c * 3 + 1] * xyz[1] +
@@ -761,6 +779,21 @@ void scan(const Profile& film, const ScanningParams& params,
                                    static_cast<int>(params.output_color_space),
                                    params.gamut_knee_threshold, params.gamut_knee_limit,
                                    params.gamut_knee_power);
+    } else if (params.output_gamut_compress == OutputGamutCompress::kJzazbz) {
+        // JzCzhz chroma reduction (Safdar 2017): hue-stable across the blue/cyan arc
+        // where OkLch twists. Same per-space selection (#201).
+        compress_rgb_jzazbz_chroma(lin_rgb, npix,
+                                   static_cast<int>(params.output_color_space),
+                                   params.gamut_knee_threshold, params.gamut_knee_limit,
+                                   params.gamut_knee_power);
+    } else if (params.output_gamut_compress == OutputGamutCompress::kCam16ucs) {
+        // CAM16-UCS chroma reduction (Li 2017) — the upstream 3bb2c2d default
+        // algorithm, here strictly opt-in. Same per-space selection (#201).
+        compress_rgb_cam16ucs_chroma(lin_rgb, npix,
+                                     static_cast<int>(params.output_color_space),
+                                     params.gamut_knee_threshold,
+                                     params.gamut_knee_limit,
+                                     params.gamut_knee_power);
     }
 
     // Scanner lens blur (scanner.lens_blur, in pixels): a per-channel 2D Gaussian

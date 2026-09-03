@@ -35,12 +35,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <new>
 #include <string>
 #include <vector>
 
 #include "spkvec_io.h"
 
 #include "model/diffusion.h"
+#include "runtime/memory_budget.h"
 
 namespace {
 
@@ -118,6 +120,27 @@ int main(int argc, char** argv) {
     std::printf("[diffusion_bpm] worst idx=%zu: got=%.8f golden=%.8f -> %s\n",
                 argmax, static_cast<double>(static_cast<float>(raw[argmax])),
                 static_cast<double>(gold.data[argmax]), pass ? "PASS" : "FAIL");
+    // #160: the FFT's scratch is admitted through the process memory budget, and a
+    // refusal must surface as OOM. It must NOT quietly fall through to the direct
+    // O(w*h*ks^2) loop -- that loop is ~10.9 hours at 12 MP, so turning memory
+    // pressure into it would be far worse than failing the render.
+    {
+        auto& budget = spk::memory::process_memory_budget();
+        const std::uint64_t restore = budget.limit_bytes();
+        budget.set_limit_bytes(1024);            // below the smallest transform's scratch
+        std::vector<double> starved(n, 0.25);
+        bool denied = false;
+        try {
+            spk::apply_diffusion_filter_um(starved.data(), w, h, df, pixel_size_um);
+        } catch (const std::bad_alloc&) {
+            denied = true;
+        }
+        budget.set_limit_bytes(restore);
+        std::printf("[diffusion_bpm] budget denial -> %s\n",
+                    denied ? "PASS (bad_alloc)" : "FAIL (silent fallback?)");
+        pass = pass && denied;
+    }
+
     std::printf("%s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

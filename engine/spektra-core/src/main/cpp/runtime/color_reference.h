@@ -81,7 +81,8 @@ ColorCorrection build_color_correction(double y_black, double y_white,
 // (_update_cmy_black_white_references, in_print=False):
 //   cmy_black = nanmax(film.density_curves, axis=0); cmy_white = 0;
 //   y = (10**cmy_to_log_xyz(cmy))[Y].
-// `film` supplies channel_density / base_density and the D50 scan illuminant.
+// `film` supplies channel_density / base_density and owns the exact resolved
+// viewing illuminant used by the scan pipeline.
 void measure_scanfilm_references(const Profile& film, double* y_black,
                                  double* y_white);
 

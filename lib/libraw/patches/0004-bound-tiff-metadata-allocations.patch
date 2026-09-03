@@ -1,0 +1,198 @@
+diff --git a/libraw/libraw_const.h b/libraw/libraw_const.h
+--- a/libraw/libraw_const.h
++++ b/libraw/libraw_const.h
+@@ -28,6 +28,12 @@
+ #define LIBRAW_MAX_PROFILE_SIZE_MB 256LL
+ #endif
+ 
++/* Cumulative member-allocator budget while open_datastream() is identifying
++ * metadata. Zero preserves upstream's unbounded behavior. */
++#ifndef LIBRAW_MAX_METADATA_ALLOC_SIZE_MB
++#define LIBRAW_MAX_METADATA_ALLOC_SIZE_MB 0LL
++#endif
++
+ #ifndef LIBRAW_MAX_NONDNG_RAW_FILE_SIZE
+ #define LIBRAW_MAX_NONDNG_RAW_FILE_SIZE 2147483647LL
+ #endif
+diff --git a/libraw/libraw_internal.h b/libraw/libraw_internal.h
+--- a/libraw/libraw_internal.h
++++ b/libraw/libraw_internal.h
+@@ -93,6 +93,7 @@
+   INT64 profile_offset;
+   INT64 toffset;
+   unsigned pana_black[4];
++  size_t identify_allocated_bytes;
+ 
+ } internal_data_t;
+ 
+diff --git a/src/utils/utils_libraw.cpp b/src/utils/utils_libraw.cpp
+--- a/src/utils/utils_libraw.cpp
++++ b/src/utils/utils_libraw.cpp
+@@ -257,6 +257,19 @@
+ 
+ void *LibRaw::malloc(size_t t)
+ {
++#if LIBRAW_MAX_METADATA_ALLOC_SIZE_MB > 0
++  if ((imgdata.progress_flags & LIBRAW_PROGRESS_OPEN) &&
++      !(imgdata.progress_flags & LIBRAW_PROGRESS_IDENTIFY))
++  {
++    const size_t limit =
++        size_t(LIBRAW_MAX_METADATA_ALLOC_SIZE_MB) * 1024U * 1024U;
++    size_t &used =
++        libraw_internal_data.internal_data.identify_allocated_bytes;
++    if (used > limit || t > limit - used)
++      throw LIBRAW_EXCEPTION_ALLOC;
++    used += t;
++  }
++#endif
+   void *p = memmgr.malloc(t);
+   if (!p)
+     throw LIBRAW_EXCEPTION_ALLOC;
+@@ -264,6 +277,19 @@
+ }
+ void *LibRaw::realloc(void *q, size_t t)
+ {
++#if LIBRAW_MAX_METADATA_ALLOC_SIZE_MB > 0
++  if ((imgdata.progress_flags & LIBRAW_PROGRESS_OPEN) &&
++      !(imgdata.progress_flags & LIBRAW_PROGRESS_IDENTIFY))
++  {
++    const size_t limit =
++        size_t(LIBRAW_MAX_METADATA_ALLOC_SIZE_MB) * 1024U * 1024U;
++    size_t &used =
++        libraw_internal_data.internal_data.identify_allocated_bytes;
++    if (used > limit || t > limit - used)
++      throw LIBRAW_EXCEPTION_ALLOC;
++    used += t;
++  }
++#endif
+   void *p = memmgr.realloc(q, t);
+   if (!p)
+     throw LIBRAW_EXCEPTION_ALLOC;
+@@ -272,6 +298,22 @@
+ 
+ void *LibRaw::calloc(size_t n, size_t t)
+ {
++#if LIBRAW_MAX_METADATA_ALLOC_SIZE_MB > 0
++  if (t && n > size_t(-1) / t)
++    throw LIBRAW_EXCEPTION_ALLOC;
++  const size_t requested = n * t;
++  if ((imgdata.progress_flags & LIBRAW_PROGRESS_OPEN) &&
++      !(imgdata.progress_flags & LIBRAW_PROGRESS_IDENTIFY))
++  {
++    const size_t limit =
++        size_t(LIBRAW_MAX_METADATA_ALLOC_SIZE_MB) * 1024U * 1024U;
++    size_t &used =
++        libraw_internal_data.internal_data.identify_allocated_bytes;
++    if (used > limit || requested > limit - used)
++      throw LIBRAW_EXCEPTION_ALLOC;
++    used += requested;
++  }
++#endif
+   void *p = memmgr.calloc(n, t);
+   if (!p)
+     throw LIBRAW_EXCEPTION_ALLOC;
+diff --git a/src/metadata/tiff.cpp b/src/metadata/tiff.cpp
+--- a/src/metadata/tiff.cpp
++++ b/src/metadata/tiff.cpp
+@@ -94,6 +94,8 @@
+       case 0x0111: /* 273, StripOffset */
+         if (len > 1 && len < 16384)
+         {
++          if (tiff_ifd[ifd].strip_offsets)
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
+           INT64 sav = ftell(ifp);
+           tiff_ifd[ifd].strip_offsets = (INT64 *)calloc(len, sizeof(INT64));
+           tiff_ifd[ifd].strip_offsets_count = len;
+@@ -526,6 +528,8 @@
+       case 0x0111: /* 273, StripOffset */
+         if (len > 1 && len < 16384)
+         {
++          if (tiff_ifd[ifd].strip_offsets)
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
+           INT64 sav = ftell(ifp);
+           tiff_ifd[ifd].strip_offsets = (INT64 *)calloc(len, sizeof(INT64));
+           tiff_ifd[ifd].strip_offsets_count = len;
+@@ -639,6 +643,8 @@
+     case 0x0117: /* 279, StripByteCounts */
+       if (len > 1 && len < 16384)
+       {
++        if (tiff_ifd[ifd].strip_byte_counts)
++          throw LIBRAW_EXCEPTION_IO_CORRUPT;
+         INT64 sav = ftell(ifp);
+         tiff_ifd[ifd].strip_byte_counts = (INT64 *)calloc(len, sizeof(INT64));
+         tiff_ifd[ifd].strip_byte_counts_count = len;
+@@ -733,9 +739,15 @@
+           tagtypeIs(LIBRAW_EXIFTOOLTAGTYPE_binary)) &&
+           (len > 1) && (len < 5100000))
+       {
+-        xmpdata = (char *)calloc(xmplen = len + 1,1);
+-        unsigned br = fread(xmpdata,1, len, ifp);
+-        xmpdata[br] = 0;
++        if (xmpdata)
++          throw LIBRAW_EXCEPTION_IO_CORRUPT;
++        char *new_xmpdata = (char *)calloc(size_t(len) + 1U, 1);
++        unsigned br = fread(new_xmpdata, 1, len, ifp);
++        if (br != len)
++          throw LIBRAW_EXCEPTION_IO_EOF;
++        new_xmpdata[br] = 0;
++        xmpdata = new_xmpdata;
++        xmplen = len + 1;
+       }
+       break;
+     case 0x7000:
+@@ -1701,9 +1713,15 @@
+       tiff_ifd[ifd].dng_levels.parsedfields |= LIBRAW_DNGFM_OPCODE1;
+ 	  if (len < 4 * 1024 * 1024) // 4M per opcode list limit
+ 	  {
+-		  tiff_ifd[ifd].dng_levels.rawopcodes[0].len = len;
+-		  tiff_ifd[ifd].dng_levels.rawopcodes[0].data = calloc(len,1);
+-		  fread(tiff_ifd[ifd].dng_levels.rawopcodes[0].data, 1, len, ifp);
++		  libraw_dng_rawopcode_t &rawopcode =
++		      tiff_ifd[ifd].dng_levels.rawopcodes[0];
++		  if (rawopcode.data)
++		    throw LIBRAW_EXCEPTION_IO_CORRUPT;
++		  void *opcode_data = calloc(len, 1);
++		  if (fread(opcode_data, 1, len, ifp) != len)
++		    throw LIBRAW_EXCEPTION_IO_EOF;
++		  rawopcode.len = len;
++		  rawopcode.data = opcode_data;
+ 	  }
+       break;
+     case 0xc741: /* 51009, OpcodeList2 */
+@@ -1711,18 +1729,30 @@
+       tiff_ifd[ifd].opcode2_offset = meta_offset = ftell(ifp);
+       if (len < 4 * 1024 * 1024) // 4M per opcode list limit
+       {
+-        tiff_ifd[ifd].dng_levels.rawopcodes[1].len = len;
+-        tiff_ifd[ifd].dng_levels.rawopcodes[1].data = calloc(len,1);
+-        fread(tiff_ifd[ifd].dng_levels.rawopcodes[1].data, 1, len, ifp);
++        libraw_dng_rawopcode_t &rawopcode =
++            tiff_ifd[ifd].dng_levels.rawopcodes[1];
++        if (rawopcode.data)
++          throw LIBRAW_EXCEPTION_IO_CORRUPT;
++        void *opcode_data = calloc(len, 1);
++        if (fread(opcode_data, 1, len, ifp) != len)
++          throw LIBRAW_EXCEPTION_IO_EOF;
++        rawopcode.len = len;
++        rawopcode.data = opcode_data;
+       }
+       break;
+     case 0xc74e: /* 51022, OpcodeList3 */
+       tiff_ifd[ifd].dng_levels.parsedfields |= LIBRAW_DNGFM_OPCODE3;
+       if (len < 4 * 1024 * 1024) // 4M per opcode list limit
+       {
+-        tiff_ifd[ifd].dng_levels.rawopcodes[2].len = len;
+-        tiff_ifd[ifd].dng_levels.rawopcodes[2].data = calloc(len,1);
+-        fread(tiff_ifd[ifd].dng_levels.rawopcodes[2].data, 1, len, ifp);
++        libraw_dng_rawopcode_t &rawopcode =
++            tiff_ifd[ifd].dng_levels.rawopcodes[2];
++        if (rawopcode.data)
++          throw LIBRAW_EXCEPTION_IO_CORRUPT;
++        void *opcode_data = calloc(len, 1);
++        if (fread(opcode_data, 1, len, ifp) != len)
++          throw LIBRAW_EXCEPTION_IO_EOF;
++        rawopcode.len = len;
++        rawopcode.data = opcode_data;
+       }
+       break;
+     case 0xfd04: /* 64772, Kodak P-series */

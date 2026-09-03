@@ -1,5 +1,9 @@
 # Spectrafilm Priority Roadmap — 2026-06-24
 
+> **Historical snapshot, not an execution order.** Accepted remaining work is routed only through
+> the live Wayfinder graph in [EXECUTION_INDEX.md](EXECUTION_INDEX.md). Status and gate-count claims
+> below describe this dated wave unless an outcome note explicitly says otherwise.
+
 > Consolidates the open items from `docs/CODE_REVIEW_2026-06-24.md` and
 > `docs/UPSTREAM_SYNC_2026-06-24.md` into one dependency-aware execution order,
 > status-verified against the codebase (the 5 review fixes + the print-curve morph

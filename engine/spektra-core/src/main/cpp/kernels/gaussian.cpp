@@ -15,6 +15,8 @@
  */
 #include "gaussian.h"
 
+#include "gaussian_hwy.h"
+
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -85,8 +87,16 @@ void gaussian_fir_plane(float* img, int w, int h, float sigma, float truncate) {
                 float kw = kernel[k + radius];
                 int ii = reflect(i + k, n);
                 const float* irow = &img[static_cast<size_t>(ii) * m];
-                for (int j = 0; j < m; ++j) {
-                    trow[j] += irow[j] * kw;
+                // OPT-IN Highway lanes (#124). Vectorises across j only — every
+                // output keeps the scalar accumulation order and no FMA is used —
+                // so the two branches are byte-identical (asserted by
+                // tests/test_gaussian_hwy.cpp), not an approximation.
+                if (hwy_fir::available()) {
+                    hwy_fir::vertical_accum(trow, irow, m, kw);
+                } else {
+                    for (int j = 0; j < m; ++j) {
+                        trow[j] += irow[j] * kw;
+                    }
                 }
             }
         }
@@ -112,11 +122,19 @@ void gaussian_fir_plane(float* img, int w, int h, float sigma, float truncate) {
                         sval += trow[reflect(j + k, m)] * kernel[k + radius];
                     orow[j] = sval;
                 }
-                for (int j = radius; j < m - radius; ++j) {
-                    float sval = 0.0f;
-                    for (int k = -radius; k <= radius; ++k)
-                        sval += trow[j + k] * kernel[k + radius];
-                    orow[j] = sval;
+                // Interior span: no reflection, so the taps are a straight
+                // window — the SIMD form (same tap order per output, no FMA) is
+                // byte-identical to the scalar loop below it.
+                if (hwy_fir::available()) {
+                    hwy_fir::horizontal_interior(trow, kernel.data(), radius,
+                                                 radius, m - radius, orow);
+                } else {
+                    for (int j = radius; j < m - radius; ++j) {
+                        float sval = 0.0f;
+                        for (int k = -radius; k <= radius; ++k)
+                            sval += trow[j + k] * kernel[k + radius];
+                        orow[j] = sval;
+                    }
                 }
                 for (int j = m - radius; j < m; ++j) {
                     float sval = 0.0f;

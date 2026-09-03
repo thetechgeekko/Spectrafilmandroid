@@ -234,6 +234,28 @@ class ParamsState {
     var toneCurveBlue by mutableStateOf<List<Pair<Float, Float>>>(emptyList())
 
     // --- Display / settings ---
+
+    /**
+     * Long edge of the interactive preview. Device/app-level setting seeded from
+     * AppSettings.previewMaxSize (NOT preset/recipe state — loadFrom leaves it
+     * alone, exactly like [gpuEngine] and [gpuExport] below).
+     *
+     * There were FOUR paths that replayed a stored value over the user's setting, and
+     * removing only the obvious one did not fix it. Recipes are keyed by source uri
+     * and auto-applied on open, so a real photo always got its stale value back while
+     * the demo image (which has no recipe) honoured the setting — which is why the bug
+     * presented as "inert for RAW only". The live path was NOT this class:
+     *
+     *   Recipes.load -> Presets.decode -> the "display" block in Presets   (the read
+     *                                                                       that bit)
+     *   Presets.encode "display"                                           (the write)
+     *   BuiltInPresets                                                     (a 3rd copy)
+     *   ParamsState.loadFrom                                               (this one)
+     *
+     * All four are gone. Dropping the READ is what disarms the recipes already on
+     * disk, which keep carrying the field. It is still WRITTEN into the engine params
+     * by toParams, exactly as gpuPreview/gpuExport are.
+     */
     var previewMaxSize by mutableIntStateOf(640)
 
     /**
@@ -369,8 +391,6 @@ class ParamsState {
         toneCurveRed = tc.red.points
         toneCurveGreen = tc.green.points
         toneCurveBlue = tc.blue.points
-
-        previewMaxSize = p.settings.previewMaxSize
     }
 
     /** Build an immutable SpektraParams from current state. */

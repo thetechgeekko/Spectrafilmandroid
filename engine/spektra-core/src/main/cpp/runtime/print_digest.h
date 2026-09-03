@@ -16,8 +16,9 @@
  *      data/filters/neutral_print_filters.json exactly like params_builder.py's
  *      apply_database_neutral_print_filters: the lookup key is
  *      [print_stock][enlarger_illuminant][film_stock] -> [C, M, Y] (Kodak CC).
- *      Falls back to the schema defaults (0,0,0) when the triple is absent,
- *      mirroring the Python "use defaults" warning branch.
+ *      The resolver itself is failure-atomic: missing/invalid input leaves the
+ *      caller's triple unchanged. Render callers initialise that triple to the
+ *      schema defaults (0,0,0), preserving Python's "use defaults" branch.
  *
  *   2) The midgray exposure normalisation factor — reproduced from the filming
  *      midgray balance (FilmingStage._compute_density_spectral_midgray_to_balance_print
@@ -43,9 +44,9 @@ namespace spk {
 // full path to the database (asset_dir/filters/neutral_print_filters.json).
 //
 // Writes [C, M, Y] (Kodak CC units) to `cc_out` and returns true when the triple
-// is found. When the file is missing/unparseable or the triple is absent, fills
-// `cc_out` with the schema defaults {0,0,0} and returns false (mirroring the
-// Python "Using defaults." branch).
+// is found. A missing/unparseable file, absent/invalid triple, or allocation
+// failure returns false and leaves all three caller-provided values unchanged;
+// the caller owns any schema-default fallback policy.
 bool resolve_neutral_cc(const std::string& json_path,
                         const std::string& print_stock,
                         const std::string& illuminant,

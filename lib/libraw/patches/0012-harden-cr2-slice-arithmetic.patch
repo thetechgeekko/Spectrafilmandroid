@@ -1,0 +1,44 @@
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -624,7 +624,7 @@ ushort *LibRaw::ljpeg_row_unrolled(int jrow, struct jhead *jh)
+ 
+ void LibRaw::lossless_jpeg_load_raw()
+ {
+-  int jwide, jhigh, jrow, jcol, val, jidx, i, j, row = 0, col = 0;
++  int jwide, jhigh, jrow, jcol, val, row = 0, col = 0;
+   struct jhead jh;
+   ushort *rp;
+ 
+@@ -677,16 +677,22 @@ void LibRaw::lossless_jpeg_load_raw()
+         val = curve[*rp++];
+         if (cr2_slice[0])
+         {
+-          jidx = jrow * jwide + jcol;
+-          i = jidx / (cr2_slice[1] * raw_height);
+-          if ((j = i >= cr2_slice[0]))
+-            i = cr2_slice[0];
+-		  if(!cr2_slice[1+j])
++          const INT64 jpeg_index = INT64(jrow) * INT64(jwide) + jcol;
++          const INT64 slice_area = INT64(cr2_slice[1]) * INT64(raw_height);
++          INT64 slice = jpeg_index / slice_area;
++          const int tail = slice >= cr2_slice[0];
++          if (tail)
++            slice = cr2_slice[0];
++          if (!cr2_slice[1 + tail])
+             throw LIBRAW_EXCEPTION_IO_CORRUPT;
+-
+-          jidx -= i * (cr2_slice[1] * raw_height);
+-          row = jidx / cr2_slice[1 + j];
+-          col = jidx % cr2_slice[1 + j] + i * cr2_slice[1];
++          const INT64 within_slice = jpeg_index - slice * slice_area;
++          const INT64 mapped_row = within_slice / cr2_slice[1 + tail];
++          const INT64 mapped_col = within_slice % cr2_slice[1 + tail] +
++              slice * INT64(cr2_slice[1]);
++          if (mapped_row > INT_MAX || mapped_col > INT_MAX)
++            throw LIBRAW_EXCEPTION_IO_CORRUPT;
++          row = int(mapped_row);
++          col = int(mapped_col);
+         }
+         if (raw_width == 3984 && (col -= 2) < 0)
+           col += (row--, raw_width);

@@ -19,8 +19,96 @@ package com.spectrafilm.pngwriter
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
+
+private const val PACK_COPY_CHUNK_BYTES = 64 * 1024
+
+class PngCancellationToken {
+    private val state = AtomicBoolean(false)
+
+    val isCancelled: Boolean
+        get() = state.get()
+
+    fun cancel() {
+        state.set(true)
+    }
+
+    internal val nativeSignal: AtomicBoolean
+        get() = state
+
+    internal fun throwIfCancelled() {
+        if (isCancelled) throw CancellationException("PNG write cancelled")
+    }
+}
+
+internal fun checkedPngByteCount(
+    width: Int,
+    height: Int,
+    bytesPerSample: Int,
+): Int {
+    require(width > 0 && height > 0) { "PNG dimensions must be positive" }
+    require(bytesPerSample > 0) { "PNG bytes per sample must be positive" }
+    val total = try {
+        val rowSamples = Math.multiplyExact(width.toLong(), 3L)
+        val rowBytes = Math.multiplyExact(rowSamples, bytesPerSample.toLong())
+        Math.multiplyExact(rowBytes, height.toLong())
+    } catch (_: ArithmeticException) {
+        throw IllegalArgumentException("PNG pixel byte count overflow")
+    }
+    require(total <= Int.MAX_VALUE.toLong()) {
+        "PNG pixel byte count exceeds ByteBuffer limits"
+    }
+    return total.toInt()
+}
+
+internal fun checkedPngOutputPath(outPath: String) {
+    require(outPath.isNotEmpty()) { "PNG output path must not be empty" }
+    require('\u0000' !in outPath) { "PNG output path must not contain NUL" }
+}
+
+internal fun packedPngBuffer(
+    source: ByteBuffer,
+    width: Int,
+    height: Int,
+    bytesPerSample: Int,
+    cancellation: PngCancellationToken? = null,
+): ByteBuffer {
+    val requiredBytes = checkedPngByteCount(width, height, bytesPerSample)
+    require(source.remaining() >= requiredBytes) {
+        "pixel buffer too small: need $requiredBytes bytes, have ${source.remaining()}"
+    }
+    val selected = source.duplicate().apply {
+        limit(position() + requiredBytes)
+    }
+    cancellation?.throwIfCancelled()
+    if (selected.isDirect) {
+        require(selected.position() % bytesPerSample == 0) {
+            "direct pixel buffer position must be $bytesPerSample-byte aligned"
+        }
+        return selected.slice().order(ByteOrder.LITTLE_ENDIAN)
+    }
+    val packed = ByteBuffer.allocateDirect(requiredBytes).order(ByteOrder.LITTLE_ENDIAN)
+    while (selected.hasRemaining()) {
+        cancellation?.throwIfCancelled()
+        val previousLimit = selected.limit()
+        selected.limit(selected.position() + minOf(PACK_COPY_CHUNK_BYTES, selected.remaining()))
+        packed.put(selected)
+        selected.limit(previousLimit)
+    }
+    cancellation?.throwIfCancelled()
+    return packed.apply { flip() }
+}
 
 object PngWriter {
+
+    private object NativeLibrary {
+        init {
+            System.loadLibrary("sfpng")
+        }
+
+        fun ensureLoaded() = Unit
+    }
 
     /**
      * Write a 16-bit RGB PNG from a direct [ByteBuffer] of little-endian uint16
@@ -46,15 +134,50 @@ object PngWriter {
         outPath: String,
         icc: ByteArray? = null,
         software: String = "Spektrafilm",
+        cancellation: PngCancellationToken? = null,
     ): Long {
-        val direct = if (rgb16.isDirect) {
-            rgb16
-        } else {
-            ByteBuffer.allocateDirect(rgb16.remaining())
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .also { it.put(rgb16.duplicate()); it.flip() }
-        }
-        return nativeWriteBuffer(direct, width, height, software, icc, outPath)
+        checkedPngOutputPath(outPath)
+        val direct = packedPngBuffer(
+            rgb16, width, height, bytesPerSample = 2, cancellation = cancellation,
+        )
+        NativeLibrary.ensureLoaded()
+        return nativeWriteBuffer(
+            direct, width, height, software, icc, outPath,
+            cancellation?.nativeSignal,
+        )
+    }
+
+    /**
+     * Write a 16-bit RGB PNG directly from the engine's display-referred float
+     * output, quantising one row at a time inside the writer.
+     *
+     * This exists to avoid the caller building a second full-size buffer: at
+     * 12.5 MP the uint16 copy is 75 MB, and filling it walks 37.5 million samples
+     * in a JVM loop, for pixels the writer is about to consume once (#175).
+     *
+     * The quantisation is deliberately identical to that loop -- clamp to [0,1],
+     * `v * 65535 + 0.5`, truncate, NaN to 0 -- so the exported pixels do not move.
+     *
+     * @param rgbFloat direct ByteBuffer, width*height*3 native-order float samples
+     */
+    fun writeFloat(
+        rgbFloat: ByteBuffer,
+        width: Int,
+        height: Int,
+        outPath: String,
+        icc: ByteArray? = null,
+        software: String = "Spektrafilm",
+        cancellation: PngCancellationToken? = null,
+    ): Long {
+        checkedPngOutputPath(outPath)
+        val direct = packedPngBuffer(
+            rgbFloat, width, height, bytesPerSample = 4, cancellation = cancellation,
+        )
+        NativeLibrary.ensureLoaded()
+        return nativeWriteFloatBuffer(
+            direct, width, height, software, icc, outPath,
+            cancellation?.nativeSignal,
+        )
     }
 
     /**
@@ -69,7 +192,20 @@ object PngWriter {
         outPath: String,
         icc: ByteArray? = null,
         software: String = "Spektrafilm",
-    ): Long = nativeWriteShorts(rgb16, width, height, software, icc, outPath)
+        cancellation: PngCancellationToken? = null,
+    ): Long {
+        checkedPngOutputPath(outPath)
+        val requiredSamples = checkedPngByteCount(width, height, bytesPerSample = 2) / 2
+        require(rgb16.size >= requiredSamples) {
+            "short buffer too small: need $requiredSamples samples, have ${rgb16.size}"
+        }
+        cancellation?.throwIfCancelled()
+        NativeLibrary.ensureLoaded()
+        return nativeWriteShorts(
+            rgb16, width, height, software, icc, outPath,
+            cancellation?.nativeSignal,
+        )
+    }
 
     /**
      * Write a 16-bit RGB PNG from a float RGB buffer quantised to uint16.
@@ -90,18 +226,32 @@ object PngWriter {
         outPath: String,
         icc: ByteArray? = null,
         software: String = "Spektrafilm",
+        cancellation: PngCancellationToken? = null,
     ): Long {
-        val n = width.toLong() * height.toLong() * 3L
-        require(rgbFloat.size >= n) { "float buffer too small for $width x $height x 3" }
-        val buf = ByteBuffer.allocateDirect((n * 2L).toInt())
+        checkedPngOutputPath(outPath)
+        val requiredBytes = checkedPngByteCount(width, height, bytesPerSample = 2)
+        val requiredSamples = requiredBytes / 2
+        require(rgbFloat.size >= requiredSamples) {
+            "float buffer too small: need $requiredSamples samples, have ${rgbFloat.size}"
+        }
+        cancellation?.throwIfCancelled()
+        val buf = ByteBuffer.allocateDirect(requiredBytes)
             .order(ByteOrder.LITTLE_ENDIAN)
         val sBuf = buf.asShortBuffer()
-        for (i in 0 until n.toInt()) {
-            val v = rgbFloat[i].coerceIn(0f, 1f)
-            sBuf.put((v * 65535f + 0.5f).toInt().toShort())
+        val rowSamples = width * 3
+        for (y in 0 until height) {
+            cancellation?.throwIfCancelled()
+            val rowStart = y * rowSamples
+            for (x in 0 until rowSamples) {
+                if (x % (PACK_COPY_CHUNK_BYTES / Float.SIZE_BYTES) == 0) {
+                    cancellation?.throwIfCancelled()
+                }
+                val v = rgbFloat[rowStart + x].coerceIn(0f, 1f)
+                sBuf.put((v * 65535f + 0.5f).toInt().toShort())
+            }
         }
         buf.rewind()
-        return nativeWriteBuffer(buf, width, height, software, icc, outPath)
+        return write(buf, width, height, outPath, icc, software, cancellation)
     }
 
     // --- native bridge (png_writer_jni.cpp / libsfpng.so) ---
@@ -112,6 +262,17 @@ object PngWriter {
         software: String,
         icc: ByteArray?,
         outPath: String,
+        cancellationSignal: AtomicBoolean?,
+    ): Long
+
+    private external fun nativeWriteFloatBuffer(
+        rgbFloat: ByteBuffer,
+        width: Int,
+        height: Int,
+        software: String,
+        icc: ByteArray?,
+        outPath: String,
+        cancellationSignal: AtomicBoolean?,
     ): Long
 
     private external fun nativeWriteShorts(
@@ -121,9 +282,6 @@ object PngWriter {
         software: String,
         icc: ByteArray?,
         outPath: String,
+        cancellationSignal: AtomicBoolean?,
     ): Long
-
-    init {
-        System.loadLibrary("sfpng")
-    }
 }

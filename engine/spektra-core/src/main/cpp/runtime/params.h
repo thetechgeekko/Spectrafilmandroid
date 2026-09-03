@@ -158,6 +158,15 @@ void digest_halation_params(FilmingParams& p, const char* use,
 //     (1.0 each under the parity defaults: no black/white correction).
 //   - density_curve_gamma: print_render.density_curve_gamma (scalar broadcast).
 struct PrintingParams {
+    // INTERNAL, never a user param: permission to offload the print-expose
+    // spectral integral to the GPU for this render. Set from spk_params'
+    // allow_gpu_scan latch (the same one scanning uses), so one toggle governs
+    // the whole GPU surface. print_expose re-gates on frame eligibility and the
+    // one-time on-device self-check, and any failure falls back to the exact
+    // CPU integral for that frame. Default false: an untouched PrintingParams
+    // is the CPU path.
+    bool allow_gpu = false;
+
     double filtered_illuminant[81] = {0.0};
     double exposure_factor_midgray = 1.0;
     double print_exposure = 1.0;

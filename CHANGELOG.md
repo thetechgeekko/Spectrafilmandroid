@@ -2,6 +2,135 @@
 
 ## Unreleased
 
+### Exact RAW decode handoff and release profiling (#158)
+
+- Replaced the decoded `std::vector<float>` plus JNI `malloc`/memcpy pair with one
+  move-only, malloc-backed float buffer that is transferred directly into the
+  native allocation registry. A 3060x4080 decode no longer creates and copies a
+  second 149,817,600-byte output allocation; cancellation, typed OOM handling,
+  token/base/capacity release validation, and the existing LibRaw limits remain.
+- Added release phase telemetry for input I/O, `open_buffer`, unpack, process,
+  processed-image creation, output allocation, uint16-to-float copy, white balance,
+  colour conversion, and JNI publication, plus an fd-capable repeated device probe.
+- Hardened that probe so exact release/R8 qualification requires a pinned expected
+  SHA-256 on every repetition. Explicit self-seeding is labelled exploratory and never
+  emits an exactness PASS; RAW argument failures keep the `TICKET158_RAW_RELEASE_R8`
+  marker, and content-URI shell permissions are selected safely by Android API level.
+- Routed the real JNI release/adopt/publication transition through the injectable
+  production ownership seam. ASan/UBSan now proves exact-once cleanup and zero
+  outstanding registry entries for cancellation, publication failure/exception,
+  post-publication revocation, success, and later close.
+- Patched LibRaw 0.22.2 remains serial in shipping builds. The compressed-Fuji
+  OpenMP corpus is nondeterministic, and the decoder still leaves `user_qual`
+  unchanged; neither exactness contract was traded for a headline speed number.
+- On the connected SM-S948W, repeated baseline/final Samsung and MotionCam outputs
+  kept their exact full-resolution SHA-256 values. In matched minified release/R8
+  runs, JNI publication p50 fell from 34.628 to 0.040 ms (Samsung) and 25.730 to
+  0.032 ms (MotionCam). Core decode remained page-fault-sensitive, so this is a
+  peak-memory/JNI handoff improvement, not a demosaic or 1-2 second export claim.
+- Measured shipping builds add no LibRaw workers: OpenMP is off for all ABIs and
+  the final ELF has no OpenMP dependency/symbol. NDK `AImageDecoder` remains a
+  separately qualified API-30+ non-RAW/fallback experiment, never a silent
+  replacement for scene-linear LibRaw or an archival-exact entry point.
+
+### Transactional storage and versioned documents (#170)
+
+- MediaStore export now stages bytes behind an app-owned pending row, verifies
+  the closed payload digest, and publishes the final display name exactly once.
+  Failed writes are cleaned up; ambiguous provider outcomes are reconciled
+  before another export, including after process death. Export work and its
+  terminal result are process-owned, so Activity recreation cannot cancel a
+  commit or turn a confirmed publication into a duplicate retry.
+- Source-picker access now persists durable URI grants, restores them across
+  launches, releases replaced grants, and presents a reauthorization state when
+  a document moves or permission is revoked. FIFO mutation ordering and durable-
+  state reconciliation cover rapid selection, demo-clear, and recreation races.
+- Recipe, preset, sidecar, and mask JSON now use bounded/versioned decoding,
+  atomic replacement, corruption quarantine, explicit migrations, and stable
+   mask schema identifiers. Exact numeric parsing prevents Android `Double`
+   rounding from accepting fractional/future versions; classification/quarantine
+   and recipe save/read/reset are race-fenced. Unsupported future recipes remain
+   untouched. Shared editor/import limits now reject spectral, upscale, film-format,
+   grain, and halation values that could otherwise amplify native allocation or
+   sampler work, even when the persisted effect is currently disabled. The native
+   grain sampler now short-circuits its numerically inevitable probability-underflow
+   result without changing RNG order and safely handles invalid/overflowing derived
+   counts and Poisson conversion.
+- Android 7-9 gallery export now requests and rechecks the max-SDK-28 legacy
+  storage permission; denial stops before any public write.
+- Added release-targeted storage instrumentation and JVM regressions for
+  interrupted writes, orphan pending rows, duplicate names, permission loss,
+  process restart, malformed/oversized JSON, and stale autosave fencing.
+
+### Profile-driven scan viewing illuminants (#169)
+
+- Added one exact, fail-closed viewing-illuminant registry. Profile loading now
+  resolves `D50` or `K75P` once and shares its spectrum, XYZ normalization, and
+  per-output-space adaptation matrices across every scan consumer; unsupported
+  or misspelled identifiers are rejected instead of falling back to D50.
+- Kodak 2383 and 2393 now use their declared Kinoton 75P illuminant through the
+  CPU direct scanner, scanner 3D-LUT/cache, Vulkan linear and fused preview,
+  experimental GPU export, viewing glare, and scanner black/white reference
+  measurement.
+- Added upstream-oracle full-route fixtures for both cinema-print stocks and
+  matching LUT17 fixtures, isolated references for all six output spaces, and
+  hashed K75P/D50 visual evidence. Direct and LUT modes are now compared with
+  their matching pinned upstream modes instead of widening a cross-mode band;
+  exact export keeps the intentionally approximate scanner LUT disabled.
+- Extended scanner-LUT/cache, GPU-host, output-space, C API/JNI, and black/white-
+  correction regressions. The global GPU self-check sees K75P first; malformed
+  identifiers return `SPK_ERR_PROFILE_INVALID` with exact detail, and reference
+  measurement is viewing-sensitive, finite, active, and repeat-deterministic.
+- Golden generation now verifies the actual imported checkout is exactly the
+  pinned commit and Git-clean both before and after oracle execution; wrong or
+  dirty checkouts fail closed, and manifests record the verified commit/state.
+  Profile-load allocation failures are contained as `SPK_ERR_OOM` at the C ABI.
+
+### Oracle-locked CAT02 RAW white balance (#192)
+
+- Replaced the tungsten/custom direct-XYZ approximation with colour-science
+  0.4.7's full CAT02 Von Kries transform in linear ACES2065-1. As-shot and
+  daylight remain byte-preserving after LibRaw; CAT output is rounded to
+  float32 before the separate float32 tint operation.
+- Added NumPy-compatible near-reference `allclose` and near-unity-tint
+  `isclose` skips, disabled FP contraction for the decoder translation unit,
+  and fail closed on non-finite or out-of-product-range temperature/tint while
+  preserving the upstream-compatible 1000 K endpoint.
+- Added a digest-generated C++ gate for all 56 locked ACES/ProPhoto vectors,
+  including HDR/wide-gamut and wrong-cast diagnostic cases. Optimized host and
+  Android arm64 runs match bit-for-bit, and fresh production-decoder runs are
+  repeat-exact for the recorded Samsung, MotionCam, and third local DNG cohorts.
+
+### RAW white-balance CAT research (#167)
+
+- Pinned the upstream RAW processor/test blobs and the exact Python, NumPy, and
+  colour-science environment. Upstream's `method='Von Kries'` resolves to CAT02;
+  the current native diagonal-XYZ approximation is not equivalent.
+- Added a dependency-free, digest-locked vector harness covering as-shot,
+  daylight, tungsten, mixed-light proxy, CCT/tint extremes, neutral/HDR patches,
+  and Samsung/MotionCam/Fujifilm camera seeds. The harness independently matched
+  colour-science 0.4.7 bit-for-bit at the declared float32 boundaries.
+- This was a research-only decision: production pixel math is unchanged and a
+  separate implementation/golden task is required.
+
+### Fail-closed exact release candidate (#168)
+
+- Stable-tag releases now bind one unsigned R8 candidate to the exact source SHA,
+  version, workflow run/attempt, uploaded artifact database ID/digest, both APK
+  hashes, all six Gradle locks, deterministic app/LibRaw SPDX, runtime classpath,
+  R8 mapping, full native symbols, fixed gate attestation, and provenance.
+- The candidate job reruns `-O2` and shipping-flags engine parity, release JVM
+  tests/lint, R8/JNI, legal, and 16 KiB checks. The protected job downloads only
+  that artifact ID, signs the exact app/instrumentation pair with no debug-key
+  fallback, proves key cleanup and certificate pinning, then verifies installed
+  byte identity, release instrumentation, cold launch, and app-fatal logs on API 35.
+- GitHub publication uses a stdlib, numeric-ID publisher that requires immutable
+  releases and exact remote bytes. It accepts only an already immutable,
+  byte-identical rerun and may delete only its own draft—never a published or
+  foreign Release. Production still requires the human LibRaw route approval and
+  protected Environment credentials/settings; local debug-test-signed device
+  evidence is not production-signing evidence.
+
 ### Parallelize the serial per-pixel maps: LUT apply + spatial filters (#122)
 
 Three families of serial hot loops now run through `kernels/parallel`'s
@@ -433,9 +562,10 @@ Lightroom-style UI redesign, new engine stages, and a major export/import upgrad
   CC values + midgray exposure from `neutral_print_filters.json` (no longer baked for specific
   pairs). Proven end-to-end on a second pair via new `print_ektar` golden; both `print_portra`
   and `print_ektar` parity tests pass. Any profile combination is now valid.
-- **Expert RAW DNG fix (`lib:libraw`)** — `USE_ZLIB` + NDK libz linked so DEFLATE-compressed
-  DNGs (Samsung Expert RAW and similar) decode correctly. Adds a typed `DecodeStatus` enum and
-  `RawDecodeException` for structured error propagation; DNG compression sniffer integrated.
+- **Qualified DEFLATE DNG subset (`lib:libraw`)** — `USE_ZLIB` + NDK libz enable
+  Compression 8 with `SampleFormat=3` floating-point data. Integer/linear Compression 8 and
+  tag `0x80B2` return typed `DEFLATE_DNG` fallback; model-level Expert RAW support is not claimed.
+  Adds structured `DecodeStatus` / `RawDecodeException` propagation and the DNG sniffer.
 
 ### New native modules
 - **`lib:tiffwriter`** (`libsftiff`) — hand-rolled 16-bit baseline TIFF writer with ICC + EXIF;
@@ -496,7 +626,7 @@ Turning the engine into a real, playable tool.
 - **Full parameter surface wired through** — every `SpektraParams` field (camera, enlarger,
   scanner, grain, halation, DIR couplers, glare, IO, settings) now reaches the engine; defaults
   stay bit-exact (parity preserved), and edits measurably change the render.
-- **RAW/DNG import** via LibRaw (`libsfraw.so`, all ABIs) → linear ACES, plus an sRGB photo
+- **RAW/DNG import** via LibRaw (`libsfraw.so`, all ABIs) → linear ProPhoto after an ACES intermediate, plus an sRGB photo
   picker (→ProPhoto) and the synthetic demo image.
 - **Full GUI organized exactly like the spektrafilm desktop GUI** — Input · Import Raw ·
   Simulation · Grain · Preflash · Halation · Couplers · Glare · Experimental · Display —

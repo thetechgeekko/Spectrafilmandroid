@@ -1,4 +1,21 @@
-# Audit — incomplete / open items (updated 2026-08-27)
+# Audit — 2026-08-29 finding snapshot
+
+> **Historical finding inventory, not live status.** Findings were ticketed after this snapshot and
+> some statements below have since been resolved or superseded. Do not infer current issue state,
+> gate count, or GPU policy from this file. Start at [EXECUTION_INDEX.md](EXECUTION_INDEX.md),
+> [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md),
+> [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md), and the
+> [Wayfinder map: production-ready Spektrafilm + 1–2 s exact export](https://github.com/thetechgeekko/Spektrafilm-android/issues/164).
+> This audit remains evidence for why tickets exist; native GitHub dependencies are the only live
+> implementation frontier.
+
+New release-blocking findings from the full-codebase pass are now ticketed: patched LibRaw plus
+hostile-input coverage, K75P/viewing-illuminant correctness, RAW WB adaptation research, static-link
+license materials, fail-closed production signing, API 36/AGP toolchain migration, JNI/parser
+hardening, one OutputDescriptor, transactional storage, a global memory budget, a digest/device
+gate, exact idle pre-render, spatial scratch/thread/grain/writer work, accessibility/E2E, privacy,
+build hygiene, final docs and signed-candidate SLO proof. See the canonical plan for linked titles
+and dependency order.
 
 A full three-lane sweep (Kotlin app layer · native engine · build/CI/docs) of everything
 **not complete**: user-facing bugs, silently-lying API surface, coverage holes, stale docs,
@@ -7,16 +24,17 @@ Status snapshot, not a commitment. The 2026-07-02 audit this replaces — and it
 resolved-item history — lives in this file's git history; everything still open from it is
 re-verified and carried below.
 
-Owner-decision items are tracked as GitHub issues (#138–#144) so they don't rot here.
+Owner decisions and implementation items are tracked as native child/dependency issues under the
+Wayfinder map so they do not rot here.
 
 ## 🔴 Notable — tracked as issues
 
 - **Release due** — the whole #120/#121/#122 perf line (−61% export RSS, O(1) lookups,
   full parallelization) is merged but unreleased; `v0.9.0` predates it. Also
   `release.yml` builds on JDK 17 while every gate runs 21. → [#138]
-- **Editor state destroyed by sub-screen navigation** — Settings/About/Diagnostics/curve
-  browser mid-edit → Back lands on the demo image (`EditorScreen` leaves composition;
-  `MainActivity.kt` `when(screen)`). → [#139]
+- **Editor session is not fully durable** — `rememberSaveableStateHolder` now fixes the original
+  same-process sub-screen navigation repro, but source/params/masks/history/process recreation,
+  stale-render suppression and lifecycle ownership still need the complete contract. → [#139]
 - **Ultra HDR export is SDR + a flat 1×1 gain map** (`ImagePipeline.kt`
   `attachNeutralGainmap`, fixed `ratioMax=1.6`) — format name over-promises. → [#140]
 - **Mask compositor allocates unbounded ART-heap planes at export resolution** — ≈1 GB

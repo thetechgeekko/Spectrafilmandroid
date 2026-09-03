@@ -26,9 +26,58 @@
  */
 #include "gpu/vulkan_compute.h"
 
+namespace spk::gpu {
+
+PointwiseDispatchGrid plan_pointwise_dispatch(uint32_t pixel_count,
+                                              uint32_t max_groups_x,
+                                              uint32_t max_groups_y) noexcept {
+    PointwiseDispatchGrid grid{};
+    if (pixel_count == 0 || max_groups_x == 0 || max_groups_y == 0) return grid;
+    constexpr uint64_t kWorkgroupSize = 64;
+    constexpr uint64_t kMaxSafeGroupsX = UINT32_MAX / kWorkgroupSize;
+    const uint64_t groups = (static_cast<uint64_t>(pixel_count) + kWorkgroupSize - 1) /
+                            kWorkgroupSize;
+    uint64_t groups_x = groups < max_groups_x ? groups : max_groups_x;
+    if (groups_x > kMaxSafeGroupsX) groups_x = kMaxSafeGroupsX;
+    const uint64_t groups_y = (groups + groups_x - 1) / groups_x;
+    if (groups_y > max_groups_y || groups_x * groups_y > UINT32_MAX) return grid;
+    grid.groups_x = static_cast<uint32_t>(groups_x);
+    grid.groups_y = static_cast<uint32_t>(groups_y);
+    grid.total_groups = static_cast<uint32_t>(groups);
+    grid.group_row_stride_pixels = groups_x * kWorkgroupSize;
+    grid.valid = true;
+    return grid;
+}
+
+const char* pointwise_fallback_reason_name(PointwiseFallbackReason reason) noexcept {
+    switch (reason) {
+        case PointwiseFallbackReason::none: return "none";
+        case PointwiseFallbackReason::vulkan_disabled: return "vulkan-disabled";
+        case PointwiseFallbackReason::unavailable: return "vulkan-unavailable";
+        case PointwiseFallbackReason::invalid_request: return "invalid-request";
+        case PointwiseFallbackReason::request_too_large: return "request-too-large";
+        case PointwiseFallbackReason::allocation_failed: return "allocation-failed";
+        case PointwiseFallbackReason::pipeline_failed: return "pipeline-failed";
+        case PointwiseFallbackReason::upload_failed: return "upload-failed";
+        case PointwiseFallbackReason::dispatch_failed: return "dispatch-failed";
+        case PointwiseFallbackReason::readback_failed: return "readback-failed";
+    }
+    return "unknown";
+}
+
+}  // namespace spk::gpu
+
 #ifndef SPK_ENABLE_VULKAN
 
 namespace spk::gpu {
+bool render_pointwise_chain(const PointwiseChainRequest&, PointwiseChainOutput*,
+                            PointwiseChainDiagnostics* diagnostics) noexcept {
+    if (diagnostics) {
+        *diagnostics = {};
+        diagnostics->fallback_reason = PointwiseFallbackReason::vulkan_disabled;
+    }
+    return false;
+}
 bool available() { return false; }
 bool cctf_encode_srgb(float*, size_t) { return false; }
 bool scan_spectral(const float*, float*, uint32_t, const float*, const float*, const float*) { return false; }
@@ -39,12 +88,18 @@ bool scan_spectral_linear(const float*, float*, uint32_t, const float*, const fl
 
 #include <vulkan/vulkan.h>
 
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <vector>
 
 #include "gpu/cctf_encode_spv.h"
+#include "gpu/filming_spv.h"
+#include "gpu/printing_spv.h"
+#include "gpu/scan_spectral_chain_spv.h"
 #include "gpu/scan_spectral_lin_spv.h"
 #include "gpu/scan_spectral_spv.h"
 
@@ -59,12 +114,46 @@ struct Buf {
     VkDeviceSize cap = 0;
 };
 
+// SPDX-FileCopyrightText: 2026 Spektrafilm Android contributors
+// SPDX-License-Identifier: GPL-3.0-only
+// Resource lifetime, private scratch, keyed static uploads and single-command
+// DAG/barrier concepts adapted from chaert-s/spektrafilm-ofx
+// src/SpektraVulkanRenderer.cpp at
+// 86476afc5b077de77e2278e3658d1ba9309892a1. This Android implementation is a
+// new bounded three-stage API: one mapped bidirectional staging buffer, two
+// device-local ping-pong buffers, and no OpenFX/desktop host integration.
+struct ResidentBuf {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize cap = 0;
+    VkDeviceSize allocationSize = 0;
+    VkMemoryPropertyFlags memoryFlags = 0;
+};
+
+enum PointwiseTable : size_t {
+    kFilmTc = 0,
+    kFilmDevelopAxis,
+    kFilmDevelopCurve,
+    kFilmDirAxis,
+    kFilmDirCurve,
+    kPrintDye,
+    kPrintIlluminantSensitivity,
+    kPrintPaperAxis,
+    kPrintPaperCurve,
+    kScanDye,
+    kScanIlluminantCmf,
+    kPointwiseTableCount,
+};
+
 struct Ctx {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
+    VkPhysicalDeviceProperties properties{};
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
     bool ok = false;
 
     // Persistent per-kernel state (built lazily on the kernel's first call).
@@ -87,6 +176,25 @@ struct Ctx {
     Kernel scanFused;  // scan_spectral.comp (density -> encoded sRGB)
     Kernel scanLin;    // scan_spectral_lin.comp (density -> unclipped linear RGB)
 
+    struct PointwiseChain {
+        std::array<VkShaderModule, 3> shaders{};
+        std::array<VkDescriptorSetLayout, 3> descriptorLayouts{};
+        std::array<VkPipelineLayout, 3> pipelineLayouts{};
+        std::array<VkPipeline, 3> pipelines{};
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, 3> descriptorSets{};
+        VkCommandPool commandPool = VK_NULL_HANDLE;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        ResidentBuf frameStaging;
+        std::array<ResidentBuf, 2> ping{};
+        ResidentBuf staticStaging;
+        std::array<ResidentBuf, kPointwiseTableCount> tables{};
+        std::array<VkDeviceSize, kPointwiseTableCount> cachedTableBytes{};
+        uint64_t cachedTableKey = 0;
+        bool pipelinesReady = false;
+    } pointwise;
+
     bool init() {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "spektra";
@@ -101,6 +209,8 @@ struct Ctx {
         std::vector<VkPhysicalDevice> devs(nphys);
         vkEnumeratePhysicalDevices(instance, &nphys, devs.data());
         phys = devs[0];
+        vkGetPhysicalDeviceProperties(phys, &properties);
+        vkGetPhysicalDeviceMemoryProperties(phys, &memoryProperties);
 
         uint32_t nq = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, nullptr);
@@ -131,6 +241,176 @@ struct Ctx {
         if (b.mem) { vkFreeMemory(device, b.mem, nullptr); b.mem = VK_NULL_HANDLE; }
         if (b.buf) { vkDestroyBuffer(device, b.buf, nullptr); b.buf = VK_NULL_HANDLE; }
         b.cap = 0;
+    }
+
+    void destroyResidentBuf(ResidentBuf& b) {
+        if (b.mapped) {
+            vkUnmapMemory(device, b.mem);
+            b.mapped = nullptr;
+        }
+        if (b.buf) {
+            vkDestroyBuffer(device, b.buf, nullptr);
+            b.buf = VK_NULL_HANDLE;
+        }
+        if (b.mem) {
+            vkFreeMemory(device, b.mem, nullptr);
+            b.mem = VK_NULL_HANDLE;
+        }
+        b.cap = 0;
+        b.allocationSize = 0;
+        b.memoryFlags = 0;
+    }
+
+    void destroyPointwise() {
+        if (!device) return;
+        vkDeviceWaitIdle(device);
+        PointwiseChain& s = pointwise;
+        if (s.fence) {
+            vkDestroyFence(device, s.fence, nullptr);
+            s.fence = VK_NULL_HANDLE;
+        }
+        if (s.commandPool) {
+            vkDestroyCommandPool(device, s.commandPool, nullptr);
+            s.commandPool = VK_NULL_HANDLE;
+            s.commandBuffer = VK_NULL_HANDLE;
+        }
+        if (s.descriptorPool) {
+            vkDestroyDescriptorPool(device, s.descriptorPool, nullptr);
+            s.descriptorPool = VK_NULL_HANDLE;
+            s.descriptorSets = {};
+        }
+        for (VkPipeline& pipeline : s.pipelines) {
+            if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+        for (VkPipelineLayout& layout : s.pipelineLayouts) {
+            if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+            layout = VK_NULL_HANDLE;
+        }
+        for (VkDescriptorSetLayout& layout : s.descriptorLayouts) {
+            if (layout) vkDestroyDescriptorSetLayout(device, layout, nullptr);
+            layout = VK_NULL_HANDLE;
+        }
+        for (VkShaderModule& shader : s.shaders) {
+            if (shader) vkDestroyShaderModule(device, shader, nullptr);
+            shader = VK_NULL_HANDLE;
+        }
+        destroyResidentBuf(s.frameStaging);
+        for (ResidentBuf& b : s.ping) destroyResidentBuf(b);
+        destroyResidentBuf(s.staticStaging);
+        for (ResidentBuf& b : s.tables) destroyResidentBuf(b);
+        s.cachedTableBytes = {};
+        s.cachedTableKey = 0;
+        s.pipelinesReady = false;
+    }
+
+    int findPreferredMemType(uint32_t bits, VkMemoryPropertyFlags required,
+                             VkMemoryPropertyFlags preferred) const {
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            const VkMemoryPropertyFlags wanted = pass == 0 ? (required | preferred) : required;
+            for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+                if ((bits & (1u << i)) &&
+                    (memoryProperties.memoryTypes[i].propertyFlags & wanted) == wanted) {
+                    return static_cast<int>(i);
+                }
+            }
+        }
+        return -1;
+    }
+
+    VkDeviceSize largestHeapFor(VkMemoryPropertyFlags required) const {
+        VkDeviceSize largest = 0;
+        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+            if ((memoryProperties.memoryTypes[i].propertyFlags & required) != required) continue;
+            const uint32_t heap = memoryProperties.memoryTypes[i].heapIndex;
+            if (heap < memoryProperties.memoryHeapCount &&
+                memoryProperties.memoryHeaps[heap].size > largest) {
+                largest = memoryProperties.memoryHeaps[heap].size;
+            }
+        }
+        return largest;
+    }
+
+    bool ensureResidentBuf(ResidentBuf& b, VkDeviceSize bytes,
+                           VkBufferUsageFlags usage,
+                           VkMemoryPropertyFlags required,
+                           VkMemoryPropertyFlags preferred,
+                           bool persistentMap,
+                           PointwiseChainDiagnostics& diagnostics) {
+        if (bytes == 0) return false;
+        if (b.buf && b.mem && b.cap >= bytes &&
+            (b.memoryFlags & required) == required && (!persistentMap || b.mapped)) {
+            return true;
+        }
+
+        destroyResidentBuf(b);
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = bytes;
+        bci.usage = usage;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device, buffer, &req);
+        const int memoryType = findPreferredMemType(req.memoryTypeBits, required, preferred);
+        if (memoryType < 0) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            return false;
+        }
+        const uint32_t heapIndex = memoryProperties.memoryTypes[memoryType].heapIndex;
+        if (heapIndex >= memoryProperties.memoryHeapCount ||
+            req.size > memoryProperties.memoryHeaps[heapIndex].size) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            return false;
+        }
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = static_cast<uint32_t>(memoryType);
+        if (vkAllocateMemory(device, &mai, nullptr, &memory) != VK_SUCCESS) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            return false;
+        }
+        if (vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            vkFreeMemory(device, memory, nullptr);
+            return false;
+        }
+
+        void* mapped = nullptr;
+        if (persistentMap &&
+            vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            vkFreeMemory(device, memory, nullptr);
+            return false;
+        }
+        b.buf = buffer;
+        b.mem = memory;
+        b.mapped = mapped;
+        b.cap = bytes;
+        b.allocationSize = req.size;
+        b.memoryFlags = memoryProperties.memoryTypes[memoryType].propertyFlags;
+        ++diagnostics.buffer_allocations;
+        return true;
+    }
+
+    bool flushResident(const ResidentBuf& b) const {
+        if ((b.memoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) return true;
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = b.mem;
+        range.offset = 0;
+        range.size = VK_WHOLE_SIZE;
+        return vkFlushMappedMemoryRanges(device, 1, &range) == VK_SUCCESS;
+    }
+
+    bool invalidateResident(const ResidentBuf& b) const {
+        if ((b.memoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) return true;
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = b.mem;
+        range.offset = 0;
+        range.size = VK_WHOLE_SIZE;
+        return vkInvalidateMappedMemoryRanges(device, 1, &range) == VK_SUCCESS;
     }
 
     // Tear down all persistent kernel state (failure recovery only — never runs
@@ -276,7 +556,598 @@ bool build_scan_pipeline(Ctx& c, Ctx::Kernel& s, const uint32_t* spv, size_t spv
     return true;
 }
 
+struct PointwiseFilmPush {
+    uint32_t npix;
+    uint32_t groupsX;
+    uint32_t totalGroups;
+    int32_t edge;
+    int32_t curvePoints;
+    float exposureMultiplier;
+    float couplerShift;
+    float couplerMatrix[9];
+};
+
+struct PointwisePrintPush {
+    uint32_t npix;
+    uint32_t groupsX;
+    uint32_t totalGroups;
+    int32_t curvePoints;
+    float midgray;
+    float exposureMultiplier;
+    float preflash[3];
+};
+
+struct PointwiseScanPush {
+    uint32_t npix;
+    uint32_t groupsX;
+    uint32_t totalGroups;
+    float matrix[12];
+};
+
+static_assert(sizeof(PointwiseFilmPush) == 64, "filming push layout drift");
+static_assert(sizeof(PointwisePrintPush) == 36, "printing push layout drift");
+static_assert(sizeof(PointwiseScanPush) == 60, "scan push layout drift");
+
+struct PreparedPointwiseRequest {
+    size_t componentCount = 0;
+    VkDeviceSize frameBytes = 0;
+    VkDeviceSize staticBytes = 0;
+    std::array<PointwiseTableSpan, kPointwiseTableCount> tables{};
+    std::array<VkDeviceSize, kPointwiseTableCount> tableBytes{};
+};
+
+bool finite_span(const PointwiseTableSpan& span) {
+    if (!span.data || span.count == 0) return false;
+    for (size_t i = 0; i < span.count; ++i) {
+        if (!std::isfinite(span.data[i])) return false;
+    }
+    return true;
+}
+
+bool finite_values(const float* values, size_t count) {
+    if (!values) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (!std::isfinite(values[i])) return false;
+    }
+    return true;
+}
+
+bool strictly_increasing_planar3(const PointwiseTableSpan& axis, uint32_t points) {
+    if (!axis.data || points < 2 || axis.count != static_cast<size_t>(points) * 3u) {
+        return false;
+    }
+    for (uint32_t row = 1; row < points; ++row) {
+        for (uint32_t channel = 0; channel < 3; ++channel) {
+            if (!(axis.data[static_cast<size_t>(row - 1) * 3u + channel] <
+                  axis.data[static_cast<size_t>(row) * 3u + channel])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool prepare_pointwise_request(const PointwiseChainRequest& request,
+                               const PointwiseChainOutput* output,
+                               PreparedPointwiseRequest& prepared,
+                               PointwiseFallbackReason& reason) {
+    constexpr uint32_t kMaxTcEdge = 1024;
+    constexpr uint32_t kMaxCurvePoints = 65536;
+    constexpr uint64_t kMaxStaticBytes = UINT64_C(64) * 1024u * 1024u;
+
+    if (!output || !output->rgb || !request.input_rgb || request.pixel_count == 0 ||
+        request.static_table_key == 0) {
+        reason = PointwiseFallbackReason::invalid_request;
+        return false;
+    }
+    const uint64_t components64 = static_cast<uint64_t>(request.pixel_count) * 3u;
+    const uint64_t frameBytes64 = components64 * sizeof(float);
+    if (components64 > std::numeric_limits<size_t>::max() ||
+        frameBytes64 > std::numeric_limits<VkDeviceSize>::max()) {
+        reason = PointwiseFallbackReason::request_too_large;
+        return false;
+    }
+    prepared.componentCount = static_cast<size_t>(components64);
+    prepared.frameBytes = static_cast<VkDeviceSize>(frameBytes64);
+    if (request.input_component_count < prepared.componentCount ||
+        output->component_capacity < prepared.componentCount) {
+        reason = PointwiseFallbackReason::invalid_request;
+        return false;
+    }
+
+    const uint32_t edge = request.film.tc_edge;
+    const uint32_t filmPoints = request.film.curve_points;
+    const uint32_t printPoints = request.print.curve_points;
+    if (edge < 2 || edge > kMaxTcEdge || filmPoints < 2 ||
+        filmPoints > kMaxCurvePoints || printPoints < 2 ||
+        printPoints > kMaxCurvePoints) {
+        reason = PointwiseFallbackReason::invalid_request;
+        return false;
+    }
+    const uint64_t tcCount = static_cast<uint64_t>(edge) * edge * 3u;
+    const uint64_t filmCurveCount = static_cast<uint64_t>(filmPoints) * 3u;
+    const uint64_t printCurveCount = static_cast<uint64_t>(printPoints) * 3u;
+
+    prepared.tables[kFilmTc] = request.film.tc_lut;
+    prepared.tables[kFilmDevelopAxis] = request.film.develop_axis;
+    prepared.tables[kFilmDevelopCurve] = request.film.develop_curve;
+    prepared.tables[kFilmDirAxis] = request.film.dir_axis;
+    prepared.tables[kFilmDirCurve] = request.film.dir_curve;
+    prepared.tables[kPrintDye] = request.print.dye;
+    prepared.tables[kPrintIlluminantSensitivity] = request.print.illuminant_sensitivity;
+    prepared.tables[kPrintPaperAxis] = request.print.paper_axis;
+    prepared.tables[kPrintPaperCurve] = request.print.paper_curve;
+    prepared.tables[kScanDye] = request.scan.dye;
+    prepared.tables[kScanIlluminantCmf] = request.scan.illuminant_cmf;
+    const uint64_t expected[kPointwiseTableCount] = {
+        tcCount,
+        filmCurveCount, filmCurveCount, filmCurveCount, filmCurveCount,
+        81u * 3u, 81u * 3u,
+        printCurveCount, printCurveCount,
+        81u * 3u, 81u * 3u,
+    };
+
+    uint64_t staticBytes = 0;
+    for (size_t i = 0; i < kPointwiseTableCount; ++i) {
+        if (expected[i] > std::numeric_limits<size_t>::max() ||
+            prepared.tables[i].count != static_cast<size_t>(expected[i]) ||
+            !finite_span(prepared.tables[i])) {
+            reason = PointwiseFallbackReason::invalid_request;
+            return false;
+        }
+        const uint64_t bytes = expected[i] * sizeof(float);
+        if (bytes > std::numeric_limits<VkDeviceSize>::max() ||
+            bytes > kMaxStaticBytes ||
+            staticBytes > kMaxStaticBytes - bytes) {
+            reason = PointwiseFallbackReason::request_too_large;
+            return false;
+        }
+        prepared.tableBytes[i] = static_cast<VkDeviceSize>(bytes);
+        staticBytes += bytes;
+    }
+    prepared.staticBytes = static_cast<VkDeviceSize>(staticBytes);
+
+    if (!strictly_increasing_planar3(request.film.develop_axis, filmPoints) ||
+        !strictly_increasing_planar3(request.film.dir_axis, filmPoints) ||
+        !strictly_increasing_planar3(request.print.paper_axis, printPoints) ||
+        !std::isfinite(request.film.exposure_multiplier) ||
+        !std::isfinite(request.film.coupler_shift) ||
+        !finite_values(request.film.coupler_matrix, 9) ||
+        !std::isfinite(request.print.midgray) ||
+        !std::isfinite(request.print.exposure_multiplier) ||
+        !finite_values(request.print.preflash, 3) ||
+        !finite_values(request.scan.xyz_to_rgb, 9)) {
+        reason = PointwiseFallbackReason::invalid_request;
+        return false;
+    }
+    reason = PointwiseFallbackReason::none;
+    return true;
+}
+
+bool build_pointwise_pipelines(Ctx& c, PointwiseChainDiagnostics& diagnostics) {
+    Ctx::PointwiseChain& s = c.pointwise;
+    if (s.pipelinesReady) return true;
+    const uint32_t* spirv[3] = {
+        kPointwiseFilmingSpv, kPointwisePrintingSpv, kPointwiseScanSpectralSpv,
+    };
+    const size_t spirvBytes[3] = {
+        sizeof(kPointwiseFilmingSpv), sizeof(kPointwisePrintingSpv),
+        sizeof(kPointwiseScanSpectralSpv),
+    };
+    const uint32_t bindingCounts[3] = {7, 6, 4};
+    const uint32_t pushBytes[3] = {
+        sizeof(PointwiseFilmPush), sizeof(PointwisePrintPush), sizeof(PointwiseScanPush),
+    };
+
+    for (size_t stage = 0; stage < 3; ++stage) {
+        if (pushBytes[stage] > c.properties.limits.maxPushConstantsSize) return false;
+        VkShaderModuleCreateInfo shaderInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        shaderInfo.codeSize = spirvBytes[stage];
+        shaderInfo.pCode = spirv[stage];
+        if (vkCreateShaderModule(c.device, &shaderInfo, nullptr, &s.shaders[stage]) != VK_SUCCESS) {
+            return false;
+        }
+
+        std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+        for (uint32_t binding = 0; binding < bindingCounts[stage]; ++binding) {
+            bindings[binding].binding = binding;
+            bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[binding].descriptorCount = 1;
+            bindings[binding].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo descriptorInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        descriptorInfo.bindingCount = bindingCounts[stage];
+        descriptorInfo.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(c.device, &descriptorInfo, nullptr,
+                                        &s.descriptorLayouts[stage]) != VK_SUCCESS) {
+            return false;
+        }
+
+        VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, pushBytes[stage]};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &s.descriptorLayouts[stage];
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &pushRange;
+        if (vkCreatePipelineLayout(c.device, &layoutInfo, nullptr,
+                                   &s.pipelineLayouts[stage]) != VK_SUCCESS) {
+            return false;
+        }
+
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = s.shaders[stage];
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = s.pipelineLayouts[stage];
+        if (vkCreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                     &s.pipelines[stage]) != VK_SUCCESS) {
+            return false;
+        }
+        ++diagnostics.pipeline_creates;
+    }
+
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 3;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    if (vkCreateDescriptorPool(c.device, &poolInfo, nullptr, &s.descriptorPool) != VK_SUCCESS) {
+        return false;
+    }
+    VkDescriptorSetAllocateInfo allocateSets{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocateSets.descriptorPool = s.descriptorPool;
+    allocateSets.descriptorSetCount = 3;
+    allocateSets.pSetLayouts = s.descriptorLayouts.data();
+    if (vkAllocateDescriptorSets(c.device, &allocateSets, s.descriptorSets.data()) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    commandPoolInfo.queueFamilyIndex = c.queueFamily;
+    if (vkCreateCommandPool(c.device, &commandPoolInfo, nullptr, &s.commandPool) != VK_SUCCESS) {
+        return false;
+    }
+    VkCommandBufferAllocateInfo allocateCommand{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocateCommand.commandPool = s.commandPool;
+    allocateCommand.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateCommand.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(c.device, &allocateCommand, &s.commandBuffer) != VK_SUCCESS) {
+        return false;
+    }
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(c.device, &fenceInfo, nullptr, &s.fence) != VK_SUCCESS) return false;
+    s.pipelinesReady = true;
+    return true;
+}
+
+void update_pointwise_descriptors(Ctx& c, const PreparedPointwiseRequest& prepared) {
+    Ctx::PointwiseChain& s = c.pointwise;
+    std::array<VkDescriptorBufferInfo, 17> infos{};
+    std::array<VkWriteDescriptorSet, 17> writes{};
+    size_t count = 0;
+    auto add = [&](size_t stage, uint32_t binding, const ResidentBuf& buffer,
+                   VkDeviceSize range) {
+        infos[count] = VkDescriptorBufferInfo{buffer.buf, 0, range};
+        writes[count] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[count].dstSet = s.descriptorSets[stage];
+        writes[count].dstBinding = binding;
+        writes[count].descriptorCount = 1;
+        writes[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[count].pBufferInfo = &infos[count];
+        ++count;
+    };
+
+    add(0, 0, s.ping[0], prepared.frameBytes);
+    add(0, 1, s.ping[1], prepared.frameBytes);
+    for (size_t i = kFilmTc; i <= kFilmDirCurve; ++i) {
+        add(0, static_cast<uint32_t>(i - kFilmTc + 2), s.tables[i], prepared.tableBytes[i]);
+    }
+    add(1, 0, s.ping[1], prepared.frameBytes);
+    add(1, 1, s.ping[0], prepared.frameBytes);
+    for (size_t i = kPrintDye; i <= kPrintPaperCurve; ++i) {
+        add(1, static_cast<uint32_t>(i - kPrintDye + 2), s.tables[i], prepared.tableBytes[i]);
+    }
+    add(2, 0, s.ping[0], prepared.frameBytes);
+    add(2, 1, s.ping[1], prepared.frameBytes);
+    add(2, 2, s.tables[kScanDye], prepared.tableBytes[kScanDye]);
+    add(2, 3, s.tables[kScanIlluminantCmf], prepared.tableBytes[kScanIlluminantCmf]);
+    vkUpdateDescriptorSets(c.device, static_cast<uint32_t>(count), writes.data(), 0, nullptr);
+}
+
 }  // namespace
+
+bool render_pointwise_chain(const PointwiseChainRequest& request,
+                            PointwiseChainOutput* output,
+                            PointwiseChainDiagnostics* diagnostics) noexcept {
+    PointwiseChainDiagnostics localDiagnostics{};
+    PointwiseChainDiagnostics& d = diagnostics ? *diagnostics : localDiagnostics;
+    d = {};
+
+    // This public seam is noexcept and fail-closed. First-use context creation
+    // performs C++ allocations (including temporary Vulkan enumeration vectors),
+    // so bad_alloc or another runtime exception must become an ordinary fallback
+    // rather than std::terminate. Caller output is not touched until every GPU
+    // operation and the finite readback validation below have completed.
+    try {
+
+    PreparedPointwiseRequest prepared{};
+    PointwiseFallbackReason validationReason = PointwiseFallbackReason::none;
+    if (!prepare_pointwise_request(request, output, prepared, validationReason)) {
+        d.fallback_reason = validationReason;
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(gpu_mutex());
+    Ctx& c = ctx();
+    if (!c.ok) {
+        d.fallback_reason = PointwiseFallbackReason::unavailable;
+        return false;
+    }
+    const VkPhysicalDeviceLimits& limits = c.properties.limits;
+    if (limits.maxComputeWorkGroupInvocations < 64 || limits.maxComputeWorkGroupSize[0] < 64) {
+        d.fallback_reason = PointwiseFallbackReason::unavailable;
+        return false;
+    }
+    if (limits.maxMemoryAllocationCount < 15) {
+        d.fallback_reason = PointwiseFallbackReason::unavailable;
+        return false;
+    }
+    const PointwiseDispatchGrid grid = plan_pointwise_dispatch(
+        request.pixel_count, limits.maxComputeWorkGroupCount[0],
+        limits.maxComputeWorkGroupCount[1]);
+    if (!grid.valid || prepared.frameBytes > limits.maxStorageBufferRange) {
+        d.fallback_reason = PointwiseFallbackReason::request_too_large;
+        return false;
+    }
+    for (VkDeviceSize bytes : prepared.tableBytes) {
+        if (bytes > limits.maxStorageBufferRange) {
+            d.fallback_reason = PointwiseFallbackReason::request_too_large;
+            return false;
+        }
+    }
+
+    Ctx::PointwiseChain& s = c.pointwise;
+    bool staticCacheHit = s.cachedTableKey == request.static_table_key &&
+                          s.cachedTableBytes == prepared.tableBytes;
+    for (size_t i = 0; i < kPointwiseTableCount && staticCacheHit; ++i) {
+        staticCacheHit = s.tables[i].buf && s.tables[i].cap >= prepared.tableBytes[i];
+    }
+
+    // Conservative heap preflight when VK_EXT_memory_budget is not enabled.
+    // Driver allocation results remain authoritative, but impossible whole-frame
+    // requests fail before tearing down a useful warm cache.
+    const uint64_t deviceBytes = static_cast<uint64_t>(prepared.frameBytes) * 2u +
+                                 static_cast<uint64_t>(prepared.staticBytes);
+    const uint64_t hostBytes = static_cast<uint64_t>(prepared.frameBytes) +
+                               static_cast<uint64_t>(prepared.staticBytes);
+    if (deviceBytes > c.largestHeapFor(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+        hostBytes > c.largestHeapFor(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        d.fallback_reason = PointwiseFallbackReason::allocation_failed;
+        return false;
+    }
+
+    auto fail = [&](PointwiseFallbackReason reason) {
+        d.engaged = false;
+        d.fallback_reason = reason;
+        c.destroyPointwise();
+        return false;
+    };
+
+    if (!build_pointwise_pipelines(c, d)) {
+        return fail(PointwiseFallbackReason::pipeline_failed);
+    }
+
+    constexpr VkBufferUsageFlags kFrameStagingUsage =
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    constexpr VkBufferUsageFlags kPingUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (!c.ensureResidentBuf(s.frameStaging, prepared.frameBytes, kFrameStagingUsage,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                             true, d) ||
+        !c.ensureResidentBuf(s.ping[0], prepared.frameBytes, kPingUsage,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, d) ||
+        !c.ensureResidentBuf(s.ping[1], prepared.frameBytes, kPingUsage,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, d)) {
+        return fail(PointwiseFallbackReason::allocation_failed);
+    }
+
+    std::array<VkDeviceSize, kPointwiseTableCount> staticOffsets{};
+    if (!staticCacheHit) {
+        constexpr VkBufferUsageFlags kStaticUsage =
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (!c.ensureResidentBuf(s.staticStaging, prepared.staticBytes,
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                 true, d)) {
+            return fail(PointwiseFallbackReason::allocation_failed);
+        }
+        VkDeviceSize offset = 0;
+        for (size_t i = 0; i < kPointwiseTableCount; ++i) {
+            if (!c.ensureResidentBuf(s.tables[i], prepared.tableBytes[i], kStaticUsage,
+                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, d)) {
+                return fail(PointwiseFallbackReason::allocation_failed);
+            }
+            staticOffsets[i] = offset;
+            std::memcpy(static_cast<unsigned char*>(s.staticStaging.mapped) + offset,
+                        prepared.tables[i].data,
+                        static_cast<size_t>(prepared.tableBytes[i]));
+            offset += prepared.tableBytes[i];
+        }
+        if (!c.flushResident(s.staticStaging)) {
+            return fail(PointwiseFallbackReason::upload_failed);
+        }
+        d.static_upload_bytes = prepared.staticBytes;
+    }
+
+    std::memcpy(s.frameStaging.mapped, request.input_rgb,
+                static_cast<size_t>(prepared.frameBytes));
+    if (!c.flushResident(s.frameStaging)) {
+        return fail(PointwiseFallbackReason::upload_failed);
+    }
+    update_pointwise_descriptors(c, prepared);
+
+    PointwiseFilmPush filmPush{};
+    filmPush.npix = request.pixel_count;
+    filmPush.groupsX = grid.groups_x;
+    filmPush.totalGroups = grid.total_groups;
+    filmPush.edge = static_cast<int32_t>(request.film.tc_edge);
+    filmPush.curvePoints = static_cast<int32_t>(request.film.curve_points);
+    filmPush.exposureMultiplier = request.film.exposure_multiplier;
+    filmPush.couplerShift = request.film.coupler_shift;
+    std::memcpy(filmPush.couplerMatrix, request.film.coupler_matrix,
+                sizeof(filmPush.couplerMatrix));
+
+    PointwisePrintPush printPush{};
+    printPush.npix = request.pixel_count;
+    printPush.groupsX = grid.groups_x;
+    printPush.totalGroups = grid.total_groups;
+    printPush.curvePoints = static_cast<int32_t>(request.print.curve_points);
+    printPush.midgray = request.print.midgray;
+    printPush.exposureMultiplier = request.print.exposure_multiplier;
+    std::memcpy(printPush.preflash, request.print.preflash, sizeof(printPush.preflash));
+
+    PointwiseScanPush scanPush{};
+    scanPush.npix = request.pixel_count;
+    scanPush.groupsX = grid.groups_x;
+    scanPush.totalGroups = grid.total_groups;
+    scanPush.matrix[0] = request.scan.xyz_to_rgb[0];
+    scanPush.matrix[1] = request.scan.xyz_to_rgb[1];
+    scanPush.matrix[2] = request.scan.xyz_to_rgb[2];
+    scanPush.matrix[4] = request.scan.xyz_to_rgb[3];
+    scanPush.matrix[5] = request.scan.xyz_to_rgb[4];
+    scanPush.matrix[6] = request.scan.xyz_to_rgb[5];
+    scanPush.matrix[8] = request.scan.xyz_to_rgb[6];
+    scanPush.matrix[9] = request.scan.xyz_to_rgb[7];
+    scanPush.matrix[10] = request.scan.xyz_to_rgb[8];
+
+    if (vkResetCommandBuffer(s.commandBuffer, 0) != VK_SUCCESS) {
+        return fail(PointwiseFallbackReason::dispatch_failed);
+    }
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(s.commandBuffer, &beginInfo) != VK_SUCCESS) {
+        return fail(PointwiseFallbackReason::dispatch_failed);
+    }
+
+    VkMemoryBarrier hostWriteBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    hostWriteBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    hostWriteBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(s.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &hostWriteBarrier,
+                         0, nullptr, 0, nullptr);
+
+    VkBufferCopy frameUpload{0, 0, prepared.frameBytes};
+    vkCmdCopyBuffer(s.commandBuffer, s.frameStaging.buf, s.ping[0].buf, 1, &frameUpload);
+    if (!staticCacheHit) {
+        for (size_t i = 0; i < kPointwiseTableCount; ++i) {
+            VkBufferCopy tableUpload{staticOffsets[i], 0, prepared.tableBytes[i]};
+            vkCmdCopyBuffer(s.commandBuffer, s.staticStaging.buf, s.tables[i].buf, 1,
+                            &tableUpload);
+        }
+    }
+
+    VkMemoryBarrier uploadBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    uploadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    uploadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(s.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &uploadBarrier,
+                         0, nullptr, 0, nullptr);
+
+    auto dispatch = [&](size_t stage, const void* push, uint32_t pushBytes) {
+        vkCmdBindPipeline(s.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          s.pipelines[stage]);
+        vkCmdBindDescriptorSets(s.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                s.pipelineLayouts[stage], 0, 1,
+                                &s.descriptorSets[stage], 0, nullptr);
+        vkCmdPushConstants(s.commandBuffer, s.pipelineLayouts[stage],
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, pushBytes, push);
+        vkCmdDispatch(s.commandBuffer, grid.groups_x, grid.groups_y, 1);
+    };
+    auto computeBarrier = [&]() {
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(s.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
+                             0, nullptr, 0, nullptr);
+    };
+
+    dispatch(0, &filmPush, sizeof(filmPush));
+    computeBarrier();
+    dispatch(1, &printPush, sizeof(printPush));
+    computeBarrier();
+    dispatch(2, &scanPush, sizeof(scanPush));
+
+    VkMemoryBarrier readbackBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readbackBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    readbackBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(s.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &readbackBarrier,
+                         0, nullptr, 0, nullptr);
+    VkBufferCopy frameReadback{0, 0, prepared.frameBytes};
+    vkCmdCopyBuffer(s.commandBuffer, s.ping[1].buf, s.frameStaging.buf, 1,
+                    &frameReadback);
+    VkMemoryBarrier hostReadBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    hostReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    hostReadBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(s.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hostReadBarrier,
+                         0, nullptr, 0, nullptr);
+    if (vkEndCommandBuffer(s.commandBuffer) != VK_SUCCESS) {
+        return fail(PointwiseFallbackReason::dispatch_failed);
+    }
+
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &s.commandBuffer;
+    if (vkQueueSubmit(c.queue, 1, &submit, s.fence) != VK_SUCCESS ||
+        vkWaitForFences(c.device, 1, &s.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
+        vkResetFences(c.device, 1, &s.fence) != VK_SUCCESS) {
+        return fail(PointwiseFallbackReason::dispatch_failed);
+    }
+    if (!c.invalidateResident(s.frameStaging)) {
+        return fail(PointwiseFallbackReason::readback_failed);
+    }
+
+    const float* mappedOutput = static_cast<const float*>(s.frameStaging.mapped);
+    for (size_t i = 0; i < prepared.componentCount; ++i) {
+        if (!std::isfinite(mappedOutput[i])) {
+            return fail(PointwiseFallbackReason::readback_failed);
+        }
+    }
+
+    std::memcpy(output->rgb, mappedOutput,
+                static_cast<size_t>(prepared.frameBytes));
+    // These counters describe completed frame work, not merely recorded or
+    // submitted commands. Every false return therefore reports zero here.
+    d.dispatches = 3;
+    d.input_uploads = 1;
+    d.final_readbacks = 1;
+    d.interstage_host_bytes = 0;
+    d.engaged = true;
+    d.fallback_reason = PointwiseFallbackReason::none;
+    if (!staticCacheHit) {
+        s.cachedTableKey = request.static_table_key;
+        s.cachedTableBytes = prepared.tableBytes;
+    }
+    return true;
+    } catch (const std::bad_alloc&) {
+        d = {};
+        d.fallback_reason = PointwiseFallbackReason::allocation_failed;
+        return false;
+    } catch (...) {
+        d = {};
+        d.fallback_reason = PointwiseFallbackReason::unavailable;
+        return false;
+    }
+}
 
 bool available() {
     std::lock_guard<std::mutex> lk(gpu_mutex());

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Spektrafilm Android contributors
+# SPDX-License-Identifier: GPL-3.0-only
+# Generator: Android NDK 27.0.12077973 shader-tools/windows-x86_64/glslc.exe
+# Reported tool: shaderc v2022.3 ndk-r26c; target SPIR-V 1.0
+# Exact command (run once for each source/output pair from this directory):
+# glslc.exe -fshader-stage=compute --target-env=vulkan1.1 -mfmt=c -o OUTPUT.inc SOURCE.comp
+61CB82CD5448A571B835FAA1D663155716CFCFCDBC4E238F61DB49F5DC553580  filming.comp
+9BF1685AC7022936DD996973C2241BA5AEC6C5FFD1476726E043C13DD659FDBC  filming_spv.inc
+296062E4D58226F6DFFC4311AA9E2D7F35D8DEA458A5E0367E162605AE810468  printing.comp
+A0BF115571621B0D3F042CA3A0A5B6E5351A2D8010A539AF6136CCFEB86DEABF  printing_spv.inc
+EA6303990DF71A0B6B0A98B1BB0EFAD3BA49FE368210AFCAEB8DCB4EC3E9F0BD  scan_spectral_chain.comp
+D8ED4EEC480EDB5E81E8F734E1B741E9240BF0DD4D881396411A69CDC6AB578B  scan_spectral_chain_spv.inc

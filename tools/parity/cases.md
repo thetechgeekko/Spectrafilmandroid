@@ -25,6 +25,8 @@ Goldens are generated from the synthetic 64×64 ramp+Macbeth test image
 | case_id        | film              | print               | route       | grain | spatial/stochastic | taps |
 |----------------|-------------------|---------------------|-------------|-------|--------------------|------|
 | `print_portra` | kodak_portra_400  | kodak_portra_endura | print       | off   | off                | all 4 |
+| `print_kodak_2383_k75p` | kodak_portra_400 | kodak_2383 | print | off | off | all 4 |
+| `print_kodak_2393_k75p` | kodak_portra_400 | kodak_2393 | print | off | off | all 4 |
 | `scan_portra`  | kodak_portra_400  | kodak_portra_endura | scan_film   | off   | off                | film_log_raw, film_density_cmy, final_rgb |
 | `print_ektar`  | kodak_ektar_100   | kodak_supra_endura  | print       | off   | off                | all 4 |
 | `scan_portra_spatial` | kodak_portra_400 | kodak_portra_endura | scan_film | off | spatial ON         | film_density_cmy, final_rgb (+) |
@@ -37,6 +39,11 @@ Goldens are generated from the synthetic 64×64 ramp+Macbeth test image
 Rationale:
 - `print_portra` is the canonical reference pair (matches `init_params` defaults)
   and exercises every stage of the full print pipeline.
+- `print_kodak_2383_k75p` and `print_kodak_2393_k75p` independently lock the
+  two bundled cinema-print profiles to their declared Kinoton 75P viewing
+  illuminant. Their `final_rgb` taps cover the K75P spectral integral and the
+  K75P-to-output-white CAT; the upstream oracle generated both fixtures, so a
+  silent D50 fallback exceeds the normal parity band.
 - `scan_portra` flips `io.scan_film` to gate the negative-scan route, which skips
   the print stage entirely (`PORTING_PLAN.md` Stage 3 `scanning.py`).
 - `print_ektar` uses a different film/paper pair to catch regressions that are
@@ -132,12 +139,28 @@ float64 irradiance. They get a dedicated stage-isolation golden + host test:
   (`use_enlarger_lut`) is left RESERVED/unwired this pass (see note).
 
 - **`scanner_lut_e2e`** — the FULL-PIPELINE gate for the WIRED opt-in scanner LUT
-  (`tests/test_scanner_lut_e2e.cpp`, asset-backed, reuses the `scan_portra`
-  fixture + golden). Runs the whole `scan_film` pipeline through `spk_simulate`
-  twice: (A) `use_scanner_lut=0` (default direct path) — asserted bit-exact vs the
-  `scan_portra` golden band (max_abs <= 1e-4), and (B) `use_scanner_lut=1` at
-  `lut_resolution` 17 and 64 — asserted within the acceleration band of (A)
-  (max_abs ~4.1e-5 at res 17, ~5.0e-7 at res 64; NOT bit-exact by design).
+  (`tests/test_scanner_lut_e2e.cpp`, asset-backed). It runs Kodak 2383/K75P,
+  Kodak 2393/K75P, and the legacy `scan_portra`/D50 route through
+  `spk_simulate`: (A) `use_scanner_lut=0` (default direct path) is asserted
+  against each committed `final_rgb` oracle (max_abs <= 1e-4, rms <= 1e-5),
+  and (B) `use_scanner_lut=1` at the upstream-default resolution 17 is asserted
+  against each case's pinned `final_rgb_scanner_lut_17.spkvec` oracle at the same
+  tight tolerance. This is a like-for-like mode gate: upstream's coarse K75P LUT
+  itself differs from direct integration by about 3.97e-3 (2383) / 7.20e-3
+  (2393), so that cross-mode delta is printed only as a diagnostic, never hidden
+  inside a widened parity band. The D50 case retains its resolution-17 and
+  resolution-64 direct-convergence checks (5e-5 / 5e-6). Viewing-only memo
+  isolation remains covered by `tests/test_lut_cache_e2e.cpp`.
+
+  The complementary route tests are `tests/test_gpu_host.cpp`, which runs both
+  K75P profiles first through linear/fused preview and experimental GPU export
+  using CPU export as a route-local reference, and
+  `tests/test_scanner_bwcorr_e2e.cpp`, which anchors corrections-OFF to the
+  committed K75P goldens and proves reference measurement is viewing-sensitive,
+  active, finite, and repeat-deterministic when enabled. Exact export keeps the
+  approximate scanner LUT disabled; increasing K75P to resolution 80 was rejected
+  here because it changes upstream semantics and expands one prepared LUT from
+  about 0.64 MiB to 69.4 MiB, far beyond the current 8 MiB cache budget.
 
 ## Tolerances
 

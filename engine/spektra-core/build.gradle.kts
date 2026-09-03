@@ -17,6 +17,7 @@ android {
 
     defaultConfig {
         minSdk = 24
+        testInstrumentationRunner = "com.spectrafilm.engine.EngineBoundaryInstrumentation"
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17"
@@ -48,4 +49,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    testImplementation(libs.junit)
 }

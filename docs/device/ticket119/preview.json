@@ -1,0 +1,147 @@
+{
+  "schema": "spk.bench_preview.v1",
+  "captured_at_millis": 1788376293814,
+  "app": {
+    "package": "com.spectrafilm.app",
+    "apk_sha256": "e86f327fa33eff46cbdfbb5e3afb7805a78918a06f3615234959094236b1f42d",
+    "version_code": 11,
+    "version_name": "0.9.0",
+    "debuggable": false
+  },
+  "device": {
+    "model": "SM-S948W",
+    "device": "m3q",
+    "manufacturer": "samsung",
+    "sdk_int": 36,
+    "release": "16",
+    "build_fingerprint": "samsung\/m3qcsx\/m3q:16\/BP4A.251205.006\/S948WVLS4AZG3_OYV4AZG3:user\/release-keys",
+    "abis": [
+      "arm64-v8a"
+    ],
+    "cpu_count": 8,
+    "gpu_renderer": "gles=3.2"
+  },
+  "source_sha256": "66381a8ed2d1a6ab471690ec5c5725798a15e134ada94c7feeb43c59bdb93195",
+  "decode_max_edge": 16384,
+  "environment": {
+    "thermal_status": 0,
+    "battery_pct": 68,
+    "plugged": 0,
+    "cpuset": "\/foreground",
+    "process_importance": 125
+  },
+  "routes": [
+    {
+      "route": "print",
+      "preset": "Portra 400 — Wedding Warm",
+      "preview_max_size": 640,
+      "engine_ms": [
+        99,
+        98,
+        106,
+        103,
+        100,
+        99,
+        101,
+        119,
+        97,
+        112,
+        103,
+        113,
+        101,
+        103,
+        95
+      ],
+      "bitmap_ms": [
+        17,
+        3,
+        3,
+        2,
+        2,
+        2,
+        3,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3,
+        2
+      ],
+      "samples_ms": [
+        116,
+        101,
+        109,
+        106,
+        103,
+        102,
+        104,
+        122,
+        100,
+        115,
+        106,
+        116,
+        104,
+        106,
+        98
+      ]
+    },
+    {
+      "route": "scan",
+      "preset": "Portra 400 — Wedding Warm",
+      "preview_max_size": 640,
+      "engine_ms": [
+        69,
+        70,
+        74,
+        77,
+        78,
+        78,
+        79,
+        71,
+        69,
+        72,
+        77,
+        70,
+        74,
+        74,
+        81
+      ],
+      "bitmap_ms": [
+        2,
+        3,
+        3,
+        3,
+        2,
+        3,
+        3,
+        2,
+        2,
+        3,
+        3,
+        2,
+        3,
+        2,
+        3
+      ],
+      "samples_ms": [
+        72,
+        73,
+        77,
+        80,
+        81,
+        82,
+        82,
+        74,
+        72,
+        75,
+        80,
+        73,
+        77,
+        77,
+        85
+      ]
+    }
+  ]
+}

@@ -12,28 +12,80 @@ package com.spectrafilm.app.masks
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.math.BigDecimal
+import java.math.BigInteger
 
 object MaskJson {
 
-    fun toJson(adjustments: List<LocalAdjustment>): JSONArray {
+    const val SCHEMA_ID = "org.spektrafilm.mask-set"
+    const val SCHEMA_VERSION = 1
+    const val MAX_ADJUSTMENTS = 64
+    const val MAX_COMPONENTS_PER_MASK = 32
+
+    /** Stable interoperable mask-set document; see docs/MASK_JSON_SCHEMA.md. */
+    fun toJson(adjustments: List<LocalAdjustment>): JSONObject {
+        require(adjustments.size <= MAX_ADJUSTMENTS) {
+            "mask adjustment count exceeds $MAX_ADJUSTMENTS"
+        }
         val arr = JSONArray()
         for (adj in adjustments) {
+            require(adj.mask.components.size <= MAX_COMPONENTS_PER_MASK) {
+                "mask component count exceeds $MAX_COMPONENTS_PER_MASK"
+            }
             arr.put(JSONObject().apply {
                 put("delta", deltaToJson(adj.delta))
                 put("mask", maskToJson(adj.mask))
             })
         }
-        return arr
+        return JSONObject().apply {
+            put("schema", SCHEMA_ID)
+            put("version", SCHEMA_VERSION)
+            put("adjustments", arr)
+        }
     }
 
-    fun fromJson(arr: JSONArray?): List<LocalAdjustment> {
-        if (arr == null) return emptyList()
+    /** Accepts the current object document and the shipped legacy bare-array v0 form. */
+    fun fromJson(value: Any?): List<LocalAdjustment> {
+        if (value == null || value === JSONObject.NULL) return emptyList()
+        val arr = when (value) {
+            is JSONArray -> value // legacy recipes/presets written before schema v1
+            is JSONObject -> {
+                require(value.optString("schema") == SCHEMA_ID) { "unsupported mask schema" }
+                val rawVersion = value.opt("version")
+                require(isExactSchemaVersion(rawVersion)) {
+                    "unsupported mask schema version: $rawVersion"
+                }
+                value.optJSONArray("adjustments")
+                    ?: throw IllegalArgumentException("mask document has no adjustments array")
+            }
+            else -> throw IllegalArgumentException("mask document must be an object or legacy array")
+        }
+        require(arr.length() <= MAX_ADJUSTMENTS) {
+            "mask adjustment count exceeds $MAX_ADJUSTMENTS"
+        }
         val out = ArrayList<LocalAdjustment>(arr.length())
         for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
+            val o = arr.optJSONObject(i)
+                ?: throw IllegalArgumentException("mask adjustment $i is not an object")
             out.add(LocalAdjustment(maskFromJson(o.optJSONObject("mask")), deltaFromJson(o.optJSONObject("delta"))))
         }
         return out
+    }
+
+    /** Do not use JSONObject.optInt: it coerces strings/fractions and can truncate large longs. */
+    private fun isExactSchemaVersion(value: Any?): Boolean = when (value) {
+        is Byte, is Short, is Int, is Long -> (value as Number).toLong() == SCHEMA_VERSION.toLong()
+        is Float -> value.isFinite() && value == SCHEMA_VERSION.toFloat()
+        is Double -> value.isFinite() && value == SCHEMA_VERSION.toDouble()
+        is BigInteger -> value == BigInteger.valueOf(SCHEMA_VERSION.toLong())
+        is BigDecimal -> value.compareTo(BigDecimal.valueOf(SCHEMA_VERSION.toLong())) == 0
+        else -> false
+    }
+
+    internal fun migrateLegacy(arr: JSONArray): JSONObject = JSONObject().apply {
+        put("schema", SCHEMA_ID)
+        put("version", SCHEMA_VERSION)
+        put("adjustments", JSONArray(arr.toString()))
     }
 
     private fun deltaToJson(d: TierADelta) = JSONObject().apply {
@@ -64,7 +116,14 @@ object MaskJson {
         if (o == null) return Mask()
         val comps = ArrayList<Mask.Component>()
         o.optJSONArray("components")?.let { ca ->
-            for (i in 0 until ca.length()) ca.optJSONObject(i)?.let { comps.add(componentFromJson(it)) }
+            require(ca.length() <= MAX_COMPONENTS_PER_MASK) {
+                "mask component count exceeds $MAX_COMPONENTS_PER_MASK"
+            }
+            for (i in 0 until ca.length()) {
+                val component = ca.optJSONObject(i)
+                    ?: throw IllegalArgumentException("mask component $i is not an object")
+                comps.add(componentFromJson(component))
+            }
         }
         val lum = o.optJSONObject("lumRange")?.let { lumRangeFromJson(it) }
         val col = o.optJSONObject("colorRange")?.let { colorRangeFromJson(it) }
@@ -96,7 +155,7 @@ object MaskJson {
     }
 
     private fun componentFromJson(o: JSONObject) = Mask.Component(
-        mode = enumOf(o.optString("mode"), BlendMode.ADD),
+        mode = strictEnum(o.optString("mode", BlendMode.ADD.name), BlendMode.ADD),
         shape = shapeFromJson(o.optJSONObject("shape")),
         invert = o.optBoolean("invert", false),
         value = f(o, "value", 1f),
@@ -118,17 +177,25 @@ object MaskJson {
 
     private fun shapeFromJson(o: JSONObject?): MaskComponent {
         if (o == null) return MaskComponent.Radial(0.5f, 0.5f, 0.25f, 0.25f)
-        return when (o.optString("type")) {
+        return when (val type = o.optString("type", "radial")) {
             "linear" -> MaskComponent.Linear(f(o, "x0"), f(o, "y0"), f(o, "x1", 1f), f(o, "y1"))
-            else -> MaskComponent.Radial(
+            "radial" -> MaskComponent.Radial(
                 f(o, "cx", 0.5f), f(o, "cy", 0.5f), f(o, "rx", 0.25f), f(o, "ry", 0.25f),
                 f(o, "feather", 0.5f), f(o, "angleDeg"),
             )
+            else -> throw IllegalArgumentException("unsupported mask shape: $type")
         }
     }
 
-    private fun f(o: JSONObject, k: String, def: Float = 0f) = o.optDouble(k, def.toDouble()).toFloat()
+    private fun f(o: JSONObject, k: String, def: Float = 0f): Float {
+        val value = o.optDouble(k, def.toDouble()).toFloat()
+        require(value.isFinite()) { "mask number $k is not finite" }
+        return value
+    }
 
-    private inline fun <reified T : Enum<T>> enumOf(name: String, def: T): T =
-        runCatching { enumValueOf<T>(name) }.getOrDefault(def)
+    private inline fun <reified T : Enum<T>> strictEnum(name: String, def: T): T {
+        if (name.isBlank()) return def
+        return runCatching { enumValueOf<T>(name) }
+            .getOrElse { throw IllegalArgumentException("unsupported ${T::class.java.simpleName}: $name") }
+    }
 }

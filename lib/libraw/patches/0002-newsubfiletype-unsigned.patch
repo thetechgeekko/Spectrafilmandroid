@@ -1,0 +1,24 @@
+diff --git a/libraw/libraw_internal.h b/libraw/libraw_internal.h
+--- a/libraw/libraw_internal.h
++++ b/libraw/libraw_internal.h
+@@ -246,7 +246,7 @@ struct tiff_ifd_t
+   int lineartable_len;
+   libraw_dng_color_t dng_color[2];
+   libraw_dng_levels_t dng_levels;
+-  int newsubfiletype;
++  unsigned int newsubfiletype;
+ };
+ 
+ struct jhead
+diff --git a/src/metadata/tiff.cpp b/src/metadata/tiff.cpp
+--- a/src/metadata/tiff.cpp
++++ b/src/metadata/tiff.cpp
+@@ -569,7 +569,7 @@ int LibRaw::parse_tiff_ifd(INT64 base)
+       parse_tiff_ifd(base);
+       break;
+     case 0x00fe: /* NewSubfileType */
+-      tiff_ifd[ifd].newsubfiletype = int(getreal(type));
++      tiff_ifd[ifd].newsubfiletype = get4();
+       break;
+     case 0x0100: /* 256, ImageWidth */
+     case 0xf001: /* 61441, Fuji RAF RawImageFullWidth */

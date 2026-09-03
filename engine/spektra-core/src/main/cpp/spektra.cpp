@@ -33,7 +33,12 @@
  */
 #include "spektra.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <dirent.h>
@@ -41,6 +46,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,13 +57,21 @@
 #endif
 
 #include "io/npy_lut.h"
+#include "gpu/vulkan_compute.h"
 #include "kernels/lut3d_cache.h"  // spk_engine holds the spectral 3D-LUT memo by value
+#include "kernels/parallel.h"     // spk_set_big_cores -> parallel_set_big_cores
+#include "model/color_output.h"
+#include "model/density_curves.h"
+#include "model/diffusion.h"
 #include "model/color_filters.h"
+#include "model/spectral.h"
+#include "profiles/json_min.h"
 #include "profiles/profile.h"
 #include "runtime/color_reference.h"
 #include "runtime/params.h"
 #include "runtime/print_digest.h"
 #include "runtime/stage_timer.h"
+#include "runtime/tc_lut_cache.h"
 #include "runtime/stages/autoexposure.h"
 #include "runtime/stages/crop_resize.h"
 #include "runtime/stages/filming.h"
@@ -64,6 +79,23 @@
 #include "runtime/stages/scanning.h"
 
 namespace {
+
+// Status detail is caller-thread-local so concurrent preview/export calls cannot
+// overwrite each other's diagnostics. A fixed buffer keeps the error path
+// allocation-free and gives the public pointer a simple lifetime contract.
+thread_local char g_last_error_message[512] = {};
+
+void clear_last_error_message() noexcept { g_last_error_message[0] = '\0'; }
+
+void set_last_error_message(const char* message) noexcept {
+    if (!message) {
+        clear_last_error_message();
+        return;
+    }
+    std::strncpy(g_last_error_message, message,
+                 sizeof(g_last_error_message) - 1);
+    g_last_error_message[sizeof(g_last_error_message) - 1] = '\0';
+}
 
 // Build the scanning-stage tone curve from the flat spk_params control points.
 // Inactive (the default) => an inactive set whose apply() is a strict no-op. Point
@@ -175,15 +207,14 @@ struct spk_engine {
     // Gaussian blur, the hanatos window/surface toggles, the camera UV/IR
     // band-pass triples, and input_gamut_compress (see engine_tc_lut below; a
     // key that dropped any of these would serve stale tc_luts across a settings
-    // change). Entries are never evicted, so node references stay valid — which
-    // also means non-default continuous params (blur sigma, UV/IR floats) add
-    // one ~885 KB entry PER DISTINCT VALUE for the engine's lifetime; the
-    // default path keeps the bare film-id key (28 bundled profiles, bounded).
-    // Bounding the non-default entries (LRU, like kernels/lut3d_cache) is an
-    // open item tracked in docs/AUDIT.md. Guarded by cache_mutex.
+    // change). The 28 bare/default profile keys are pinned behind their own
+    // count+byte ceilings. Parameterized keys use an 8 MiB byte-budgeted LRU,
+    // so continuous blur / UV / IR slider motion cannot grow native residency.
+    // Shared leases keep an evicted LUT alive only for renders already reading
+    // it. Cache allocations also reserve the process MemoryDomain::Cache budget.
     std::mutex cache_mutex;
     std::map<std::string, spk::Profile> profile_cache;   // id -> parsed Profile
-    std::map<std::string, spk::NdArray> tc_lut_cache;    // film id -> filming tc_lut
+    spk::TcLutCache tc_lut_cache;
 
     // FILM-DENSITY (film_density_cmy) memo, one slot PER ROUTE (PERF). Unlike
     // profile_cache/tc_lut_cache above — which are keyed by an IMMUTABLE
@@ -242,16 +273,74 @@ struct spk_engine {
     // output-only edit (scanner / output space / tone curve / glare) rerun
     // scan() alone. The entry buffer holds print_density_cmy. Same mutex.
     FilmMemoSlot print_density_memo;
+
+    // Prepared immutable f32 tables for the resident filming -> printing -> scan
+    // operation (#148). The cache compares every table byte and shape exactly;
+    // the nonzero generation is an opaque identity token for the lower-level GPU
+    // static-table cache, never a content digest. A shared_ptr lets a render keep
+    // the table storage alive after dropping this mutex and throughout the GPU
+    // submit/wait. Only one bounded latest-table entry is retained per engine.
+    struct PointwisePreparedTables {
+        uint64_t generation = 0;
+        uint32_t tc_edge = 0;
+        uint32_t film_curve_points = 0;
+        uint32_t print_curve_points = 0;
+        std::vector<float> tc_lut;
+        std::vector<float> develop_axis;
+        std::vector<float> develop_curve;
+        std::vector<float> dir_axis;
+        std::vector<float> dir_curve;
+        std::vector<float> print_dye;
+        std::vector<float> print_illuminant_sensitivity;
+        std::vector<float> paper_axis;
+        std::vector<float> paper_curve;
+        std::vector<float> scan_dye;
+        std::vector<float> scan_illuminant_cmf;
+    };
+    std::mutex pointwise_cache_mutex;
+    std::shared_ptr<const PointwisePreparedTables> pointwise_prepared;
+    uint64_t pointwise_cache_hits = 0;
+    uint64_t pointwise_cache_misses = 0;
+
+    struct PointwiseCapabilityKey {
+        uint32_t revision = 0;
+        uint32_t source_flags = 0;
+        uint64_t generation = 0;
+        uint64_t input_gain_bits = 0;
+        float values[22]{};  // film scalar/matrix + print scalars + scan matrix
+    };
+    std::mutex pointwise_capability_mutex;
+    bool pointwise_capability_valid = false;
+    bool pointwise_capability_passed = false;
+    PointwiseCapabilityKey pointwise_capability_key;
 };
 
 // Host-only accessors for the print-route film_density_cmy cache counters. The host
 // parity tests compile spektra.cpp directly into their binary and read these to
 // assert the cache actually engaged, WITHOUT touching spektra.h / the public ABI /
-// JNI. Gated on the HOST build (!__ANDROID__) so they never enter the shipped
+// JNI. Gated on HOST builds or the explicit standalone-device-test macro, so
+// they never enter the shipped library.
 // libspektra.so; not declared in any header — tests forward-declare them. The host
 // parity job (engine-parity) builds with the host g++ toolchain, so __ANDROID__ is
 // undefined and these are available there without needing an extra -D flag.
-#ifndef __ANDROID__
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+thread_local int g_spk_test_pointwise_fault = 0;
+thread_local double g_spk_test_pointwise_direct_gain = 1.0;
+thread_local size_t g_spk_test_last_asset_max_bytes = 0;
+thread_local size_t g_spk_test_last_asset_bytes_allocated = 0;
+
+void spk_test_pointwise_set_fault(int fault) {
+    g_spk_test_pointwise_fault = fault;
+}
+double spk_test_pointwise_direct_gain(void) {
+    return g_spk_test_pointwise_direct_gain;
+}
+size_t spk_test_last_asset_max_bytes(void) {
+    return g_spk_test_last_asset_max_bytes;
+}
+size_t spk_test_last_asset_bytes_allocated(void) {
+    return g_spk_test_last_asset_bytes_allocated;
+}
 uint64_t spk_test_film_cache_hits(spk_engine* eng) {
     if (!eng) return 0;
     std::lock_guard<std::mutex> g(eng->film_cache_mutex);
@@ -291,33 +380,95 @@ uint64_t spk_test_lut_cache_hits(spk_engine* eng) {
 uint64_t spk_test_lut_cache_misses(spk_engine* eng) {
     return eng ? eng->lut_cache.misses() : 0;
 }
+uint64_t spk_test_tc_lut_cache_hits(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().hits : 0;
+}
+uint64_t spk_test_tc_lut_cache_misses(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().misses : 0;
+}
+uint64_t spk_test_tc_lut_cache_evictions(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().evictions : 0;
+}
+size_t spk_test_tc_lut_cache_dynamic_bytes(spk_engine* eng) {
+    return eng ? eng->tc_lut_cache.stats().dynamic_bytes : 0;
+}
+void spk_test_tc_lut_cache_set_dynamic_budget(spk_engine* eng, size_t bytes) {
+    if (eng) eng->tc_lut_cache.set_dynamic_byte_budget(bytes);
+}
+uint64_t spk_test_pointwise_cache_hits(spk_engine* eng) {
+    if (!eng) return 0;
+    std::lock_guard<std::mutex> g(eng->pointwise_cache_mutex);
+    return eng->pointwise_cache_hits;
+}
+uint64_t spk_test_pointwise_cache_misses(spk_engine* eng) {
+    if (!eng) return 0;
+    std::lock_guard<std::mutex> g(eng->pointwise_cache_mutex);
+    return eng->pointwise_cache_misses;
+}
+uint64_t spk_test_pointwise_cache_generation(spk_engine* eng) {
+    if (!eng) return 0;
+    std::lock_guard<std::mutex> g(eng->pointwise_cache_mutex);
+    return eng->pointwise_prepared ? eng->pointwise_prepared->generation : 0;
+}
 #endif
 
 // Read a bundled asset by its path relative to the spektra/ asset root (e.g.
 // "profiles/kodak_portra_400.json") into `out`. Returns false on open failure.
 // In AAssetManager mode (Android) it opens via AAssetManager_open; otherwise it
 // reads asset_dir/<rel_path> with std::ifstream (the historical, parity-gated
-// behavior). Throws nothing.
+// behavior). Open/size/I/O failures return false; vector allocation may throw.
+enum class AssetReadFailure : uint8_t {
+    kNone = 0,
+    kNotFound,
+    kTooLarge,
+    kIo,
+};
+
 static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
-                           std::vector<char>& out) {
-    if (!eng) return false;
+                           std::vector<char>& out,
+                           size_t max_bytes = std::numeric_limits<size_t>::max(),
+                           AssetReadFailure* failure = nullptr) {
+    if (failure) *failure = AssetReadFailure::kNone;
+    const auto reject = [failure](AssetReadFailure reason) noexcept {
+        if (failure) *failure = reason;
+        return false;
+    };
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+    g_spk_test_last_asset_max_bytes = max_bytes;
+    g_spk_test_last_asset_bytes_allocated = 0;
+#endif
+    if (!eng) return reject(AssetReadFailure::kIo);
 #ifdef __ANDROID__
     if (eng->use_asset_mgr()) {
         std::string full = eng->asset_base.empty()
                                ? rel_path
                                : eng->asset_base + "/" + rel_path;
-        AAsset* a = AAssetManager_open(eng->asset_mgr, full.c_str(),
-                                       AASSET_MODE_BUFFER);
-        if (!a) return false;
-        off_t len = AAsset_getLength(a);
-        out.resize(len > 0 ? static_cast<size_t>(len) : 0);
-        bool ok = true;
-        if (len > 0) {
-            int read = AAsset_read(a, out.data(), static_cast<size_t>(len));
-            ok = (read == static_cast<int>(len));
+        std::unique_ptr<AAsset, decltype(&AAsset_close)> a(
+            AAssetManager_open(eng->asset_mgr, full.c_str(),
+                               AASSET_MODE_BUFFER),
+            &AAsset_close);
+        if (!a) return reject(AssetReadFailure::kNotFound);
+        const off_t len = AAsset_getLength(a.get());
+        if (len < 0) {
+            return reject(AssetReadFailure::kIo);
         }
-        AAsset_close(a);
-        return ok;
+        if (static_cast<uintmax_t>(len) > max_bytes ||
+            static_cast<uintmax_t>(len) > std::numeric_limits<size_t>::max() ||
+            static_cast<uintmax_t>(len) >
+                static_cast<uintmax_t>(std::numeric_limits<int>::max())) {
+            return reject(AssetReadFailure::kTooLarge);
+        }
+        const size_t size = static_cast<size_t>(len);
+        out.resize(size);
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+        g_spk_test_last_asset_bytes_allocated = size;
+#endif
+        bool ok = true;
+        if (size > 0) {
+            const int read = AAsset_read(a.get(), out.data(), size);
+            ok = read >= 0 && static_cast<size_t>(read) == size;
+        }
+        return ok ? true : reject(AssetReadFailure::kIo);
     }
 #endif
     // Filesystem mode: read asset_dir/<rel_path> — historical ifstream behavior.
@@ -325,12 +476,21 @@ static bool spk_read_asset(spk_engine* eng, const std::string& rel_path,
     if (!path.empty() && path.back() != '/') path += '/';
     path += rel_path;
     std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) return false;
+    if (!in) return reject(AssetReadFailure::kNotFound);
     std::streamsize size = in.tellg();
-    if (size < 0) return false;
+    if (size < 0) return reject(AssetReadFailure::kIo);
+    const uintmax_t unsigned_size = static_cast<uintmax_t>(size);
+    if (unsigned_size > max_bytes ||
+        unsigned_size > std::numeric_limits<size_t>::max()) {
+        return reject(AssetReadFailure::kTooLarge);
+    }
     in.seekg(0, std::ios::beg);
     out.resize(static_cast<size_t>(size));
-    if (size > 0 && !in.read(out.data(), size)) return false;
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+    g_spk_test_last_asset_bytes_allocated = static_cast<size_t>(size);
+#endif
+    if (size > 0 && !in.read(out.data(), size))
+        return reject(AssetReadFailure::kIo);
     return true;
 }
 
@@ -341,17 +501,33 @@ static const spk::NdArray& engine_spectra(spk_engine* eng) {
     std::lock_guard<std::mutex> g(eng->lut_mutex);
     if (!eng->lut_loaded) {
         std::vector<char> buf;
-        if (!spk_read_asset(eng, kSpectraLutRel, buf))
+        if (!spk_read_asset(eng, kSpectraLutRel, buf,
+                            spk::kMaxNpyFileBytes))
             throw std::runtime_error("spektra: cannot read spectra LUT asset");
         eng->spectra_lut = spk::parse_npy(buf.data(), buf.size(), kSpectraLutRel);
+        if (eng->spectra_lut.shape != std::vector<int>({192, 192, 81}) ||
+            eng->spectra_lut.data.size() != 2'985'984u) {
+            eng->spectra_lut = {};
+            throw std::runtime_error("spektra: spectra LUT shape must be 192x192x81");
+        }
         eng->lut_loaded = true;
     }
     return eng->spectra_lut;
 }
 
+class ProfileAssetNotFound final : public std::runtime_error {
+ public:
+    using std::runtime_error::runtime_error;
+};
+
+class ProfileInvalid final : public std::runtime_error {
+ public:
+    using std::runtime_error::runtime_error;
+};
+
 // Load a film/print profile by id (e.g. "kodak_portra_400") through spk_read_asset.
-// Throws std::runtime_error if the asset can't be read; load_profile_string
-// throws on parse failure.
+// Asset absence and invalid content stay distinct so the additive C status and
+// JNI diagnostic do not collapse a rejected viewing-illuminant ID into "not found".
 static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) {
     {
         std::lock_guard<std::mutex> g(eng->cache_mutex);
@@ -360,9 +536,23 @@ static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) 
     }
     std::vector<char> buf;
     std::string rel = std::string("profiles/") + id + ".json";
-    if (!spk_read_asset(eng, rel, buf))
-        throw std::runtime_error("spektra: cannot read profile asset " + rel);
-    spk::Profile parsed = spk::load_profile_string(std::string(buf.data(), buf.size()));
+    AssetReadFailure read_failure = AssetReadFailure::kNone;
+    if (!spk_read_asset(eng, rel, buf, spk::json::kMaxInputBytes,
+                        &read_failure)) {
+        if (read_failure == AssetReadFailure::kTooLarge) {
+            throw ProfileInvalid("profile '" + id +
+                                 "': JSON input exceeds 1 MiB limit");
+        }
+        throw ProfileAssetNotFound("spektra: cannot read profile asset " + rel);
+    }
+    spk::Profile parsed;
+    try {
+        parsed = spk::load_profile_string(std::string(buf.data(), buf.size()));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw ProfileInvalid("profile '" + id + "': " + e.what());
+    }
     std::lock_guard<std::mutex> g(eng->cache_mutex);
     // Insert if still absent (another thread may have raced us); either way the
     // stored value equals a fresh parse, so the result is identical.
@@ -374,20 +564,17 @@ static spk::Profile load_engine_profile(spk_engine* eng, const std::string& id) 
 // live param the build consumes. For the DEFAULT values the key is just the film
 // id and the cached LUT is byte-identical to rebuilding it (build_filming_tc_lut
 // is a pure function of film profile, the immutable spectra LUT, the D55
-// constant, and those inputs). A non-default value gets its own cache slot so
-// distinct adaptations never collide. Returns a reference into the never-evicted
-// cache map (node references stay valid; see the growth note on tc_lut_cache
-// above). Throws on build failure (caller maps to SPK_ERR_ASSET_IO, as the
-// inline build did).
-static const spk::NdArray& engine_tc_lut(spk_engine* eng,
-                                         const std::string& film_id,
-                                         const spk::Profile& film,
-                                         float spectral_gaussian_blur,
-                                         bool apply_window, bool apply_surface,
-                                         const float* filter_uv,
-                                         const float* filter_ir,
-                                         spk::InputGamutCompress input_gamut_compress =
-                                             spk::InputGamutCompress::kOff) {
+// constant, and those inputs). A non-default value gets its own LRU slot so
+// distinct adaptations never collide. The returned shared lease keeps the
+// immutable LUT alive across concurrent eviction. Throws on build failure
+// (caller maps to SPK_ERR_ASSET_IO, as the inline build did).
+static spk::TcLutCache::Lease engine_tc_lut(
+        spk_engine* eng, const std::string& film_id,
+        const spk::Profile& film, float spectral_gaussian_blur,
+        bool apply_window, bool apply_surface, const float* filter_uv,
+        const float* filter_ir,
+        spk::InputGamutCompress input_gamut_compress =
+            spk::InputGamutCompress::kOff) {
     // Compose a key that folds the blur sigma's exact IEEE-754 bytes plus the
     // window/surface toggles and the camera UV/IR band-pass so distinct adaptations
     // (or float jitter) never alias. The DEFAULT (blur==0, window on, surface off,
@@ -398,9 +585,11 @@ static const spk::NdArray& engine_tc_lut(spk_engine* eng,
         (filter_uv[0] > 0.0f || filter_ir[0] > 0.0f);
     const bool gamut_in_on =
         input_gamut_compress != spk::InputGamutCompress::kOff;
+    const bool parameterized =
+        spectral_gaussian_blur > 0.0f || !apply_window || apply_surface ||
+        band_pass_on || gamut_in_on;
     std::string key = film_id;
-    if (spectral_gaussian_blur > 0.0f || !apply_window || apply_surface ||
-        band_pass_on || gamut_in_on) {
+    if (parameterized) {
         key.push_back('|');
         const unsigned char* b =
             reinterpret_cast<const unsigned char*>(&spectral_gaussian_blur);
@@ -433,19 +622,12 @@ static const spk::NdArray& engine_tc_lut(spk_engine* eng,
                 key.push_back(static_cast<char>(gb[i]));
         }
     }
-    {
-        std::lock_guard<std::mutex> g(eng->cache_mutex);
-        auto it = eng->tc_lut_cache.find(key);
-        if (it != eng->tc_lut_cache.end()) return it->second;
-    }
-    spk::NdArray lut = spk::build_filming_tc_lut(film, engine_spectra(eng),
-                                                 kD55Illuminant,
-                                                 spectral_gaussian_blur,
-                                                 apply_window, apply_surface,
-                                                 filter_uv, filter_ir,
-                                                 input_gamut_compress);
-    std::lock_guard<std::mutex> g(eng->cache_mutex);
-    return eng->tc_lut_cache.emplace(key, std::move(lut)).first->second;
+    return eng->tc_lut_cache.get_or_build(key, !parameterized, [&] {
+        return spk::build_filming_tc_lut(
+            film, engine_spectra(eng), kD55Illuminant,
+            spectral_gaussian_blur, apply_window, apply_surface, filter_uv,
+            filter_ir, input_gamut_compress);
+    });
 }
 
 // FNV-1a 64-bit over raw bytes. Used to build the print-route film_density_cmy
@@ -565,6 +747,8 @@ static uint64_t compute_film_cache_key(const std::vector<double>& rgb, int width
     h = fnv1a64(h, &p->halation_renormalize, sizeof(p->halation_renormalize));
     //    Camera optical diffusion filter (9 shape fields; active folded below):
     h = fnv1a64(h, &p->camera_diffusion_strength, sizeof(p->camera_diffusion_strength));
+    h = fnv1a64(h, &p->camera_diffusion_family,
+                sizeof(p->camera_diffusion_family));
     h = fnv1a64(h, &p->camera_diffusion_spatial_scale,
                 sizeof(p->camera_diffusion_spatial_scale));
     h = fnv1a64(h, &p->camera_diffusion_halo_warmth,
@@ -622,6 +806,10 @@ static uint64_t compute_print_density_key(const std::vector<float>& film_density
     h = fnv1a64(h, &height, sizeof(height));
     if (p->film_profile) h = fnv1a64(h, p->film_profile, std::strlen(p->film_profile));
     if (p->print_profile) h = fnv1a64(h, p->print_profile, std::strlen(p->print_profile));
+    if (p->enlarger_illuminant) {
+        h = fnv1a64(h, p->enlarger_illuminant,
+                    std::strlen(p->enlarger_illuminant));
+    }
     // tc_lut shape (engine_tc_lut key inputs): the midgray exposure factor inside
     // print_expose is computed FROM the tc_lut directly — not through the film
     // bytes — so these film-side params are genuine printing-stage inputs and
@@ -672,6 +860,8 @@ static uint64_t compute_print_density_key(const std::vector<float>& film_density
     h = fnv1a64(h, p->grain_density_min, sizeof(p->grain_density_min));
     // Enlarger optical diffusion filter (print_expose spatial pass) + µm->px.
     h = fnv1a64(h, &p->enlarger_diffusion_active, sizeof(p->enlarger_diffusion_active));
+    h = fnv1a64(h, &p->enlarger_diffusion_family,
+                sizeof(p->enlarger_diffusion_family));
     h = fnv1a64(h, &p->enlarger_diffusion_strength,
                 sizeof(p->enlarger_diffusion_strength));
     h = fnv1a64(h, &p->enlarger_diffusion_spatial_scale,
@@ -773,14 +963,17 @@ void apply_user_grain(spk::GrainParams& g, const spk_params* p) {
 }
 
 // Apply the camera/enlarger optical diffusion-filter params from spk_params onto
-// the digested struct. The C API does not expose filter_family, so it stays at
-// the schema default (black_pro_mist). active defaults to 0, so default params
+// the digested struct. The family selector is validated at each route entry and
+// then copied into the native model. active defaults to 0, so default params
 // leave the diffusion filter inactive (a strict no-op). `is_camera` selects the
 // camera (filming) vs enlarger (printing) field group.
 void apply_user_diffusion_filter(spk::DiffusionFilterParams& d,
                                  const spk_params* p, bool is_camera) {
-    d.family = spk::DiffusionFamily::kBlackProMist;  // schema default family.
     if (is_camera) {
+        const int32_t family = p->camera_diffusion_family;
+        d.family = family == SPK_DIFFUSION_DEFAULT
+                       ? spk::DiffusionFamily::kBlackProMist
+                       : static_cast<spk::DiffusionFamily>(family - 1);
         d.active = (p->camera_diffusion_active != 0);
         d.strength = p->camera_diffusion_strength;
         d.spatial_scale = p->camera_diffusion_spatial_scale;
@@ -792,6 +985,10 @@ void apply_user_diffusion_filter(spk::DiffusionFilterParams& d,
         d.bloom_intensity = p->camera_diffusion_bloom_intensity;
         d.bloom_size = p->camera_diffusion_bloom_size;
     } else {
+        const int32_t family = p->enlarger_diffusion_family;
+        d.family = family == SPK_DIFFUSION_DEFAULT
+                       ? spk::DiffusionFamily::kBlackProMist
+                       : static_cast<spk::DiffusionFamily>(family - 1);
         d.active = (p->enlarger_diffusion_active != 0);
         d.strength = p->enlarger_diffusion_strength;
         d.spatial_scale = p->enlarger_diffusion_spatial_scale;
@@ -922,16 +1119,830 @@ void preprocess_geometry(const spk_image* in, const spk_params* p,
                           pixel_size_um);
 }
 
+inline bool cancellation_requested(spk_cancel_check cancel,
+                                   void* cancel_user_data) noexcept {
+    return spk::parallel_cancellation_poll(cancel, cancel_user_data);
+}
+
+bool valid_diffusion_family(int32_t family) noexcept {
+    return family >= SPK_DIFFUSION_DEFAULT &&
+           family <= SPK_DIFFUSION_CINEBLOOM;
+}
+
+bool supported_input_color_space(const char* value) noexcept {
+    return value == nullptr || value[0] == '\0' ||
+           std::strcmp(value, "ProPhoto RGB") == 0;
+}
+
+bool valid_rgb_shape(const spk_image* image) noexcept {
+    if (!image || !image->data || image->width <= 0 || image->height <= 0) {
+        return false;
+    }
+    const auto pixels = static_cast<std::uint64_t>(image->width) *
+                        static_cast<std::uint64_t>(image->height);
+    return pixels <= static_cast<std::uint64_t>(
+                         std::numeric_limits<int>::max()) &&
+           pixels <= static_cast<std::uint64_t>(
+                          std::numeric_limits<std::size_t>::max() / 3u);
+}
+
+// Validate every caller-controlled geometry value before crop_resize performs
+// floating-point-to-integer casts or allocates a derived frame. The crop math
+// mirrors crop_image's NumPy round/slice semantics closely enough to prove that
+// both intermediate and final extents are non-empty and representable. The
+// final byte cap is the same one enforced by the direct-ByteBuffer JNI seam.
+bool valid_preprocess_geometry(const spk_image* image,
+                               const spk_params* params) noexcept {
+    if (!valid_rgb_shape(image) || !params) return false;
+
+    const float raw_factor = params->upscale_factor;
+    if (!std::isfinite(raw_factor) || raw_factor < 0.0f) return false;
+    const double factor = raw_factor == 0.0f
+                              ? 1.0
+                              : static_cast<double>(raw_factor);
+
+    std::int64_t crop_w = image->width;
+    std::int64_t crop_h = image->height;
+    if (params->crop != 0) {
+        for (int axis = 0; axis < 2; ++axis) {
+            const float center = params->crop_center[axis];
+            const float size = params->crop_size[axis];
+            if (!std::isfinite(center) || center < 0.0f || center > 1.0f ||
+                !std::isfinite(size) || size <= 0.0f || size > 1.0f) {
+                return false;
+            }
+        }
+
+        const double h = static_cast<double>(image->height);
+        const double w = static_cast<double>(image->width);
+        const double longest = std::max(h, w);
+        // center/size are (x,y); crop_image flips them to (row,column).
+        const std::int64_t center_row = static_cast<std::int64_t>(
+            std::nearbyint(h * params->crop_center[1]));
+        const std::int64_t center_col = static_cast<std::int64_t>(
+            std::nearbyint(w * params->crop_center[0]));
+        const std::int64_t size_rows = static_cast<std::int64_t>(
+            std::nearbyint(longest * params->crop_size[1]));
+        const std::int64_t size_cols = static_cast<std::int64_t>(
+            std::nearbyint(longest * params->crop_size[0]));
+        if (size_rows <= 0 || size_cols <= 0) return false;
+
+        std::int64_t row0 = static_cast<std::int64_t>(
+            std::nearbyint(static_cast<double>(center_row) - size_rows / 2.0));
+        std::int64_t col0 = static_cast<std::int64_t>(
+            std::nearbyint(static_cast<double>(center_col) - size_cols / 2.0));
+        if (row0 < 0) row0 = 0;
+        if (col0 < 0) col0 = 0;
+        if (row0 + size_rows > image->height) row0 = image->height - size_rows;
+        if (col0 + size_cols > image->width) col0 = image->width - size_cols;
+
+        const auto slice_extent = [](std::int64_t start, std::int64_t size,
+                                     std::int64_t dimension) noexcept {
+            std::int64_t stop = start + size;
+            if (start < 0) start += dimension;
+            if (stop < 0) stop += dimension;
+            start = std::max<std::int64_t>(0, std::min(start, dimension));
+            stop = std::max<std::int64_t>(0, std::min(stop, dimension));
+            return stop > start ? stop - start : std::int64_t{0};
+        };
+        crop_h = slice_extent(row0, size_rows, image->height);
+        crop_w = slice_extent(col0, size_cols, image->width);
+        if (crop_w <= 0 || crop_h <= 0) return false;
+    }
+
+    const double rounded_w = std::nearbyint(factor * static_cast<double>(crop_w));
+    const double rounded_h = std::nearbyint(factor * static_cast<double>(crop_h));
+    if (!std::isfinite(rounded_w) || !std::isfinite(rounded_h) ||
+        rounded_w > static_cast<double>(std::numeric_limits<int>::max()) ||
+        rounded_h > static_cast<double>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    const std::uint64_t out_w = static_cast<std::uint64_t>(
+        std::max(1.0, rounded_w));
+    const std::uint64_t out_h = static_cast<std::uint64_t>(
+        std::max(1.0, rounded_h));
+    if (out_h != 0 && out_w > std::numeric_limits<std::uint64_t>::max() / out_h) {
+        return false;
+    }
+    const std::uint64_t pixels = out_w * out_h;
+    constexpr std::uint64_t kRgbF32BytesPerPixel = 3u * sizeof(float);
+    return pixels <= static_cast<std::uint64_t>(
+                         std::numeric_limits<int>::max()) &&
+           pixels <= static_cast<std::uint64_t>(INT32_MAX) /
+                         kRgbF32BytesPerPixel &&
+           pixels <= static_cast<std::uint64_t>(
+                         std::numeric_limits<std::size_t>::max() / 3u);
+}
+
+struct PointwiseDynamicParameters {
+    float film_exposure_multiplier = 1.0f;
+    float film_coupler_shift = 0.0f;
+    float film_coupler_matrix[9]{};
+    float print_midgray = 1.0f;
+    float print_exposure_multiplier = 1.0f;
+    float scan_xyz_to_rgb[9]{};
+};
+
+bool pointwise_checked_float(double value, float* out) noexcept {
+    if (!out || !std::isfinite(value)) return false;
+    const float converted = static_cast<float>(value);
+    if (!std::isfinite(converted)) return false;
+    *out = converted;
+    return true;
+}
+
+bool pointwise_finite(const std::vector<float>& values) noexcept {
+    for (float value : values)
+        if (!std::isfinite(value)) return false;
+    return true;
+}
+
+bool pointwise_strict_axis(const std::vector<float>& axis,
+                           uint32_t points) noexcept {
+    if (points < 2 || axis.size() != static_cast<size_t>(points) * 3u ||
+        !pointwise_finite(axis)) {
+        return false;
+    }
+    for (uint32_t row = 1; row < points; ++row)
+        for (uint32_t channel = 0; channel < 3; ++channel)
+            if (!(axis[static_cast<size_t>(row - 1u) * 3u + channel] <
+                  axis[static_cast<size_t>(row) * 3u + channel])) {
+                return false;
+            }
+    return true;
+}
+
+bool pointwise_same_bytes(const std::vector<float>& a,
+                          const std::vector<float>& b) noexcept {
+    return a.size() == b.size() &&
+           (a.empty() ||
+            std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
+bool pointwise_same_tables(
+    const spk_engine::PointwisePreparedTables& a,
+    const spk_engine::PointwisePreparedTables& b) noexcept {
+    return a.tc_edge == b.tc_edge &&
+           a.film_curve_points == b.film_curve_points &&
+           a.print_curve_points == b.print_curve_points &&
+           pointwise_same_bytes(a.tc_lut, b.tc_lut) &&
+           pointwise_same_bytes(a.develop_axis, b.develop_axis) &&
+           pointwise_same_bytes(a.develop_curve, b.develop_curve) &&
+           pointwise_same_bytes(a.dir_axis, b.dir_axis) &&
+           pointwise_same_bytes(a.dir_curve, b.dir_curve) &&
+           pointwise_same_bytes(a.print_dye, b.print_dye) &&
+           pointwise_same_bytes(a.print_illuminant_sensitivity,
+                                b.print_illuminant_sensitivity) &&
+           pointwise_same_bytes(a.paper_axis, b.paper_axis) &&
+           pointwise_same_bytes(a.paper_curve, b.paper_curve) &&
+           pointwise_same_bytes(a.scan_dye, b.scan_dye) &&
+           pointwise_same_bytes(a.scan_illuminant_cmf,
+                                b.scan_illuminant_cmf);
+}
+
+// The lower-level Vulkan table cache is process-global, so opaque generations
+// must be unique across every engine instance and engine recreation. Zero is a
+// permanent exhausted sentinel: after UINT64_MAX no token is ever reused.
+std::atomic<uint64_t> g_pointwise_next_generation{1};
+
+uint64_t allocate_pointwise_generation() noexcept {
+    uint64_t current =
+        g_pointwise_next_generation.load(std::memory_order_relaxed);
+    while (current != 0) {
+        const uint64_t next =
+            current == std::numeric_limits<uint64_t>::max() ? 0 : current + 1;
+        if (g_pointwise_next_generation.compare_exchange_weak(
+                current, next, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return current;
+        }
+    }
+    return 0;
+}
+
+std::shared_ptr<const spk_engine::PointwisePreparedTables>
+cache_pointwise_tables(spk_engine* eng,
+                       spk_engine::PointwisePreparedTables candidate,
+                       bool* cache_hit) {
+    auto fresh = std::make_shared<spk_engine::PointwisePreparedTables>(
+        std::move(candidate));
+    std::lock_guard<std::mutex> lock(eng->pointwise_cache_mutex);
+    if (eng->pointwise_prepared &&
+        pointwise_same_tables(*eng->pointwise_prepared, *fresh)) {
+        ++eng->pointwise_cache_hits;
+        if (cache_hit) *cache_hit = true;
+        return eng->pointwise_prepared;
+    }
+    fresh->generation = allocate_pointwise_generation();
+    if (fresh->generation == 0) return {};
+    eng->pointwise_prepared = fresh;
+    ++eng->pointwise_cache_misses;
+    if (cache_hit) *cache_hit = false;
+    return fresh;
+}
+
+bool build_pointwise_tables(
+    const spk::Profile& film, const spk::Profile& paper,
+    const spk::NdArray& tc_lut, const spk::FilmingParams& fparams,
+    const spk::PrintingParams& pparams,
+    const spk::ViewingIlluminant& viewing,
+    spk_engine::PointwisePreparedTables* tables,
+    PointwiseDynamicParameters* dynamic) {
+    constexpr int kBands = 81;
+    constexpr int kMaxTcEdge = 1024;
+    constexpr int kMaxCurvePoints = 65536;
+    if (!tables || !dynamic || film.n_samples != kBands ||
+        paper.n_samples != kBands || film.n_density_pts < 2 ||
+        paper.n_density_pts < 2 || film.n_density_pts > kMaxCurvePoints ||
+        paper.n_density_pts > kMaxCurvePoints ||
+        film.channel_density.size() != static_cast<size_t>(kBands) * 3u ||
+        film.base_density.size() != static_cast<size_t>(kBands) ||
+        film.log_exposure.size() != static_cast<size_t>(film.n_density_pts) ||
+        film.density_curves.size() !=
+            static_cast<size_t>(film.n_density_pts) * 3u ||
+        paper.channel_density.size() != static_cast<size_t>(kBands) * 3u ||
+        paper.base_density.size() != static_cast<size_t>(kBands) ||
+        paper.log_sensitivity.size() != static_cast<size_t>(kBands) * 3u ||
+        paper.log_exposure.size() != static_cast<size_t>(paper.n_density_pts) ||
+        paper.density_curves.size() !=
+            static_cast<size_t>(paper.n_density_pts) * 3u ||
+        !viewing.spectrum || !viewing.xyz_to_rgb ||
+        !std::isfinite(viewing.normalization) || viewing.normalization == 0.0 ||
+        tc_lut.shape.size() != 3 || tc_lut.shape[0] < 2 ||
+        tc_lut.shape[0] > kMaxTcEdge || tc_lut.shape[1] != tc_lut.shape[0] ||
+        tc_lut.shape[2] != 3) {
+        return false;
+    }
+    const int edge = tc_lut.shape[0];
+    const size_t tc_count = static_cast<size_t>(edge) * edge * 3u;
+    if (tc_lut.data.size() != tc_count) return false;
+
+    tables->tc_edge = static_cast<uint32_t>(edge);
+    tables->film_curve_points = static_cast<uint32_t>(film.n_density_pts);
+    tables->print_curve_points = static_cast<uint32_t>(paper.n_density_pts);
+    tables->tc_lut.resize(tc_count);
+    for (size_t i = 0; i < tc_count; ++i)
+        if (!pointwise_checked_float(tc_lut.data[i], &tables->tc_lut[i]))
+            return false;
+
+    const int film_points = film.n_density_pts;
+    const size_t film_curve_count = static_cast<size_t>(film_points) * 3u;
+    tables->develop_curve.resize(film_curve_count);
+    spk::normalize_density_curves(film.density_curves.data(), film_points,
+                                  tables->develop_curve.data());
+    tables->develop_axis.resize(film_curve_count);
+    for (int row = 0; row < film_points; ++row) {
+        if (!std::isfinite(film.log_exposure[static_cast<size_t>(row)]))
+            return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            const float gamma = fparams.density_curve_gamma[channel];
+            if (!std::isfinite(gamma) || gamma == 0.0f) return false;
+            tables->develop_axis[static_cast<size_t>(row) * 3u + channel] =
+                film.log_exposure[static_cast<size_t>(row)] / gamma;
+        }
+    }
+    if (!pointwise_finite(tables->develop_curve) ||
+        !pointwise_strict_axis(tables->develop_axis,
+                               tables->film_curve_points)) {
+        return false;
+    }
+
+    double matrix[9]{};
+    if (fparams.dir_couplers.active)
+        spk::compute_dir_couplers_matrix(fparams.dir_couplers, matrix);
+    for (int i = 0; i < 9; ++i)
+        if (!pointwise_checked_float(matrix[i],
+                                     &dynamic->film_coupler_matrix[i]))
+            return false;
+    if (!pointwise_checked_float(
+            fparams.dir_couplers.active
+                ? fparams.dir_couplers.high_exposure_couplers_shift
+                : 0.0,
+            &dynamic->film_coupler_shift)) {
+        return false;
+    }
+    tables->dir_axis = tables->develop_axis;
+    tables->dir_curve.resize(film_curve_count);
+    if (!fparams.dir_couplers.active) {
+        tables->dir_curve = tables->develop_curve;
+    } else {
+        std::vector<double> exposure(static_cast<size_t>(film_points));
+        std::vector<double> shifted(static_cast<size_t>(film_points));
+        std::vector<double> values(static_cast<size_t>(film_points));
+        std::vector<double> interpolated(static_cast<size_t>(film_points));
+        for (int row = 0; row < film_points; ++row)
+            exposure[static_cast<size_t>(row)] =
+                static_cast<double>(film.log_exposure[static_cast<size_t>(row)]);
+        for (int channel = 0; channel < 3; ++channel) {
+            for (int row = 0; row < film_points; ++row) {
+                double amount = 0.0;
+                for (int donor = 0; donor < 3; ++donor)
+                    amount += static_cast<double>(tables->develop_curve[
+                                  static_cast<size_t>(row) * 3u + donor]) *
+                              matrix[donor * 3 + channel];
+                shifted[static_cast<size_t>(row)] =
+                    exposure[static_cast<size_t>(row)] - amount;
+                values[static_cast<size_t>(row)] =
+                    static_cast<double>(tables->develop_curve[
+                        static_cast<size_t>(row) * 3u + channel]);
+            }
+            spk::np_interp_array(exposure.data(), film_points, shifted.data(),
+                                 values.data(), film_points,
+                                 interpolated.data());
+            for (int row = 0; row < film_points; ++row)
+                if (!pointwise_checked_float(
+                        interpolated[static_cast<size_t>(row)],
+                        &tables->dir_curve[static_cast<size_t>(row) * 3u +
+                                           channel])) {
+                    return false;
+                }
+        }
+    }
+    if (!pointwise_finite(tables->dir_curve) ||
+        !pointwise_strict_axis(tables->dir_axis,
+                               tables->film_curve_points)) {
+        return false;
+    }
+
+    std::vector<double> sensitivity(static_cast<size_t>(kBands) * 3u);
+    for (int band = 0; band < kBands; ++band)
+        for (int channel = 0; channel < 3; ++channel) {
+            double value = std::pow(
+                10.0, static_cast<double>(paper.log_sensitivity[
+                          static_cast<size_t>(band) * 3u + channel]));
+            if (std::isnan(value)) value = 0.0;
+            if (!std::isfinite(value)) return false;
+            sensitivity[static_cast<size_t>(band) * 3u + channel] = value;
+        }
+
+    tables->print_dye.assign(static_cast<size_t>(kBands) * 3u, 0.0f);
+    tables->print_illuminant_sensitivity.assign(
+        static_cast<size_t>(kBands) * 3u, 0.0f);
+    for (int band = 0; band < kBands; ++band) {
+        const float* density =
+            film.channel_density.data() + static_cast<size_t>(band) * 3u;
+        const float base = film.base_density[static_cast<size_t>(band)];
+        const double illuminant = pparams.filtered_illuminant[band];
+        if (std::isnan(base) || std::isnan(illuminant) ||
+            std::isnan(density[0]) || std::isnan(density[1]) ||
+            std::isnan(density[2])) {
+            continue;  // sanctioned spectral NaN band: the CPU zeros its light
+        }
+        if (!std::isfinite(base) || !std::isfinite(illuminant)) return false;
+        const double weight =
+            std::pow(10.0, -static_cast<double>(base)) * illuminant;
+        if (!std::isfinite(weight)) return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            if (!std::isfinite(density[channel])) return false;
+            tables->print_dye[static_cast<size_t>(band) * 3u + channel] =
+                density[channel];
+            if (!pointwise_checked_float(
+                    weight * sensitivity[static_cast<size_t>(band) * 3u +
+                                         channel],
+                    &tables->print_illuminant_sensitivity[
+                        static_cast<size_t>(band) * 3u + channel])) {
+                return false;
+            }
+        }
+    }
+
+    const int paper_points = paper.n_density_pts;
+    const size_t paper_curve_count = static_cast<size_t>(paper_points) * 3u;
+    tables->paper_curve.assign(paper.density_curves.begin(),
+                               paper.density_curves.end());
+    tables->paper_axis.resize(paper_curve_count);
+    for (int row = 0; row < paper_points; ++row) {
+        if (!std::isfinite(paper.log_exposure[static_cast<size_t>(row)]))
+            return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            const float gamma = pparams.density_curve_gamma[channel];
+            if (!std::isfinite(gamma) || gamma == 0.0f) return false;
+            tables->paper_axis[static_cast<size_t>(row) * 3u + channel] =
+                paper.log_exposure[static_cast<size_t>(row)] / gamma;
+        }
+    }
+    if (!pointwise_finite(tables->paper_curve) ||
+        !pointwise_strict_axis(tables->paper_axis,
+                               tables->print_curve_points)) {
+        return false;
+    }
+
+    tables->scan_dye.assign(static_cast<size_t>(kBands) * 3u, 0.0f);
+    tables->scan_illuminant_cmf.assign(static_cast<size_t>(kBands) * 3u,
+                                       0.0f);
+    const double inverse_normalization = 1.0 / viewing.normalization;
+    for (int band = 0; band < kBands; ++band) {
+        const float* density =
+            paper.channel_density.data() + static_cast<size_t>(band) * 3u;
+        const float base = paper.base_density[static_cast<size_t>(band)];
+        if (std::isnan(base) || std::isnan(density[0]) ||
+            std::isnan(density[1]) || std::isnan(density[2])) {
+            continue;  // sanctioned spectral NaN band
+        }
+        const double illuminant =
+            static_cast<double>(viewing.spectrum[band]);
+        if (!std::isfinite(base) || !std::isfinite(illuminant)) return false;
+        const double weight = std::pow(10.0, -static_cast<double>(base)) *
+                              illuminant * inverse_normalization;
+        if (!std::isfinite(weight)) return false;
+        for (int channel = 0; channel < 3; ++channel) {
+            if (!std::isfinite(density[channel]) ||
+                !std::isfinite(spk::kCieCmf1931[band][channel])) {
+                return false;
+            }
+            tables->scan_dye[static_cast<size_t>(band) * 3u + channel] =
+                density[channel];
+            if (!pointwise_checked_float(
+                    weight * static_cast<double>(
+                                 spk::kCieCmf1931[band][channel]),
+                    &tables->scan_illuminant_cmf[
+                        static_cast<size_t>(band) * 3u + channel])) {
+                return false;
+            }
+        }
+    }
+
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column) {
+            double value = 0.0;
+            for (int inner = 0; inner < 3; ++inner)
+                value += spk::kRGB_to_RGB_CCTF[SPK_CS_SRGB]
+                                                    [row * 3 + inner] *
+                         viewing.xyz_to_rgb[SPK_CS_SRGB]
+                                           [inner * 3 + column];
+            if (!pointwise_checked_float(
+                    value, &dynamic->scan_xyz_to_rgb[row * 3 + column])) {
+                return false;
+            }
+        }
+    return pointwise_checked_float(pparams.exposure_factor_midgray,
+                                   &dynamic->print_midgray) &&
+           pointwise_checked_float(
+               pparams.print_exposure * pparams.bw_exposure_correction,
+               &dynamic->print_exposure_multiplier) &&
+           pointwise_finite(tables->print_dye) &&
+           pointwise_finite(tables->print_illuminant_sensitivity) &&
+           pointwise_finite(tables->scan_dye) &&
+           pointwise_finite(tables->scan_illuminant_cmf);
+}
+
+spk::ScanningParams build_print_scanning_params(
+    spk_engine* eng, const spk_params* p, bool print_stochastic,
+    const spk::ColorCorrection& bw_corr) {
+    spk::ScanningParams params;
+    params.scan_film = false;
+    params.allow_gpu = (p->allow_gpu_scan != 0);
+    params.output_color_space = p->output_color_space;
+    params.output_cctf_encoding = (p->output_cctf_encoding != 0);
+    params.output_gamut_compress =
+        static_cast<spk::OutputGamutCompress>(p->output_gamut_compress);
+    if (print_stochastic && p->print_glare_active != 0) {
+        params.glare_active = true;
+        params.glare_percent = p->print_glare_percent;
+        params.glare_roughness = p->print_glare_roughness;
+        params.glare_blur = p->print_glare_blur;
+    }
+    params.lens_blur = static_cast<double>(p->scanner_lens_blur);
+    params.unsharp_sigma = p->scanner_unsharp[0];
+    params.unsharp_amount = p->scanner_unsharp[1];
+    if (p->use_scanner_lut != 0) {
+        params.use_lut = true;
+        params.lut_resolution = p->lut_resolution;
+        params.lut_cache = &eng->lut_cache;
+    }
+    params.tone_curve = build_tone_curve_set(p);
+    if (bw_corr.active) {
+        params.bw_xyz_correction = true;
+        params.bw_xyz_m = bw_corr.m;
+        params.bw_xyz_q = bw_corr.q;
+    }
+    return params;
+}
+
+const char* pointwise_route_ineligibility(
+    const spk_params* p, const spk::Profile& film,
+    const spk::Profile& paper, const spk::NdArray& tc_lut,
+    const spk::FilmingParams& fparams,
+    const spk::PrintingParams& pparams,
+    const spk::ScanningParams& sparams, std::vector<float>* final_rgb,
+    std::vector<float>* tap_log_raw,
+    std::vector<float>* tap_film_density_cmy,
+    std::vector<float>* tap_print_density_cmy, int npix) noexcept {
+    if (p->allow_gpu_scan == 0) return "not_requested";
+    if (!final_rgb) return "no_final_output";
+    if (tap_log_raw || tap_film_density_cmy || tap_print_density_cmy)
+        return "debug_tap";
+    if (npix <= 0 || static_cast<uint64_t>(npix) > UINT32_MAX)
+        return "invalid_dimensions";
+    if (p->rgb_to_raw_method != SPK_RGB2RAW_HANATOS2025)
+        return "rgb_to_raw_method";
+    if (!film.is_negative()) return "film_not_negative";
+    if (film.n_samples != 81 || paper.n_samples != 81)
+        return "profile_spectral_shape";
+    if (tc_lut.shape.size() != 3 || tc_lut.shape[0] < 2 ||
+        tc_lut.shape[0] != tc_lut.shape[1] || tc_lut.shape[2] != 3)
+        return "tc_lut_shape";
+    if (!std::isfinite(fparams.dir_couplers.diffusion_size_um) ||
+        fparams.dir_couplers.diffusion_size_um > 0.0)
+        return "dir_diffusion";
+    if (fparams.grain.active) return "grain";
+    if (fparams.halation.active) return "halation";
+    if (fparams.halation.boost_ev > 0.0) return "highlight_boost";
+    if (fparams.diffusion_filter.active) return "camera_diffusion";
+    if (fparams.lens_blur_um > 0.0) return "camera_lens_blur";
+    if (fparams.bw_exposure_correction != 1.0)
+        return "film_bw_correction";
+    if (pparams.diffusion_filter.active) return "print_diffusion";
+    if (pparams.morph.active) return "print_morph";
+    if (pparams.preflash_exposure > 0.0) return "preflash";
+    if (pparams.bw_exposure_correction != 1.0 ||
+        sparams.bw_xyz_correction)
+        return "scan_bw_correction";
+    if (sparams.scan_film) return "scan_film";
+    if (sparams.glare_active && sparams.glare_percent > 0.0f)
+        return "scan_glare";
+    if (sparams.output_gamut_compress !=
+        spk::OutputGamutCompress::kLegacyClip)
+        return "output_gamut";
+    if (sparams.lens_blur > 0.0 ||
+        (sparams.unsharp_sigma > 0.0 && sparams.unsharp_amount > 0.0))
+        return "scan_spatial";
+    if (sparams.output_color_space != SPK_CS_SRGB ||
+        !sparams.output_cctf_encoding)
+        return "output_encoding";
+    return nullptr;
+}
+
+void note_pointwise_diagnostics(
+    bool requested, bool attempted, const char* reason,
+    const spk::gpu::PointwiseChainDiagnostics& diagnostics = {}) {
+    spk::stage_timing_note_gpu_pointwise(
+        requested, attempted, diagnostics.engaged,
+        reason ? reason : spk::gpu::pointwise_fallback_reason_name(
+                              diagnostics.fallback_reason),
+        diagnostics.dispatches, diagnostics.input_uploads,
+        diagnostics.final_readbacks, diagnostics.interstage_host_bytes,
+        diagnostics.pipeline_creates, diagnostics.buffer_allocations,
+        diagnostics.static_upload_bytes);
+}
+
+bool pointwise_test_fault(int fault) noexcept {
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+    return g_spk_test_pointwise_fault == fault;
+#else
+    (void)fault;
+    return false;
+#endif
+}
+
+spk_engine::PointwiseCapabilityKey make_pointwise_capability_key(
+    uint64_t generation, const PointwiseDynamicParameters& dynamic,
+    bool direct, double input_gain) noexcept {
+    // Bump whenever the embedded lattice/oracle contract changes. The shader
+    // binaries and driver/device are bound by the lifetime of this process.
+    constexpr uint32_t kSelfTestRevision = 1;
+    spk_engine::PointwiseCapabilityKey key;
+    key.revision = kSelfTestRevision;
+    key.source_flags = direct ? 1u : 0u;
+    key.generation = generation;
+    std::memcpy(&key.input_gain_bits, &input_gain, sizeof(input_gain));
+    size_t offset = 0;
+    key.values[offset++] = dynamic.film_exposure_multiplier;
+    key.values[offset++] = dynamic.film_coupler_shift;
+    for (float value : dynamic.film_coupler_matrix)
+        key.values[offset++] = value;
+    key.values[offset++] = dynamic.print_midgray;
+    key.values[offset++] = dynamic.print_exposure_multiplier;
+    for (float value : dynamic.scan_xyz_to_rgb)
+        key.values[offset++] = value;
+    return key;
+}
+
+bool same_pointwise_capability_key(
+    const spk_engine::PointwiseCapabilityKey& a,
+    const spk_engine::PointwiseCapabilityKey& b) noexcept {
+    return a.revision == b.revision &&
+           a.source_flags == b.source_flags &&
+           a.generation == b.generation &&
+           a.input_gain_bits == b.input_gain_bits &&
+           std::memcmp(a.values, b.values, sizeof(a.values)) == 0;
+}
+
+// -2 = cache lock failure, -1 = no cached verdict, 0 = failed, 1 = passed.
+// The mutex protects only the tiny verdict copy and is never held while waiting
+// for the GPU. Catch lock failures internally because this is a fail-closed
+// acceleration seam and must never terminate a noexcept-adjacent C API call.
+int cached_pointwise_capability(
+    spk_engine* eng,
+    const spk_engine::PointwiseCapabilityKey& key) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(eng->pointwise_capability_mutex);
+        if (!eng->pointwise_capability_valid ||
+            !same_pointwise_capability_key(eng->pointwise_capability_key, key)) {
+            return -1;
+        }
+        return eng->pointwise_capability_passed ? 1 : 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+bool store_pointwise_capability(
+    spk_engine* eng, const spk_engine::PointwiseCapabilityKey& key,
+    bool passed) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(eng->pointwise_capability_mutex);
+        eng->pointwise_capability_key = key;
+        eng->pointwise_capability_passed = passed;
+        eng->pointwise_capability_valid = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+enum class PointwiseSelfTestOutcome : uint8_t {
+    passed,
+    failed,
+    cancelled,
+};
+
+struct PointwiseSelfTestResult {
+    PointwiseSelfTestOutcome outcome = PointwiseSelfTestOutcome::failed;
+    double duration_ms = 0.0;
+    uint32_t chain_runs = 0;
+    spk::gpu::PointwiseChainDiagnostics totals{};
+};
+
+void add_pointwise_self_test_diagnostics(
+    PointwiseSelfTestResult* result,
+    const spk::gpu::PointwiseChainDiagnostics& diagnostics) noexcept {
+    result->totals.dispatches += diagnostics.dispatches;
+    result->totals.input_uploads += diagnostics.input_uploads;
+    result->totals.final_readbacks += diagnostics.final_readbacks;
+    result->totals.interstage_host_bytes += diagnostics.interstage_host_bytes;
+    result->totals.pipeline_creates += diagnostics.pipeline_creates;
+    result->totals.buffer_allocations += diagnostics.buffer_allocations;
+    result->totals.static_upload_bytes += diagnostics.static_upload_bytes;
+    if (diagnostics.fallback_reason !=
+        spk::gpu::PointwiseFallbackReason::none) {
+        result->totals.fallback_reason = diagnostics.fallback_reason;
+    }
+}
+
+PointwiseSelfTestResult run_pointwise_capability_check(
+    const spk::gpu::PointwiseChainRequest& live_request,
+    const spk::Profile& film, const spk::Profile& paper,
+    const spk::NdArray& tc_lut,
+    const spk::FilmingParams& fparams,
+    const spk::PrintingParams& pparams,
+    const spk::ScanningParams& sparams, bool direct, double direct_gain,
+    spk_cancel_check cancel, void* cancel_user_data) {
+    constexpr uint32_t kPixels = 8u * 8u * 8u;
+    constexpr size_t kComponents = static_cast<size_t>(kPixels) * 3u;
+    static constexpr float kKnots[8] = {
+        -0.125f, 0.0f, 0.01f, 0.18f, 0.5f, 1.0f, 2.0f, 4.0f};
+    PointwiseSelfTestResult result;
+    const auto started = std::chrono::steady_clock::now();
+    const auto finish = [&result, started](PointwiseSelfTestOutcome outcome) {
+        result.outcome = outcome;
+        result.duration_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        return result;
+    };
+
+    std::array<float, kComponents> input{};
+    size_t pixel = 0;
+    for (float r : kKnots)
+        for (float g : kKnots)
+            for (float b : kKnots) {
+                input[pixel * 3u + 0u] = r;
+                input[pixel * 3u + 1u] = g;
+                input[pixel * 3u + 2u] = b;
+                ++pixel;
+            }
+
+    spk::gpu::PointwiseChainRequest request = live_request;
+    request.input_rgb = input.data();
+    request.input_component_count = kComponents;
+    request.pixel_count = kPixels;
+    std::array<float, kComponents> first{};
+    std::array<float, kComponents> repeat{};
+    for (uint32_t run = 0; run < 3; ++run) {
+        if (cancellation_requested(cancel, cancel_user_data))
+            return finish(PointwiseSelfTestOutcome::cancelled);
+        float* destination = run == 0 ? first.data() : repeat.data();
+        spk::gpu::PointwiseChainOutput output{destination, kComponents};
+        spk::gpu::PointwiseChainDiagnostics diagnostics{};
+        ++result.chain_runs;
+        if (!spk::gpu::render_pointwise_chain(request, &output,
+                                              &diagnostics)) {
+            add_pointwise_self_test_diagnostics(&result, diagnostics);
+            return finish(PointwiseSelfTestOutcome::failed);
+        }
+        add_pointwise_self_test_diagnostics(&result, diagnostics);
+        if (run != 0 &&
+            std::memcmp(first.data(), repeat.data(), sizeof(first)) != 0) {
+            return finish(PointwiseSelfTestOutcome::failed);
+        }
+        if (cancellation_requested(cancel, cancel_user_data))
+            return finish(PointwiseSelfTestOutcome::cancelled);
+    }
+
+    const double gain = direct ? direct_gain : 1.0;
+    if (!std::isfinite(gain))
+        return finish(PointwiseSelfTestOutcome::failed);
+    std::array<float, kComponents> film_log{};
+    std::array<float, kComponents> film_density{};
+    std::array<float, kComponents> print_log{};
+    std::array<float, kComponents> print_density{};
+    std::array<float, kComponents> cpu_rgb{};
+    try {
+        spk::ScopedStageTimingSuppression suppress_product_stage_slots;
+        // Use only the direct CPU stages. expose_f32_gain with gain=1 exactly
+        // represents the already-materialized source; the direct source folds
+        // its measured gain once, matching the live GPU request.
+        spk::expose_f32_gain(input.data(), gain, static_cast<int>(kPixels), 1,
+                             fparams, tc_lut, film_log.data());
+        spk::develop(film_log.data(), static_cast<int>(kPixels), 1, film,
+                     fparams, film_density.data());
+        spk::PrintingParams cpu_print = pparams;
+        cpu_print.allow_gpu = false;
+        cpu_print.use_enlarger_lut = false;
+        cpu_print.lut_cache = nullptr;
+        spk::print_expose(film, paper, cpu_print, film_density.data(),
+                          static_cast<int>(kPixels), 1, print_log.data());
+        spk::print_develop(paper, cpu_print, print_log.data(),
+                           static_cast<int>(kPixels), print_density.data());
+        spk::ScanningParams cpu_scan = sparams;
+        cpu_scan.allow_gpu = false;
+        cpu_scan.use_lut = false;
+        cpu_scan.lut_cache = nullptr;
+        cpu_scan.tone_curve.active = false;
+        spk::scan(paper, cpu_scan, print_density.data(),
+                  static_cast<int>(kPixels), 1, cpu_rgb.data());
+    } catch (const spk::ParallelCancelled&) {
+        return finish(PointwiseSelfTestOutcome::cancelled);
+    } catch (...) {
+        return finish(PointwiseSelfTestOutcome::failed);
+    }
+    if (cancellation_requested(cancel, cancel_user_data))
+        return finish(PointwiseSelfTestOutcome::cancelled);
+
+    double max_abs = 0.0;
+    double squared = 0.0;
+    for (size_t i = 0; i < kComponents; ++i) {
+        if (!std::isfinite(first[i]) || !std::isfinite(cpu_rgb[i])) {
+            return finish(PointwiseSelfTestOutcome::failed);
+        }
+        const double difference = std::fabs(
+            static_cast<double>(first[i]) -
+            static_cast<double>(cpu_rgb[i]));
+        max_abs = std::max(max_abs, difference);
+        squared += difference * difference;
+    }
+    const double rms = std::sqrt(squared / static_cast<double>(kComponents));
+    if (max_abs > 1e-4 || rms > 1e-5)
+        return finish(PointwiseSelfTestOutcome::failed);
+    return finish(PointwiseSelfTestOutcome::passed);
+}
+
+void note_pointwise_self_test(
+    const char* state,
+    const PointwiseSelfTestResult* result = nullptr) noexcept {
+    const spk::gpu::PointwiseChainDiagnostics empty{};
+    const spk::gpu::PointwiseChainDiagnostics& totals =
+        result ? result->totals : empty;
+    spk::stage_timing_note_gpu_pointwise_self_test(
+        state, result ? result->duration_ms : 0.0,
+        result ? result->chain_runs : 0, totals.dispatches,
+        totals.input_uploads, totals.final_readbacks,
+        totals.interstage_host_bytes, totals.pipeline_creates,
+        totals.buffer_allocations, totals.static_upload_bytes);
+}
+
 // Run the scan_film pipeline, producing display RGB plus the intermediate taps.
 // `tap_*` pointers, when non-null, receive the corresponding intermediate.
 spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params* p,
                          std::vector<float>* final_rgb,
                          std::vector<float>* tap_log_raw,
                          std::vector<float>* tap_density_cmy,
-                         int* out_w = nullptr, int* out_h = nullptr) {
-    if (!eng || !in || !p || !in->data) return SPK_ERR_BAD_ARGS;
-    if (in->width <= 0 || in->height <= 0) return SPK_ERR_BAD_ARGS;
+                         int* out_w = nullptr, int* out_h = nullptr,
+                         spk_cancel_check cancel = nullptr,
+                         void* cancel_user_data = nullptr) try {
+    if (!eng || !p || !valid_preprocess_geometry(in, p)) {
+        return SPK_ERR_BAD_ARGS;
+    }
     if (!p->film_profile) return SPK_ERR_BAD_ARGS;
+    if (!supported_input_color_space(p->input_color_space) ||
+        !valid_diffusion_family(p->camera_diffusion_family) ||
+        !valid_diffusion_family(p->enlarger_diffusion_family)) {
+        return SPK_ERR_BAD_ARGS;
+    }
+    spk::ParallelCancellationScope cancellation_scope(cancel, cancel_user_data);
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 0) Geometry preprocess (pipeline._preprocess -> crop_and_rescale). Runs
     //    BEFORE filming, mirroring Python ordering. Default params (crop off,
@@ -941,9 +1952,9 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     PreprocessedInput pin;
     int width = 0, height = 0;
     double resize_pixel_size_um = 0.0;
-    spk::stage_timings_reset();  // per-render diagnostic (#146/#152); observation only
     { spk::ScopedStage _t(spk::STG_PREPROCESS);
       preprocess_geometry(in, p, &pin, &width, &height, &resize_pixel_size_um); }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     const int npix = width * height;
     if (out_w) *out_w = width;
     if (out_h) *out_h = height;
@@ -952,13 +1963,19 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     spk::Profile film;
     try {
         film = load_engine_profile(eng, p->film_profile);
-    } catch (const std::exception&) {
+    } catch (const std::bad_alloc&) {
+        return SPK_ERR_OOM;
+    } catch (const ProfileAssetNotFound&) {
         return SPK_ERR_PROFILE_NOT_FOUND;
+    } catch (const ProfileInvalid& e) {
+        set_last_error_message(e.what());
+        return SPK_ERR_PROFILE_INVALID;
     }
     if (film.log_sensitivity.empty() || film.log_exposure.empty() ||
         film.window_params.size() < 4) {
         return SPK_ERR_INTERNAL;  // profile lacks filming fields
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 2) Digested filming params (auto-exposure off; stochastic/grain off).
     //    Spatial effects are PER-EFFECT gated, exactly like the oracle: absent
@@ -1022,19 +2039,19 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     // 3) Build (or reuse the engine-cached) Hanatos2025 filming tc_lut (D55
     //    reference illuminant). Cached by film id — byte-identical to rebuilding
     //    (see engine_tc_lut / the spk_engine cache note).
-    const spk::NdArray* tc_lut_ptr = nullptr;
+    spk::TcLutCache::Lease tc_lut_lease;
     try {
         spk::ScopedStage _t(spk::STG_TC_LUT);  // cold-start heavy (#152)
-        tc_lut_ptr = &engine_tc_lut(eng, p->film_profile, film, p->spectral_gaussian_blur,
-                                    p->apply_hanatos_window != 0,
-                                    p->apply_hanatos_surface != 0,
-                                    p->camera_filter_uv, p->camera_filter_ir,
-                                    static_cast<spk::InputGamutCompress>(
-                                        p->input_gamut_compress));
+        tc_lut_lease = engine_tc_lut(
+            eng, p->film_profile, film, p->spectral_gaussian_blur,
+            p->apply_hanatos_window != 0, p->apply_hanatos_surface != 0,
+            p->camera_filter_uv, p->camera_filter_ir,
+            static_cast<spk::InputGamutCompress>(p->input_gamut_compress));
     } catch (const std::exception&) {
         return SPK_ERR_ASSET_IO;
     }
-    const spk::NdArray& tc_lut = *tc_lut_ptr;
+    const spk::NdArray& tc_lut = *tc_lut_lease;
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 4) expose(): the image runs as float64 (ProPhoto linear). `rgb` was built
     //    by preprocess_geometry above (crop/rescale applied, float64), matching
@@ -1103,6 +2120,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
         }
         // MISS path is handled after unlocking (we don't compute under the lock).
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     if (!scan_film_cache_hit) {
         std::vector<float> log_raw(out_elems);
@@ -1113,6 +2131,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
             spk::expose(pin.rgb.data(), width, height, fparams, tc_lut,
                         log_raw.data());
         }
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (tap_log_raw) *tap_log_raw = log_raw;
 
         // The float64 image is dead past expose — at 12 MP this releases
@@ -1123,6 +2142,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
         // 5) develop(): log_raw -> density_cmy (+ DIR couplers, spatial diffusion if on).
         density_cmy.resize(out_elems);
         spk::develop(log_raw.data(), width, height, film, fparams, density_cmy.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (use_scan_film_cache) {
             std::lock_guard<std::mutex> g(eng->film_cache_mutex);
             auto& slot = eng->film_memo[spk_engine::kMemoScan];
@@ -1139,6 +2159,7 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
     if (tap_density_cmy) *tap_density_cmy = density_cmy;
 
     if (!final_rgb) return SPK_OK;  // caller only wanted an earlier tap
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 6) scan(): density_cmy -> display RGB (output_color_space, CCTF per params).
     spk::ScanningParams sparams;
@@ -1182,7 +2203,21 @@ spk_status run_scan_film(spk_engine* eng, const spk_image* in, const spk_params*
 
     final_rgb->assign(static_cast<size_t>(npix) * 3, 0.0f);
     spk::scan(film, sparams, density_cmy.data(), width, height, final_rgb->data());
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        final_rgb->clear();
+        return SPK_ERR_CANCELLED;
+    }
     return SPK_OK;
+} catch (const std::bad_alloc&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_density_cmy) tap_density_cmy->clear();
+    return SPK_ERR_OOM;
+} catch (const spk::ParallelCancelled&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_density_cmy) tap_density_cmy->clear();
+    return SPK_ERR_CANCELLED;
 }
 
 // Run the negative -> print -> scan route, producing display RGB plus the
@@ -1193,10 +2228,20 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
                      std::vector<float>* tap_log_raw,
                      std::vector<float>* tap_film_density_cmy,
                      std::vector<float>* tap_print_density_cmy,
-                     int* out_w = nullptr, int* out_h = nullptr) {
-    if (!eng || !in || !p || !in->data) return SPK_ERR_BAD_ARGS;
-    if (in->width <= 0 || in->height <= 0) return SPK_ERR_BAD_ARGS;
+                     int* out_w = nullptr, int* out_h = nullptr,
+                     spk_cancel_check cancel = nullptr,
+                     void* cancel_user_data = nullptr) try {
+    if (!eng || !p || !valid_preprocess_geometry(in, p)) {
+        return SPK_ERR_BAD_ARGS;
+    }
     if (!p->film_profile || !p->print_profile) return SPK_ERR_BAD_ARGS;
+    if (!supported_input_color_space(p->input_color_space) ||
+        !valid_diffusion_family(p->camera_diffusion_family) ||
+        !valid_diffusion_family(p->enlarger_diffusion_family)) {
+        return SPK_ERR_BAD_ARGS;
+    }
+    spk::ParallelCancellationScope cancellation_scope(cancel, cancel_user_data);
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 0) Geometry preprocess (crop_and_rescale) BEFORE filming, mirroring the
     //    Python pipeline._preprocess. Default params -> passthrough. The print
@@ -1207,9 +2252,9 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     PreprocessedInput pin;
     int width = 0, height = 0;
     double resize_pixel_size_um = 0.0;
-    spk::stage_timings_reset();  // per-render diagnostic (#146/#152); observation only
     { spk::ScopedStage _t(spk::STG_PREPROCESS);
       preprocess_geometry(in, p, &pin, &width, &height, &resize_pixel_size_um); }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     const int npix = width * height;
     if (out_w) *out_w = width;
     if (out_h) *out_h = height;
@@ -1219,8 +2264,13 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     try {
         film = load_engine_profile(eng, p->film_profile);
         prnt = load_engine_profile(eng, p->print_profile);
-    } catch (const std::exception&) {
+    } catch (const std::bad_alloc&) {
+        return SPK_ERR_OOM;
+    } catch (const ProfileAssetNotFound&) {
         return SPK_ERR_PROFILE_NOT_FOUND;
+    } catch (const ProfileInvalid& e) {
+        set_last_error_message(e.what());
+        return SPK_ERR_PROFILE_INVALID;
     }
     if (film.log_sensitivity.empty() || film.log_exposure.empty() ||
         film.window_params.size() < 4) {
@@ -1230,24 +2280,25 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         prnt.density_curves.empty()) {
         return SPK_ERR_INTERNAL;  // print profile lacks printing fields
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 2) Build (or reuse the engine-cached) Hanatos2025 filming tc_lut (D55
     //    reference illuminant). Needed both by the filming expose and by the
     //    native midgray digest below. Cached by film id — byte-identical to
     //    rebuilding (see engine_tc_lut / the spk_engine cache note).
-    const spk::NdArray* tc_lut_ptr = nullptr;
+    spk::TcLutCache::Lease tc_lut_lease;
     try {
         spk::ScopedStage _t(spk::STG_TC_LUT);  // cold-start heavy (#152)
-        tc_lut_ptr = &engine_tc_lut(eng, p->film_profile, film, p->spectral_gaussian_blur,
-                                    p->apply_hanatos_window != 0,
-                                    p->apply_hanatos_surface != 0,
-                                    p->camera_filter_uv, p->camera_filter_ir,
-                                    static_cast<spk::InputGamutCompress>(
-                                        p->input_gamut_compress));
+        tc_lut_lease = engine_tc_lut(
+            eng, p->film_profile, film, p->spectral_gaussian_blur,
+            p->apply_hanatos_window != 0, p->apply_hanatos_surface != 0,
+            p->camera_filter_uv, p->camera_filter_ir,
+            static_cast<spk::InputGamutCompress>(p->input_gamut_compress));
     } catch (const std::exception&) {
         return SPK_ERR_ASSET_IO;
     }
-    const spk::NdArray& tc_lut = *tc_lut_ptr;
+    const spk::NdArray& tc_lut = *tc_lut_lease;
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 3) Native print digest for ANY (film, paper) pair:
     //    (a) neutral dichroic CC resolved from neutral_print_filters.json
@@ -1255,21 +2306,31 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     //        to the schema defaults {0,0,0}, mirroring params_builder.py.
     //    (b) midgray exposure factor computed natively from the filming midgray
     //        balance + the print sensitivity/filtered illuminant.
-    const double* enl = spk::enlarger_illuminant("TH-KG3");
-    if (!enl) return SPK_ERR_INTERNAL;
+    const char* illuminant = p->enlarger_illuminant;
+    if (!illuminant || illuminant[0] == '\0') illuminant = "TH-KG3";
+    const double* enl = spk::enlarger_illuminant(illuminant);
+    if (!enl) {
+        set_last_error_message("unsupported enlarger illuminant");
+        return SPK_ERR_BAD_ARGS;
+    }
     const std::string film_stock  = !film.stock.empty() ? film.stock : p->film_profile;
     const std::string print_stock = !prnt.stock.empty() ? prnt.stock : p->print_profile;
-    double neutral_cc[3];
+    // Resolver failure is failure-atomic, so initialize the schema fallback
+    // before either the asset read or JSON/key lookup can fail.
+    double neutral_cc[3] = {0.0, 0.0, 0.0};
     if (p->neutral_print_filters_from_database) {
         // Read neutral_print_filters.json via the asset abstraction (FS or AAsset),
         // then resolve from the in-memory bytes. A missing/unreadable asset yields
         // defaults {0,0,0}, mirroring the Python FileNotFoundError branch.
         spk::ScopedStage _t(spk::STG_PRINT_DIGEST);
         std::vector<char> nf;
-        if (spk_read_asset(eng, kNeutralFiltersRel, nf)) {
-            spk::resolve_neutral_cc_string(std::string(nf.data(), nf.size()),
-                                           print_stock, "TH-KG3", film_stock,
-                                           neutral_cc);
+        if (spk_read_asset(eng, kNeutralFiltersRel, nf,
+                           spk::json::kMaxInputBytes)) {
+            if (!pointwise_test_fault(6)) {
+                (void)spk::resolve_neutral_cc_string(
+                    std::string(nf.data(), nf.size()), print_stock, illuminant,
+                    film_stock, neutral_cc);
+            }
         } else {
             neutral_cc[0] = neutral_cc[1] = neutral_cc[2] = 0.0;
         }
@@ -1303,6 +2364,10 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
           p->normalize_print_exposure != 0, p->print_exposure_compensation != 0); }
     // enlarger.print_exposure (default 1.0) multiplies the print exposure.
     pparams.print_exposure = p->print_exposure;
+    // Same GPU latch scanning uses (INTERNAL — never the raw user flag), so one
+    // toggle governs both offloads. print_expose re-gates per frame and falls
+    // back to the exact CPU integral on any failure.
+    pparams.allow_gpu = (p->allow_gpu_scan != 0);
 
     // OPT-IN s023 print density-curve morph (print_render.density_curves_morph).
     // Default-off -> print_develop uses the stored density_curves table (the
@@ -1451,6 +2516,324 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     fparams.halation.boost_ev = p->halation_boost_ev;
     fparams.halation.boost_range = p->halation_boost_range;
     fparams.halation.protect_ev = p->halation_protect_ev;
+    // Build scan settings before the film memo so the conservative resident
+    // route can prove that its three shaders cover the whole requested frame.
+    // The same object is reused unchanged by the CPU fallback below.
+    spk::ScanningParams sparams = build_print_scanning_params(
+        eng, p, print_stochastic, bw_corr);
+
+    const char* pointwise_ineligible = pointwise_route_ineligibility(
+        p, film, prnt, tc_lut, fparams, pparams, sparams, final_rgb,
+        tap_log_raw, tap_film_density_cmy, tap_print_density_cmy, npix);
+    if (pointwise_ineligible) {
+        note_pointwise_diagnostics(p->allow_gpu_scan != 0, false,
+                                   pointwise_ineligible);
+    } else {
+        // Any failure after full-chain eligibility disables both legacy partial
+        // GPU stages for this same CPU fallback frame.
+        bool pointwise_failed = false;
+        const char* preparation_failure = nullptr;
+        if (pointwise_test_fault(2) ||
+            cancellation_requested(cancel, cancel_user_data)) {
+            note_pointwise_diagnostics(true, false, "cancelled_before_prepare");
+            return SPK_ERR_CANCELLED;
+        }
+
+        bool pointwise_gpu_available = false;
+        try {
+            pointwise_gpu_available = spk::gpu::available();
+        } catch (...) {
+            pointwise_gpu_available = false;
+        }
+        if (!pointwise_gpu_available) {
+            note_pointwise_diagnostics(true, false, "unavailable");
+            pointwise_failed = true;
+        } else {
+          std::shared_ptr<const spk_engine::PointwisePreparedTables> prepared;
+          PointwiseDynamicParameters dynamic;
+          std::vector<float> materialized_input;
+          const float* pointwise_input = nullptr;
+          try {
+            const spk::ViewingIlluminant* viewing =
+                prnt.resolved_viewing_illuminant;
+            if (!viewing) {
+                viewing = &spk::require_viewing_illuminant(
+                    prnt.viewing_illuminant);
+            }
+            spk_engine::PointwisePreparedTables candidate;
+            if (!build_pointwise_tables(film, prnt, tc_lut, fparams, pparams,
+                                        *viewing, &candidate, &dynamic)) {
+                preparation_failure = "table_validation";
+            } else {
+                bool cache_hit = false;
+                prepared = cache_pointwise_tables(eng, std::move(candidate),
+                                                   &cache_hit);
+                (void)cache_hit;
+                if (!prepared) preparation_failure = "generation_exhausted";
+            }
+
+            double exposure_multiplier =
+                std::pow(2.0, fparams.exposure_compensation_ev);
+            if (pin.direct) exposure_multiplier *= pin.gain;
+            if (!preparation_failure &&
+                !pointwise_checked_float(
+                    exposure_multiplier,
+                    &dynamic.film_exposure_multiplier)) {
+                preparation_failure = "exposure_validation";
+            }
+
+          } catch (const std::bad_alloc&) {
+            preparation_failure = "allocation_failed";
+          } catch (const std::exception&) {
+            preparation_failure = "table_validation";
+          }
+
+          if (preparation_failure) {
+            note_pointwise_diagnostics(true, false, preparation_failure);
+            pointwise_failed = true;
+          } else if (pointwise_test_fault(3) ||
+                     cancellation_requested(cancel, cancel_user_data)) {
+            note_pointwise_diagnostics(true, false,
+                                       "cancelled_before_dispatch");
+            return SPK_ERR_CANCELLED;
+          } else {
+            const size_t component_count = static_cast<size_t>(npix) * 3u;
+            spk::gpu::PointwiseChainRequest request{};
+            request.input_rgb = pointwise_input;
+            request.input_component_count = component_count;
+            request.pixel_count = static_cast<uint32_t>(npix);
+            request.static_table_key = prepared->generation;
+            request.film.tc_lut = {prepared->tc_lut.data(),
+                                   prepared->tc_lut.size()};
+            request.film.tc_edge = prepared->tc_edge;
+            request.film.develop_axis = {prepared->develop_axis.data(),
+                                         prepared->develop_axis.size()};
+            request.film.develop_curve = {prepared->develop_curve.data(),
+                                          prepared->develop_curve.size()};
+            request.film.dir_axis = {prepared->dir_axis.data(),
+                                     prepared->dir_axis.size()};
+            request.film.dir_curve = {prepared->dir_curve.data(),
+                                      prepared->dir_curve.size()};
+            request.film.curve_points = prepared->film_curve_points;
+            request.film.exposure_multiplier =
+                dynamic.film_exposure_multiplier;
+            request.film.coupler_shift = dynamic.film_coupler_shift;
+            std::memcpy(request.film.coupler_matrix,
+                        dynamic.film_coupler_matrix,
+                        sizeof(request.film.coupler_matrix));
+            request.print.dye = {prepared->print_dye.data(),
+                                 prepared->print_dye.size()};
+            request.print.illuminant_sensitivity = {
+                prepared->print_illuminant_sensitivity.data(),
+                prepared->print_illuminant_sensitivity.size()};
+            request.print.paper_axis = {prepared->paper_axis.data(),
+                                        prepared->paper_axis.size()};
+            request.print.paper_curve = {prepared->paper_curve.data(),
+                                         prepared->paper_curve.size()};
+            request.print.curve_points = prepared->print_curve_points;
+            request.print.midgray = dynamic.print_midgray;
+            request.print.exposure_multiplier =
+                dynamic.print_exposure_multiplier;
+            request.scan.dye = {prepared->scan_dye.data(),
+                                prepared->scan_dye.size()};
+            request.scan.illuminant_cmf = {
+                prepared->scan_illuminant_cmf.data(),
+                prepared->scan_illuminant_cmf.size()};
+            std::memcpy(request.scan.xyz_to_rgb, dynamic.scan_xyz_to_rgb,
+                        sizeof(request.scan.xyz_to_rgb));
+
+            // Full-frame conversion/scratch are deferred until the tiny keyed
+            // capability verdict passes. Cached device failures therefore do
+            // not allocate or touch live image planes.
+            std::vector<float> scratch;
+            bool capability_passed = false;
+            if (!pointwise_failed) {
+                const double source_gain = pin.direct ? pin.gain : 1.0;
+#if !defined(__ANDROID__) || defined(SPK_POINTWISE_TEST_HOOKS)
+                g_spk_test_pointwise_direct_gain = source_gain;
+#endif
+                const spk_engine::PointwiseCapabilityKey capability_key =
+                    make_pointwise_capability_key(
+                        prepared->generation, dynamic, pin.direct, source_gain);
+                const int cached_capability =
+                    cached_pointwise_capability(eng, capability_key);
+                if (cached_capability == -2) {
+                    note_pointwise_self_test("not_run");
+                    note_pointwise_diagnostics(
+                        true, false, "capability_cache_failed");
+                    pointwise_failed = true;
+                } else if (cached_capability > 0) {
+                    note_pointwise_self_test("cached_pass");
+                    capability_passed = true;
+                } else if (cached_capability == 0) {
+                    // Failed verdicts are retained to avoid repeatedly running
+                    // known-bad device/shader configurations. `not_run` is the
+                    // truthful state for this render; the route reason carries
+                    // the cached failure disposition.
+                    note_pointwise_self_test("not_run");
+                    note_pointwise_diagnostics(
+                        true, false, "capability_check_failed_cached");
+                    pointwise_failed = true;
+                } else {
+                    const PointwiseSelfTestResult self_test =
+                        run_pointwise_capability_check(
+                            request, film, prnt, tc_lut, fparams, pparams,
+                            sparams, pin.direct, source_gain, cancel,
+                            cancel_user_data);
+                    if (self_test.outcome ==
+                        PointwiseSelfTestOutcome::cancelled) {
+                        // Cancellation is not a numeric/device verdict and must
+                        // never poison this exact keyed configuration.
+                        note_pointwise_self_test("ran_fail", &self_test);
+                        note_pointwise_diagnostics(
+                            true, false, "cancelled_during_self_test");
+                        return SPK_ERR_CANCELLED;
+                    }
+                    capability_passed =
+                        self_test.outcome == PointwiseSelfTestOutcome::passed;
+                    note_pointwise_self_test(
+                        capability_passed ? "ran_pass" : "ran_fail",
+                        &self_test);
+                    const bool capability_stored =
+                        store_pointwise_capability(
+                            eng, capability_key, capability_passed);
+                    if (!capability_stored) {
+                        capability_passed = false;
+                        note_pointwise_diagnostics(
+                            true, false, "capability_cache_failed");
+                        pointwise_failed = true;
+                    } else if (!capability_passed) {
+                        note_pointwise_diagnostics(
+                            true, false, "capability_check_failed");
+                        pointwise_failed = true;
+                    }
+                }
+            }
+
+            if (capability_passed && !pointwise_failed) {
+                const char* live_input_failure = nullptr;
+                try {
+                    if (pin.direct) {
+                        for (size_t i = 0; i < component_count; ++i) {
+                            if (!std::isfinite(in->data[i])) {
+                                live_input_failure = "input_nonfinite";
+                                break;
+                            }
+                        }
+                        pointwise_input = in->data;
+                    } else if (pin.rgb.size() != component_count) {
+                        live_input_failure = "input_shape";
+                    } else {
+                        materialized_input.resize(component_count);
+                        for (size_t i = 0; i < component_count; ++i) {
+                            if (!pointwise_checked_float(
+                                    pin.rgb[i], &materialized_input[i])) {
+                                live_input_failure = "input_nonfinite";
+                                break;
+                            }
+                        }
+                        pointwise_input = materialized_input.data();
+                    }
+                    if (!live_input_failure) {
+                        if (pointwise_test_fault(1)) throw std::bad_alloc();
+                        scratch.resize(component_count);
+                    }
+                } catch (const std::bad_alloc&) {
+                    live_input_failure = "allocation_failed";
+                }
+                if (live_input_failure) {
+                    note_pointwise_diagnostics(true, false,
+                                               live_input_failure);
+                    capability_passed = false;
+                    pointwise_failed = true;
+                } else {
+                    request.input_rgb = pointwise_input;
+                }
+            }
+
+            if (capability_passed && !pointwise_failed) {
+                if (cancellation_requested(cancel, cancel_user_data)) {
+                    note_pointwise_diagnostics(
+                        true, false, "cancelled_before_dispatch");
+                    return SPK_ERR_CANCELLED;
+                }
+                spk::gpu::PointwiseChainOutput output{scratch.data(),
+                                                      scratch.size()};
+                spk::gpu::PointwiseChainDiagnostics diagnostics{};
+                bool rendered = false;
+                if (pointwise_test_fault(5)) {
+                    diagnostics.fallback_reason =
+                        spk::gpu::PointwiseFallbackReason::dispatch_failed;
+                } else {
+                    rendered = spk::gpu::render_pointwise_chain(
+                        request, &output, &diagnostics);
+                }
+                // Poll immediately after the GPU returns: neither the tone
+                // post-pass nor a CPU fallback may begin for a cancelled frame.
+                if (pointwise_test_fault(4) ||
+                    cancellation_requested(cancel, cancel_user_data)) {
+                    diagnostics.engaged = false;
+                    note_pointwise_diagnostics(
+                        true, true, "cancelled_after_dispatch", diagnostics);
+                    return SPK_ERR_CANCELLED;
+                }
+                if (!rendered) {
+                    note_pointwise_diagnostics(true, true, nullptr,
+                                               diagnostics);
+                    pointwise_failed = true;
+                } else {
+                    bool finite = true;
+                    bool cancelled_after_dispatch = false;
+                    for (size_t i = 0; i < scratch.size(); ++i) {
+                        if ((i & 4095u) == 0u &&
+                            cancellation_requested(cancel, cancel_user_data)) {
+                            cancelled_after_dispatch = true;
+                            break;
+                        }
+                        finite &= std::isfinite(scratch[i]);
+                    }
+                    if (finite && !cancelled_after_dispatch &&
+                        sparams.tone_curve.active) {
+                        for (size_t i = 0; i < scratch.size(); ++i) {
+                            if ((i & 4095u) == 0u &&
+                                cancellation_requested(cancel,
+                                                       cancel_user_data)) {
+                                cancelled_after_dispatch = true;
+                                break;
+                            }
+                            scratch[i] = sparams.tone_curve.apply(
+                                static_cast<int>(i % 3u), scratch[i]);
+                            finite &= std::isfinite(scratch[i]);
+                        }
+                    }
+                    if (cancelled_after_dispatch ||
+                        cancellation_requested(cancel, cancel_user_data)) {
+                        diagnostics.engaged = false;
+                        note_pointwise_diagnostics(
+                            true, true, "cancelled_after_dispatch",
+                            diagnostics);
+                        return SPK_ERR_CANCELLED;
+                    }
+                    if (!finite) {
+                        diagnostics.engaged = false;
+                        note_pointwise_diagnostics(
+                            true, true, "nonfinite_output", diagnostics);
+                        pointwise_failed = true;
+                    } else {
+                        note_pointwise_diagnostics(true, true, "none",
+                                                   diagnostics);
+                        *final_rgb = std::move(scratch);
+                        return SPK_OK;
+                    }
+                }
+            }
+          }
+        }
+        if (pointwise_failed) {
+            pparams.allow_gpu = false;
+            sparams.allow_gpu = false;
+        }
+    }
 
     // `pin` (the preprocessed input — materialized float64 or the direct
     // float32 form) was built by preprocess_geometry above.
@@ -1502,6 +2885,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         }
         // MISS path is handled after unlocking (we don't compute under the lock).
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     if (!film_cache_hit) {
         std::vector<float> film_log_raw(out_elems);
@@ -1512,6 +2896,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
             spk::expose(pin.rgb.data(), width, height, fparams, tc_lut,
                         film_log_raw.data());
         }
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (tap_log_raw) *tap_log_raw = film_log_raw;
 
         // The float64 image is dead past expose — at 12 MP this releases
@@ -1522,6 +2907,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         film_density_cmy.resize(out_elems);
         spk::develop(film_log_raw.data(), width, height, film, fparams,
                      film_density_cmy.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (use_film_cache) {
             // Store {width, height, film_density_cmy} + key under the lock, count miss.
             std::lock_guard<std::mutex> g(eng->film_cache_mutex);
@@ -1565,10 +2951,12 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
             pd_hit = true;
         }
     }
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     if (!pd_hit) {
         std::vector<float> print_log_raw(out_elems);
         spk::print_expose(film, prnt, pparams, film_density_cmy.data(), width, height,
                           print_log_raw.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         // film_density_cmy's last read was print_expose (the tap copy was taken
         // above; the memo store below uses pd_key only) — at 12 MP this
         // releases ~144 MB before print_develop/scan run (EXPORT_FASTPATH
@@ -1577,6 +2965,7 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
         print_density_cmy.resize(out_elems);
         spk::print_develop(prnt, pparams, print_log_raw.data(), npix,
                            print_density_cmy.data());
+        if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
         if (!pd_bypass) {
             std::lock_guard<std::mutex> g(eng->film_cache_mutex);
             auto& slot = eng->print_density_memo;
@@ -1593,20 +2982,16 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     if (tap_print_density_cmy) *tap_print_density_cmy = print_density_cmy;
 
     if (!final_rgb) return SPK_OK;  // caller only wanted an earlier tap
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // 5) Scan the print (D50 viewing illuminant, print profile's dyes).
-    spk::ScanningParams sparams;
-    sparams.scan_film = false;
+    // `sparams` was built before the resident route and is reused here.
     // GPU preview fast-path (#146): set only when spk_simulate_preview latched
     // allow_gpu_scan; scan() re-gates on frame eligibility + the self-check.
-    sparams.allow_gpu = (p->allow_gpu_scan != 0);
-    sparams.output_color_space = p->output_color_space;
-    sparams.output_cctf_encoding = (p->output_cctf_encoding != 0);
+    // Preserve the explicit false set after a failed full-chain attempt.
     // OPT-IN output gamut compression (print route, same scan() position as scan_film).
     // Default kLegacyClip (0) keeps the existing clip so print goldens stay byte-identical;
     // the knee stays at the ScanningParams oracle production default (0,1,6).
-    sparams.output_gamut_compress =
-        static_cast<spk::OutputGamutCompress>(p->output_gamut_compress);
     // Viewing glare on the PRINT route (scanning.py applies glare = print_render.glare
     // here, in XYZ space, before XYZ->RGB). It is STOCHASTIC (per-pixel lognormal via
     // np.random.randn) so an active result is NOT bit-exact vs the oracle (exactly
@@ -1622,41 +3007,37 @@ spk_status run_print(spk_engine* eng, const spk_image* in, const spk_params* p,
     // With the parity toggles (grain_active == 0) glare never runs. When a caller
     // turns the stochastic branch on AND enables print glare, the effect is applied
     // at the oracle position but held to a visual (not bit-exact) tolerance.
-    if (print_stochastic && p->print_glare_active != 0) {
-        sparams.glare_active = true;
-        sparams.glare_percent = p->print_glare_percent;
-        sparams.glare_roughness = p->print_glare_roughness;
-        sparams.glare_blur = p->print_glare_blur;
-    }
     // Scanner lens blur + unsharp on the print route (scanning.py runs the same
     // _apply_blur_and_unsharp on both routes). Each self-gates inside scan()
     // (sigma > 0, amount > 0, blur > 0) exactly like the oracle; the
     // deactivate_spatial_effects debug switch is expressed by passing zeros.
-    sparams.lens_blur = static_cast<double>(p->scanner_lens_blur);
-    sparams.unsharp_sigma = p->scanner_unsharp[0];
-    sparams.unsharp_amount = p->scanner_unsharp[1];
     // OPT-IN scanner 3D-LUT acceleration on the print-scan route (same
     // settings.use_scanner_lut gate; scan_film == false so scan() picks the print
     // density-curve domain bounds). Default 0 => never constructed, print goldens
     // stay bit-exact.
-    if (p->use_scanner_lut != 0) {
-        sparams.use_lut = true;
-        sparams.lut_resolution = p->lut_resolution;
-        sparams.lut_cache = &eng->lut_cache;  // memo the build (PERF, byte-identical)
-    }
-    sparams.tone_curve = build_tone_curve_set(p);
     // Scanner BLACK/WHITE XYZ correction (print route): apply the shared affine
     // (m, q) per pixel in scan(). Inactive (strict no-op) by default / when the
     // print paper is not negative.
-    if (bw_corr.active) {
-        sparams.bw_xyz_correction = true;
-        sparams.bw_xyz_m = bw_corr.m;
-        sparams.bw_xyz_q = bw_corr.q;
-    }
     final_rgb->assign(static_cast<size_t>(npix) * 3, 0.0f);
     spk::scan(prnt, sparams, print_density_cmy.data(), width, height,
               final_rgb->data());
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        final_rgb->clear();
+        return SPK_ERR_CANCELLED;
+    }
     return SPK_OK;
+} catch (const std::bad_alloc&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_film_density_cmy) tap_film_density_cmy->clear();
+    if (tap_print_density_cmy) tap_print_density_cmy->clear();
+    return SPK_ERR_OOM;
+} catch (const spk::ParallelCancelled&) {
+    if (final_rgb) final_rgb->clear();
+    if (tap_log_raw) tap_log_raw->clear();
+    if (tap_film_density_cmy) tap_film_density_cmy->clear();
+    if (tap_print_density_cmy) tap_print_density_cmy->clear();
+    return SPK_ERR_CANCELLED;
 }
 
 // Allocate an spk_image and copy `data` into it.
@@ -1710,8 +3091,29 @@ int spk_gpu_scan_state(void) { return spk::gpu_scan_preview_state(); }
 
 uint64_t spk_gpu_scan_frames(void) { return spk::gpu_scan_frames_rendered(); }
 
+int spk_gpu_print_state(void) { return spk::gpu_print_expose_state(); }
+
+uint64_t spk_gpu_print_frames(void) { return spk::gpu_print_frames_rendered(); }
+
+uint64_t spk_diffusion_fft_fallbacks(void) {
+    return spk::diffusion_fft_fallbacks();
+}
+void spk_diffusion_reset_fft_fallbacks(void) { spk::diffusion_reset_fft_fallbacks(); }
+
+void spk_set_big_cores(int mode) { spk::parallel_set_big_cores(mode); }
+
+int spk_big_core_count(void) { return spk::parallel_big_core_count(); }
+
 int spk_stage_timings(char* buf, int cap) {
     return spk::stage_timings_format(buf, cap);
+}
+
+uint64_t spk_stage_timing_render_id(void) {
+    return spk::stage_timing_render_id();
+}
+
+int spk_stage_timings_json(char* buf, int cap) {
+    return spk::stage_timings_json_format(buf, cap);
 }
 
 void spk_default_params(spk_params* p) {
@@ -1721,6 +3123,7 @@ void spk_default_params(spk_params* p) {
     std::memset(p, 0, sizeof(*p));
     p->film_profile = film;
     p->print_profile = print;
+    p->enlarger_illuminant = "TH-KG3";
 
     // camera
     p->exposure_compensation_ev = 0.0f;
@@ -1734,6 +3137,7 @@ void spk_default_params(spk_params* p) {
     p->camera_filter_uv[0] = 0.0f; p->camera_filter_uv[1] = 410.0f; p->camera_filter_uv[2] = 8.0f;
     p->camera_filter_ir[0] = 0.0f; p->camera_filter_ir[1] = 675.0f; p->camera_filter_ir[2] = 15.0f;
     p->camera_diffusion_active = 0;
+    p->camera_diffusion_family = SPK_DIFFUSION_BLACK_PRO_MIST;
     p->camera_diffusion_strength = 0.5f;
     p->camera_diffusion_spatial_scale = 1.0f;
     p->camera_diffusion_halo_warmth = 0.0f;
@@ -1758,6 +3162,7 @@ void spk_default_params(spk_params* p) {
     p->preflash_y_filter_shift = 0.0f;
     p->preflash_m_filter_shift = 0.0f;
     p->enlarger_diffusion_active = 0;
+    p->enlarger_diffusion_family = SPK_DIFFUSION_BLACK_PRO_MIST;
     p->enlarger_diffusion_strength = 0.5f;
     p->enlarger_diffusion_spatial_scale = 1.0f;
     p->enlarger_diffusion_halo_warmth = 0.0f;
@@ -1849,6 +3254,7 @@ void spk_default_params(spk_params* p) {
     p->output_color_space = SPK_CS_SRGB;
     p->output_cctf_encoding = 1;
     p->input_cctf_decoding = 0;
+    p->input_color_space = "ProPhoto RGB";
     p->crop = 0;
     p->crop_center[0] = 0.5f; p->crop_center[1] = 0.5f;
     p->crop_size[0] = 0.1f; p->crop_size[1] = 0.1f;
@@ -1890,11 +3296,16 @@ const char* spk_status_str(spk_status s) {
         case SPK_ERR_ASSET_IO:          return "asset I/O error";
         case SPK_ERR_OOM:               return "out of memory";
         case SPK_ERR_INTERNAL:          return "internal error";
+        case SPK_ERR_PROFILE_INVALID:   return "invalid profile";
+        case SPK_ERR_CANCELLED:         return "cancelled";
         default:                        return "unknown";
     }
 }
 
+const char* spk_last_error_message(void) { return g_last_error_message; }
+
 spk_status spk_engine_create(const char* asset_dir, spk_engine** out) {
+    clear_last_error_message();
     if (!out) return SPK_ERR_BAD_ARGS;
     if (!asset_dir) return SPK_ERR_BAD_ARGS;  // filesystem mode requires a dir.
     auto eng = std::make_unique<spk_engine>();
@@ -1905,6 +3316,7 @@ spk_status spk_engine_create(const char* asset_dir, spk_engine** out) {
 }
 
 spk_status spk_engine_create_asset_manager(void* aasset_manager, spk_engine** out) {
+    clear_last_error_message();
     if (!out) return SPK_ERR_BAD_ARGS;
 #ifdef __ANDROID__
     if (!aasset_manager) return SPK_ERR_BAD_ARGS;
@@ -1925,6 +3337,7 @@ void spk_engine_destroy(spk_engine* eng) { delete eng; }
 
 spk_status spk_engine_list_profiles(spk_engine* eng, char* buf, size_t buf_len,
                                     size_t* needed) {
+    clear_last_error_message();
     if (!eng) return SPK_ERR_BAD_ARGS;
     std::string list;
 #ifdef __ANDROID__
@@ -1961,17 +3374,78 @@ spk_status spk_engine_list_profiles(spk_engine* eng, char* buf, size_t buf_len,
 
     size_t req = list.size() + 1;  // include NUL
     if (needed) *needed = req;
-    if (!buf || buf_len < req) return SPK_ERR_BAD_ARGS;  // caller resizes & retries
+    if (!buf) return needed ? SPK_OK : SPK_ERR_BAD_ARGS;
+    if (buf_len < req) return SPK_ERR_BAD_ARGS;
     std::memcpy(buf, list.c_str(), req);
     return SPK_OK;
 }
 
+int spk_engine_tc_lut_cache_stats_json(spk_engine* eng, char* buf, int cap) {
+    constexpr int kRequiredCapacity = 2048;
+    if (!eng || !buf || cap < kRequiredCapacity) {
+        if (buf && cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    const spk::TcLutCacheStats s = eng->tc_lut_cache.stats();
+    const int written = std::snprintf(
+        buf, static_cast<size_t>(cap),
+        "{\"schema\":\"spk.tc_lut_cache.v1\","
+        "\"memory_boundary\":\"post-build-cache-residency\","
+        "\"hits\":%llu,\"misses\":%llu,\"race_hits\":%llu,"
+        "\"evictions\":%llu,\"oversize_bypasses\":%llu,"
+        "\"entry_limit_bypasses\":%llu,\"budget_bypasses\":%llu,"
+        "\"global_budget_denials\":%llu,\"build_failures\":%llu,"
+        "\"accounting_overflows\":%llu,\"classification_conflicts\":%llu,"
+        "\"cache_held_bytes\":%zu,\"pinned_bytes\":%zu,"
+        "\"dynamic_bytes\":%zu,\"pinned_entries\":%zu,"
+        "\"dynamic_entries\":%zu,\"pinned_byte_budget\":%zu,"
+        "\"dynamic_byte_budget\":%zu,\"max_pinned_entries\":%zu,"
+        "\"max_dynamic_entries\":%zu}",
+        static_cast<unsigned long long>(s.hits),
+        static_cast<unsigned long long>(s.misses),
+        static_cast<unsigned long long>(s.race_hits),
+        static_cast<unsigned long long>(s.evictions),
+        static_cast<unsigned long long>(s.oversize_bypasses),
+        static_cast<unsigned long long>(s.entry_limit_bypasses),
+        static_cast<unsigned long long>(s.budget_bypasses),
+        static_cast<unsigned long long>(s.global_budget_denials),
+        static_cast<unsigned long long>(s.build_failures),
+        static_cast<unsigned long long>(s.accounting_overflows),
+        static_cast<unsigned long long>(s.classification_conflicts),
+        s.cache_held_bytes, s.pinned_bytes, s.dynamic_bytes,
+        s.pinned_entries, s.dynamic_entries, s.pinned_byte_budget,
+        s.dynamic_byte_budget, s.max_pinned_entries, s.max_dynamic_entries);
+    if (written < 0 || written >= cap) {
+        buf[0] = '\0';
+        return 0;
+    }
+    return written;
+}
+
 spk_status spk_simulate(spk_engine* eng, const spk_image* in, const spk_params* p,
                         spk_image* out) {
+    return spk_simulate_cancellable(eng, in, p, out, nullptr, nullptr);
+}
+
+spk_status spk_simulate_cancellable(spk_engine* eng, const spk_image* in,
+                                    const spk_params* p, spk_image* out,
+                                    spk_cancel_check cancel,
+                                    void* cancel_user_data) {
+    clear_last_error_message();
+    // The C API itself cannot know whether an exact render is a user export,
+    // magnifier, or another caller. JNI supplies that logical purpose through
+    // an outer context; direct C callers get the neutral exact_render label.
+    spk::ScopedRenderTiming timing(spk::RTK_EXACT_RENDER);
     // Validate every pointer before any deref, matching spk_simulate_preview /
     // spk_simulate_tap. `in` is read for width/height just below, so guard it
     // (and its data) here rather than relying on the run_* callees.
-    if (!eng || !in || !p || !out || !in->data) return SPK_ERR_BAD_ARGS;
+    if (out) *out = {};
+    if (!eng || !p || !out || !valid_rgb_shape(in)) {
+        return timing.finish(SPK_ERR_BAD_ARGS);
+    }
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
     // EXPERIMENTAL GPU export latch (#149 option B, #154). gpu_export routes the
     // scan stage through the GPU on export, gated by scan()'s self-check + CPU
     // fallback. Only SETS the internal latch (never clears), so a preview
@@ -1988,32 +3462,53 @@ spk_status spk_simulate(spk_engine* eng, const spk_image* in, const spk_params* 
     spk_status st;
     int ow = in->width, oh = in->height;
     if (p->scan_film) {
-        st = run_scan_film(eng, in, p, &rgb, nullptr, nullptr, &ow, &oh);
+        st = run_scan_film(eng, in, p, &rgb, nullptr, nullptr, &ow, &oh,
+                           cancel, cancel_user_data);
     } else {
         // Print (enlarger) route: filming -> printing -> scan(print).
-        st = run_print(eng, in, p, &rgb, nullptr, nullptr, nullptr, &ow, &oh);
+        st = run_print(eng, in, p, &rgb, nullptr, nullptr, nullptr, &ow, &oh,
+                       cancel, cancel_user_data);
     }
-    if (st != SPK_OK) return st;
-    return fill_out_image(out, rgb, ow, oh,
-                          static_cast<int>(p->output_color_space));
+    if (st != SPK_OK) return timing.finish(st);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
+    return timing.finish(fill_out_image(out, rgb, ow, oh,
+                                        static_cast<int>(p->output_color_space)));
 }
 
 spk_status spk_simulate_preview(spk_engine* eng, const spk_image* in,
                                 const spk_params* p, spk_image* out) {
-    if (!eng || !in || !p || !out || !in->data) return SPK_ERR_BAD_ARGS;
+    return spk_simulate_preview_cancellable(eng, in, p, out, nullptr, nullptr);
+}
+
+spk_status spk_simulate_preview_cancellable(spk_engine* eng, const spk_image* in,
+                                            const spk_params* p, spk_image* out,
+                                            spk_cancel_check cancel,
+                                            void* cancel_user_data) {
+    clear_last_error_message();
+    spk::ScopedRenderTiming timing(spk::RTK_PREVIEW);
+    if (out) *out = {};
+    if (!eng || !p || !out || !valid_rgb_shape(in)) {
+        return timing.finish(SPK_ERR_BAD_ARGS);
+    }
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
     // Proxy-approximate / export-exact (docs/PERF_ROADMAP.md): the interactive preview
     // runs the approximate LUT fast-path (the scanner density->log_xyz spectral integral
-    // is PCHIP-interpolated through a 3D LUT instead of evaluated per pixel, ~5e-5 vs the
-    // direct path — see runtime/stages/scanning.h). spk_simulate (export) keeps the exact
-    // direct spectral evaluation, so the bit-exact parity goldens are untouched. We copy
-    // the caller's params and force the LUT on for the preview only.
+    // is PCHIP-interpolated through a 3D LUT instead of evaluated per pixel; error is
+    // profile/domain dependent — see runtime/stages/scanning.h). spk_simulate keeps the
+    // caller's explicit setting; the app's exact-export route keeps it off. We copy the
+    // caller's params and force the LUT on for the preview only.
     spk_params pp = *p;
     // Force BOTH spectral LUTs on for the interactive preview (proxy-approximate / export-exact):
     // the scanner density->log_xyz integral AND the enlarger print-expose integral are the two
-    // per-pixel hotspots, so PCHIP-interpolating both through their 3D LUTs (~5e-5 / ~1e-4 vs the
-    // direct evaluation) roughly halves the preview render on the print route. spk_simulate
-    // (export) keeps the exact direct evaluation, so the bit-exact parity goldens — none of which
-    // call simulate_preview — are untouched. The enlarger LUT is inert on the scan_film route.
+    // per-pixel hotspots, so PCHIP-interpolating both through their 3D LUTs roughly halves
+    // the preview render on the print route. Scanner error is profile/domain dependent;
+    // the enlarger gate remains ~1e-4 vs direct. The app's exact export keeps both LUTs off,
+    // and the bit-exact parity goldens do not call simulate_preview. The enlarger LUT is
+    // inert on the scan_film route.
     if (pp.use_scanner_lut == 0) pp.use_scanner_lut = 1;
     if (pp.use_enlarger_lut == 0) pp.use_enlarger_lut = 1;
     if (pp.lut_resolution < 2) pp.lut_resolution = 17;
@@ -2036,7 +3531,8 @@ spk_status spk_simulate_preview(spk_engine* eng, const spk_image* in,
     int longest = in->width > in->height ? in->width : in->height;
     if (longest <= max_size) {
         // Already small enough: run the full simulate on the original.
-        return spk_simulate(eng, in, p, out);
+        return timing.finish(spk_simulate_cancellable(
+            eng, in, p, out, cancel, cancel_user_data));
     }
     // Downscale (bilinear) to the preview target, preserving aspect ratio, then
     // simulate. Done in input (linear ProPhoto) space, before the pipeline.
@@ -2048,15 +3544,23 @@ spk_status spk_simulate_preview(spk_engine* eng, const spk_image* in,
 
     std::vector<float> small;
     downscale_bilinear(in->data, in->width, in->height, dw, dh, &small);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
 
     spk_image small_img{small.data(), dw, dh, in->color_space};
-    return spk_simulate(eng, &small_img, p, out);
+    return timing.finish(spk_simulate_cancellable(
+        eng, &small_img, p, out, cancel, cancel_user_data));
 }
 
 spk_status spk_simulate_tap(spk_engine* eng, const spk_image* in,
                             const spk_params* p, const char* tap_name,
                             spk_image* out) {
-    if (!out || !p || !tap_name || !in) return SPK_ERR_BAD_ARGS;
+    clear_last_error_message();
+    spk::ScopedRenderTiming timing(spk::RTK_TAP);
+    if (!out || !p || !tap_name || !in) {
+        return timing.finish(SPK_ERR_BAD_ARGS);
+    }
 
     // Debug taps feed the parity harness: hard-zero the INTERNAL GPU latch so a
     // raw C caller's allow_gpu_scan can never put GPU output into a tap
@@ -2076,50 +3580,69 @@ spk_status spk_simulate_tap(spk_engine* eng, const spk_image* in,
         // scan_film route: only the negative taps + final RGB exist.
         if (tap == "film_log_raw") {
             st = run_scan_film(eng, in, p, nullptr, &log_raw, nullptr, &ow, &oh);
-            if (st != SPK_OK) return st;
-            return fill_out_image(out, log_raw, ow, oh, in->color_space);
+            if (st != SPK_OK) return timing.finish(st);
+            return timing.finish(
+                fill_out_image(out, log_raw, ow, oh, in->color_space));
         } else if (tap == "film_density_cmy") {
             st = run_scan_film(eng, in, p, nullptr, &log_raw, &film_density_cmy,
                                &ow, &oh);
-            if (st != SPK_OK) return st;
-            return fill_out_image(out, film_density_cmy, ow, oh, in->color_space);
+            if (st != SPK_OK) return timing.finish(st);
+            return timing.finish(
+                fill_out_image(out, film_density_cmy, ow, oh, in->color_space));
         } else if (tap == "final_rgb") {
             st = run_scan_film(eng, in, p, &final_rgb, nullptr, nullptr, &ow, &oh);
-            if (st != SPK_OK) return st;
-            return fill_out_image(out, final_rgb, ow, oh,
-                                  static_cast<int>(p->output_color_space));
+            if (st != SPK_OK) return timing.finish(st);
+            return timing.finish(fill_out_image(
+                out, final_rgb, ow, oh,
+                static_cast<int>(p->output_color_space)));
         }
-        return SPK_ERR_BAD_ARGS;  // unknown / print-only tap on scan_film route
+        return timing.finish(
+            SPK_ERR_BAD_ARGS);  // unknown / print-only tap on scan_film route
     }
 
     // Print route taps (filming -> printing -> scan).
     if (tap == "film_log_raw") {
         st = run_print(eng, in, p, nullptr, &log_raw, nullptr, nullptr, &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, log_raw, ow, oh, in->color_space);
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(fill_out_image(out, log_raw, ow, oh, in->color_space));
     } else if (tap == "film_density_cmy") {
         st = run_print(eng, in, p, nullptr, nullptr, &film_density_cmy, nullptr,
                        &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, film_density_cmy, ow, oh, in->color_space);
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(
+            fill_out_image(out, film_density_cmy, ow, oh, in->color_space));
     } else if (tap == "print_density_cmy") {
         st = run_print(eng, in, p, nullptr, nullptr, nullptr, &print_density_cmy,
                        &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, print_density_cmy, ow, oh, in->color_space);
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(
+            fill_out_image(out, print_density_cmy, ow, oh, in->color_space));
     } else if (tap == "final_rgb") {
         st = run_print(eng, in, p, &final_rgb, nullptr, nullptr, nullptr, &ow, &oh);
-        if (st != SPK_OK) return st;
-        return fill_out_image(out, final_rgb, ow, oh,
-                              static_cast<int>(p->output_color_space));
+        if (st != SPK_OK) return timing.finish(st);
+        return timing.finish(fill_out_image(
+            out, final_rgb, ow, oh,
+            static_cast<int>(p->output_color_space)));
     }
-    return SPK_ERR_BAD_ARGS;  // unknown tap
+    return timing.finish(SPK_ERR_BAD_ARGS);  // unknown tap
 }
 
 spk_status spk_meter_exposure_ev(spk_engine* eng, const spk_image* in,
                                  const spk_params* p, double* out_ev) {
-    if (!eng || !in || !p || !out_ev || !in->data) return SPK_ERR_BAD_ARGS;
-    if (in->width <= 0 || in->height <= 0) return SPK_ERR_BAD_ARGS;
+    return spk_meter_exposure_ev_cancellable(
+        eng, in, p, out_ev, nullptr, nullptr);
+}
+
+spk_status spk_meter_exposure_ev_cancellable(spk_engine* eng,
+                                             const spk_image* in,
+                                             const spk_params* p,
+                                             double* out_ev,
+                                             spk_cancel_check cancel,
+                                             void* cancel_user_data) {
+    clear_last_error_message();
+    if (!eng || !p || !out_ev || !valid_rgb_shape(in)) return SPK_ERR_BAD_ARGS;
+    if (!supported_input_color_space(p->input_color_space)) return SPK_ERR_BAD_ARGS;
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
 
     // AE off => the render applies no gain, so the caller's gain is unity (0 EV).
     *out_ev = 0.0;
@@ -2145,6 +3668,7 @@ spk_status spk_meter_exposure_ev(spk_engine* eng, const spk_image* in,
     *out_ev = spk::measure_auto_exposure_ev_f32(
         in->data, w, h, spk::AeColorSpace::kProPhotoRGB,
         /*apply_cctf_decoding=*/p->input_cctf_decoding != 0, method, known);
+    if (cancellation_requested(cancel, cancel_user_data)) return SPK_ERR_CANCELLED;
     return SPK_OK;
 }
 
@@ -2159,8 +3683,21 @@ static inline float shaper_to_linear(float e) {
 spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
                              int32_t shaper,
                              char* out_text, size_t out_cap, size_t* needed) {
+    return spk_bake_cube_lut_cancellable(
+        eng, p, lut_size, shaper, out_text, out_cap, needed, nullptr, nullptr);
+}
+
+spk_status spk_bake_cube_lut_cancellable(
+        spk_engine* eng, const spk_params* p, int lut_size, int32_t shaper,
+        char* out_text, size_t out_cap, size_t* needed,
+        spk_cancel_check cancel, void* cancel_user_data) {
+    clear_last_error_message();
+    spk::ScopedRenderTiming timing(spk::RTK_LUT_BAKE);
     if (needed) *needed = 0;
-    if (!eng || !p) return SPK_ERR_BAD_ARGS;
+    if (!eng || !p) return timing.finish(SPK_ERR_BAD_ARGS);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
 
     // Clamp the lattice size to a sane range. 33 is the default; below 2 a 3D LUT
     // is meaningless, and >256 explodes the bake cost (N^3 lattice points).
@@ -2233,6 +3770,9 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     const bool shaped = shaper != 0;
     size_t idx = 0;
     for (int r = 0; r < n; ++r) {
+        if (cancellation_requested(cancel, cancel_user_data)) {
+            return timing.finish(SPK_ERR_CANCELLED);
+        }
         float rv = static_cast<float>(r) / denom;
         if (shaped) rv = shaper_to_linear(rv);
         for (int g = 0; g < n; ++g) {
@@ -2256,12 +3796,17 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     std::vector<float> rgb;
     spk_status st;
     if (bp.scan_film) {
-        st = run_scan_film(eng, &in_img, &bp, &rgb, nullptr, nullptr);
+        st = run_scan_film(eng, &in_img, &bp, &rgb, nullptr, nullptr,
+                           nullptr, nullptr, cancel, cancel_user_data);
     } else {
-        st = run_print(eng, &in_img, &bp, &rgb, nullptr, nullptr, nullptr);
+        st = run_print(eng, &in_img, &bp, &rgb, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, cancel, cancel_user_data);
     }
-    if (st != SPK_OK) return st;
-    if (rgb.size() != count * 3) return SPK_ERR_INTERNAL;
+    if (st != SPK_OK) return timing.finish(st);
+    if (rgb.size() != count * 3) return timing.finish(SPK_ERR_INTERNAL);
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
 
     // --- Emit the .cube text -------------------------------------------------
     const char* cs_name = "sRGB";
@@ -2313,6 +3858,10 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     out += "DOMAIN_MAX 1.0 1.0 1.0\n";
 
     for (size_t i = 0; i < count; ++i) {
+        if ((i & 1023u) == 0u &&
+            cancellation_requested(cancel, cancel_user_data)) {
+            return timing.finish(SPK_ERR_CANCELLED);
+        }
         std::snprintf(line, sizeof(line), "%.6f %.6f %.6f\n",
                       static_cast<double>(rgb[i * 3 + 0]),
                       static_cast<double>(rgb[i * 3 + 1]),
@@ -2321,10 +3870,19 @@ spk_status spk_bake_cube_lut(spk_engine* eng, const spk_params* p, int lut_size,
     }
 
     const size_t req = out.size() + 1;  // include NUL terminator
+    if (cancellation_requested(cancel, cancel_user_data)) {
+        return timing.finish(SPK_ERR_CANCELLED);
+    }
     if (needed) *needed = req;
-    if (!out_text || out_cap < req) return SPK_ERR_BAD_ARGS;  // caller resizes & retries
+    // A null output with `needed` is the successful sizing-query form. Keeping
+    // it successful lets a JNI two-pass bake remain one successful logical
+    // timing context instead of poisoning it with an expected BAD_ARGS child.
+    if (!out_text) {
+        return timing.finish(needed ? SPK_OK : SPK_ERR_BAD_ARGS);
+    }
+    if (out_cap < req) return timing.finish(SPK_ERR_BAD_ARGS);
     std::memcpy(out_text, out.c_str(), req);
-    return SPK_OK;
+    return timing.finish(SPK_OK);
 }
 
 void spk_image_free(spk_image* img) {

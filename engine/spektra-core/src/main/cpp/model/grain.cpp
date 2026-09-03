@@ -21,7 +21,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <thread>
 #include <cmath>
 #include <vector>
 
@@ -57,6 +56,16 @@ void layer_particle_model(const float* density, int npix, int width, int height,
                           double density_max, double n_particles_per_pixel,
                           double grain_uniformity, uint64_t seed,
                           double blur_particle, float* out) {
+    if (npix <= 0) return;
+    if (!(n_particles_per_pixel > 0.0) ||
+        !std::isfinite(n_particles_per_pixel)) {
+        // Invalid imported geometry/particle scales can otherwise derive 0/Inf
+        // here and feed non-representable rates into the statistical samplers.
+        // Copying the shifted input makes this particle-sampling step an exact
+        // no-op at the caller's density-min seam; no RNG is consumed here.
+        if (out != density) std::copy(density, density + npix, out);
+        return;
+    }
     const double od_particle = density_max / n_particles_per_pixel;
 
     // PARALLEL, AND THREAD-INVARIANT. This stage was serial — the one per-pixel stage
@@ -90,14 +99,22 @@ void layer_particle_model(const float* density, int npix, int width, int height,
     // order, so dynamic assignment cannot change the result.
     const int nblocks = (npix + kGrainBlockPixels - 1) / kGrainBlockPixels;
     std::atomic<int> next_block{0};
-    auto worker = [&]() {
+    auto worker = [&](const std::atomic<bool>* stop) {
         for (;;) {
+            if (stop && stop->load(std::memory_order_relaxed)) break;
             const int b = next_block.fetch_add(1, std::memory_order_relaxed);
             if (b >= nblocks) break;
             const int i0 = b * kGrainBlockPixels;
             const int i1 = std::min(i0 + kGrainBlockPixels, npix);
             StatsRng rng(grain_block_seed(seed, b));
             for (int i = i0; i < i1; ++i) {
+                // Worker threads never touch the JNI-backed callback. They only
+                // observe the caller-owned stop flag, at a granularity small
+                // enough to bound even the expensive binomial inversion tail.
+                if (stop && (i & 63) == 0 &&
+                    stop->load(std::memory_order_relaxed)) {
+                    return;
+                }
                 // probability_of_development = clip(density/density_max, 1e-6, 1-1e-6)
                 double p = static_cast<double>(density[i]) / density_max;
                 if (p < 1e-6) p = 1e-6;
@@ -113,15 +130,11 @@ void layer_particle_model(const float* density, int npix, int width, int height,
     };
     int nthreads = spk::parallel_num_threads();
     if (nthreads > nblocks) nthreads = nblocks < 1 ? 1 : nblocks;
-    if (nthreads <= 1) {
-        worker();
-    } else {
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(nthreads) - 1);
-        for (int t = 1; t < nthreads; ++t) pool.emplace_back(worker);
-        worker();                       // the calling thread pulls its share too
-        for (auto& t : pool) t.join();
-    }
+    // The dynamic dispatcher preserves the fixed-block arithmetic above while
+    // containing worker and partial thread-construction failures. With an
+    // active JNI cancellation callback it keeps this caller as the sole polling
+    // orchestrator; otherwise the caller participates in the work queue.
+    spk::detail::parallel_dispatch_dynamic(nthreads, worker);
 
     // Per-particle dye-cloud blur: grain.py uses
     //   grain = fast_gaussian_filter(grain, blur_particle*sqrt(od_particle))

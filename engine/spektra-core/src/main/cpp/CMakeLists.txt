@@ -22,18 +22,27 @@ if (NOT CMAKE_CXX_FLAGS_DEBUG MATCHES "-O")
 endif()
 
 
+# EVERY SOURCE MUST BE LISTED HERE BY HAND. The host parity build compiles with a
+# glob (`kernels/*.cpp model/*.cpp ...` — see the build line in CLAUDE.md), so a new
+# .cpp picked up there is NOT picked up here. A file missing from this list therefore
+# passes the whole 39-gate parity suite locally and fails only in the Android
+# `ninja ... spektra` step, which is a slow and confusing way to find out. That is
+# exactly how kernels/fft.cpp and kernels/fft_convolve.cpp broke CI on 551c57f.
 add_library(spektra SHARED
         spektra.cpp
         spektra_jni.cpp
         # Kernels:
         kernels/interp.cpp
         kernels/gaussian.cpp
+        kernels/gaussian_hwy.cpp            # Highway SIMD FIR (compiles to nothing unless SPK_ENABLE_HIGHWAY)
         kernels/exponential_filter.cpp      # float64 Gaussian + exponential mixture (spatial)
         kernels/spectral_upsampling.cpp     # Hanatos2025 RGB->spectrum (M3)
         kernels/stats.cpp                   # Poisson + Binomial samplers (grain, M6)
         kernels/lut3d.cpp                   # opt-in PCHIP 3D LUT accel (M7, default OFF)
         kernels/lut3d_cache.cpp             # engine memo for built 3D LUTs (PERF, byte-identical)
         kernels/parallel.cpp                # deterministic fork-join threading (per-pixel stages + spatial/LUT maps)
+        kernels/fft.cpp                     # deterministic radix-2 complex FFT (fixed butterfly order)
+        kernels/fft_convolve.cpp            # O(n log n) diffusion PSF convolution (#160)
         kernels/tonecurve.cpp               # optional 1D tone curve on final display RGB
         kernels/half.cpp                    # fp16 (NEON) <-> f32 conversion (preview proxy storage)
         # LUT/asset loaders:
@@ -55,6 +64,7 @@ add_library(spektra SHARED
         # Filming stage (rgb -> raw -> negative density), ported in M4:
         model/couplers.cpp                   # DIR couplers (M4)
         runtime/params.cpp                   # minimal digested filming params (M4)
+        runtime/tc_lut_cache.cpp             # byte-budgeted filming tc_lut LRU (#142)
         runtime/stages/filming.cpp           # rgb -> raw -> film density CMY (M4)
         # Printing (enlarger) stage + dichroic filters, ported in M4
         # (negative -> enlarger expose -> print develop -> scan print):
@@ -95,11 +105,99 @@ if(SPK_ENABLE_VULKAN)
     target_link_libraries(spektra ${vulkan-lib})
 endif()
 
+# OPT-IN Highway SIMD kernels (#124; plan in docs/research/highway-vendoring.md).
+# OFF by default: without it kernels/gaussian_hwy.cpp compiles to nothing and the
+# library is byte-identical to today. When ON, google/highway 1.4.0 is fetched at
+# configure time (release asset + SHA256, the lib:libraw FetchContent pattern) and
+# the f32 separable-FIR Gaussian gains explicit SIMD lanes.
+#
+# DETERMINISM: the ported passes vectorise ACROSS OUTPUT PIXELS only — each output's
+# accumulation order over the kernel taps is unchanged — so the SIMD path is
+# bit-identical to the scalar one, not an approximation. HWY_COMPILE_ONLY_STATIC
+# pins ONE target per ABI (no runtime dispatch), making instruction selection an
+# asserted contract rather than a compiler-lowering accident; see the static_assert
+# in kernels/gaussian_hwy.cpp.
+option(SPK_ENABLE_HIGHWAY "Build the Highway SIMD kernels (opt-in, bit-identical)" OFF)
+set(SPK_HIGHWAY_VERSION "1.4.0" CACHE STRING "Vendored google/highway release tag")
+set(SPK_HIGHWAY_URL
+    "https://github.com/google/highway/releases/download/${SPK_HIGHWAY_VERSION}/highway-${SPK_HIGHWAY_VERSION}.tar.gz"
+    CACHE STRING "Highway release-asset tarball URL")
+# Release asset (immutable), verified two ways in docs/research/highway-vendoring.md.
+set(SPK_HIGHWAY_SHA256 "36f672ab48ddb3c8555e9e89e16fe400cd7d16c6eb455a1a3d0c146a63ababdc"
+    CACHE STRING "SHA256 of the Highway release asset")
+# Escape hatch for offline/air-gapped builds: point at an extracted checkout.
+set(SPK_HIGHWAY_SOURCE_DIR "" CACHE PATH
+    "Pre-vendored highway source dir (contains hwy/highway.h); skips FetchContent")
+if(SPK_ENABLE_HIGHWAY)
+    # HWY_ENABLE_TESTS=OFF is MANDATORY: ON downloads googletest at *configure* time.
+    set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(HWY_FORCE_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    if(SPK_HIGHWAY_SOURCE_DIR AND EXISTS "${SPK_HIGHWAY_SOURCE_DIR}/hwy/highway.h")
+        message(STATUS "spektra: using pre-vendored Highway at ${SPK_HIGHWAY_SOURCE_DIR}")
+        add_subdirectory("${SPK_HIGHWAY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/hwy-build" EXCLUDE_FROM_ALL)
+    else()
+        include(FetchContent)
+        FetchContent_Declare(
+            highway_upstream
+            URL "${SPK_HIGHWAY_URL}"
+            URL_HASH SHA256=${SPK_HIGHWAY_SHA256}
+        )
+        FetchContent_GetProperties(highway_upstream)
+        if(NOT highway_upstream_POPULATED)
+            FetchContent_Populate(highway_upstream)
+        endif()
+        add_subdirectory("${highway_upstream_SOURCE_DIR}" "${highway_upstream_BINARY_DIR}"
+                         EXCLUDE_FROM_ALL)
+    endif()
+    target_compile_definitions(spektra PRIVATE
+        SPK_ENABLE_HIGHWAY=1
+        HWY_COMPILE_ONLY_STATIC=1   # one target per ABI, no runtime dispatch
+        HWY_DISABLE_PCLMUL_AES=1)   # x86_64: keep the baseline at SSE4 w/o PCLMUL/AES
+    target_link_libraries(spektra hwy)
+endif()
+
 # OPT-IN Intel oneTBB parallel backend (default OFF). When ON, kernels/parallel.h
 # schedules the per-pixel stages through tbb::parallel_for (simple_partitioner over the
 # same fixed chunk boundaries -> still bit-identical across thread counts). Default
 # builds keep the dependency-free fork-join and are unchanged. Provide oneTBB via the
 # toolchain/find_package or a pinned FetchContent (mirroring lib:libraw) when enabling.
+# ---------------------------------------------------------------------------
+# OPT-IN per-ABI microarchitecture tuning (perf-lab).
+#
+# The shipped flags target the ABI baseline: arm64-v8a means ARMv8.0, so the
+# compiler may not use anything a 2018 phone lacked, even on a 2026 flagship.
+# -mcpu lets it schedule for the real part and use the later ISA revisions
+# (dotprod, fp16 arithmetic, LSE atomics) it already knows about.
+#
+# WHY THIS IS OFF BY DEFAULT AND SHOULD STAY THAT WAY UNTIL MEASURED: raising
+# the baseline produces an APK that SIGILLs on any device older than the chosen
+# core. It also changes instruction selection, so it can move the last bits of a
+# float result and must be re-gated against the parity suite before it ships.
+# The safe shipping form of this idea is -mtune (schedule for a core, keep the
+# baseline ISA), which is what SPK_TUNE_ONLY selects.
+option(SPK_TUNE_ARM64 "arm64: tune codegen for a specific core (perf lab)" OFF)
+set(SPK_TUNE_ARM64_CPU "cortex-a76" CACHE STRING
+    "Core to pass to -mcpu/-mtune when SPK_TUNE_ARM64 is on")
+option(SPK_TUNE_ONLY "Use -mtune (schedule only, baseline ISA kept) rather than -mcpu" ON)
+
+if(SPK_TUNE_ARM64 AND ANDROID_ABI STREQUAL "arm64-v8a")
+    if(SPK_TUNE_ONLY)
+        target_compile_options(spektra PRIVATE -mtune=${SPK_TUNE_ARM64_CPU})
+        message(STATUS "spektra: -mtune=${SPK_TUNE_ARM64_CPU} (baseline ISA kept)")
+    else()
+        target_compile_options(spektra PRIVATE -mcpu=${SPK_TUNE_ARM64_CPU})
+        message(WARNING
+            "spektra: -mcpu=${SPK_TUNE_ARM64_CPU} RAISES THE ISA BASELINE. The "
+            "resulting library will crash with SIGILL on older arm64 devices, and "
+            "instruction selection changes must be re-gated against the parity "
+            "suite before shipping.")
+    endif()
+endif()
+
 option(SPK_USE_TBB "Use Intel oneTBB as the parallel-for backend" OFF)
 if(SPK_USE_TBB)
     find_package(TBB REQUIRED)
@@ -138,3 +236,6 @@ target_link_options(spektra PRIVATE "-Wl,-z,max-page-size=16384")
 # tests/test_grain_sublayer.cpp (sublayer + micro-structure; also asserts a
 # distinct noise character vs the non-sublayer path). References regenerated by
 # tests/gen_grain_ref.py / tests/gen_grain_sublayer_ref.py (oracle, fixed seed).
+# Being statistical, neither can see an element-wise change in the samplers, so
+# kernels/stats.cpp's degenerate-CDF short-circuit is gated separately and
+# element-wise by tests/test_binomial_shortcircuit.cpp.

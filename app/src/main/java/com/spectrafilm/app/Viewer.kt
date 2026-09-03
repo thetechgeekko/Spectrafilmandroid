@@ -41,9 +41,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -62,15 +65,29 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.IntOffset
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlin.math.min
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
+import java.util.IdentityHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -98,12 +115,18 @@ fun GpuPreviewSurface(
     onZoomStart: () -> Unit = {},
     onZoomIn: () -> Unit = onZoomStart,
     onUnavailable: () -> Unit = {},
+    // Height of whatever overlays the bottom of this surface (the floating adjustment panel):
+    // the zoom control centres in the part that is still visible (#181, 200% font).
+    controlsBottomInset: Dp = 0.dp,
 ) {
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     val aspect = proxy.width.toFloat() / proxy.height.toFloat()
+    val previewDesc = stringResource(R.string.tool_viewer_preview_desc)
     Box(
         modifier = modifier
             .onSizeChanged { viewSize = it }
+            // The GL view has no semantics of its own; describe the preview + its gestures here.
+            .semantics { contentDescription = previewDesc }
             .pointerInput(Unit) {
                 // This surface is fit-only; any pinch hands off to the CPU zoom path.
                 detectTransformGestures { _, _, zoom, _ ->
@@ -131,7 +154,10 @@ fun GpuPreviewSurface(
         // ZoomableImage already zoomed (the CPU path owns pinch/pan + the sharp ROI render).
         ZoomButton(
             "+",
-            modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
+            contentDescription = stringResource(R.string.tool_viewer_zoom_in),
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 6.dp, bottom = controlsBottomInset),
         ) { onZoomIn() }
     }
 }
@@ -173,11 +199,13 @@ fun ZoomableImage(
     onRoiSettled: ((RoiRect) -> Unit)? = null,
     onRoiCleared: (() -> Unit)? = null,
     roiOverlay: RoiOverlay? = null,
+    // See [GpuPreviewSurface.controlsBottomInset].
+    controlsBottomInset: Dp = 0.dp,
     // Scale to start at on first composition — used when the GPU fit surface hands off via its
     // "+" button so zoom-in lands already zoomed instead of at fit. Default 1f (fit) everywhere else.
     initialScale: Float = 1f,
 ) {
-    var scale by remember { mutableStateOf(initialScale) }
+    var scale by remember { mutableFloatStateOf(initialScale) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
     // While zoomed, an edit (renderKey bump) makes the current sharp ROI crop stale: hide it so the
@@ -209,12 +237,25 @@ fun ZoomableImage(
         }
     }
 
-    // Clamp the pan so the (scaled) content stays within the view bounds.
-    fun clampOffset(raw: Offset, s: Float): Offset {
-        val maxX = max(0f, (viewSize.width * (s - 1f)) / 2f)
-        val maxY = max(0f, (viewSize.height * (s - 1f)) / 2f)
-        return Offset(raw.x.coerceIn(-maxX, maxX), raw.y.coerceIn(-maxY, maxY))
-    }
+    // Clamp the pan so the (scaled) CONTENT stays within the view bounds.
+    //
+    // The bound must come from the fitted CONTENT rect, not the viewport. The
+    // bitmap is drawn ContentScale.Fit and is therefore LETTERBOXED: at fit it
+    // fills one axis and leaves bars on the other. Using the viewport extent on
+    // the letterboxed axis over-permits the pan by exactly the letterbox ratio,
+    // and the image can be dragged clean out of view — a black viewport with the
+    // zoom pill still reading 410%.
+    //
+    // Measured on device (998x1802 viewport, 4:3 landscape content, s=4.1):
+    // content fits to 998x749, so the true bound is (749*4.1 - 1802)/2 = 634,
+    // while the viewport formula gave (1802*(4.1-1))/2 = 2793 — 4.4x too far.
+    //
+    // The horizontal axis was correct only BY ACCIDENT: this content fills the
+    // width at fit, so fitW == viewSize.width and the two formulas coincide.
+    // That is why panning left/right behaved and up/down went black; a PORTRAIT
+    // photo on this same screen would have broken the other way round.
+    fun clampOffset(raw: Offset, s: Float): Offset =
+        clampPanOffset(raw, viewSize, s, aspect)
 
     Box(
         modifier = modifier
@@ -255,13 +296,15 @@ fun ZoomableImage(
             },
         contentAlignment = Alignment.Center,
     ) {
+        val zoomState = stringResource(R.string.tool_viewer_zoom_state, (scale * 100f).roundToInt())
         Image(
             bitmap = image,
-            contentDescription = "preview",
+            contentDescription = stringResource(R.string.tool_viewer_preview_desc),
             contentScale = ContentScale.Fit,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspect)
+                .semantics { stateDescription = zoomState }
                 .graphicsLayer(
                     scaleX = scale,
                     scaleY = scale,
@@ -302,30 +345,35 @@ fun ZoomableImage(
         // drive the SAME scale/offset as the gestures, so pan-clamping and the sharp ROI render
         // apply identically. Anchored to the right edge so it clears the bottom control row.
         Column(
-            modifier = Modifier.align(Alignment.CenterEnd).padding(end = 6.dp),
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 6.dp, bottom = controlsBottomInset),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ZoomButton("+") {
+            ZoomButton("+", stringResource(R.string.tool_viewer_zoom_in)) {
                 val ns = (scale * 1.6f).coerceIn(MIN_ZOOM, MAX_ZOOM)
                 scale = ns
                 offset = clampOffset(offset, ns)
             }
             if (scale > 1.01f) {
                 Text(
-                    "${(scale * 100f).roundToInt()}%",
+                    stringResource(R.string.tool_viewer_zoom_percent, (scale * 100f).roundToInt()),
                     color = Color.White,
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier
                         .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
                         .padding(horizontal = 6.dp, vertical = 2.dp),
                 )
-                ZoomButton("−") {  // minus
+                ZoomButton("−", stringResource(R.string.tool_viewer_zoom_out)) {  // minus
                     val ns = (scale / 1.6f).coerceIn(MIN_ZOOM, MAX_ZOOM)
                     scale = ns
                     offset = if (ns <= 1.01f) Offset.Zero else clampOffset(offset, ns)
                 }
-                ZoomButton("Fit") {
+                ZoomButton(
+                    stringResource(R.string.tool_viewer_zoom_fit_short),
+                    stringResource(R.string.tool_viewer_zoom_fit),
+                ) {
                     scale = 1f
                     offset = Offset.Zero
                 }
@@ -334,16 +382,26 @@ fun ZoomableImage(
     }
 }
 
-/** A small translucent circular button for the [ZoomableImage] zoom-control cluster. */
+/**
+ * A small translucent circular button for the [ZoomableImage] zoom-control cluster. [label] is the
+ * visible glyph ("+", "−", "Fit"); [contentDescription] is what TalkBack announces instead of it.
+ */
 @Composable
-private fun ZoomButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun ZoomButton(
+    label: String,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Surface(
         shape = CircleShape,
         color = Color.Black.copy(alpha = 0.5f),
         modifier = modifier
+            .minimumInteractiveComponentSize()
             .size(40.dp)
             .clip(CircleShape)
-            .clickable(onClick = onClick),
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { this.contentDescription = contentDescription },
     ) {
         Box(contentAlignment = Alignment.Center) {
             Text(
@@ -376,6 +434,21 @@ private fun fitRect(view: IntSize, aspect: Float): FloatArray {
     val left = view.width / 2f - fitW / 2f
     val top = view.height / 2f - fitH / 2f
     return floatArrayOf(left, top, fitW, fitH)
+}
+
+/**
+ * Clamp a pan offset so the SCALED CONTENT cannot be dragged outside the viewport.
+ *
+ * Top-level and `internal` so the math is unit-testable — the defect below shipped
+ * because the only clamp coverage used a square image in a square view, i.e. the
+ * one geometry where the bug is invisible.
+ */
+internal fun clampPanOffset(raw: Offset, view: IntSize, scale: Float, aspect: Float): Offset {
+    if (view.width <= 0 || view.height <= 0 || !(aspect > 0f)) return Offset.Zero
+    val (_, _, fitW, fitH) = fitRect(view, aspect)
+    val maxX = max(0f, (fitW * scale - view.width) / 2f)
+    val maxY = max(0f, (fitH * scale - view.height) / 2f)
+    return Offset(raw.x.coerceIn(-maxX, maxX), raw.y.coerceIn(-maxY, maxY))
 }
 
 /** Inverse of the viewport transform: a view-space point → normalized image coords (UNclamped). */
@@ -453,11 +526,18 @@ fun CompareSlider(
     after: Bitmap,
     modifier: Modifier = Modifier,
 ) {
-    var split by remember { mutableStateOf(0.5f) }
-    var width by remember { mutableStateOf(0) }
+    var split by remember { mutableFloatStateOf(0.5f) }
+    var width by remember { mutableIntStateOf(0) }
     val aspect = after.width.toFloat() / after.height.toFloat()
     val beforeImg = remember(before) { before.asImageBitmap() }
     val afterImg = remember(after) { after.asImageBitmap() }
+    // Drag/tap-only wipe: one merged node describing the comparison, its split as state, and
+    // three custom actions so a screen reader can move the wipe without a gesture.
+    val compareDesc = stringResource(R.string.tool_viewer_compare_desc)
+    val compareState = stringResource(R.string.tool_viewer_compare_state, (split * 100f).roundToInt())
+    val showBefore = stringResource(R.string.tool_viewer_compare_show_before)
+    val showAfter = stringResource(R.string.tool_viewer_compare_show_after)
+    val splitHalf = stringResource(R.string.tool_viewer_compare_split_half)
 
     Box(
         modifier = modifier
@@ -465,6 +545,15 @@ fun CompareSlider(
             .aspectRatio(aspect)
             .clipToBounds()
             .onSizeChanged { width = it.width }
+            .semantics(mergeDescendants = true) {
+                contentDescription = compareDesc
+                stateDescription = compareState
+                customActions = listOf(
+                    CustomAccessibilityAction(showBefore) { split = 1f; true },
+                    CustomAccessibilityAction(showAfter) { split = 0f; true },
+                    CustomAccessibilityAction(splitHalf) { split = 0.5f; true },
+                )
+            }
             .pointerInput(Unit) {
                 detectTapGestures { pos ->
                     if (width > 0) split = (pos.x / width).coerceIn(0f, 1f)
@@ -477,12 +566,12 @@ fun CompareSlider(
             },
         contentAlignment = Alignment.Center,
     ) {
-        // After (full frame).
-        Image(afterImg, "after", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+        // After (full frame). Both images are described by the parent node, so no per-image cd.
+        Image(afterImg, null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
         // Before, clipped to the left of the split via a draw-phase rect clip.
         Image(
             bitmap = beforeImg,
-            contentDescription = "before",
+            contentDescription = null,
             contentScale = ContentScale.Fit,
             modifier = Modifier
                 .fillMaxSize()
@@ -501,8 +590,8 @@ fun CompareSlider(
                     strokeWidth = 3f,
                 )
             }
-            CompareTag("BEFORE", Alignment.TopStart)
-            CompareTag("AFTER", Alignment.TopEnd)
+            CompareTag(stringResource(R.string.tool_viewer_before_tag), Alignment.TopStart)
+            CompareTag(stringResource(R.string.tool_viewer_after_tag), Alignment.TopEnd)
         }
     }
 }
@@ -525,25 +614,34 @@ private fun CompareTag(text: String, alignment: Alignment) {
 
 /**
  * A compact, translucent histogram overlaid on the TOP EDGE of the live preview
- * (Lightroom-mobile style). Reuses [computeHistogram] (run off the main thread)
- * and [drawHistogram]; recomputes when the preview [bitmap] identity changes.
- *
- * The bitmap is the live preview reference — the render path replaces (never
- * recycles) it, so the background read here cannot hit a recycled buffer.
+ * (Lightroom-mobile style). Sampling and binning both run off-main under an explicit read lease.
+ * Replacing the bitmap resets the remembered bins synchronously, and retirement defers recycle
+ * until any already-running reader releases its lease.
  */
 @Composable
 fun PreviewHistogramOverlay(bitmap: Bitmap, modifier: Modifier = Modifier) {
-    var hist by remember { mutableStateOf<Histogram?>(null) }
+    // Keying state by identity prevents the previous frame's bins from being displayed while the
+    // new frame is sampled. LaunchedEffect cancellation also rejects any late old-frame result.
+    var hist by remember(bitmap) { mutableStateOf<Histogram?>(null) }
     LaunchedEffect(bitmap) {
-        hist = withContext(Dispatchers.Default) { computeHistogram(bitmap) }
+        hist = try {
+            computeHistogram(bitmap)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            Diag.w("preview histogram unavailable: ${failure.message}")
+            null
+        }
     }
     val h = hist ?: return
+    val histogramDesc = stringResource(R.string.tool_viewer_histogram_desc)
     Box(
         modifier = modifier
             .fillMaxWidth(0.6f)
             .height(56.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(Color.Black.copy(alpha = 0.42f)),
+            .background(Color.Black.copy(alpha = 0.42f))
+            .semantics { contentDescription = histogramDesc },
     ) {
         Canvas(Modifier.fillMaxSize().padding(4.dp)) { drawHistogram(h) }
     }
@@ -558,31 +656,137 @@ class Histogram(
     val peak: Int,
 )
 
-/** Sample the bitmap (stride-decimated for speed) into 256-bin RGB + luma histograms. */
-fun computeHistogram(bmp: Bitmap): Histogram {
+/**
+ * Small identity-keyed read-lease registry. The owner may retire a value immediately; physical
+ * release is deferred until existing readers close, and new readers are rejected after retirement.
+ */
+internal class RetirableReadLeaseRegistry<T : Any>(
+    private val isPhysicallyRetired: (T) -> Boolean,
+    private val physicallyRetire: (T) -> Unit,
+    private val beforeLeaseConstruction: () -> Unit = {},
+) {
+    private data class State(var readers: Int = 0, var retired: Boolean = false)
+
+    internal class Lease<T : Any>(
+        val value: T,
+        private val release: () -> Unit,
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean(false)
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) release()
+        }
+    }
+
+    private val states = IdentityHashMap<T, State>()
+
+    @Synchronized
+    fun acquire(value: T): Lease<T>? {
+        if (isPhysicallyRetired(value)) return null
+        val state = states.getOrPut(value) { State() }
+        if (state.retired) return null
+        state.readers++
+        return try {
+            beforeLeaseConstruction()
+            Lease(value) { release(value, state) }
+        } catch (failure: Throwable) {
+            state.readers--
+            if (state.readers == 0 && !state.retired) states.remove(value)
+            throw failure
+        }
+    }
+
+    @Synchronized
+    fun retire(value: T) {
+        if (isPhysicallyRetired(value)) return
+        val state = states[value]
+        if (state == null) {
+            // Retire under the same monitor as acquire. This closes the acquire/recycle window.
+            physicallyRetire(value)
+            return
+        }
+        if (state.retired) return
+        state.retired = true
+        if (state.readers == 0) retireNow(value, state)
+    }
+
+    @Synchronized
+    private fun release(value: T, expected: State) {
+        val state = states[value]
+        check(state === expected && state.readers > 0) { "read-lease registry underflow" }
+        state.readers--
+        if (state.retired && state.readers == 0) retireNow(value, state)
+    }
+
+    /** Caller holds this registry's monitor. */
+    private fun retireNow(value: T, expected: State) {
+        check(states[value] === expected)
+        physicallyRetire(value)
+        states.remove(value)
+    }
+}
+
+private val previewBitmapReadLeases = RetirableReadLeaseRegistry<Bitmap>(
+    isPhysicallyRetired = { bitmap -> bitmap.isRecycled },
+    physicallyRetire = { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() },
+)
+
+/** Retire a preview deterministically once every histogram reader has released it. */
+internal fun retirePreviewBitmap(bitmap: Bitmap) {
+    previewBitmapReadLeases.retire(bitmap)
+}
+
+/** Bitmap-independent immutable sample set; safe to bin after its Bitmap is retired. */
+internal class HistogramSamples internal constructor(pixels: IntArray) {
+    internal val pixels: IntArray = pixels.copyOf()
+}
+
+/** Capture stride-decimated pixels while the caller holds a preview read lease. */
+private fun sampleHistogram(bmp: Bitmap): HistogramSamples {
     val w = bmp.width
     val h = bmp.height
-    val r = IntArray(256); val g = IntArray(256); val b = IntArray(256); val l = IntArray(256)
-    // Cap the number of sampled pixels for responsiveness on large bitmaps.
     val total = w.toLong() * h.toLong()
     val targetSamples = 200_000L
     val stride = max(1, (total / targetSamples).toInt())
-    val px = IntArray(w)
+    val sampledWidth = (w + stride - 1) / stride
+    val sampledHeight = (h + stride - 1) / stride
+    val samples = IntArray(sampledWidth * sampledHeight)
+    val row = IntArray(w)
+    var sampleIndex = 0
     var sy = 0
     while (sy < h) {
-        bmp.getPixels(px, 0, w, 0, sy, w, 1)
+        bmp.getPixels(row, 0, w, 0, sy, w, 1)
         var sx = 0
         while (sx < w) {
-            val c = px[sx]
-            val rr = (c shr 16) and 0xFF
-            val gg = (c shr 8) and 0xFF
-            val bb = c and 0xFF
-            r[rr]++; g[gg]++; b[bb]++
-            val y = ((rr * 54 + gg * 183 + bb * 19) shr 8).coerceIn(0, 255)
-            l[y]++
+            samples[sampleIndex++] = row[sx]
             sx += stride
         }
         sy += stride
+    }
+    check(sampleIndex == samples.size) { "histogram sample geometry mismatch" }
+    return HistogramSamples(samples)
+}
+
+/**
+ * Sample a bitmap (stride-decimated for speed) into 256-bin RGB + luma histograms. The entire
+ * Bitmap access runs on Dispatchers.Default and is protected from deterministic recycle by a read
+ * lease. A frame retired before the worker acquires it produces no histogram.
+ */
+suspend fun computeHistogram(bmp: Bitmap): Histogram? = withContext(Dispatchers.Default) {
+    val lease = previewBitmapReadLeases.acquire(bmp) ?: return@withContext null
+    lease.use { computeHistogram(sampleHistogram(it.value)) }
+}
+
+/** Bin a Bitmap-independent sample captured by [sampleHistogram]. */
+internal fun computeHistogram(samples: HistogramSamples): Histogram {
+    val r = IntArray(256); val g = IntArray(256); val b = IntArray(256); val l = IntArray(256)
+    for (c in samples.pixels) {
+        val rr = (c shr 16) and 0xFF
+        val gg = (c shr 8) and 0xFF
+        val bb = c and 0xFF
+        r[rr]++; g[gg]++; b[bb]++
+        val y = ((rr * 54 + gg * 183 + bb * 19) shr 8).coerceIn(0, 255)
+        l[y]++
     }
     var peak = 1
     for (i in 0 until 256) {
@@ -639,9 +843,10 @@ fun MagnifierOverlay(
             modifier = Modifier.padding(24.dp),
         ) {
             Text(
-                "100% crop",
+                stringResource(R.string.tool_viewer_magnifier_title),
                 color = Color.White,
                 style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.semantics { heading() },
             )
             Box(
                 Modifier
@@ -656,7 +861,7 @@ fun MagnifierOverlay(
                     // 1:1 — no upscale of the preview — so dye-cloud grain truly resolves.
                     Image(
                         bitmap = c.asImageBitmap(),
-                        contentDescription = "100% crop",
+                        contentDescription = stringResource(R.string.tool_viewer_magnifier_image_desc),
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -664,20 +869,23 @@ fun MagnifierOverlay(
                     CircularProgressIndicator(color = Color.White)
                 }
             }
+            // Progress copy is announced as it changes (polite: never interrupts).
             Text(
                 status,
                 color = Color.White.copy(alpha = 0.8f),
                 style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
             )
             if (rendering) {
                 Text(
-                    "Rendering full-resolution crop…",
+                    stringResource(R.string.tool_viewer_magnifier_rendering),
                     color = Color.White.copy(alpha = 0.7f),
                     style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
             }
             TextButton(onClick = onClose) {
-                Text("Close", color = Color.White)
+                Text(stringResource(R.string.tool_close), color = Color.White)
             }
         }
     }

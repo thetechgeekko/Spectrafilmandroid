@@ -1,6 +1,17 @@
-# Spektrafilm for Android 
+# Spektrafilm for Android
+
+> **Development status:** the current tree has active post-v0.9.0 implementation work and remains
+> under a production-release hold. Public positioning relative to the owner's Latent camera project
+> is an unresolved human decision in
+> [Make README and project status truthful for the next release](https://github.com/thetechgeekko/Spektrafilm-android/issues/144).
+> Live engineering work and known gates are in the [execution index](docs/EXECUTION_INDEX.md).
+
+<details>
+<summary>Earlier owner status note (retained verbatim pending that decision)</summary>
 
 Hello fellow geeks this app was a concept to do Spectral simulation BUT getting it perfect took a long time even after using Claude Max plan and running multiple agents to complete the app. So basically its a AI slop (And i am sorry for that). Even after getting good results from the app i was not satisfied. As i wanted a app which actually takes raw and processes it at extreme super fast speed just like taking a HDR+ photo in GCAM. As soon as i exported one photo from this app i was confident that i could do better and relentlessly worked on a different app which can take straight film emulated high images with a swipe to change presets, and have a one another way of taking the picture the HDR way not like Google's exposure fusion which gives pop effect to a photo. Researching day and night , but no luck . First i tried taking raw capture straight from sensor just like how motioncam does, yes, it is very hard until you read AOSP and everything was laid out there but you have to add your own tricks like using multiple workers to process the raw stream, package the raw buffer, merge bracketed buffer, get depth map , do film emulation and export the image as jpeg. I also tried taking raw frames+pcm audio+gyro data and convert it with film emulation Its still under WIP as there are so many bugs and i do not want to use AI for this as this is one of the projects that I wanted to do since 2016. So, therefore from this moment this app will be superseded by "Latent" a Film emulation Camera app. If i had any free time i will update the app and make it faster if someone needs it.
+
+</details>
 
 Spectral film simulation on your phone — a native port of the
 [spektrafilm](https://github.com/andreavolpato/spektrafilm) engine, with a Jetpack Compose editor.
@@ -32,11 +43,12 @@ sensitivities, develops the dyes through the film's measured density curves, pri
 through a virtual enlarger onto paper, and scans the result. Negative, enlarger, print, scan — the
 whole chain, the way it really happens.
 
-The engine is a faithful C++ port of Andrea Volpato's research project. Every stage was checked
-bit-for-bit against the original Python engine, so what you get on your phone matches what the
-desktop tool produces. The science, the film-stock measurements, and the spectral data are all his
-work; this project brings them to Android with an editor that should feel familiar if you've used
-Lightroom.
+The engine is a parity-first C++ port of Andrea Volpato's research project. Its stages are checked
+against the pinned Python oracle within the declared numeric tolerance, with byte-identical output
+across worker counts for the same build. That does not imply identical bytes across CPU
+architectures, compiler builds, CPU and GPU routes, or encoded containers. The science, film-stock
+measurements, and spectral data are upstream work; this project brings them to Android with an
+editor that should feel familiar if you've used Lightroom.
 
 ## What you can do with it
 
@@ -48,10 +60,11 @@ combinations.
 **Start from a look, then make it yours.** 28 built-in presets cover researched film-and-print
 combinations. You can save your own, and import or export them to share.
 
-**Tune the whole pipeline.** Every parameter from the desktop tool is here, organized the same way:
-exposure and auto-metering (7 patterns), DIR couplers, halation and in-emulsion scatter, diffusion
-filters, the enlarger's dichroic filters and print exposure, grain (a stochastic particle model with
-sublayers and micro-structure), and the scanner. Changes preview live.
+**Tune the film pipeline.** The current pinned port exposes exposure and auto-metering (7 patterns),
+DIR couplers, halation and in-emulsion scatter, diffusion filters, the enlarger's dichroic filters
+and print exposure, grain (a stochastic particle model with sublayers and micro-structure), and the
+scanner. Latest-upstream coverage and any inert or unavailable controls are tracked explicitly; the
+README does not treat an older parity baseline as permanent full-feature parity.
 
 **Edit like a photographer.** A tone curve (master plus per-channel red/green/blue), contrast,
 saturation and vibrance, and local masks — radial, gradient, and luminance/color range with
@@ -63,20 +76,27 @@ simulation underneath stays untouched.
 photo, and "balance to film stock" warms the input to a tungsten stock's reference light — the
 digital equivalent of an 85 filter — so tungsten film doesn't render a daylight scene blue.
 
-**Bring in RAW, send out real files.** RAW and DNG import through LibRaw (including Samsung Expert
-RAW / compressed DNG), plus the usual photo picker and a built-in demo image. Export to JPEG, Ultra
-HDR, 8- or 16-bit PNG, 16- or 32-bit TIFF, or a scene-linear TIFF for grading elsewhere — in any of
-6 output color spaces, with source EXIF carried across. You can also export the look as a 3D LUT
-(.cube or CLF).
+**Bring in RAW, send out real files.** Supported RAW and DNG files use the pinned, patched LibRaw
+decoder; unsupported compressed inputs may use Android's display-referred platform fallback and
+are not claimed to be RAW/oracle-identical. The usual photo picker and a built-in demo image are
+also available. Rendered JPEG, PNG8/16, and TIFF16/32F exports offer six output spaces. PNG16 and
+rendered TIFF carry the selected ICC profile; bitmap JPEG/PNG8 tagging needs API 26+, falls back to
+plain sRGB tagging on API 24–25, and cannot faithfully tag ACES in its 8-bit path. Scene-linear
+TIFF32F is a separate pre-simulation export: verbatim decoded input primaries, deliberately untagged
+and EXIF-Uncalibrated for grading elsewhere. An experimental Ultra HDR container exists, but its
+honest gain-map/transfer release contract remains open. Source EXIF carry-through currently applies
+to JPEG. You can also bake the engine look as a 3D LUT (`.cube` or CLF); that synthetic-lattice
+operation excludes source-dependent and spatial/stochastic effects.
 
 **Keep your originals.** Edits are stored as a sidecar keyed to the source file and re-applied when
 you reopen or export. The original RAW is never modified.
 
 ## Install
 
-Download the APK from the [Releases](../../releases/latest) page (or grab the build artifact from the
-latest green CI run), allow installs from unknown sources, and open it. Minimum Android 7.0 (API 24).
-The native engine ships for arm64-v8a, armeabi-v7a, and x86_64.
+Download the latest public APK from the
+[Releases](https://github.com/thetechgeekko/Spektrafilm-android/releases/latest) page, allow installs from
+unknown sources, and open it. CI artifacts are development evidence, not production-signed releases.
+Minimum Android 7.0 (API 24). The native engine ships for arm64-v8a, armeabi-v7a, and x86_64.
 
 ## How it was made
 
@@ -96,9 +116,11 @@ This app stands on open color science and open source, and the credit belongs to
 
 ### A note on accuracy
 
-The port was done parity-first. We ran the real Python engine headless as a live oracle, captured
-golden vectors of every intermediate result, then ported each stage to C++ and gated it against
-those vectors. A `tools/parity` harness and CI keep it honest on every commit.
+The port was done parity-first. We ran the real Python engine headless as an oracle, captured golden
+vectors of intermediate results, then ported each stage to C++ and gated it against those vectors.
+The current gate is oracle tolerance (`max_abs <= 1e-4`, `rms <= 1e-5`) plus same-build
+worker-count invariance. A `tools/parity` harness and CI enforce 39 cases at O2 and at the shipping
+compiler flags.
 
 | Stage | Difference vs the original |
 |-------|----------------------------|
@@ -109,8 +131,9 @@ those vectors. A `tools/parity` harness and CI keep it honest on every commit.
 | Halation + scatter + coupler diffusion | ~1.5e-7 |
 | Grain (stochastic) | mean-preserving; noise std matched |
 
-Those are float32 rounding differences — the double-precision math reproduces the original exactly.
-The architecture and the full stage-by-stage map are in [`docs/`](docs/).
+These are representative stage measurements, not a promise of universal byte identity. Exactness
+levels, current limitations, and the full implementation route are in the
+[execution index](docs/EXECUTION_INDEX.md).
 
 ## Author
 
@@ -123,9 +146,10 @@ If the app brings you something, say hi and share your renders.
 
 ## Documentation
 
+- [`docs/EXECUTION_INDEX.md`](docs/EXECUTION_INDEX.md) — current authority order and live-work loop
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — engine and app architecture
-- [`docs/PORTING_PLAN.md`](docs/PORTING_PLAN.md) — module-by-module port map
-- [`docs/MOBILE_STRATEGY.md`](docs/MOBILE_STRATEGY.md) — parity and mobile design notes
+- [`docs/PRODUCTION_READINESS_PLAN.md`](docs/PRODUCTION_READINESS_PLAN.md) — release acceptance architecture
+- [`docs/BIT_IDENTICAL_EXPORT_ROADMAP.md`](docs/BIT_IDENTICAL_EXPORT_ROADMAP.md) — exactness and performance contract
 - [`docs/RAW_DNG.md`](docs/RAW_DNG.md) — RAW/DNG decode notes
 - [`tools/parity/`](tools/parity/) — the golden-vector parity harness
 - [`NOTICE.md`](NOTICE.md) — attributions

@@ -1,0 +1,34 @@
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -882,13 +882,26 @@ void LibRaw::ljpeg_idct(struct jhead *jh)
+   if (!cs[0])
+     FORC(106) cs[c] = float(cos((c & 31) * M_PI / 16) / 2);
+   memset(work, 0, sizeof work);
+-  work[0][0][0] = float(jh->vpred[0] += ljpeg_diff(jh->huff[0]) * jh->quant[0]);
++  const INT64 dc = INT64(jh->vpred[0]) +
++      INT64(ljpeg_diff(jh->huff[0])) * INT64(jh->quant[0]);
++  if (dc < INT_MIN || dc > INT_MAX)
++    throw LIBRAW_EXCEPTION_IO_CORRUPT;
++  jh->vpred[0] = int(dc);
++  work[0][0][0] = float(jh->vpred[0]);
+   for (i = 1; i < 64; i++)
+   {
+     len = gethuff(jh->huff[16]);
+-    i += skip = len >> 4;
+-    if (!(len &= 15) && skip < 15)
+-      break;
++    skip = len >> 4;
++    len &= 15;
++    i += skip;
++    if ((unsigned)i >= 64)
++      throw LIBRAW_EXCEPTION_IO_CORRUPT;
++    if (!len)
++    {
++      if (skip < 15)
++        break;
++      continue;
++    }
+     coef = getbits(len);
+     if ((coef & (1 << (len - 1))) == 0)
+       coef -= (1 << len) - 1;

@@ -8,8 +8,11 @@
  */
 package com.spectrafilm.app.masks
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class MasksRoundTripTest {
@@ -40,7 +43,7 @@ class MasksRoundTripTest {
     @Test
     fun missingBlock_isEmpty() {
         assertTrue(MaskJson.fromJson(null).isEmpty())
-        assertEquals(0, MaskJson.toJson(emptyList()).length())
+        assertEquals(0, MaskJson.toJson(emptyList()).getJSONArray("adjustments").length())
     }
 
     @Test
@@ -52,5 +55,73 @@ class MasksRoundTripTest {
         assertEquals("per-component value kept", 0.5f, comp.value, 0f)
         val radial = restored[0].mask.components[0].shape as MaskComponent.Radial
         assertEquals("radial angle kept", 30f, radial.angleDeg, 0f)
+    }
+
+    @Test
+    fun currentDocument_hasStableSchemaIdAndVersion() {
+        val json = MaskJson.toJson(sample)
+
+        assertEquals("org.spektrafilm.mask-set", json.getString("schema"))
+        assertEquals(1, json.getInt("version"))
+        assertEquals(sample.size, json.getJSONArray("adjustments").length())
+    }
+
+    @Test
+    fun legacyArray_migratesWithoutChangingMaskMeaning() {
+        val current = MaskJson.toJson(sample)
+        val legacy = current.getJSONArray("adjustments")
+
+        assertEquals(sample, MaskJson.fromJson(legacy))
+    }
+
+    @Test
+    fun unsupportedFutureVersion_isRejectedInsteadOfPartiallyApplied() {
+        val future = JSONObject()
+            .put("schema", "org.spektrafilm.mask-set")
+            .put("version", 999)
+            .put("adjustments", JSONArray())
+
+        assertThrows(IllegalArgumentException::class.java) { MaskJson.fromJson(future) }
+    }
+
+    @Test
+    fun schemaVersion_rejectsCoercedFractionStringAndOverflow() {
+        for (invalid in listOf<Any>(1.9, "1", 4_294_967_297L)) {
+            val document = JSONObject()
+                .put("schema", MaskJson.SCHEMA_ID)
+                .put("version", invalid)
+                .put("adjustments", JSONArray())
+
+            assertThrows(IllegalArgumentException::class.java) { MaskJson.fromJson(document) }
+        }
+
+        val mathematicallyIntegral = JSONObject()
+            .put("schema", MaskJson.SCHEMA_ID)
+            .put("version", 1.0)
+            .put("adjustments", JSONArray())
+        assertEquals(emptyList<LocalAdjustment>(), MaskJson.fromJson(mathematicallyIntegral))
+    }
+
+    @Test
+    fun adjustmentAndComponentLimits_areEnforced() {
+        val tooManyAdjustments = JSONObject()
+            .put("schema", "org.spektrafilm.mask-set")
+            .put("version", 1)
+            .put("adjustments", JSONArray().apply {
+                repeat(MaskJson.MAX_ADJUSTMENTS + 1) { put(JSONObject()) }
+            })
+        assertThrows(IllegalArgumentException::class.java) {
+            MaskJson.fromJson(tooManyAdjustments)
+        }
+
+        val tooManyComponents = MaskJson.toJson(sample)
+        tooManyComponents.getJSONArray("adjustments").getJSONObject(0)
+            .getJSONObject("mask")
+            .put("components", JSONArray().apply {
+                repeat(MaskJson.MAX_COMPONENTS_PER_MASK + 1) { put(JSONObject()) }
+            })
+        assertThrows(IllegalArgumentException::class.java) {
+            MaskJson.fromJson(tooManyComponents)
+        }
     }
 }

@@ -13,12 +13,24 @@
  */
 #include "model/diffusion.h"
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>   // debug.spektra.fftmax / .fft (tuning_knob)
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 #include "kernels/exponential_filter.h"
+#include "kernels/fft_convolve.h"
 #include "kernels/parallel.h"
+#include "runtime/memory_budget.h"
+#include "runtime/stage_timer.h"
 
 // M_PI is not in standard C++ <cmath>; some toolchains gate it behind
 // _USE_MATH_DEFINES / _GNU_SOURCE. Provide the IEEE-754 double value (identical
@@ -328,7 +340,157 @@ double bloom_max_lambda_um(const FamilyCfg& cfg) {
     return cfg.bloom.lambda_um * cfg.bloom.spread;
 }
 
+// Pick the convolution implementation by COST, not by a magic kernel size, because
+// the crossover moves with the image as well as the kernel.
+//
+//   direct : w*h*ks^2 multiply-adds.
+//   FFT    : per tile, two 2D transforms (the image forward, the product inverse)
+//            plus the pointwise multiply. A 2D transform of N x N is 2N line
+//            transforms of length N, each ~5*N*log2(N) flops. The kernel's own
+//            transform is amortised over the tiles and ignored, which biases the
+//            estimate slightly AGAINST the FFT -- the safe direction.
+//
+// Measured crossover on this model is ks ~= 15 at both preview and export sizes,
+// which matches the closed-form estimate in docs/research/perf-lab.md 20. Black
+// Pro-Mist runs ks = 273 at the 640px default preview and ks = 1725 at 12 MP, so
+// it is 20-120x past the crossover and always takes the FFT.
+//
+// SPK_DIFFUSION_FFT=0 forces the direct loop (A/B measurement, and an escape hatch
+// if a device ever mis-measures); =1 forces the FFT even where direct would win.
+// Kept for the stable diagnostics ABI. Cost-selected FFT work no longer falls
+// back to the direct O(w*h*ks^2) loop: scratch denial propagates as OOM, so this
+// counter must remain zero. A non-zero value is therefore a regression alarm.
+thread_local std::atomic<unsigned long long> g_fft_fallbacks{0};
+
+// Transform-size cap, overridable so the trade can be MEASURED rather than assumed.
+// Scratch is 2*N*(N/2+1)*2*8 + N*N*8 bytes: 100.7 MB at N = 2048, 402.8 MB at
+// N = 4096. (This comment previously said 134 / 537 MB -- the pre-r2c formula.
+// The real-to-complex change halved the spectra and nobody updated the number.)
+//
+// Raising it is worth a lot when the kernel is large -- at 12 MP Black Pro-Mist
+// has ks = 1725, so N = 2048 leaves a usable block of only 324 (2.5% of each
+// transform) and needs 130 tiles, where N = 4096 gives a block of 2372 and needs
+// 4. But 402.8 MB is a lot to ask of a phone mid-export, and if the allocation
+// fails, fft_convolve_same throws std::bad_alloc and the render boundary reports
+// a controlled OOM. It must never fall through to the direct loop: at 12 MP that
+// can turn resource pressure into hours of unbounded work.
+// An r2c f32 transform would buy N=4096's block size at roughly N=2048's memory.
+// Read a tuning knob that must be settable on a SHIPPING build.
+//
+// std::getenv alone is not enough on Android: an app process inherits no shell
+// environment, and `wrap.<pkg>` (the usual way in) requires a debuggable app, so
+// on a release APK -- the only build whose numbers are worth measuring -- these
+// knobs were simply unreachable. The device session hit exactly that: the
+// SPK_DIFFUSION_FFT_MAX experiment could not be run without a rebuild per value,
+// and a rebuild drops the loaded image, so the experiment cost a human every
+// time.
+//
+// So: env var first (host tests, benches, CI), then an Android system property,
+// which `adb shell setprop` can set on a release build with no rebuild:
+//
+//     adb shell setprop debug.spektra.fftmax 4096
+//     adb shell setprop debug.spektra.fft 0        # force the direct loop
+//
+// Same mechanism as debug.spektra.dumpparams, which is already proven to work on
+// this project's release builds.
+const char* tuning_knob(const char* env_name, const char* prop_name, char* buf,
+                        size_t cap) {
+    if (const char* env = std::getenv(env_name)) return env;
+#if defined(__ANDROID__)
+    if (cap >= PROP_VALUE_MAX && __system_property_get(prop_name, buf) > 0 && buf[0])
+        return buf;
+#else
+    (void)prop_name; (void)buf; (void)cap;
+#endif
+    return nullptr;
+}
+
+// Scratch for one N x N transform: two r2c spectra plus one real plane.
+double fft_scratch_bytes(int n) {
+    const double nd = n;
+    return 2.0 * nd * (nd / 2.0 + 1.0) * 2.0 * 8.0 + nd * nd * 8.0;
+}
+
+int fft_max_transform() {
+    char buf[92] = {0};
+    if (const char* v0 = tuning_knob("SPK_DIFFUSION_FFT_MAX", "debug.spektra.fftmax",
+                                     buf, sizeof(buf))) {
+        const int v = std::atoi(v0);
+        if (v >= 16) return v;
+    }
+    return kFftConvMaxTransform;
+}
+
+// Admit the transform's scratch through the process memory budget, stepping the
+// ceiling down until one fits.
+//
+// N = 4096 is 5.2x faster than 2048 on a 12 MP Pro-Mist frame, but it wants
+// 402.8 MB, and a 12 MP export already peaks near 1.5 GB. Reserving it (rather
+// than guessing a fraction of the headroom) is what keeps that from turning a
+// completing render into a controlled OOM: if the budget cannot admit 4096 the
+// next candidate down is tried, and the render is slower instead of dead. It
+// also makes this scratch VISIBLE in spk.memory_budget.v1, which it was not.
+//
+// The reservation is held by the caller for exactly the convolution's lifetime,
+// so a second render sees the first one's bytes rather than the same headroom
+// twice.
+memory::MemoryReservation reserve_fft_scratch(int w, int h, int ks, int* chosen_cap) {
+    const int ceiling = fft_max_transform();
+    memory::MemoryBudget& budget = memory::process_memory_budget();
+    for (int cap = ceiling; cap >= 16; cap /= 2) {
+        const int n = fft_convolve_transform_size(w, h, ks, cap);
+        if (n < ks + 1) break;
+        memory::MemoryReservation reservation = budget.try_reserve(
+            static_cast<std::uint64_t>(fft_scratch_bytes(n)),
+            memory::MemoryDomain::NativeScratch, memory::MemoryStage::Spatial);
+        if (reservation) {
+            *chosen_cap = cap;
+            return reservation;
+        }
+        // The size the selector picked is independent of the ceiling below some
+        // point (it is already choosing the cheapest); once that happens, going
+        // lower cannot free anything, so stop rather than spin.
+        if (fft_convolve_transform_size(w, h, ks, cap / 2) == n) break;
+    }
+    *chosen_cap = 0;
+    return {};
+}
+
+bool use_fft(int w, int h, int ks) {
+    char buf[92] = {0};
+    if (const char* v0 = tuning_knob("SPK_DIFFUSION_FFT", "debug.spektra.fft",
+                                     buf, sizeof(buf))) {
+        if (v0[0] == '0') return false;
+        if (v0[0] == '1') return true;
+    }
+    // Estimated against the CEILING, not the transform the budget will actually
+    // admit. A clamped run picks a smaller N and is slower, but still orders of
+    // magnitude below the direct loop at the kernel sizes that get here, so the
+    // FFT-vs-direct verdict does not change.
+    const int n = fft_convolve_transform_size(w, h, ks, fft_max_transform());
+    if (n < ks + 1) return false;                 // no valid block -> direct
+    const int block = n - ks + 1;
+    const double tiles = std::ceil(static_cast<double>(h) / block) *
+                         std::ceil(static_cast<double>(w) / block);
+    const double nn = static_cast<double>(n) * n;
+    const double log2n = std::log2(static_cast<double>(n));
+    const double fft_flops = tiles * (2.0 * (2.0 * 5.0 * nn * log2n) + 6.0 * nn);
+    // Direct MACs are ~2 flops each; require a 2x margin before switching, so a
+    // near-tie keeps the bit-exact path.
+    const double direct_flops =
+        2.0 * static_cast<double>(w) * static_cast<double>(h) * ks * ks;
+    return fft_flops * 2.0 < direct_flops;
+}
+
 }  // namespace
+
+unsigned long long diffusion_fft_fallbacks() {
+    return g_fft_fallbacks.load(std::memory_order_relaxed);
+}
+
+void diffusion_reset_fft_fallbacks() {
+    g_fft_fallbacks.store(0, std::memory_order_relaxed);
+}
 
 void apply_diffusion_filter_um(double* raw, int w, int h,
                                const DiffusionFilterParams& params,
@@ -449,10 +611,47 @@ void apply_diffusion_filter_um(double* raw, int w, int h,
             }
         });
         const std::vector<double>& kern = psf[c];
-        // mode='same' direct convolution: out[y,x] = sum_{i,j} padded[y+i, x+j]
+        // mode='same' convolution: out[y,x] = sum_{i,j} padded[y+i, x+j]
         // * flip(kern)[i,j], centred. For a symmetric centred kernel the centre
         // offsets (ks-1)/2 == radius, so out[y,x] over the original window maps
         // to padded[y .. y+ks-1, x .. x+ks-1] convolved with the flipped kernel.
+        //
+        // TWO IMPLEMENTATIONS OF THE SAME SUM. The direct loop below is O(w*h*ks^2),
+        // and ks scales with image width (radius is a fixed size on the FILM, so it
+        // grows as pixel_size_um shrinks) -- which makes this stage QUADRATIC in
+        // pixel count. Measured: 30.7 s for one 640px preview and an extrapolated
+        // 10.9 hours for a 12 MP export, at the app's default Black Pro-Mist
+        // settings (#160, docs/research/perf-lab.md 20). kernels/fft_convolve
+        // computes the identical sum in O(n log n).
+        //
+        // Reassociating a sum changes its last bits, so the FFT result is NOT
+        // byte-identical to the direct loop -- measured drift is ~1e-15 relative,
+        // eleven orders inside the 1e-4 parity bar (tests/test_fft_convolve.cpp).
+        // Both paths ARE byte-identical across worker counts, which is the contract
+        // that matters here.
+        //
+        // The direct loop stays reachable only when the cost model selects it for
+        // a small kernel. Once FFT is selected, memory denial must fail closed.
+        if (use_fft(w, h, ks)) {
+            int cap = 0;
+            const memory::MemoryReservation scratch =
+                reserve_fft_scratch(w, h, ks, &cap);
+            if (!scratch) {
+                // Every candidate was refused, so there is no affordable FFT. The
+                // direct loop is not a fallback here -- at 12 MP it is hours -- so
+                // this surfaces as OOM exactly like a failed allocation would.
+                throw std::bad_alloc{};
+            }
+            if (!fft_convolve_same(padded.data(), pw, ph, kern.data(), ks, w, h,
+                                   blurred.data(), /*out_stride=*/3, /*out_offset=*/c,
+                                   cap)) {
+                // All dimensions above are constructed from the same validated
+                // image/kernel geometry. False therefore means an internal
+                // invariant bug, not a recoverable request for the direct path.
+                throw std::logic_error("diffusion FFT rejected valid geometry");
+            }
+            continue;
+        }
         // Each output row is an independent O(w*ks^2) accumulation over the
         // read-only padded plane.
         parallel_for_weighted(0, h, w, [&](int lo, int hi) {

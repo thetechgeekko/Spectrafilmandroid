@@ -115,9 +115,11 @@ the loops before committing to it.
 5. **No ARM build/run capability** in the dev environment or CI (both x86_64), so any NEON
    intrinsics — or even portable vector code's NEON lowering — cannot be *perf*-validated on
    the target architecture from here.
-6. The engine already ships an **opt-in scanner 3D-LUT** (`use_scanner_lut`, default OFF,
-   ~5e-5) that accelerates exactly this density→log_xyz integral. The established project
-   philosophy is therefore **bit-exact by default; approximate acceleration is opt-in**.
+6. The engine already ships an **opt-in scanner 3D-LUT** (`use_scanner_lut`, default OFF)
+   that accelerates exactly this density→log_xyz integral. Its LUT17 error is
+   profile/domain dependent: the locked D50 case is <=5e-5, while K75P 2383/2393 are about
+   0.0040/0.0073 vs direct. The established project philosophy is therefore **bit-exact by
+   default; approximate acceleration is opt-in**.
 
 ## Decision
 

@@ -1,0 +1,410 @@
+{
+  "schema": "spk.bench_capture.v1",
+  "captured_at_millis": 1788400111712,
+  "app": {
+    "package": "com.spectrafilm.app",
+    "apk_sha256": "e117db8fd3c9a2809187c36b9fc60365c05e9395a61a1e9eef5c2552b459786f",
+    "version_code": 11,
+    "version_name": "0.9.0",
+    "debuggable": false
+  },
+  "device": {
+    "model": "SM-S948W",
+    "device": "m3q",
+    "manufacturer": "samsung",
+    "sdk_int": 36,
+    "release": "16",
+    "build_fingerprint": "samsung\/m3qcsx\/m3q:16\/BP4A.251205.006\/S948WVLS4AZG3_OYV4AZG3:user\/release-keys",
+    "abis": [
+      "arm64-v8a"
+    ],
+    "cpu_count": 8,
+    "gpu_renderer": "gles=3.2"
+  },
+  "corpus": {
+    "source_sha256": "66381a8ed2d1a6ab471690ec5c5725798a15e134ada94c7feeb43c59bdb93195",
+    "source_bytes": 37460417,
+    "width": 4080,
+    "height": 3060
+  },
+  "protocol": {
+    "requested_runs": 1,
+    "gate_runs": 5,
+    "smoke": true
+  },
+  "samples": [
+    {
+      "cell": "BASE",
+      "format": "JPEG_Q95",
+      "run_index": 0,
+      "state": "cold",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 1,
+      "total_ms": 8534,
+      "phases_ms": {
+        "decode": 1459,
+        "simulate": 6802,
+        "grade": 121,
+        "encode": 136
+      },
+      "phases_sum_ms": 8518,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "f7ec4764c6a157c31e43f9a9c76a81f1089bb4352a2b68e70a21311fe2f3b4f0",
+      "decoded_sample_sha256": "16a12ee69e0278dfa1b60e1b994f1b010da8c595bf9fb4f8a09cbd72ec03b894",
+      "normalized_metadata_sha256": "776c0777f5b6a6e4148f64757b15577dd6cc8b6034dea1e2cdf598977903f5af",
+      "container_sha256": "70145513a4449b6ba2dcd0c65d45415d4ac2b3e67a738d4a96357fc76f7ddf15",
+      "container_bytes": 787775,
+      "memory": {
+        "total_pss_kb": 87568,
+        "total_private_dirty_kb": 81416,
+        "native_heap_alloc_kb": 31192,
+        "vm_hwm_kb": 1324316,
+        "vm_rss_kb": 154396
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "PNG16",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 2,
+      "total_ms": 8491,
+      "phases_ms": {
+        "decode": 1298,
+        "simulate": 6598,
+        "grade": 0,
+        "encode": 580
+      },
+      "phases_sum_ms": 8476,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "f7ec4764c6a157c31e43f9a9c76a81f1089bb4352a2b68e70a21311fe2f3b4f0",
+      "decoded_sample_sha256": "3c18bfa2cdf93664f08b177330e485adbcd281e549da62fcf94aba857c601b91",
+      "normalized_metadata_sha256": "b5f9454b46c1f9b5c03c6c584804c3c9e6dc3947417e68408a4cb7e12970a8d4",
+      "container_sha256": "74237c9d8543e549e8f746aad17dcd250459213d8ca16d4a39fc60e353f815c5",
+      "container_bytes": 11531511,
+      "memory": {
+        "total_pss_kb": 147776,
+        "total_private_dirty_kb": 141540,
+        "native_heap_alloc_kb": 31198,
+        "vm_hwm_kb": 1379128,
+        "vm_rss_kb": 214832
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "TIFF16",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 3,
+      "total_ms": 9680,
+      "phases_ms": {
+        "decode": 1364,
+        "simulate": 6767,
+        "grade": 0,
+        "encode": 1533
+      },
+      "phases_sum_ms": 9664,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "f7ec4764c6a157c31e43f9a9c76a81f1089bb4352a2b68e70a21311fe2f3b4f0",
+      "decoded_sample_sha256": "bef8d89f46bdf45fa1ce2797e5e3a281e908780ff73cd4947e60959068c078fe",
+      "normalized_metadata_sha256": "118dd487e511fdb9407b3257c83f1be5f54b6ba1a69c82328d47283448e978c1",
+      "container_sha256": "39f29adbf7f75df097e2697d9e9417678b499a1eeb43c4fb5ae66fe5b64878ac",
+      "container_bytes": 74909624,
+      "memory": {
+        "total_pss_kb": 260738,
+        "total_private_dirty_kb": 254404,
+        "native_heap_alloc_kb": 31193,
+        "vm_hwm_kb": 1440184,
+        "vm_rss_kb": 328352
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "BASE",
+      "format": "ULTRA_HDR",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 4,
+      "total_ms": 9532,
+      "phases_ms": {
+        "decode": 1394,
+        "simulate": 7406,
+        "grade": 560,
+        "encode": 150
+      },
+      "phases_sum_ms": 9510,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "f7ec4764c6a157c31e43f9a9c76a81f1089bb4352a2b68e70a21311fe2f3b4f0",
+      "decoded_sample_sha256": "16a12ee69e0278dfa1b60e1b994f1b010da8c595bf9fb4f8a09cbd72ec03b894",
+      "normalized_metadata_sha256": "9f84aae56279c9a3076a2ab67d86cb7c92dc163d3376505089bfe4a840fad8b9",
+      "container_sha256": "4ea403c134ebe8425afb40514728295eca85d5f146ccbe016de149b39f8698b2",
+      "container_bytes": 792846,
+      "memory": {
+        "total_pss_kb": 89609,
+        "total_private_dirty_kb": 83216,
+        "native_heap_alloc_kb": 31959,
+        "vm_hwm_kb": 1551816,
+        "vm_rss_kb": 157840
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "JPEG_Q95",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 5,
+      "total_ms": 20329,
+      "phases_ms": {
+        "decode": 1407,
+        "simulate": 18561,
+        "grade": 93,
+        "encode": 246
+      },
+      "phases_sum_ms": 20307,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "39d5b0436ecdc3e0cf5ef614c0efda64c4e28736646907297629a4b9a4d9e9cb",
+      "decoded_sample_sha256": "fb871262211971e220c106a3ae7ce738a720ec45815eb136a86002898bdc55bf",
+      "normalized_metadata_sha256": "1cdacdb54d681478ed3bae49d272c5960d69d9396869a5e8b7ef2cf51dc9d5e2",
+      "container_sha256": "f89c5151ea311d49d14d20b033a8cdaf855ad5c716296b63e6e24abe134aab10",
+      "container_bytes": 2493014,
+      "memory": {
+        "total_pss_kb": 90671,
+        "total_private_dirty_kb": 84176,
+        "native_heap_alloc_kb": 31195,
+        "vm_hwm_kb": 1724548,
+        "vm_rss_kb": 158692
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "PNG16",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 6,
+      "total_ms": 21782,
+      "phases_ms": {
+        "decode": 1465,
+        "simulate": 18560,
+        "grade": 0,
+        "encode": 1740
+      },
+      "phases_sum_ms": 21765,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "39d5b0436ecdc3e0cf5ef614c0efda64c4e28736646907297629a4b9a4d9e9cb",
+      "decoded_sample_sha256": "d7130ec5bc0f1465745f7dd3f9440db0aae1a8866ad19bc1ab51c3ea1d8b983a",
+      "normalized_metadata_sha256": "6b41835be85dfe483f72b95f7d66b293ae4999bb8cb92d9c3649723ca6a55216",
+      "container_sha256": "76935fcc75bb81f788949a290de1a907e89c34e6e8dbbf681399b470323ebf2f",
+      "container_bytes": 60933963,
+      "memory": {
+        "total_pss_kb": 196973,
+        "total_private_dirty_kb": 190480,
+        "native_heap_alloc_kb": 31192,
+        "vm_hwm_kb": 1725700,
+        "vm_rss_kb": 265240
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "TIFF16",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 7,
+      "total_ms": 21947,
+      "phases_ms": {
+        "decode": 1457,
+        "simulate": 18852,
+        "grade": 0,
+        "encode": 1622
+      },
+      "phases_sum_ms": 21931,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "39d5b0436ecdc3e0cf5ef614c0efda64c4e28736646907297629a4b9a4d9e9cb",
+      "decoded_sample_sha256": "76ce42646c1d72aa2dfedaaf031f4582b9fac18db543d120bb5a31fd1a0023e3",
+      "normalized_metadata_sha256": "118dd487e511fdb9407b3257c83f1be5f54b6ba1a69c82328d47283448e978c1",
+      "container_sha256": "23481bf7299ab04a98b32ba5d7edd1bdff29f8e7e632ddb063f8e52079d62f85",
+      "container_bytes": 74909624,
+      "memory": {
+        "total_pss_kb": 261457,
+        "total_private_dirty_kb": 254956,
+        "native_heap_alloc_kb": 31193,
+        "vm_hwm_kb": 1831932,
+        "vm_rss_kb": 329272
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 23,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    },
+    {
+      "cell": "HEAVY",
+      "format": "ULTRA_HDR",
+      "run_index": 0,
+      "state": "warm",
+      "thermal_wait": {
+        "required": -1,
+        "waited_ms": 0,
+        "timed_out": false
+      },
+      "served_from_cache": false,
+      "render_id": 8,
+      "total_ms": 21310,
+      "phases_ms": {
+        "decode": 1454,
+        "simulate": 19050,
+        "grade": 543,
+        "encode": 243
+      },
+      "phases_sum_ms": 21290,
+      "grade_inputs": {
+        "saturation": 0,
+        "vibrance": 0,
+        "gamut_compress": 0,
+        "active": false
+      },
+      "engine_sample_sha256": "39d5b0436ecdc3e0cf5ef614c0efda64c4e28736646907297629a4b9a4d9e9cb",
+      "decoded_sample_sha256": "fb871262211971e220c106a3ae7ce738a720ec45815eb136a86002898bdc55bf",
+      "normalized_metadata_sha256": "f40384c69497a4dfdafd71209f444857b868e8dcb53364a7035668b8107cf09c",
+      "container_sha256": "bc025b5ed1abdf5c0cec8897f288bad982637bbe1711a38e359988edfb539f12",
+      "container_bytes": 2498085,
+      "memory": {
+        "total_pss_kb": 91967,
+        "total_private_dirty_kb": 85460,
+        "native_heap_alloc_kb": 31959,
+        "vm_hwm_kb": 1831932,
+        "vm_rss_kb": 159864
+      },
+      "environment": {
+        "thermal_status": 0,
+        "battery_pct": 22,
+        "plugged": 0,
+        "cpuset": "\/foreground",
+        "process_importance": 125
+      }
+    }
+  ],
+  "journeys": {
+    "cancellation": "cancelled:CancellationException",
+    "foreground_during_export": true,
+    "reopen_published": "pass"
+  }
+}

@@ -259,6 +259,10 @@ say "Baseline builds from the CURRENT checkout: $BASELINE_SHA"
 note "Must include the #119 prep commit (export-timing breadcrumbs + <profileable>),"
 note "or stages 5–7 have nothing to read. Without keystore.properties the release"
 note "build falls back to debug signing — fine for a sideloaded baseline."
+note "RELEASE, not debug, and this is not a formality: debug and release differ"
+note "by ~2x overall and UNEVENLY per module (perf-lab.md 19). A baseline taken"
+note "on a debug APK measures the compiler, not the app, and cannot be compared"
+note "against any release number. Record the build type in every table."
 if confirm "Run ./gradlew :app:assembleRelease now (few minutes)?"; then
   ./gradlew :app:assembleRelease
   APK=app/build/outputs/apk/release/app-release.apk
@@ -292,9 +296,9 @@ say "duration from the Spektra breadcrumbs and records the median and max."
 for ROUTE in scan print; do
   printf '\n'
   if [[ "$ROUTE" == scan ]]; then
-    step "Set the route to SCAN (the 'Scan film' toggle ON), leave grain/halation at defaults."
+    step "Set the route to SCAN: Simulation > Scanner > 'Slide mode (skip print)' ON. Leave grain/halation at defaults."
   else
-    step "Set the route to PRINT ('Scan film' toggle OFF)."
+    step "Set the route to PRINT: Simulation > Scanner > 'Slide mode (skip print)' OFF."
   fi
   pause "Route set? Starting capture — press Enter, then do the 5 drags."
   adbw logcat -c
@@ -316,7 +320,8 @@ stage "Export wall times: grain × route × format"
 say "Eight exports. For each combo the wizard tells you the toggles, you run"
 say "Export in the app, and the duration is read from the breadcrumb."
 note "Format lives in the export sheet (PNG 16-bit / TIFF). Grain: the Grain"
-note "section's Active toggle. Route: the 'Scan film' toggle."
+note "section's Active toggle. Route: Simulation > Scanner > 'Slide mode (skip print)'"
+note "(ON = scan/slide, OFF = print)."
 for COMBO in \
   "grainOFF scan PNG16" "grainOFF scan TIFF" \
   "grainOFF print PNG16" "grainOFF print TIFF" \

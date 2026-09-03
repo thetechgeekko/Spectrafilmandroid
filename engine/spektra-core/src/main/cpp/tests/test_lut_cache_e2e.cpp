@@ -42,10 +42,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <vector>
 
+#include "kernels/lut3d_cache.h"
+#include "model/color_output.h"
+#include "profiles/profile.h"
+#include "runtime/stages/scanning.h"
 #include "spektra.h"
 
 // Host-only memo counters (spektra.cpp, #ifndef __ANDROID__). Forward-declared
@@ -284,6 +289,61 @@ int main(int argc, char** argv) {
               (std::string(route) + ": 1 vs 8 workers byte-identical").c_str());
         check(bit_identical(t1, cold),
               (std::string(route) + ": 1-worker warm == cold").c_str());
+    }
+
+    // --- 5. VIEWING-WHITE CACHE ISOLATION ----------------------------------
+    // Keep every profile table and density sample byte-identical, changing ONLY
+    // the resolved viewing illuminant. The second call must miss; otherwise a
+    // K75P stock can silently reuse a D50 scanner LUT (or vice versa). Returning
+    // to K75P must hit and reproduce the first K75P result byte-for-byte.
+    {
+        spk::Profile k75p = spk::load_profile_file(
+            asset_dir + "/profiles/kodak_2383.json");
+        spk::Profile d50 = k75p;
+        d50.viewing_illuminant = "D50";
+        d50.resolved_viewing_illuminant =
+            spk::find_viewing_illuminant("D50");
+
+        constexpr int w = 4, h = 4;
+        std::vector<float> density(static_cast<size_t>(w) * h * 3);
+        for (int p = 0; p < w * h; ++p) {
+            density[static_cast<size_t>(p) * 3 + 0] = 0.05f + 0.07f * p;
+            density[static_cast<size_t>(p) * 3 + 1] = 0.11f + 0.05f * p;
+            density[static_cast<size_t>(p) * 3 + 2] = 0.17f + 0.03f * p;
+        }
+
+        spk::Lut3DCache cache;
+        spk::ScanningParams q;
+        q.scan_film = false;
+        q.use_lut = true;
+        q.lut_resolution = 17;
+        q.lut_cache = &cache;
+        std::vector<float> k75p_a(density.size()), d50_out(density.size()),
+            k75p_b(density.size());
+
+        spk::scan(k75p, q, density.data(), w, h, k75p_a.data());
+        const uint64_t misses_after_k75p = cache.misses();
+        spk::scan(d50, q, density.data(), w, h, d50_out.data());
+        const bool white_changed_key = cache.misses() > misses_after_k75p;
+        const uint64_t hits_before_return = cache.hits();
+        spk::scan(k75p, q, density.data(), w, h, k75p_b.data());
+        const bool warm_hit = cache.hits() > hits_before_return;
+        const bool warm_exact = bit_identical(k75p_a, k75p_b);
+
+        double white_delta = 0.0;
+        for (size_t i = 0; i < k75p_a.size(); ++i) {
+            const double d = std::fabs(static_cast<double>(k75p_a[i]) -
+                                       static_cast<double>(d50_out[i]));
+            if (d > white_delta) white_delta = d;
+        }
+        const bool discriminating = white_delta > 1e-3;
+        const bool pass = white_changed_key && warm_hit && warm_exact &&
+                          discriminating;
+        std::printf("[lut_cache_e2e] viewing-only D50/K75P: miss=%d "
+                    "return-hit=%d warm-exact=%d max-delta=%.6e -> %s\n",
+                    white_changed_key ? 1 : 0, warm_hit ? 1 : 0,
+                    warm_exact ? 1 : 0, white_delta, pass ? "PASS" : "FAIL");
+        if (!pass) g_fail = 1;
     }
 
     std::printf("[lut_cache_e2e] final memo state: %llu hits / %llu misses\n",

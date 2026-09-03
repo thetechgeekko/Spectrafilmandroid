@@ -44,6 +44,12 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -59,8 +65,8 @@ fun PixelSampleOverlay(
     bitmap: Bitmap,
     onPick: (Float, Float, Float, Float, Float) -> Unit,
     onCancel: () -> Unit,
-    title: String = "Tap to pick a color",
-    hint: String = "Tap the color you want the mask to target (e.g. a red), then apply.",
+    title: String = stringResource(R.string.tool_sample_title_color),
+    hint: String = stringResource(R.string.tool_sample_hint_color),
 ) {
     val imageAspect = bitmap.width.toFloat().coerceAtLeast(1f) / bitmap.height.toFloat().coerceAtLeast(1f)
     val image: ImageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
@@ -68,6 +74,13 @@ fun PixelSampleOverlay(
     var point by remember { mutableStateOf<Offset?>(null) }     // normalized 0..1 sample location
     var sampled by remember { mutableStateOf<Triple<Float, Float, Float>?>(null) }
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    fun sampleAt(nx: Float, ny: Float) {
+        point = Offset(nx, ny)
+        val (px, py) = PixelSample.pixel(nx, ny, bitmap.width, bitmap.height)
+        sampled = PixelSample.rgb01(bitmap.getPixel(px, py))
+    }
+    val canvasDesc = stringResource(R.string.tool_sample_canvas_desc)
+    val sampleCenterLabel = stringResource(R.string.tool_sample_center)
 
     Box(
         Modifier
@@ -81,33 +94,42 @@ fun PixelSampleOverlay(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextTooltip("Cancel") {
+                val cancelLabel = stringResource(R.string.tool_cancel)
+                TextTooltip(cancelLabel) {
                     IconButton(onClick = onCancel) {
-                        Icon(SpectraIcons.Cancel, contentDescription = "Cancel", tint = Color.White)
+                        Icon(SpectraIcons.Cancel, contentDescription = cancelLabel, tint = Color.White)
                     }
                 }
                 Text(
                     title, color = Color.White,
                     style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(start = 4.dp),
+                    modifier = Modifier.padding(start = 4.dp).semantics { heading() },
                 )
                 Spacer(Modifier.weight(1f))
-                // live swatch of the current sample
+                // live swatch of the current sample (the colour is announced as 0..255 RGB)
                 val s = sampled
                 if (s != null) {
+                    val swatchDesc = stringResource(
+                        R.string.tool_sample_swatch_desc,
+                        (s.first * 255f).roundToInt(),
+                        (s.second * 255f).roundToInt(),
+                        (s.third * 255f).roundToInt(),
+                    )
                     Box(
                         Modifier.size(28.dp).clip(CircleShape)
                             .background(Color(s.first, s.second, s.third))
-                            .padding(end = 4.dp),
+                            .padding(end = 4.dp)
+                            .semantics { contentDescription = swatchDesc },
                     )
                     Spacer(Modifier.size(8.dp))
                 }
-                TextTooltip("Apply") {
+                val applyLabel = stringResource(R.string.tool_apply)
+                TextTooltip(applyLabel) {
                     IconButton(
                         onClick = { sampled?.let { val p = point; onPick(it.first, it.second, it.third, p?.x ?: 0.5f, p?.y ?: 0.5f) } },
                         enabled = sampled != null,
                     ) {
-                        Icon(SpectraIcons.Confirm, contentDescription = "Apply", tint = Color.White)
+                        Icon(SpectraIcons.Confirm, contentDescription = applyLabel, tint = Color.White)
                     }
                 }
             }
@@ -125,12 +147,15 @@ fun PixelSampleOverlay(
                             detectTapGestures { pos ->
                                 val w = canvasSize.width.toFloat().coerceAtLeast(1f)
                                 val h = canvasSize.height.toFloat().coerceAtLeast(1f)
-                                val nx = (pos.x / w).coerceIn(0f, 1f)
-                                val ny = (pos.y / h).coerceIn(0f, 1f)
-                                point = Offset(nx, ny)
-                                val (px, py) = PixelSample.pixel(nx, ny, bitmap.width, bitmap.height)
-                                sampled = PixelSample.rgb01(bitmap.getPixel(px, py))
+                                sampleAt((pos.x / w).coerceIn(0f, 1f), (pos.y / h).coerceIn(0f, 1f))
                             }
+                        }
+                        // Tap-only canvas: expose a screen-reader path (sample the centre) alongside.
+                        .semantics {
+                            contentDescription = canvasDesc
+                            customActions = listOf(
+                                CustomAccessibilityAction(sampleCenterLabel) { sampleAt(0.5f, 0.5f); true },
+                            )
                         },
                 ) {
                     Canvas(Modifier.fillMaxSize()) {

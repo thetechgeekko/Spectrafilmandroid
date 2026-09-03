@@ -158,8 +158,9 @@ int main(int argc, char** argv) {
     // --- Pass 1: size the buffer (null out_text). ---------------------------
     size_t needed = 0;
     st = spk_bake_cube_lut(eng, &p, N, 0, nullptr, 0, &needed);
-    if (needed == 0) {
-        std::fprintf(stderr, "sizing pass set needed=0 (st=%s)\n", spk_status_str(st));
+    if (st != SPK_OK || needed == 0) {
+        std::fprintf(stderr, "sizing pass failed (needed=%zu st=%s)\n",
+                     needed, spk_status_str(st));
         ok = false;
     }
 

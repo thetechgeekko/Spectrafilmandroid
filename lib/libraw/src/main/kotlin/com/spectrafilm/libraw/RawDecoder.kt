@@ -1,10 +1,12 @@
 /*
  * Spektrafilm for Android — lib:libraw Kotlin facade.
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
- * Uses LibRaw (LGPL-2.1).
+ * Uses statically included, dual-offered LibRaw; distribution is governed by the
+ * bundled decision record and fail-closed release audit.
  *
  * Decodes a camera RAW / DNG into a linear, scene-referred float32 RGB buffer with
- * bit-parity to spektrafilm's desktop rawpy settings (see docs/RAW_DNG.md and
+ * the same processing-option contract as Spektrafilm's desktop rawpy path (see
+ * docs/RAW_DNG.md and
  * spektrafilm/utils/raw_file_processor.py):
  *   output_color = ACES (ACES2065-1), output_bps = 16, no_auto_bright,
  *   gamma = (1,1) [linear], white balance per WhiteBalance below.
@@ -21,6 +23,8 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * White-balance modes, mirroring raw_file_processor.py:
@@ -46,18 +50,151 @@ enum class WhiteBalance(val nativeMode: Int) {
 }
 
 /**
- * Linear, scene-referred decode result. [data] is a *direct* float32 RGB
- * ByteBuffer (length = width*height*3*4 bytes), matching engine LinearImage. The
- * caller can construct `LinearImage(data, width, height, colorSpace)` directly.
+ * Linear, scene-referred decode result backed by a *direct* float32 RGB
+ * ByteBuffer (length = width*height*3*4 bytes), matching engine LinearImage.
+ * Cross-module consumers retain pixels only through [acquireDataLease]. Same-module
+ * adapters may use the internal scoped borrow; each reader gets an independent
+ * native-order view and [close] defers native release until every active reader
+ * returns.
  * [colorSpace] is "ProPhoto RGB" — the decode path converts from its ACES2065-1
  * intermediate to the engine's linear ProPhoto input space.
+ * [precisionDescriptor] keeps source precision, effective levels, layout, route,
+ * and HDR-relevant metadata distinct from this float32 interchange buffer.
  */
-class LinearResult(
-    val data: ByteBuffer,
+class LinearResult private constructor(
+    data: ByteBuffer,
     val width: Int,
     val height: Int,
     val colorSpace: String = "ProPhoto RGB",
-)
+    val precisionDescriptor: RawPrecisionDescriptor,
+    private val release: (ByteBuffer) -> Unit,
+) : AutoCloseable {
+    // Capture the caller's logical sample window once. Later position/limit changes
+    // on the constructor argument cannot change the bytes exposed to a reader.
+    private val backingData = data.duplicate().order(data.order())
+
+    init {
+        require(backingData.isDirect) { "LinearResult requires a direct ByteBuffer" }
+        require(backingData.order() == ByteOrder.nativeOrder()) {
+            "LinearResult ByteBuffer must use native byte order"
+        }
+        require(width > 0 && height > 0) { "invalid dimensions ${width}x$height" }
+    }
+
+    private val lifecycle = AtomicInteger(0)
+
+    /** True once no new readers can acquire a lease. Active readers may still be draining. */
+    val isClosed: Boolean get() = lifecycle.get() < 0
+
+    /** Construct a managed/non-owning result. Native decodes use an owning path. */
+    constructor(
+        data: ByteBuffer,
+        width: Int,
+        height: Int,
+        colorSpace: String = "ProPhoto RGB",
+        precisionDescriptor: RawPrecisionDescriptor =
+            RawPrecisionDescriptor.forManagedLinear(colorSpace),
+    ) : this(data, width, height, colorSpace, precisionDescriptor, {})
+
+    /**
+     * An explicitly held native-buffer lease. [data] is valid only until [close].
+     * Closing the owning [LinearResult] prevents new leases but does not invalidate
+     * this one; native release waits for every acquired lease to close.
+     */
+    class DataLease internal constructor(
+        val data: ByteBuffer,
+        private val releaseLease: () -> Unit,
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean(false)
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) releaseLease()
+        }
+    }
+
+    /** Acquire a lease whose lifetime may be transferred to another native-buffer owner. */
+    fun acquireDataLease(): DataLease {
+        while (true) {
+            val state = lifecycle.get()
+            check(state >= 0) { "LinearResult is closed" }
+            check(state != Int.MAX_VALUE) { "LinearResult has too many active leases" }
+            if (lifecycle.compareAndSet(state, state + 1)) break
+        }
+        return DataLease(
+            backingData.duplicate().order(ByteOrder.nativeOrder()),
+            ::releaseDataLease,
+        )
+    }
+
+    /**
+     * Same-module scoped read. Returning [Unit] prevents the borrowed buffer from
+     * becoming a public generic return value; cross-module ownership transfer must
+     * use [acquireDataLease] explicitly.
+     */
+    internal fun withDataLease(block: (ByteBuffer) -> Unit) {
+        acquireDataLease().use { lease -> block(lease.data) }
+    }
+
+    private fun releaseDataLease() {
+        if (lifecycle.decrementAndGet() == CLOSED) release(backingData)
+    }
+
+    override fun close() {
+        while (true) {
+            val state = lifecycle.get()
+            if (state < 0) return
+            if (lifecycle.compareAndSet(state, state or CLOSED)) {
+                if (state == 0) release(backingData)
+                return
+            }
+        }
+    }
+
+    internal companion object {
+        private const val CLOSED = Int.MIN_VALUE
+
+        fun forTest(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            release: () -> Unit,
+        ): LinearResult = LinearResult(
+            data = data,
+            width = width,
+            height = height,
+            precisionDescriptor = RawPrecisionDescriptor.forManagedLinear("ProPhoto RGB"),
+            release = { release() },
+        )
+
+        fun fromNative(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            colorSpace: String,
+            precisionDescriptor: RawPrecisionDescriptor =
+                RawPrecisionDescriptor.forManagedLinear(colorSpace),
+            release: (ByteBuffer) -> Unit,
+        ): LinearResult = try {
+            LinearResult(
+                data,
+                width,
+                height,
+                colorSpace,
+                precisionDescriptor,
+                release,
+            )
+        } catch (constructionFailure: Throwable) {
+            try {
+                release(data)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== constructionFailure) {
+                    constructionFailure.addSuppressed(releaseFailure)
+                }
+            }
+            throw constructionFailure
+        }
+    }
+}
 
 object RawDecoder {
 
@@ -76,8 +213,7 @@ object RawDecoder {
      * count**) of a full-resolution decode.
      *
      * **Benefits:**
-     * - Peak native memory is approximately **¼** of a full-res decode — the primary
-     *   OOM surface for 50–200 MP Expert RAW / large DNG files on low-RAM devices.
+     * - Processed-image memory is approximately **¼** of a full-res Bayer decode.
      * - Significantly faster: no demosaic neighbourhood search, smaller copy.
      *
      * **Limitations / tradeoffs:**
@@ -90,7 +226,10 @@ object RawDecoder {
      *   `dcraw_make_mem_image` reports the post-process dimensions, so the returned
      *   `width * height * 3 == rgb.size()` invariant is always satisfied.
      *
-     * **Default `false`** → full-resolution decode; existing behaviour is unchanged.
+     * The pre-unpack safety ceiling remains **12 MiPixels on 64-bit** and
+     * **8 MiPixels on 32-bit**, even when this flag is true; some linear/non-Bayer
+     * formats ignore LibRaw's half-size request. Tiled high-MP decode is tracked by
+     * ticket #173. **Default `false`** requests full-resolution output within the cap.
      */
     data class Settings(
         val whiteBalance: WhiteBalance = WhiteBalance.AS_SHOT,
@@ -114,7 +253,17 @@ object RawDecoder {
         @JvmField val width: Int,
         @JvmField val height: Int,
         @JvmField val colorSpace: String,
-    )
+        @JvmField val allocationToken: Long,
+        descriptorWords: IntArray,
+        descriptorReals: FloatArray,
+    ) {
+        // Construct and validate while JNI still owns the publication attempt. If
+        // the ABI is malformed, NewObject fails and native publication rolls back
+        // the allocation instead of exposing a partially trusted result.
+        @JvmField
+        val precisionDescriptor: RawPrecisionDescriptor =
+            RawPrecisionDescriptor.fromNative(descriptorWords, descriptorReals)
+    }
 
     private val RAW_EXTENSIONS = setOf(
         "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
@@ -129,27 +278,34 @@ object RawDecoder {
         isRawFile(name.substringAfterLast('.', missingDelimiterValue = ""))
 
     /** Decode a fully-read RAW/DNG byte array to linear ProPhoto RGB (via ACES2065-1). */
-    fun decodeToLinear(bytes: ByteArray, settings: Settings = Settings()): LinearResult =
-        nativeDecodeBytes(
+    fun decodeToLinear(
+        bytes: ByteArray,
+        settings: Settings = Settings(),
+        cancellation: RawDecodeCancellation? = null,
+    ): LinearResult {
+        RawInputLimits.requireWithinLimit(bytes.size)
+        return nativeDecodeBytes(
             bytes, settings.whiteBalance.nativeMode, settings.temperatureK, settings.tint,
             settings.halfSize, settings.maxLongEdge,
+            cancellation?.tokenForDecode() ?: NO_CANCELLATION,
         ).toLinear()
+    }
 
     /**
      * Decode from a direct ByteBuffer (zero input copy). If [input] is not direct
      * it is copied into a direct buffer first.
      */
-    fun decodeToLinear(input: ByteBuffer, settings: Settings = Settings()): LinearResult {
-        val direct = if (input.isDirect) {
-            input
-        } else {
-            ByteBuffer.allocateDirect(input.remaining()).order(ByteOrder.nativeOrder())
-                .also { it.put(input.duplicate()); it.flip() }
-        }
+    fun decodeToLinear(
+        input: ByteBuffer,
+        settings: Settings = Settings(),
+        cancellation: RawDecodeCancellation? = null,
+    ): LinearResult {
+        val direct = RawInputWindow.directRemaining(input)
         return nativeDecodeBuffer(
             direct, direct.remaining(),
             settings.whiteBalance.nativeMode, settings.temperatureK, settings.tint,
             settings.halfSize, settings.maxLongEdge,
+            cancellation?.tokenForDecode() ?: NO_CANCELLATION,
         ).toLinear()
     }
 
@@ -157,47 +313,88 @@ object RawDecoder {
      * Decode from a file descriptor (e.g. `ParcelFileDescriptor.detachFd()` from a
      * SAF Uri). The fd is duplicated natively; the caller retains ownership.
      */
-    fun decodeToLinear(fd: Int, settings: Settings = Settings()): LinearResult =
+    fun decodeToLinear(
+        fd: Int,
+        settings: Settings = Settings(),
+        cancellation: RawDecodeCancellation? = null,
+    ): LinearResult =
         nativeDecodeFd(
             fd, settings.whiteBalance.nativeMode, settings.temperatureK, settings.tint,
             settings.halfSize, settings.maxLongEdge,
+            cancellation?.tokenForDecode() ?: NO_CANCELLATION,
         ).toLinear()
 
-    /** Decode by reading an InputStream fully into memory (SAF convenience). */
-    fun decodeToLinear(stream: InputStream, settings: Settings = Settings()): LinearResult =
-        decodeToLinear(stream.readBytes(), settings)
+    /** Decode an InputStream with the same 64 MiB ceiling as the native path. */
+    fun decodeToLinear(
+        stream: InputStream,
+        settings: Settings = Settings(),
+        cancellation: RawDecodeCancellation? = null,
+    ): LinearResult = decodeToLinear(
+        RawInputLimits.readBounded(stream) {
+            cancellation?.isCancellationRequested == true
+        },
+        settings,
+        cancellation,
+    )
+
+    /** Creates a reusable cooperative cancellation generation. */
+    fun newCancellation(): RawDecodeCancellation {
+        val token = nativeCreateCancellation()
+        check(token != NO_CANCELLATION) { "native cancellation token creation failed" }
+        return RawDecodeCancellation.fromNative(
+            token = token,
+            cancelNative = { nativeCancelCancellation(token) },
+            releaseNative = { nativeReleaseCancellation(token) },
+        )
+    }
 
     /**
      * Free a native (off-heap) RAW result buffer. The full-resolution decode hands back
-     * a [LinearResult.data] / [NativeResult.data] backed by `malloc` + `NewDirectByteBuffer`
+     * a [LinearResult] / [NativeResult.data] backed by `malloc` + `NewDirectByteBuffer`
      * (NOT `ByteBuffer.allocateDirect`), so it lives outside the ART managed heap and is
      * NOT reclaimed by the GC — the owner must free it explicitly when done. Safe to call
      * with any direct buffer this object produced; a no-op on a null/unmapped buffer.
      */
-    fun freeOffHeap(buf: ByteBuffer) = nativeFree(buf)
+    @Deprecated("LinearResult owns its native allocation; call close()")
+    fun freeOffHeap(@Suppress("UNUSED_PARAMETER") buf: ByteBuffer): Nothing =
+        error("RawDecoder.freeOffHeap is unsafe; close the owning LinearResult")
 
     private fun NativeResult.toLinear(): LinearResult {
         // Native gives little-/native-endian float32; tag the byte order so callers
         // reading as a FloatBuffer get correct values.
         data.order(ByteOrder.nativeOrder())
-        return LinearResult(data, width, height, colorSpace)
+        return LinearResult.fromNative(
+            data,
+            width,
+            height,
+            colorSpace,
+            precisionDescriptor,
+        ) { owned ->
+            check(nativeRelease(allocationToken, owned) == NATIVE_RELEASED) {
+                "native RAW allocation ownership mismatch"
+            }
+        }
     }
 
     /**
      * ## Mobile / Pixel / Samsung compressed DNG coverage
      *
-     * Most mobile DNGs (Google Pixel computational RAW, plain camera DNGs) use
-     * one of three raw-plane compressions, ALL decoded natively here:
+     * Native paths covered by this pinned decoder are:
      *
      *  * **Uncompressed** (Compression 1) — decoded natively.
      *  * **Lossless-JPEG / LJ92** (Compression 7) — the common Pixel encoding;
      *    decoded natively by LibRaw's own internal lossless-JPEG code (no
      *    libjpeg needed).
-     *  * **DEFLATE/ZIP** (Compression 8) — decoded natively (this module is
-     *    built with zlib; the NDK ships libz).
+     * Variants that need a typed, explicitly display-referred platform/next-codec
+     * fallback (no precision-preserving float/libjpeg/libjxl route is qualified):
      *
-     * Variants that still need a platform fallback (no libjpeg/libjxl vendored):
-     *
+     *  * **Integer/linear DEFLATE** (Compression 8), and Adobe-deflate tag
+     *    **0x80B2** — pinned LibRaw 0.22.2 does not decode these through the
+     *    qualified path; surfaces as [DecodeStatus.DEFLATE_DNG].
+     *  * **Floating-point DEFLATE/ZIP** (Compression 8, SampleFormat 3) — LibRaw's
+     *    memory-bitmap route would quantize the float source before this module's
+     *    float32 boundary. It therefore fails closed as [DecodeStatus.DEFLATE_DNG]
+     *    instead of claiming native precision parity.
      *  * **Lossy-baseline-JPEG DNG** (DNG 1.4 lossy, Compression 0x884C; or
      *    old-style JPEG, Compression 6) — common in Samsung Expert RAW. LibRaw
      *    `unpack()` fails; the native layer throws [RawDecodeException] with
@@ -208,10 +405,11 @@ object RawDecoder {
      *
      * ### Recommended app-side fallback (implemented in the app module, NOT here)
      *
-     * On [DecodeStatus.LOSSY_JPEG_DNG] / [DecodeStatus.JPEGXL_DNG] (and,
-     * defensively, on [DecodeStatus.FILE_UNSUPPORTED] for a `.dng`), fall back to
-     * Android's platform DNG decoder, backed by the system codecs, which decodes
-     * lossy / JPEG-XL DNG. Use [android.graphics.ImageDecoder] (API 28+):
+     * On [DecodeStatus.DEFLATE_DNG], [DecodeStatus.LOSSY_JPEG_DNG], or
+     * [DecodeStatus.JPEGXL_DNG] (and defensively on
+     * [DecodeStatus.FILE_UNSUPPORTED] for a `.dng`), use the platform/next-codec
+     * fallback selected by the app. Example with [android.graphics.ImageDecoder]
+     * (API 28+):
      *
      * ```kotlin
      * // App-side (feature module), NOT in lib:libraw:
@@ -220,13 +418,16 @@ object RawDecoder {
      *     // ... hand r to SpektraEngine ...
      * } catch (e: RawDecodeException) {
      *     when (e.status) {
+     *         DecodeStatus.DEFLATE_DNG,
      *         DecodeStatus.LOSSY_JPEG_DNG,
      *         DecodeStatus.JPEGXL_DNG,
      *         DecodeStatus.FILE_UNSUPPORTED -> {
      *             val src = ImageDecoder.createSource(resolver, uri) // API 28+
      *             val bmp = ImageDecoder.decodeBitmap(src)
-     *             // NOTE: bmp is display-referred sRGB, not linear ACES, so this
-     *             // bypasses the spectral pipeline (preview / import only).
+     *             val source = RawPrecisionDescriptor
+     *                 .forPlatformDisplayReferredFallback("sRGB")
+     *             // `source` can only be PLATFORM_DISPLAY_REFERRED: this bitmap is
+     *             // not native RAW parity and bypasses the scene-linear pipeline.
      *         }
      *         else -> throw e
      *     }
@@ -242,21 +443,27 @@ object RawDecoder {
     // --- native bridge (raw_decoder_jni.cpp) ---
     private external fun nativeDecodeBytes(
         bytes: ByteArray, wbMode: Int, temperatureK: Double, tint: Double,
-        halfSize: Boolean, maxLongEdge: Int,
+        halfSize: Boolean, maxLongEdge: Int, cancellationToken: Long,
     ): NativeResult
 
     private external fun nativeDecodeBuffer(
         buffer: ByteBuffer, len: Int, wbMode: Int, temperatureK: Double, tint: Double,
-        halfSize: Boolean, maxLongEdge: Int,
+        halfSize: Boolean, maxLongEdge: Int, cancellationToken: Long,
     ): NativeResult
 
     private external fun nativeDecodeFd(
         fd: Int, wbMode: Int, temperatureK: Double, tint: Double,
-        halfSize: Boolean, maxLongEdge: Int,
+        halfSize: Boolean, maxLongEdge: Int, cancellationToken: Long,
     ): NativeResult
 
-    /** Free a native (malloc + NewDirectByteBuffer) result buffer (see [freeOffHeap]). */
-    private external fun nativeFree(buffer: ByteBuffer)
+    /** Release an exact token/base/capacity match from the native registry. */
+    private external fun nativeRelease(allocationToken: Long, buffer: ByteBuffer): Int
+    private external fun nativeCreateCancellation(): Long
+    private external fun nativeCancelCancellation(cancellationToken: Long): Boolean
+    private external fun nativeReleaseCancellation(cancellationToken: Long): Boolean
+
+    private const val NATIVE_RELEASED = 0
+    private const val NO_CANCELLATION = 0L
 
     init {
         System.loadLibrary("sfraw")
@@ -272,7 +479,6 @@ object RawDecoder {
  *  - Lossless-JPEG / LJ92 DNG (Compression 7) — common Google Pixel and other
  *    computational-RAW DNGs; LibRaw decodes these with its own internal
  *    lossless-JPEG code (no libjpeg required).
- *  - DEFLATE / ZIP DNG (Compression 8) — via zlib.
  *  - Mainstream camera RAW (CR2/CR3/NEF/ARW/RAF/ORF/RW2/...).
  */
 enum class DecodeStatus(val code: Int) {
@@ -285,8 +491,9 @@ enum class DecodeStatus(val code: Int) {
     PROCESS(6),
     NO_MEMORY(7),
     FORMAT(8),
+    CANCELLED(9),
 
-    /** DEFLATE-compressed DNG but the build lacks zlib (should not happen). */
+    /** Unsupported DEFLATE layout, or a float DNG with no precision-safe RGB route. */
     DEFLATE_DNG(10),
 
     /**
@@ -302,6 +509,9 @@ enum class DecodeStatus(val code: Int) {
      * decodes JXL). See [RawDecoder].
      */
     JPEGXL_DNG(12),
+
+    /** Contradictory/unbounded precision, black/white, or CFA metadata. */
+    PRECISION_METADATA(13),
     ;
 
     companion object {

@@ -39,13 +39,20 @@
  *   "
  */
 #include "png_writer.h"
+#include "png_writer_jni_boundary.h"
 
+#include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <zlib.h>
+#include <dirent.h>
 
 using namespace spectrafilm;
 
@@ -276,18 +283,32 @@ void runCase(const char* label,
         CHECK(inflated.size() == filtRowBytes * static_cast<size_t>(H),
               "IDAT inflated size = (1 + W*3*2)*H");
 
-        // Verify filter bytes are all 0 (None) and pixel samples round-trip.
+        // Reconstruct the scanlines and compare pixels. Rows now choose between
+        // filter 0 (None) and filter 2 (Up) per row (#175), so this UNFILTERS
+        // rather than assuming a filter -- which is also what any decoder does.
         bool pixOk = true;
         bool filterOk = true;
-        for (int y = 0; y < H && (pixOk || filterOk); ++y) {
+        std::vector<uint8_t> recon(rowBytes * static_cast<size_t>(H));
+        for (int y = 0; y < H; ++y) {
             const uint8_t* row = inflated.data() + y * filtRowBytes;
-            if (row[0] != 0) { filterOk = false; }
-            // Samples start at row+1; each 16-bit sample is big-endian in file.
-            const uint8_t* s = row + 1;
+            const int type = row[0];
+            if (type != 0 && type != 2) { filterOk = false; }
+            uint8_t* cur = recon.data() + static_cast<size_t>(y) * rowBytes;
+            const uint8_t* prev =
+                y > 0 ? recon.data() + static_cast<size_t>(y - 1) * rowBytes : nullptr;
+            for (size_t i = 0; i < rowBytes; ++i) {
+                const uint8_t x = row[1 + i];
+                cur[i] = (type == 2)
+                    ? static_cast<uint8_t>(x + (prev ? prev[i] : 0))
+                    : x;
+            }
+        }
+        for (int y = 0; y < H && pixOk; ++y) {
+            const uint8_t* cur = recon.data() + static_cast<size_t>(y) * rowBytes;
             for (int x = 0; x < W * 3; ++x) {
-                uint16_t sampleBE = (static_cast<uint16_t>(s[x * 2]) << 8) |
-                                     static_cast<uint16_t>(s[x * 2 + 1]);
-                uint16_t orig = pixels[static_cast<size_t>(y) * W * 3 + x];
+                const uint16_t sampleBE = (static_cast<uint16_t>(cur[x * 2]) << 8) |
+                                           static_cast<uint16_t>(cur[x * 2 + 1]);
+                const uint16_t orig = pixels[static_cast<size_t>(y) * W * 3 + x];
                 if (sampleBE != orig) { pixOk = false; }
             }
         }
@@ -314,7 +335,291 @@ void runCase(const char* label,
     std::printf("    file: %s (%zu bytes)\n", path.c_str(), wr.bytesWritten);
 }
 
+struct CancelAfterPolls {
+    int polls = 0;
+    int cancelAt = 1;
+};
+
+bool cancelAfter(void* opaque) noexcept {
+    auto* state = static_cast<CancelAfterPolls*>(opaque);
+    return ++state->polls >= state->cancelAt;
+}
+
+struct TempStageCancellation {
+    const char* directory;
+    const char* filePrefix;
+};
+
+bool tempStageExists(void* opaque) noexcept {
+    const auto* state = static_cast<const TempStageCancellation*>(opaque);
+    DIR* directory = opendir(state->directory);
+    if (directory == nullptr) return false;
+    bool found = false;
+    const size_t prefixLength = std::strlen(state->filePrefix);
+    while (const dirent* entry = readdir(directory)) {
+        if (std::strncmp(entry->d_name, state->filePrefix, prefixLength) == 0) {
+            found = true;
+            break;
+        }
+    }
+    closedir(directory);
+    return found;
+}
+
+struct ConcurrentCancellation {
+    std::atomic<int> polls{0};
+    std::atomic<bool> cancelled{false};
+};
+
+bool blockUntilConcurrentCancel(void* opaque) noexcept {
+    auto* state = static_cast<ConcurrentCancellation*>(opaque);
+    const int poll = state->polls.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (poll == 2) {
+        while (!state->cancelled.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    }
+    return state->cancelled.load(std::memory_order_acquire);
+}
+
+void runSafetyCases() {
+    std::printf("[safety]\n");
+    const uint16_t onePixel[3] = {1, 2, 3};
+    PngMetadata meta;
+    std::vector<uint8_t> out = {0xAA};
+
+    auto huge = writePng16ToMemory(onePixel, INT_MAX, INT_MAX, meta, out);
+    CHECK(!huge.ok, "overflow dimensions are rejected before allocation");
+    CHECK(out.empty(), "overflow failure publishes no partial memory output");
+
+    auto invalidPath = writePng16ToFile(
+        reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(1)),
+        1, 1, meta, "");
+    CHECK(!invalidPath.ok && invalidPath.error == "empty output path",
+          "empty path is rejected before any pixel read");
+    static constexpr char kNulPath[] = "/tmp/sf_png_nul\0ignored.png";
+    const std::string nulPath(kNulPath, sizeof(kNulPath) - 1u);
+    invalidPath = writePng16ToFile(onePixel, 1, 1, meta, nulPath);
+    CHECK(!invalidPath.ok && invalidPath.error == "output path contains NUL",
+          "embedded-NUL path is rejected deterministically");
+
+    std::vector<uint16_t> pixels(4u * 8u * 3u, 0x1234);
+    CancelAfterPolls state{0, 3};
+    PngCancellation cancellation{&state, cancelAfter};
+    auto cancelled = writePng16ToMemory(
+        pixels.data(), 4, 8, meta, out, &cancellation);
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancellation is reported distinctly from write failure");
+    CHECK(state.polls == 3, "cancellation is polled while encoding rows");
+    CHECK(out.empty(), "cancelled encode publishes no partial memory output");
+
+    const std::string path = "/tmp/sf_png_cancelled.png";
+    {
+        FILE* existing = std::fopen(path.c_str(), "wb");
+        const uint8_t sentinel[] = {0x51, 0x52, 0x53};
+        std::fwrite(sentinel, 1, sizeof(sentinel), existing);
+        std::fclose(existing);
+    }
+    state = {0, 3};
+    cancelled = writePng16ToFile(
+        pixels.data(), 4, 8, meta, path, &cancellation);
+    std::vector<uint8_t> unchanged;
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancelled file write returns cancellation");
+    CHECK(readFile(path, unchanged) && unchanged == std::vector<uint8_t>({0x51, 0x52, 0x53}),
+          "cancelled file write leaves the published destination unchanged");
+    std::remove(path.c_str());
+
+    const std::string stagedPath = "/tmp/sf_png_staged_cancel.png";
+    {
+        FILE* existing = std::fopen(stagedPath.c_str(), "wb");
+        const uint8_t sentinel[] = {0x41, 0x42, 0x43};
+        std::fwrite(sentinel, 1, sizeof(sentinel), existing);
+        std::fclose(existing);
+    }
+    TempStageCancellation stagedState{"/tmp", "sf_png_staged_cancel.png.tmp."};
+    PngCancellation stagedCancellation{&stagedState, tempStageExists};
+    cancelled = writePng16ToFile(
+        pixels.data(), 4, 8, meta, stagedPath, &stagedCancellation);
+    unchanged.clear();
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancellation during staged output is reported");
+    CHECK(readFile(stagedPath, unchanged) && unchanged == std::vector<uint8_t>({0x41, 0x42, 0x43}),
+          "staged cancellation never replaces the destination");
+    CHECK(!tempStageExists(&stagedState),
+          "staged cancellation removes the incomplete temporary file");
+    std::remove(stagedPath.c_str());
+
+    ConcurrentCancellation concurrentState;
+    PngCancellation concurrentCancellation{
+        &concurrentState, blockUntilConcurrentCancel,
+    };
+    PngWriteResult concurrentResult;
+    out = {0xAA};
+    std::thread writer([&]() {
+        concurrentResult = writePng16ToMemory(
+            pixels.data(), 4, 8, meta, out, &concurrentCancellation);
+    });
+    while (concurrentState.polls.load(std::memory_order_acquire) < 2)
+        std::this_thread::yield();
+    concurrentState.cancelled.store(true, std::memory_order_release);
+    writer.join();
+    CHECK(!concurrentResult.ok && concurrentResult.cancelled && out.empty(),
+          "concurrent cancellation is race-free and publishes no memory output");
+}
+
+void runExceptionTranslationCases() {
+    using spectrafilm::pngjni::NativeExceptionKind;
+    using spectrafilm::pngjni::BufferWindow;
+    using spectrafilm::pngjni::BufferWindowError;
+    using spectrafilm::pngjni::containNativeExceptions;
+    using spectrafilm::pngjni::stableMessage;
+
+    std::printf("[jni-exception-translation]\n");
+    NativeExceptionKind kind = NativeExceptionKind::None;
+    int value = containNativeExceptions<int>([]() -> int { throw std::bad_alloc(); }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::OutOfMemory,
+          "bad_alloc is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "PNG write failed: out of memory") == 0,
+          "bad_alloc maps to a stable Kotlin error message");
+
+    value = containNativeExceptions<int>([]() -> int { throw std::runtime_error("unstable detail"); }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::Standard,
+          "std::exception is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "PNG write failed: native exception") == 0,
+          "std::exception maps to a stable Kotlin error message");
+
+    value = containNativeExceptions<int>([]() -> int { throw 7; }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::Unknown,
+          "unknown exception is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "PNG write failed: unknown native exception") == 0,
+          "unknown exception maps to a stable Kotlin error message");
+
+    BufferWindow window;
+    auto windowError = spectrafilm::pngjni::validateBufferWindow(
+        4, 16, 20, 20, 12, window);
+    CHECK(windowError == BufferWindowError::None && window.offset == 4 && window.length == 12,
+          "direct-buffer validation honours the logical position and limit");
+    windowError = spectrafilm::pngjni::validateBufferWindow(
+        4, 15, 20, 20, 12, window);
+    CHECK(windowError == BufferWindowError::TooSmall,
+          "direct-buffer validation rejects a short logical window");
+    windowError = spectrafilm::pngjni::validateBufferWindow(
+        4, 16, 20, 19, 12, window);
+    CHECK(windowError == BufferWindowError::Malformed,
+          "direct-buffer validation rejects inconsistent capacities");
+}
+
 }  // namespace
+
+// #175: the encoder now feeds deflate one scanline at a time instead of building
+// the whole filtered image first, and the float entry quantizes per row instead of
+// building a second full image. Those are MEMORY changes only -- PNG16 container
+// identity is a gated contract (the export benchmark compares whole-container
+// digests), so the bytes must not move by one.
+//
+// The reference here is the algorithm that was replaced: concatenate every filtered
+// scanline, then deflate the result in one pass with the same settings.
+static void runStreamingIdentityCases() {
+    std::printf("\n[streaming identity]\n");
+    const int W = 129, H = 97;   // several rows, and a row that is not a chunk multiple
+    const size_t rowSamples = static_cast<size_t>(W) * 3;
+    std::vector<uint16_t> pixels(rowSamples * H);
+    for (int y = 0; y < H; ++y) {
+        for (size_t x = 0; x < rowSamples; ++x) {
+            // Mixed compressible and incompressible content, so the deflate stream
+            // exercises both literal and match paths.
+            const size_t i = static_cast<size_t>(y) * rowSamples + x;
+            pixels[i] = static_cast<uint16_t>(((i * 2654435761u) >> 11) ^ (y << 7));
+            if ((x / 9) % 3 == 0) pixels[i] = static_cast<uint16_t>(0x1234 + y);
+        }
+    }
+
+    PngMetadata meta;
+    meta.software = "Spektrafilm-test";
+    std::vector<uint8_t> file;
+    const PngWriteResult res =
+        writePng16ToMemory(pixels.data(), W, H, meta, file, nullptr);
+    CHECK(res.ok, "streaming encode succeeds");
+    if (!res.ok) return;
+
+    const std::vector<Chunk> chunks = parseChunks(file);
+    const Chunk* idat = nullptr;
+    for (const Chunk& c : chunks) if (std::strcmp(c.type, "IDAT") == 0) idat = &c;
+    CHECK(idat != nullptr, "exactly one IDAT chunk (bands stay one deflate stream)");
+    if (idat == nullptr) return;
+    int idatCount = 0;
+    for (const Chunk& c : chunks) if (std::strcmp(c.type, "IDAT") == 0) idatCount++;
+    CHECK(idatCount == 1, "the banded encode still emits a single IDAT");
+
+    // The encode is parallel, so the bytes must not depend on how many threads ran.
+    // Bands are fixed by row count and concatenated in order, so this is a property
+    // of the design; it is asserted because a future change could break it silently.
+    {
+        setenv("SPK_PNG_WORKERS", "1", 1);
+        std::vector<uint8_t> serial;
+        const PngWriteResult one = writePng16ToMemory(pixels.data(), W, H, meta,
+                                                      serial, nullptr);
+        setenv("SPK_PNG_WORKERS", "8", 1);
+        std::vector<uint8_t> parallel;
+        const PngWriteResult eight = writePng16ToMemory(pixels.data(), W, H, meta,
+                                                        parallel, nullptr);
+        unsetenv("SPK_PNG_WORKERS");
+        CHECK(one.ok && eight.ok, "1-worker and 8-worker encodes both succeed");
+        CHECK(serial.size() == parallel.size() &&
+                  std::memcmp(serial.data(), parallel.data(), serial.size()) == 0,
+              "output is byte-identical at 1 and 8 workers");
+    }
+
+    // The file encoder streams and the memory encoder buffers, so they are two
+    // implementations of one format. They must agree byte for byte, or a container
+    // digest would depend on which entry point the caller happened to use.
+    {
+        const std::string streamPath = "/tmp/sf_png_stream_file.png";
+        const PngWriteResult fileRes =
+            writePng16ToFile(pixels.data(), W, H, meta, streamPath, nullptr);
+        CHECK(fileRes.ok, "streaming file write succeeds");
+        std::vector<uint8_t> streamed;
+        if (fileRes.ok && readFile(streamPath, streamed)) {
+            CHECK(streamed.size() == file.size() &&
+                      std::memcmp(streamed.data(), file.data(), file.size()) == 0,
+                  "streamed file is byte-identical to the in-memory encode");
+            CHECK(fileRes.bytesWritten == streamed.size(),
+                  "bytesWritten matches the streamed file size");
+        } else {
+            CHECK(false, "streamed file readable");
+        }
+        std::remove(streamPath.c_str());
+    }
+
+    // The float entry must produce the same file as quantizing first and writing.
+    std::vector<float> floats(pixels.size());
+    for (size_t i = 0; i < pixels.size(); ++i)
+        floats[i] = static_cast<float>(pixels[i]) / 65535.0f;
+    std::vector<uint16_t> requantized(pixels.size());
+    for (size_t i = 0; i < floats.size(); ++i) {
+        const float v = floats[i];
+        if (!(v > 0.0f)) { requantized[i] = 0; continue; }
+        if (v >= 1.0f) { requantized[i] = 65535; continue; }
+        requantized[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+    }
+    const std::string floatPath = "/tmp/sf_png_stream_float.png";
+    const std::string refPath = "/tmp/sf_png_stream_ref.png";
+    const PngWriteResult floatRes =
+        writePngFloatToFile(floats.data(), W, H, meta, floatPath, nullptr);
+    const PngWriteResult refRes =
+        writePng16ToFile(requantized.data(), W, H, meta, refPath, nullptr);
+    CHECK(floatRes.ok && refRes.ok, "float and uint16 file writes both succeed");
+    std::vector<uint8_t> floatFile, refFile;
+    if (readFile(floatPath, floatFile) && readFile(refPath, refFile)) {
+        CHECK(floatFile.size() == refFile.size() &&
+                  std::memcmp(floatFile.data(), refFile.data(), refFile.size()) == 0,
+              "row-quantized float write is byte-identical to the staged uint16 write");
+    } else {
+        CHECK(false, "both files readable");
+    }
+    std::remove(floatPath.c_str());
+    std::remove(refPath.c_str());
+}
 
 int main() {
     const int W = 5, H = 4;
@@ -362,6 +667,11 @@ int main() {
         meta.iccProfile = icc;
         runCase("no_software", pixels, W, H, meta);
     }
+
+    runStreamingIdentityCases();
+
+    runSafetyCases();
+    runExceptionTranslationCases();
 
     std::printf("\n%s (%d failure%s)\n",
                 g_failures == 0 ? "PASS" : "FAIL",

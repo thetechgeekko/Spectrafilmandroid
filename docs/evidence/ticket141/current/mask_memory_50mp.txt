@@ -1,0 +1,8 @@
+﻿TICKET141_MASK_MEMORY: RESULT
+width=8192 height=6104 pixels=50003968 masks=4 repeats=2
+scratch_payload_bytes=232882188 scratch_reserved_bytes=232888044 max_radius=409 memory_tier=xlarge physical_bytes=11662970880
+baseline_pss_kib=10058 peak_pss_kib=833147 delta_pss_kib=823089
+baseline_rss_kib=71672 peak_rss_kib=899244 delta_rss_kib=827572
+durations_ms=80698.804396,77612.094137 sha256=0fdacce5d7b8ac6a65e8ec9bedc3bbd60f6c23b95a2e020a2aed8e77d18930b6
+note=single-process release-device observation; output-buffer bytes are included; not a 12.5/50 MP qualification until both approved cells and graceful denial run
+

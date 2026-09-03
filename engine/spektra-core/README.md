@@ -3,11 +3,17 @@
 Native (C++/NDK) port of spektrafilm's `runtime` + `model` packages, exposed to the app through
 a thin JNI + Kotlin facade.
 
-> **Status: shipped.** The engine is fully implemented, bit-exact against the spektrafilm
-> oracle (golden-vector parity harness, `max_abs ≤ 1e-4` / `rms ≤ 1e-5`, byte-identical across
-> thread counts), NEON-accelerated (`kernels/exp10.h`), and ships in released APKs (v0.7.0+).
-> The C++ header, JNI bridge, and Kotlin facade/params are the stable contract; see
-> `../../docs/PORTING_PLAN.md` for the upstream module map and the parity strategy.
+> **Status: shipped for the pinned reviewed baseline.** The engine passes oracle tolerance
+> (`max_abs ≤ 1e-4`, `rms ≤ 1e-5`) and same-build worker-count identity; this is not universal
+> cross-build/ABI/CPU/GPU byte identity. Latest-upstream coverage remains owned by the parity-manifest
+> ticket. The C++ header, JNI bridge, and Kotlin facade/params are the current boundary; see
+> [`docs/EXECUTION_INDEX.md`](../../docs/EXECUTION_INDEX.md) for authority and
+> [`docs/BIT_IDENTICAL_EXPORT_ROADMAP.md`](../../docs/BIT_IDENTICAL_EXPORT_ROADMAP.md) for the
+> numeric contract.
+
+Native allocation tokens, data leases, checked direct-buffer windows, cancellation checkpoints,
+and render/close verification are specified in
+[`docs/JNI_LIFETIME_SAFETY.md`](../../docs/JNI_LIFETIME_SAFETY.md).
 
 ## Layout
 

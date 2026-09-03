@@ -1,14 +1,20 @@
 # Spektrafilm release pipeline.
 #
-# Fires on tag push `v*` (e.g. v0.4.0). Builds a signed release APK using the
-# production keystore stored in repo secrets, attaches the APK + SHA-256 to the
-# existing GitHub Release for that tag (or creates one if missing).
+# Fires on a stable vMAJOR.MINOR.PATCH tag. Gates and attests one exact unsigned
+# app/instrumentation pair without secrets, then signs and device-verifies those
+# bytes only inside the protected `release-signing` Environment. Publication
+# requires immutable releases and retains the APK, both SPDX documents, LibRaw
+# source/relink ZIP, all dependency locks, R8 mapping, full native symbols,
+# runtime classpath, provenance, sidecars, and checksums.
 #
-# Required secrets (set via `gh secret set` — see HANDOFF.md):
+# Required `release-signing` Environment secrets (repo-level copies forbidden):
 #   SIGNING_KEYSTORE           base64 of spectrafilm-release.jks
 #   SIGNING_KEY_ALIAS          keystore alias (e.g. spectrafilm)
 #   SIGNING_KEYSTORE_PASSWORD  store password
 #   SIGNING_KEY_PASSWORD       key password
+#   RELEASE_GITHUB_TOKEN       fine-grained token/App token with repository
+#                              Administration(read) + Contents(write); required
+#                              to prove immutable releases are enabled.
 name: Release
 
 on:
@@ -21,116 +27,1124 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build-signed-apk:
-    name: Build signed release APK
+  resolve-release:
+    name: Resolve immutable release commit
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      - name: Determine ref
-        id: ref
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and resolve commit
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "ref=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-            echo "version=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
           else
-            echo "ref=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            tag="${EVENT_REF#refs/tags/}"
+          fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag must be a stable vMAJOR.MINOR.PATCH value without leading zeros"
+            exit 1
+          fi
+          git fetch --force origin "+refs/tags/${tag}:refs/tags/${tag}"
+          sha="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Tag did not resolve to one commit"
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "push" ]; then
+            event_commit="$(git rev-parse "${EVENT_SHA}^{commit}")"
+            if [ "$sha" != "$event_commit" ]; then
+              echo "::error::Release tag moved after the push event; refusing the replacement target"
+              exit 1
+            fi
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  qualify-libraw:
+    name: Qualify pinned LibRaw before signing
+    needs: resolve-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      run_id: ${{ steps.qualification-receipt.outputs.run_id }}
+      run_attempt: ${{ steps.qualification-receipt.outputs.run_attempt }}
+      source_sha: ${{ steps.qualification-receipt.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.sha }}
+
+      - name: Reject unresolved or unsupported LibRaw distribution route
+        run: |
+          set -euo pipefail
+          python3 tools/compliance/libraw_bundle.py audit-route \
+            --repo-root . \
+            --require-resolved
+
+      - name: Install native test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang cmake ninja-build libomp-dev patch zlib1g-dev
+
+      - name: Run shipping-serial hostile-input sanitizer gate
+        run: |
+          set -euo pipefail
+          cmake -S lib/libraw/src/test/host -B build/libraw-release-serial-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DSFRAW_HOST_ENABLE_SANITIZERS=ON \
+            -DSFRAW_HOST_ENABLE_OPENMP=OFF \
+            -DSFRAW_HOST_BUILD_FUZZER=OFF
+          cmake --build build/libraw-release-serial-asan --parallel
+          ctest --test-dir build/libraw-release-serial-asan --output-on-failure
+
+      - name: Run OpenMP hostile-input sanitizer gate
+        run: |
+          set -euo pipefail
+          cmake -S lib/libraw/src/test/host -B build/libraw-release-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DSFRAW_HOST_ENABLE_SANITIZERS=ON \
+            -DSFRAW_HOST_ENABLE_OPENMP=ON \
+            -DSFRAW_HOST_REQUIRE_OPENMP=ON \
+            -DSFRAW_HOST_BUILD_FUZZER=ON
+          cmake --build build/libraw-release-asan --parallel
+          ctest --test-dir build/libraw-release-asan --output-on-failure
+
+      - name: Run bounded public-seam fuzz gate
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          mkdir -p build/libraw-release-fuzz-corpus
+          mkdir -p build/libraw-release-sniffer-corpus
+          cp build/libraw-release-asan/fuzz-seeds/*.dng build/libraw-release-fuzz-corpus/
+          cp build/libraw-release-asan/fuzz-seeds/*.tiff build/libraw-release-fuzz-corpus/
+          cp build/libraw-release-asan/fuzz-seeds/*.x3f build/libraw-release-fuzz-corpus/
+          cp build/libraw-release-asan/fuzz-seeds/*.dng build/libraw-release-sniffer-corpus/
+          cp build/libraw-release-asan/fuzz-seeds/*.tiff build/libraw-release-sniffer-corpus/
+          cp build/libraw-release-asan/fuzz-seeds/*.x3f build/libraw-release-sniffer-corpus/
+          build/libraw-release-asan/sfraw_libraw_fuzzer \
+            -runs=1000 -max_total_time=60 -max_len=16777216 \
+            -rss_limit_mb=1024 -timeout=10 build/libraw-release-fuzz-corpus
+          build/libraw-release-asan/sfraw_dng_sniffer_fuzzer \
+            -runs=1000 -max_total_time=60 -max_len=16777216 \
+            -rss_limit_mb=1024 -timeout=10 build/libraw-release-sniffer-corpus
+
+      - name: Run thread-safety sanitizer gate
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -euo pipefail
+          cmake -S lib/libraw/src/test/host -B build/libraw-release-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DSFRAW_HOST_ENABLE_SANITIZERS=OFF \
+            -DSFRAW_HOST_ENABLE_TSAN=ON \
+            -DSFRAW_HOST_ENABLE_OPENMP=OFF
+          cmake --build build/libraw-release-tsan --parallel \
+            --target sfraw_ljpeg_concurrency_test
+          ctest --test-dir build/libraw-release-tsan --output-on-failure \
+            -R '^sfraw\.ljpeg\.concurrent-first-use$'
+
+      - name: Emit current-attempt LibRaw qualification receipt
+        id: qualification-receipt
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+  # Keep the release gate structurally identical to CI by calling the same
+  # committed runner. It covers JNI safety helpers + engine C cancellation ABI,
+  # bounded tc_lut-cache lifetime/admission, fork/join exception containment,
+  # and writer tests; the actual Android JNI bridge runs on API 35 before publish.
+  qualify-native-safety:
+    name: Qualify engine and PNG/TIFF native safety
+    needs: resolve-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      run_id: ${{ steps.qualification-receipt.outputs.run_id }}
+      run_attempt: ${{ steps.qualification-receipt.outputs.run_attempt }}
+      source_sha: ${{ steps.qualification-receipt.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.sha }}
+          persist-credentials: false
+
+      - name: Run shared host-native sanitizer qualification
+        working-directory: ${{ github.workspace }}
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:report_signal_unsafe=0
+        run: |
+          set -euo pipefail
+          bash tools/release/run_native_safety.sh
+
+      - name: Emit current-attempt native safety qualification receipt
+        id: qualification-receipt
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+  build-release-candidate:
+    name: Build unsigned release candidate
+    needs: [resolve-release, qualify-libraw, qualify-native-safety]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      artifact_id: ${{ steps.candidate-upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.candidate-upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.sha }}
+          persist-credentials: false
+
+      - name: Reject stale LibRaw qualification from a prior run attempt
+        env:
+          QUALIFIED_RUN_ID: ${{ needs.qualify-libraw.outputs.run_id }}
+          QUALIFIED_RUN_ATTEMPT: ${{ needs.qualify-libraw.outputs.run_attempt }}
+          QUALIFIED_SOURCE_SHA: ${{ needs.qualify-libraw.outputs.source_sha }}
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$QUALIFIED_RUN_ID" != "$GITHUB_RUN_ID" ] || \
+             [ "$QUALIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ] || \
+             [ "$QUALIFIED_SOURCE_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::LibRaw qualification is stale; use Re-run all jobs"
+            exit 1
           fi
 
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.ref.outputs.ref }}
+      - name: Reject stale native safety qualification from a prior run attempt
+        env:
+          QUALIFIED_RUN_ID: ${{ needs.qualify-native-safety.outputs.run_id }}
+          QUALIFIED_RUN_ATTEMPT: ${{ needs.qualify-native-safety.outputs.run_attempt }}
+          QUALIFIED_SOURCE_SHA: ${{ needs.qualify-native-safety.outputs.source_sha }}
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$QUALIFIED_RUN_ID" != "$GITHUB_RUN_ID" ] || \
+             [ "$QUALIFIED_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ] || \
+             [ "$QUALIFIED_SOURCE_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Native safety qualification is stale; use Re-run all jobs"
+            exit 1
+          fi
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
-      - name: Install NDK + CMake + build-tools
-        # NDK r27 -> 16 KB-aligned native segments; build-tools 35 -> zipalign -P 16
-        # page-aligns the bundled .so to 16 KB (Android 15 16 KB page requirement).
+      - name: Install NDK + CMake + pinned build-tools
         run: sdkmanager "ndk;27.0.12077973" "cmake;3.22.1" "build-tools;35.0.0"
 
-      - name: Decode keystore from secret
+      - name: Verify Gradle wrapper provenance
+        run: |
+          set -euo pipefail
+          echo "7d3a4ac4de1c32b59bc6a4eb8ecb8e612ccd0cf1ae1e99f66902da64df296172  gradle/wrapper/gradle-wrapper.jar" \
+            | sha256sum -c -
+          grep -Fx \
+            "distributionSha256Sum=bd71102213493060956ec229d946beee57158dbd89d0e62b91bca0fa2c5f3531" \
+            gradle/wrapper/gradle-wrapper.properties
+
+      - name: Revalidate immutable release tag before candidate build
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/${VERSION}:refs/tags/${VERSION}"
+          CURRENT_SHA="$(git rev-parse "refs/tags/${VERSION}^{commit}")"
+          if [ "$CURRENT_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Release tag moved after qualification; refusing candidate build"
+            exit 1
+          fi
+
+      - name: Verify release tag matches app version source
+        env:
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          source = pathlib.Path("app/build.gradle.kts").read_text(encoding="utf-8")
+          expected_version = os.environ["VERSION"].removeprefix("v")
+
+          def exactly_one(pattern: str, label: str) -> str:
+              values = re.findall(pattern, source, flags=re.MULTILINE)
+              if len(values) != 1:
+                  raise SystemExit(f"::error::{label} must have exactly one literal declaration")
+              return values[0]
+
+          application_id = exactly_one(
+              r'^\s*applicationId\s*=\s*"([^"]+)"\s*$', "applicationId"
+          )
+          version_name = exactly_one(
+              r'^\s*versionName\s*=\s*"([^"]+)"\s*$', "versionName"
+          )
+          version_code = exactly_one(
+              r'^\s*versionCode\s*=\s*([0-9]+)\s*$', "versionCode"
+          )
+          if application_id != "com.spectrafilm.app":
+              raise SystemExit("::error::Unexpected release applicationId")
+          if version_name != expected_version:
+              raise SystemExit(
+                  f"::error::Tag {os.environ['VERSION']} does not match versionName {version_name}"
+              )
+          if int(version_code) <= 0:
+              raise SystemExit("::error::versionCode must be positive")
+          PY
+
+      - name: Run release-policy offline regression tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/release/tests -p 'test_*.py'
+
+      - name: Run O2 exact engine parity
+        run: |
+          set -euo pipefail
+          mkdir -p build/release-gates
+          bash tools/parity/run_engine_parity.sh build/release-parity-o2
+          printf 'PASS\n' > build/release-gates/o2-exact-engine-parity
+
+      - name: Run shipping-flags exact engine parity
+        env:
+          SPK_PARITY_EXTRA_FLAGS: -O3 -ffast-math -fno-finite-math-only
+        run: |
+          set -euo pipefail
+          bash tools/parity/run_engine_parity.sh build/release-parity-shipping
+          printf 'PASS\n' > build/release-gates/shipping-exact-engine-parity
+
+      - name: Run release JVM tests and lint
+        run: |
+          set -euo pipefail
+          ./gradlew \
+            :app:testReleaseUnitTest \
+            :lib:libraw:testReleaseUnitTest \
+            :engine:spektra-core:testReleaseUnitTest \
+            :lib:pngwriter:testReleaseUnitTest \
+            :lib:tiffwriter:testReleaseUnitTest \
+            :app:lintRelease \
+            --stacktrace
+          printf 'PASS\n' > build/release-gates/release-jvm-tests-and-lint
+
+      - name: Assemble unsigned minified release candidate
+        env:
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          test ! -e keystore.properties
+          test ! -e spectrafilm-release.jks
+          ./gradlew :app:assembleRelease --stacktrace
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          test -f "$APK"
+          if "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK" >/dev/null 2>&1; then
+            echo "::error::Non-secret build job unexpectedly produced a signed APK"
+            exit 1
+          fi
+          PACKAGE_LINE="$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | sed -n '1p')"
+          EXPECTED_VERSION="${VERSION#v}"
+          if [[ "$PACKAGE_LINE" != *"package: name='com.spectrafilm.app'"* ]] || \
+             [[ "$PACKAGE_LINE" != *"versionName='${EXPECTED_VERSION}'"* ]] || \
+             [[ ! "$PACKAGE_LINE" =~ versionCode=\'[1-9][0-9]*\' ]]; then
+            echo "::error::Compiled APK package/version identity does not match the release tag"
+            exit 1
+          fi
+          printf 'PASS\n' > build/release-gates/unsigned-release-assembly
+
+      - name: Assemble exact-candidate instrumentation APK
+        run: |
+          set -euo pipefail
+          ./gradlew \
+            :app:assembleReleaseAndroidTest \
+            :engine:spektra-core:assembleDebugAndroidTest \
+            --stacktrace
+          TEST_APK=app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+          ENGINE_TEST_APK=engine/spektra-core/build/outputs/apk/androidTest/debug/spektra-core-debug-androidTest.apk
+          test -f "$TEST_APK"
+          test -f "$ENGINE_TEST_APK"
+          TEST_MANIFEST="$("$ANDROID_HOME/build-tools/35.0.0/aapt" \
+            dump xmltree "$TEST_APK" AndroidManifest.xml)"
+          if [[ "$TEST_MANIFEST" != *'E: instrumentation'* ]] || \
+             [[ "$TEST_MANIFEST" != *'android:name(0x01010003)="com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation"'* ]] || \
+             [[ "$TEST_MANIFEST" != *'android:targetPackage(0x01010021)="com.spectrafilm.app"'* ]]; then
+            echo "::error::Release gate APK does not target the exact production package/runner"
+            exit 1
+          fi
+          ENGINE_TEST_MANIFEST="$("$ANDROID_HOME/build-tools/35.0.0/aapt" \
+            dump xmltree "$ENGINE_TEST_APK" AndroidManifest.xml)"
+          if [[ "$ENGINE_TEST_MANIFEST" != *'E: instrumentation'* ]] || \
+             [[ "$ENGINE_TEST_MANIFEST" != *'android:name(0x01010003)="com.spectrafilm.engine.EngineBoundaryInstrumentation"'* ]] || \
+             [[ "$ENGINE_TEST_MANIFEST" != *'android:targetPackage(0x01010021)="com.spectrafilm.engine.test"'* ]]; then
+            echo "::error::Engine boundary APK runner/target identity drifted"
+            exit 1
+          fi
+          printf 'PASS\n' > build/release-gates/release-instrumentation-assembly
+          printf 'PASS\n' > build/release-gates/engine-jni-boundary-assembly
+
+      - name: Capture locked release runtime classpath
+        run: |
+          set -euo pipefail
+          ./gradlew :app:writeReleaseRuntimeClasspath
+          test -s build/release-runtime-classpath.txt
+          cp build/release-runtime-classpath.txt build/release-runtime-classpath.first.txt
+          rm build/release-runtime-classpath.txt
+          ./gradlew :app:writeReleaseRuntimeClasspath
+          cmp build/release-runtime-classpath.first.txt build/release-runtime-classpath.txt
+
+      - name: Verify R8 and 16 KiB candidate invariants
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          test -s app/build/outputs/mapping/release/mapping.txt
+          test -s app/build/outputs/native-debug-symbols/release/native-debug-symbols.zip
+          "$BT/zipalign" -c -v -P 16 4 "$APK"
+          tools/r8_check/check_release_dex.sh "$APK" "$BT"
+          ELF_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ELF_ROOT"' EXIT
+          unzip -oq "$APK" 'lib/arm64-v8a/*.so' 'lib/x86_64/*.so' -d "$ELF_ROOT"
+          mapfile -t SO_FILES < <(find "$ELF_ROOT/lib" -type f -name '*.so' | LC_ALL=C sort)
+          if [ "${#SO_FILES[@]}" -eq 0 ]; then
+            echo "::error::Candidate contains no 64-bit native libraries"
+            exit 1
+          fi
+          for so in "${SO_FILES[@]}"; do
+            mapfile -t LOAD_ALIGNMENTS < <(readelf -lW "$so" | awk '$1 == "LOAD" {print $NF}')
+            if [ "${#LOAD_ALIGNMENTS[@]}" -eq 0 ]; then
+              echo "::error::No PT_LOAD segments in ${so}"
+              exit 1
+            fi
+            for alignment in "${LOAD_ALIGNMENTS[@]}"; do
+              if [ "$alignment" != "0x4000" ]; then
+                echo "::error::Non-16-KiB PT_LOAD alignment in ${so}: ${alignment}"
+                exit 1
+              fi
+            done
+          done
+          printf 'PASS\n' > build/release-gates/r8-and-16k-candidate
+
+      - name: Verify legal notices in the unsigned candidate
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          verify_asset() {
+            local path="$1"
+            local expected="$2"
+            local actual
+            actual="$(unzip -p "$APK" "assets/$path" | sha256sum | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Missing or altered legal asset: $path"
+              exit 1
+            fi
+          }
+          verify_asset third_party/libraw/COPYRIGHT 574c88f5dd59414cfc896293a63defbc2d525a418ed413d7ab7dcc43cf79c509
+          verify_asset third_party/libraw/LICENSE.LGPL eea173a556abac0370461e57e12aab266894ea6be3874c2be05fd87871f75449
+          verify_asset third_party/libraw/LICENSE.CDDL 0e3098d2d54a12434715f6679ea408d57da5e8d613c385c58ecc6fe5d30cc81f
+          verify_asset legal/spektrafilm/LICENSE.GPL-3.0 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+          verify_asset legal/spektrafilm/NOTICE.md 9bab38c4b25b361081f0bcfdabe10f7d5dc0d2a50cc7626612b88971bc8081cb
+
+      - name: Stage hash-bound candidate and compliance materials
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          CANDIDATE=candidate
+          COMPLIANCE_DIR=build/libraw-compliance-release
+          ARCHIVE="$COMPLIANCE_DIR/LibRaw-0.22.2.tar.gz"
+          mkdir -p "$CANDIDATE" "$COMPLIANCE_DIR"
+          cp app/build/outputs/apk/release/app-release-unsigned.apk \
+            "$CANDIDATE/app-release-unsigned.apk"
+          cp app/build/outputs/apk/androidTest/release/app-release-androidTest.apk \
+            "$CANDIDATE/app-release-gate-androidTest.apk"
+          cp engine/spektra-core/build/outputs/apk/androidTest/debug/spektra-core-debug-androidTest.apk \
+            "$CANDIDATE/engine-boundary-debug-androidTest.apk"
+          cp app/build/outputs/mapping/release/mapping.txt \
+            "$CANDIDATE/r8-mapping.txt"
+          cp app/build/outputs/native-debug-symbols/release/native-debug-symbols.zip \
+            "$CANDIDATE/native-debug-symbols.zip"
+          cp build/release-runtime-classpath.txt \
+            "$CANDIDATE/release-runtime-classpath.txt"
+          curl --fail --location --retry 3 \
+            --output "$ARCHIVE" \
+            https://www.libraw.org/data/LibRaw-0.22.2.tar.gz
+          echo "de86b035655accff8d4010f1a221fdf50d353cb7b1422ba26f14a0db92612cfa  $ARCHIVE" \
+            | sha256sum -c -
+          python3 tools/compliance/libraw_bundle.py build \
+            --repo-root . \
+            --archive "$ARCHIVE" \
+            --output "$CANDIDATE/libraw-source-relink.zip" \
+            --sbom-output "$CANDIDATE/libraw.spdx.json"
+          python3 tools/compliance/libraw_bundle.py verify \
+            --repo-root . \
+            --bundle "$CANDIDATE/libraw-source-relink.zip" \
+            --require-resolved
+          unzip -p "$CANDIDATE/libraw-source-relink.zip" sbom.spdx.json \
+            | cmp - "$CANDIDATE/libraw.spdx.json"
+
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_SHA")"
+          python3 tools/release/app_spdx.py \
+            --repo-root . \
+            --version "$VERSION" \
+            --source-sha "$RELEASE_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --libraw-spdx "$CANDIDATE/libraw.spdx.json" \
+            --runtime-report "$CANDIDATE/release-runtime-classpath.txt" \
+            --output "$CANDIDATE/app.spdx.json"
+
+          python3 - "$CANDIDATE/gradle-locks.zip" <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          root = pathlib.Path(".")
+          output = pathlib.Path(sys.argv[1])
+          lock_paths = (
+              "settings-gradle.lockfile",
+              "app/gradle.lockfile",
+              "engine/spektra-core/gradle.lockfile",
+              "lib/libraw/gradle.lockfile",
+              "lib/pngwriter/gradle.lockfile",
+              "lib/tiffwriter/gradle.lockfile",
+          )
+          discovered = tuple(
+              sorted(
+                  path.relative_to(root).as_posix()
+                  for path in root.rglob("*gradle.lockfile")
+                  if "build" not in path.parts and ".gradle" not in path.parts
+              )
+          )
+          if discovered != tuple(sorted(lock_paths)):
+              raise SystemExit(
+                  f"::error::Gradle lock inventory drift: expected={lock_paths!r} "
+                  f"actual={discovered!r}"
+              )
+          with zipfile.ZipFile(
+              output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+          ) as archive:
+              for relative in lock_paths:
+                  info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.create_system = 3
+                  info.external_attr = 0o100644 << 16
+                  archive.writestr(info, (root / relative).read_bytes())
+          PY
+          unzip -Z1 "$CANDIDATE/gradle-locks.zip" \
+            > build/actual-gradle-lock-inventory.txt
+          printf '%s\n' \
+            settings-gradle.lockfile \
+            app/gradle.lockfile \
+            engine/spektra-core/gradle.lockfile \
+            lib/libraw/gradle.lockfile \
+            lib/pngwriter/gradle.lockfile \
+            lib/tiffwriter/gradle.lockfile \
+            > build/expected-gradle-lock-inventory.txt
+          cmp build/expected-gradle-lock-inventory.txt \
+            build/actual-gradle-lock-inventory.txt
+
+          printf 'PASS\n' > build/release-gates/libraw-qualification
+          printf 'PASS\n' > build/release-gates/native-safety-sanitizers
+          python3 tools/release/gate_attestation.py create \
+            --version "$VERSION" \
+            --source-sha "$RELEASE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --unsigned-apk "$CANDIDATE/app-release-unsigned.apk" \
+            --instrumentation-apk "$CANDIDATE/app-release-gate-androidTest.apk" \
+            --engine-instrumentation-apk "$CANDIDATE/engine-boundary-debug-androidTest.apk" \
+            --marker-dir build/release-gates \
+            --attestation "$CANDIDATE/RELEASE_GATE_ATTESTATION.txt"
+          {
+            printf 'schema=spektrafilm-release-candidate-v1\n'
+            printf 'version=%s\n' "$VERSION"
+            printf 'release_sha=%s\n' "$RELEASE_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } > "$CANDIDATE/CANDIDATE_METADATA.txt"
+          (
+            cd "$CANDIDATE"
+            find . -maxdepth 1 -type f ! -name CANDIDATE_SHA256SUMS \
+              -printf '%f\n' | LC_ALL=C sort \
+              | xargs sha256sum > CANDIDATE_SHA256SUMS
+          )
+
+      - name: Upload immutable unsigned candidate
+        id: candidate-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate-${{ needs.resolve-release.outputs.version }}-${{ needs.resolve-release.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-and-publish:
+    name: Sign, qualify, and publish the exact candidate
+    needs: [resolve-release, qualify-libraw, qualify-native-safety, build-release-candidate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release-signing
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up JDK 17 for Android build-tools
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Install pinned signing build-tools only
+        run: sdkmanager "build-tools;35.0.0"
+
+      - name: Validate exact candidate artifact identity
+        env:
+          CANDIDATE_ARTIFACT_ID: ${{ needs.build-release-candidate.outputs.artifact_id }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.build-release-candidate.outputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE_ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Candidate upload did not return one numeric artifact database ID"
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_ARTIFACT_DIGEST" =~ ^(sha256:)?[0-9a-f]{64}$ ]]; then
+            echo "::error::Candidate upload did not return one SHA-256 artifact digest"
+            exit 1
+          fi
+
+      - name: Download and verify candidate archive by exact artifact ID and digest
+        env:
+          ACTIONS_TOKEN: ${{ github.token }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.build-release-candidate.outputs.artifact_id }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.build-release-candidate.outputs.artifact_digest }}
+          EXPECTED_ARTIFACT_NAME: release-candidate-${{ needs.resolve-release.outputs.version }}-${{ needs.resolve-release.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.sha }}
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}"
+          mkdir -p build candidate
+          curl --fail-with-body --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${ACTIONS_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$API" -o build/candidate-artifact.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          artifact = json.loads(
+              Path("build/candidate-artifact.json").read_text(encoding="utf-8")
+          )
+          expected_digest = os.environ["CANDIDATE_ARTIFACT_DIGEST"].removeprefix(
+              "sha256:"
+          )
+          expected = {
+              "id": int(os.environ["CANDIDATE_ARTIFACT_ID"]),
+              "name": os.environ["EXPECTED_ARTIFACT_NAME"],
+              "expired": False,
+              "digest": f"sha256:{expected_digest}",
+          }
+          for key, value in expected.items():
+              if artifact.get(key) != value:
+                  raise SystemExit(
+                      f"artifact metadata mismatch for {key}: "
+                      f"expected={value!r} actual={artifact.get(key)!r}"
+                  )
+          workflow_run = artifact.get("workflow_run")
+          if not isinstance(workflow_run, dict):
+              raise SystemExit("artifact metadata is missing workflow_run identity")
+          if str(workflow_run.get("id")) != os.environ["GITHUB_RUN_ID"]:
+              raise SystemExit("artifact was not created by this workflow run")
+          if workflow_run.get("head_sha") != os.environ["EXPECTED_WORKFLOW_SHA"]:
+              raise SystemExit("artifact was not created from this workflow invocation")
+          PY
+          curl --fail-with-body --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${ACTIONS_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$API/zip" -o build/candidate-artifact.zip
+          EXPECTED_DIGEST="${CANDIDATE_ARTIFACT_DIGEST#sha256:}"
+          ACTUAL_DIGEST="$(sha256sum build/candidate-artifact.zip | cut -d' ' -f1)"
+          if [ "$ACTUAL_DIGEST" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::Candidate artifact archive digest mismatch"
+            exit 1
+          fi
+          unzip -q build/candidate-artifact.zip -d candidate
+
+      - name: Verify candidate identity, gates, and transport hashes
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            CANDIDATE_METADATA.txt \
+            CANDIDATE_SHA256SUMS \
+            RELEASE_GATE_ATTESTATION.txt \
+            app-release-gate-androidTest.apk \
+            app-release-unsigned.apk \
+            app.spdx.json \
+            engine-boundary-debug-androidTest.apk \
+            gradle-locks.zip \
+            libraw-source-relink.zip \
+            libraw.spdx.json \
+            native-debug-symbols.zip \
+            r8-mapping.txt \
+            release-runtime-classpath.txt \
+            | LC_ALL=C sort > build/expected-candidate-files.txt
+          find candidate -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort > build/actual-candidate-files.txt
+          cmp build/expected-candidate-files.txt build/actual-candidate-files.txt
+          (
+            cd candidate
+            sha256sum -c CANDIDATE_SHA256SUMS
+          )
+
+          {
+            printf 'schema=spektrafilm-release-candidate-v1\n'
+            printf 'version=%s\n' "$VERSION"
+            printf 'release_sha=%s\n' "$RELEASE_SHA"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+          } > build/expected-candidate-metadata.txt
+          cmp build/expected-candidate-metadata.txt candidate/CANDIDATE_METADATA.txt
+
+          python3 tools/release/gate_attestation.py verify \
+            --version "$VERSION" \
+            --source-sha "$RELEASE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --unsigned-apk candidate/app-release-unsigned.apk \
+            --instrumentation-apk candidate/app-release-gate-androidTest.apk \
+            --engine-instrumentation-apk candidate/engine-boundary-debug-androidTest.apk \
+            --attestation candidate/RELEASE_GATE_ATTESTATION.txt
+
+          if "$ANDROID_HOME/build-tools/35.0.0/apksigner" \
+              verify candidate/app-release-unsigned.apk >/dev/null 2>&1; then
+            echo "::error::Transferred production candidate must remain unsigned"
+            exit 1
+          fi
+          PACKAGE_LINE="$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging \
+            candidate/app-release-unsigned.apk | sed -n '1p')"
+          EXPECTED_VERSION="${VERSION#v}"
+          if [[ "$PACKAGE_LINE" != *"package: name='com.spectrafilm.app'"* ]] || \
+             [[ "$PACKAGE_LINE" != *"versionName='${EXPECTED_VERSION}'"* ]] || \
+             [[ ! "$PACKAGE_LINE" =~ versionCode=\'[1-9][0-9]*\' ]]; then
+            echo "::error::Transferred APK identity does not match the qualified tag"
+            exit 1
+          fi
+
+          LOCK_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$LOCK_ROOT"' EXIT
+          unzip -q candidate/gradle-locks.zip -d "$LOCK_ROOT"
+          printf '%s\n' \
+            settings-gradle.lockfile \
+            app/gradle.lockfile \
+            engine/spektra-core/gradle.lockfile \
+            lib/libraw/gradle.lockfile \
+            lib/pngwriter/gradle.lockfile \
+            lib/tiffwriter/gradle.lockfile \
+            > build/expected-gradle-lock-inventory.txt
+          unzip -Z1 candidate/gradle-locks.zip \
+            > build/actual-gradle-lock-inventory.txt
+          cmp build/expected-gradle-lock-inventory.txt \
+            build/actual-gradle-lock-inventory.txt
+          while IFS= read -r lock; do
+            cmp "$lock" "$LOCK_ROOT/$lock"
+          done < build/expected-gradle-lock-inventory.txt
+
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_SHA")"
+          python3 tools/release/app_spdx.py \
+            --repo-root . \
+            --version "$VERSION" \
+            --source-sha "$RELEASE_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --libraw-spdx candidate/libraw.spdx.json \
+            --runtime-report candidate/release-runtime-classpath.txt \
+            --output build/recomputed-app.spdx.json
+          cmp build/recomputed-app.spdx.json candidate/app.spdx.json
+          python3 tools/compliance/libraw_bundle.py verify \
+            --repo-root . \
+            --bundle candidate/libraw-source-relink.zip \
+            --require-resolved
+          unzip -p candidate/libraw-source-relink.zip sbom.spdx.json \
+            | cmp - candidate/libraw.spdx.json
+          test -s candidate/r8-mapping.txt
+          unzip -t candidate/native-debug-symbols.zip
+
+      - name: Revalidate immutable release tag before signing
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/${VERSION}:refs/tags/${VERSION}"
+          CURRENT_SHA="$(git rev-parse "refs/tags/${VERSION}^{commit}")"
+          if [ "$CURRENT_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Release tag moved after candidate qualification"
+            exit 1
+          fi
+
+      - name: Align exact unsigned candidate and gate APK
+        run: |
+          set -euo pipefail
+          mkdir -p signed
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          "$BT/zipalign" -f -P 16 4 \
+            candidate/app-release-unsigned.apk \
+            signed/app-release-aligned.apk
+          "$BT/zipalign" -f -P 16 4 \
+            candidate/app-release-gate-androidTest.apk \
+            signed/app-release-gate-aligned.apk
+          "$BT/zipalign" -c -v -P 16 4 signed/app-release-aligned.apk
+          "$BT/zipalign" -c -v -P 16 4 signed/app-release-gate-aligned.apk
+
+      - name: Sign exact candidate and instrumentation APK
         env:
           KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${KEYSTORE_B64:-}" ]; then
-            echo "::error::SIGNING_KEYSTORE secret is empty"; exit 1
-          fi
-          printf '%s' "$KEYSTORE_B64" | base64 -d > spectrafilm-release.jks
-          ls -l spectrafilm-release.jks
+          KEYSTORE_FILE="$RUNNER_TEMP/spektrafilm-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.jks"
+          cleanup_key() {
+            rm -f -- "$KEYSTORE_FILE"
+          }
+          trap cleanup_key EXIT
+          for value in \
+            "${KEYSTORE_B64:-}" \
+            "${SIGNING_KEY_ALIAS:-}" \
+            "${SIGNING_KEYSTORE_PASSWORD:-}" \
+            "${SIGNING_KEY_PASSWORD:-}"; do
+            if [ -z "$value" ]; then
+              echo "::error::A required release-signing secret is empty"
+              exit 1
+            fi
+          done
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE_FILE"
+          test -s "$KEYSTORE_FILE"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE_FILE" \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass env:SIGNING_KEYSTORE_PASSWORD \
+            --key-pass env:SIGNING_KEY_PASSWORD \
+            --out signed/app-release.apk \
+            signed/app-release-aligned.apk
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE_FILE" \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass env:SIGNING_KEYSTORE_PASSWORD \
+            --key-pass env:SIGNING_KEY_PASSWORD \
+            --out signed/app-release-gate-androidTest.apk \
+            signed/app-release-gate-aligned.apk
 
-      - name: Write keystore.properties
-        env:
-          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          STORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: |
-          cat > keystore.properties <<EOF
-          storeFile=spectrafilm-release.jks
-          storePassword=${STORE_PASSWORD}
-          keyAlias=${KEY_ALIAS}
-          keyPassword=${KEY_PASSWORD}
-          EOF
-
-      - name: Assemble signed release APK
-        run: ./gradlew :app:assembleRelease --stacktrace
-
-      - name: Verify signature
-        run: |
-          set -euo pipefail
-          APK=app/build/outputs/apk/release/app-release.apk
-          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
-          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "$APK"
-
-      - name: Stage release artifacts
-        id: stage
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.ref.outputs.version }}"
-          NAME="Spektrafilm-${VERSION}.apk"
-          mkdir -p out
-          cp app/build/outputs/apk/release/app-release.apk "out/${NAME}"
-          ( cd out && sha256sum "${NAME}" > "${NAME}.sha256" )
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-          echo "apk=out/${NAME}" >> "$GITHUB_OUTPUT"
-          echo "sha=out/${NAME}.sha256" >> "$GITHUB_OUTPUT"
-          ls -l out
-
-      - name: Upload artifacts (workflow)
-        uses: actions/upload-artifact@v4
-        with:
-          name: signed-release-${{ steps.ref.outputs.version }}
-          path: out/
-
-      - name: Attach to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.ref.outputs.version }}"
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" \
-              "${{ steps.stage.outputs.apk }}" \
-              "${{ steps.stage.outputs.sha }}" \
-              --clobber
-          else
-            gh release create "$VERSION" \
-              --title "$VERSION" \
-              --generate-notes \
-              "${{ steps.stage.outputs.apk }}" \
-              "${{ steps.stage.outputs.sha }}"
-          fi
-
-      - name: Cleanup keystore from runner
+      - name: Verify signing material cleanup
         if: always()
         run: |
-          rm -f spectrafilm-release.jks keystore.properties
+          set -euo pipefail
+          KEYSTORE_FILE="$RUNNER_TEMP/spektrafilm-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.jks"
+          test ! -e "$KEYSTORE_FILE"
+          test ! -e keystore.properties
+          if git ls-files --others --exclude-standard -- \
+              '*.jks' '*.keystore' keystore.properties | grep -q .; then
+            echo "::error::Signing material leaked into the workspace"
+            exit 1
+          fi
+
+      - name: Verify production certificate on both APKs
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          EXPECTED="$(printf '%s' "${EXPECTED_CERT_SHA256:-}" \
+            | tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]')"
+          if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::release-signing variable RELEASE_CERT_SHA256 is missing/invalid"
+            exit 1
+          fi
+          signer_digest() {
+            local apk="$1"
+            local certs
+            certs="$("$ANDROID_HOME/build-tools/35.0.0/apksigner" \
+              verify --verbose --print-certs "$apk")"
+            mapfile -t digests < <(
+              printf '%s\n' "$certs" \
+                | sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' \
+                | tr -d ':' | tr '[:upper:]' '[:lower:]'
+            )
+            if [ "${#digests[@]}" -ne 1 ] || \
+               [[ ! "${digests[0]}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::$apk must have exactly one valid signer" >&2
+              return 1
+            fi
+            printf '%s\n' "${digests[0]}"
+          }
+          TARGET_CERT="$(signer_digest signed/app-release.apk)"
+          TEST_CERT="$(signer_digest signed/app-release-gate-androidTest.apk)"
+          if [ "$TARGET_CERT" != "$EXPECTED" ] || [ "$TEST_CERT" != "$EXPECTED" ]; then
+            echo "::error::Production certificate fingerprint mismatch"
+            exit 1
+          fi
+          printf '%s\n' "$TARGET_CERT" > build/release-cert-sha256.txt
+
+      - name: Verify signed R8, legal, and 16 KiB invariants
+        run: |
+          set -euo pipefail
+          APK=signed/app-release.apk
+          TEST_APK=signed/app-release-gate-androidTest.apk
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          "$BT/zipalign" -c -v -P 16 4 "$APK"
+          "$BT/zipalign" -c -v -P 16 4 "$TEST_APK"
+          tools/r8_check/check_release_dex.sh "$APK" "$BT"
+          TEST_MANIFEST="$("$BT/aapt" dump xmltree "$TEST_APK" AndroidManifest.xml)"
+          if [[ "$TEST_MANIFEST" != *'E: instrumentation'* ]] || \
+             [[ "$TEST_MANIFEST" != *'android:name(0x01010003)="com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation"'* ]] || \
+             [[ "$TEST_MANIFEST" != *'android:targetPackage(0x01010021)="com.spectrafilm.app"'* ]]; then
+            echo "::error::Signed test APK runner/target identity drifted"
+            exit 1
+          fi
+
+          ELF_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ELF_ROOT"' EXIT
+          unzip -oq "$APK" 'lib/arm64-v8a/*.so' 'lib/x86_64/*.so' -d "$ELF_ROOT"
+          mapfile -t SO_FILES < <(find "$ELF_ROOT/lib" -type f -name '*.so' | LC_ALL=C sort)
+          if [ "${#SO_FILES[@]}" -eq 0 ]; then
+            echo "::error::Signed candidate contains no 64-bit native libraries"
+            exit 1
+          fi
+          for so in "${SO_FILES[@]}"; do
+            mapfile -t LOAD_ALIGNMENTS < <(
+              readelf -lW "$so" | awk '$1 == "LOAD" {print $NF}'
+            )
+            if [ "${#LOAD_ALIGNMENTS[@]}" -eq 0 ]; then
+              echo "::error::No PT_LOAD segments in $so"
+              exit 1
+            fi
+            for alignment in "${LOAD_ALIGNMENTS[@]}"; do
+              if [ "$alignment" != 0x4000 ]; then
+                echo "::error::Non-16-KiB PT_LOAD alignment in $so: $alignment"
+                exit 1
+              fi
+            done
+          done
+
+          verify_asset() {
+            local path="$1"
+            local expected="$2"
+            local actual
+            actual="$(unzip -p "$APK" "assets/$path" | sha256sum | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Missing or altered legal asset: $path"
+              exit 1
+            fi
+          }
+          verify_asset third_party/libraw/COPYRIGHT 574c88f5dd59414cfc896293a63defbc2d525a418ed413d7ab7dcc43cf79c509
+          verify_asset third_party/libraw/LICENSE.LGPL eea173a556abac0370461e57e12aab266894ea6be3874c2be05fd87871f75449
+          verify_asset third_party/libraw/LICENSE.CDDL 0e3098d2d54a12434715f6679ea408d57da5e8d613c385c58ecc6fe5d30cc81f
+          verify_asset legal/spektrafilm/LICENSE.GPL-3.0 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+          verify_asset legal/spektrafilm/NOTICE.md 9bab38c4b25b361081f0bcfdabe10f7d5dc0d2a50cc7626612b88971bc8081cb
+
+      - name: Run exact signed candidate instrumentation and API smoke
+        uses: reactivecircus/android-emulator-runner@4c44018e59b437e86cdfc41da381398f93ed8808 # v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
+          # One line on purpose: the action runs each script line in its own
+          # `sh -c`, so the body lives in a file (see the script header).
+          script: bash tools/ci/release_device_smoke.sh
+      - name: Retain exact-candidate device evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-device-evidence-${{ needs.resolve-release.outputs.version }}-${{ needs.resolve-release.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/device-smoke/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stage signed release artifacts and provenance
+        env:
+          CANDIDATE_ARTIFACT_ID: ${{ needs.build-release-candidate.outputs.artifact_id }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.build-release-candidate.outputs.artifact_digest }}
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f build/device-smoke/api35-device-smoke.txt
+          grep -Fx PASS build/device-smoke/api35-device-smoke.txt
+          test -f build/device-smoke/engine-boundary-instrumentation-api35.txt
+          grep -Fx PASS build/device-smoke/engine-boundary-instrumentation-api35.txt
+          test -s build/device-smoke/engine-boundary-instrumentation.txt
+          grep -Fq 'ENGINE_BOUNDARY_INSTRUMENTATION: PASS' \
+            build/device-smoke/engine-boundary-instrumentation.txt
+          grep -Fx 'INSTRUMENTATION_CODE: -1' \
+            build/device-smoke/engine-boundary-instrumentation.txt
+          NAME="Spektrafilm-${VERSION}.apk"
+          BUNDLE_NAME="Spektrafilm-${VERSION}-libraw-source-relink.zip"
+          LIBRAW_SBOM_NAME="Spektrafilm-${VERSION}-libraw.spdx.json"
+          APP_SBOM_NAME="Spektrafilm-${VERSION}-app.spdx.json"
+          MAPPING_NAME="Spektrafilm-${VERSION}-r8-mapping.txt"
+          SYMBOLS_NAME="Spektrafilm-${VERSION}-native-debug-symbols.zip"
+          LOCKS_NAME="Spektrafilm-${VERSION}-gradle-locks.zip"
+          RUNTIME_NAME="Spektrafilm-${VERSION}-release-runtime-classpath.txt"
+          ENGINE_BOUNDARY_APK_NAME="Spektrafilm-${VERSION}-engine-boundary-androidTest.apk"
+          ENGINE_BOUNDARY_EVIDENCE_NAME="Spektrafilm-${VERSION}-engine-boundary-instrumentation.txt"
+          PROVENANCE_NAME="Spektrafilm-${VERSION}-provenance.txt"
+          mkdir -p out
+          cp signed/app-release.apk "out/$NAME"
+          cp candidate/libraw-source-relink.zip "out/$BUNDLE_NAME"
+          cp candidate/libraw.spdx.json "out/$LIBRAW_SBOM_NAME"
+          cp candidate/app.spdx.json "out/$APP_SBOM_NAME"
+          cp candidate/r8-mapping.txt "out/$MAPPING_NAME"
+          cp candidate/native-debug-symbols.zip "out/$SYMBOLS_NAME"
+          cp candidate/gradle-locks.zip "out/$LOCKS_NAME"
+          cp candidate/release-runtime-classpath.txt "out/$RUNTIME_NAME"
+          cp candidate/engine-boundary-debug-androidTest.apk \
+            "out/$ENGINE_BOUNDARY_APK_NAME"
+          cp build/device-smoke/engine-boundary-instrumentation.txt \
+            "out/$ENGINE_BOUNDARY_EVIDENCE_NAME"
+
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_SHA")"
+          UNSIGNED_SHA="$(sha256sum candidate/app-release-unsigned.apk | cut -d' ' -f1)"
+          SIGNED_SHA="$(sha256sum signed/app-release.apk | cut -d' ' -f1)"
+          SIGNED_TEST_SHA="$(sha256sum signed/app-release-gate-androidTest.apk | cut -d' ' -f1)"
+          INSTALLED_SHA="$(sha256sum build/device-smoke/installed-base.apk | cut -d' ' -f1)"
+          ENGINE_BOUNDARY_APK_SHA="$(sha256sum candidate/engine-boundary-debug-androidTest.apk | cut -d' ' -f1)"
+          ENGINE_BOUNDARY_EVIDENCE_SHA="$(sha256sum build/device-smoke/engine-boundary-instrumentation.txt | cut -d' ' -f1)"
+          {
+            printf 'schema=spektrafilm-release-provenance-v1\n'
+            printf 'version=%s\n' "$VERSION"
+            printf 'release_sha=%s\n' "$RELEASE_SHA"
+            printf 'source_date_epoch=%s\n' "$SOURCE_DATE_EPOCH"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'candidate_artifact_id=%s\n' "$CANDIDATE_ARTIFACT_ID"
+            printf 'candidate_artifact_digest=%s\n' "$CANDIDATE_ARTIFACT_DIGEST"
+            printf 'unsigned_apk_sha256=%s\n' "$UNSIGNED_SHA"
+            printf 'signed_apk_sha256=%s\n' "$SIGNED_SHA"
+            printf 'installed_base_apk_sha256=%s\n' "$INSTALLED_SHA"
+            printf 'signed_instrumentation_apk_sha256=%s\n' "$SIGNED_TEST_SHA"
+            printf 'engine_boundary_instrumentation_apk_sha256=%s\n' \
+              "$ENGINE_BOUNDARY_APK_SHA"
+            printf 'engine_boundary_instrumentation_evidence_sha256=%s\n' \
+              "$ENGINE_BOUNDARY_EVIDENCE_SHA"
+            printf 'certificate_sha256=%s\n' "$(cat build/release-cert-sha256.txt)"
+            printf 'app_sbom_sha256=%s\n' \
+              "$(sha256sum candidate/app.spdx.json | cut -d' ' -f1)"
+            printf 'dependency_locks_sha256=%s\n' \
+              "$(sha256sum candidate/gradle-locks.zip | cut -d' ' -f1)"
+            printf 'r8_mapping_sha256=%s\n' \
+              "$(sha256sum candidate/r8-mapping.txt | cut -d' ' -f1)"
+            printf 'native_symbols_sha256=%s\n' \
+              "$(sha256sum candidate/native-debug-symbols.zip | cut -d' ' -f1)"
+            printf 'gate.parity-o2=PASS\n'
+            printf 'gate.parity-shipping=PASS\n'
+            printf 'gate.native-safety-sanitizers=PASS\n'
+            printf 'gate.jvm-unit-lint=PASS\n'
+            printf 'gate.instrumentation-api35=PASS\n'
+            printf 'gate.engine-boundary-instrumentation-api35=PASS\n'
+            printf 'gate.r8-jni=PASS\n'
+            printf 'gate.elf-zip-16k=PASS\n'
+            printf 'gate.installed-byte-identity=PASS\n'
+          } > "out/$PROVENANCE_NAME"
+          (
+            cd out
+            sha256sum "$NAME" > "$NAME.sha256"
+            sha256sum "$BUNDLE_NAME" > "$BUNDLE_NAME.sha256"
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+              | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Revalidate immutable tag before artifact publication
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/${VERSION}:refs/tags/${VERSION}"
+          CURRENT_SHA="$(git rev-parse "refs/tags/${VERSION}^{commit}")"
+          if [ "$CURRENT_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Release tag moved after device qualification"
+            exit 1
+          fi
+
+      - name: Upload immutable signed artifacts
+        id: signed-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-${{ needs.resolve-release.outputs.version }}-${{ needs.resolve-release.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/
+            signed/app-release-gate-androidTest.apk
+            build/device-smoke/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach verified set to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 tools/release/github_release.py \
+            --tag "$VERSION" \
+            --source-sha "$RELEASE_SHA" \
+            --assets-dir out

@@ -36,14 +36,17 @@
  *     model/grain.cpp kernels/stats.cpp kernels/gaussian.cpp \
  *     -o /tmp/test_grain
  */
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "spkvec_io.h"
 
+#include "kernels/stats.h"
 #include "model/grain.h"
 
 namespace {
@@ -92,9 +95,97 @@ void channel_noise_std(const std::vector<float>& x,
     }
 }
 
+// Resource-amplification regression at the sampler seam. When the initial
+// binomial probability underflows to exactly zero, the existing inversion walk
+// can only return n; walking hundreds of millions of zero-probability terms is
+// therefore wasted work. The shortcut must still consume the inversion branch's
+// one uniform draw so the following grain samples remain byte-reproducible.
+bool sampler_extreme_input_regression() {
+    bool pass = true;
+
+    constexpr int64_t kHugeN = 250'000'000;
+    constexpr double kNearOneP = 1.0 - 1e-12;
+    spk::StatsRng actual_rng(0x170u);
+    spk::StatsRng reference_rng(0x170u);
+    (void)reference_rng.uniform();  // draw consumed by CDF inversion
+
+    const auto started = std::chrono::steady_clock::now();
+    const int64_t underflow_sample =
+        spk::fast_binomial_one(kHugeN, kNearOneP, actual_rng);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    const bool underflow_ok =
+        underflow_sample == kHugeN &&
+        actual_rng.uniform() == reference_rng.uniform() &&
+        elapsed < std::chrono::milliseconds(500);
+    pass = pass && underflow_ok;
+    std::printf("Sampler zero-probability shortcut: %s\n",
+                underflow_ok ? "PASS" : "FAIL");
+
+    // Invalid or unrepresentable Poisson rates have a deterministic saturated
+    // result and must never reach llround(NaN/Inf). Rejected rates consume no RNG.
+    spk::StatsRng invalid_rng(0x171u);
+    spk::StatsRng invalid_reference_rng(0x171u);
+    const bool nonfinite_ok =
+        spk::fast_poisson_one(std::numeric_limits<double>::quiet_NaN(), invalid_rng) == 0 &&
+        spk::fast_poisson_one(std::numeric_limits<double>::infinity(), invalid_rng) ==
+            std::numeric_limits<int64_t>::max() &&
+        spk::fast_poisson_one(std::numeric_limits<double>::max(), invalid_rng) ==
+            std::numeric_limits<int64_t>::max() &&
+        invalid_rng.uniform() == invalid_reference_rng.uniform();
+    pass = pass && nonfinite_ok;
+    std::printf("Sampler non-finite/overflow rates: %s\n",
+                nonfinite_ok ? "PASS" : "FAIL");
+
+    // A finite lambda immediately below 2^63 can still overflow after the
+    // normal perturbation. Across several deterministic streams, every result
+    // must remain representable and at least one positive perturbation saturates.
+    const double near_i64_limit =
+        std::nextafter(0x1p63, 0.0);
+    bool saw_saturation = false;
+    bool finite_overflow_ok = true;
+    for (uint64_t seed = 0; seed < 64; ++seed) {
+        spk::StatsRng rng(seed);
+        const int64_t sample = spk::fast_poisson_one(near_i64_limit, rng);
+        finite_overflow_ok = finite_overflow_ok && sample >= 0;
+        saw_saturation = saw_saturation ||
+                         sample == std::numeric_limits<int64_t>::max();
+    }
+    finite_overflow_ok = finite_overflow_ok && saw_saturation;
+    pass = pass && finite_overflow_ok;
+    std::printf("Sampler finite rounded overflow: %s\n",
+                finite_overflow_ok ? "PASS" : "FAIL");
+
+    // The public particle-layer seam must degrade to an exact no-op if an
+    // invalid particle area/pixel size produced a non-positive or non-finite
+    // particles-per-pixel count. This prevents invalid imported parameters from
+    // entering the samplers while retaining the original density plane.
+    const float density[] = {0.1f, 0.2f, 0.3f, 0.4f};
+    constexpr double kInvalidCounts[] = {
+        0.0,
+        -1.0,
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN(),
+    };
+    bool derived_count_ok = true;
+    for (double invalid_count : kInvalidCounts) {
+        float output[] = {-1.0f, -1.0f, -1.0f, -1.0f};
+        spk::layer_particle_model(density, 4, 2, 2, 2.0, invalid_count,
+                                  0.97, 123u, output);
+        for (int i = 0; i < 4; ++i)
+            derived_count_ok = derived_count_ok && output[i] == density[i];
+    }
+    pass = pass && derived_count_ok;
+    std::printf("Grain invalid derived-count no-op: %s\n",
+                derived_count_ok ? "PASS" : "FAIL");
+
+    return pass;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!sampler_extreme_input_regression()) return 1;
+
     std::string smooth_path = argc > 1 ? argv[1] : kSmoothGolden;
     std::string oracle_path = argc > 2 ? argv[2] : kOracleGrainy;
 

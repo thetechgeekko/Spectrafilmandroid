@@ -1,13 +1,21 @@
 # Performance roadmap — toward Lightroom-class speed
 
+> **Current plan (2026-08-29):** use
+> [EXECUTION_INDEX.md](EXECUTION_INDEX.md) and
+> [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md) for the 1–2 second export
+> architecture, exactness levels, current ticket graph and OSS decisions. This file preserves the
+> shipped/historical performance narrative. The 6.251 s device run predates current-HEAD exact CPU
+> changes and must not be presented as a fresh baseline until the release/R8 matrix is rerun.
+
 Goal: interactive speed comparable to Lightroom mobile. This records **measured** numbers, the
 **measured bottleneck**, and a staged plan — with the hard constraint called out up front.
 
-## The constraint (read first)
+## The constraint (historical wording; read the current exactness matrix first)
 Spektrafilm's headline value is **bit-exact parity** with the spektrafilm oracle (the whole
 CI `engine-parity` gate). The techniques that make Lightroom fast — **GPU**, **fp16**, and
 **LUT-accelerating the spectral integrals** — are **not bit-identical** (GPU/fp16 differ in the
-last bits; LUTs trade ~5e-5 for speed). So they cannot be the *default* path without redefining
+last bits; LUT interpolation error is profile/domain dependent—at LUT17 the locked D50 scanner
+case is <=5e-5 while K75P 2383/2393 are about 0.0040/0.0073). So they cannot be the *default* path without redefining
 "correct". The viable model is Lightroom's own: **approximate for the interactive proxy, exact
 for export.** Which precision policy to adopt is a product decision (see end).
 
@@ -91,7 +99,7 @@ with resolution / enlarger paths / grain-ON.
 
 | # | Item | Speedup (est.) | Bit-exact? | Effort |
 |---|------|---------------|-----------|--------|
-| 1 | **Vulkan compute** port of the per-pixel spectral kernels (expose/print/scan) | **10–50×** (the real Lightroom lever) | No (GPU rounding) | XL — needs device + a compute-shader port. *NB:* an experimental default-OFF OpenGL ES **3D-LUT loupe** (`app/.../LutGpuPreview.kt`) is already in the tree — a different technique (a baked pointwise-look LUT sampled by GLES graphics, grain/halation forced off), **not** this per-kernel compute port; it does not subsume this item. Feasibility + exactness question settled in `docs/research/gpu-bit-exact.md` (#135): fp32-within-oracle-tolerance is the achievable bar; vkdt filmsim (GPLv3) is the recommended shader seed. **In progress**: PR #145/#150 measured all three integrals inside the oracle bar on the S26 Ultra; GPU M1 (#146) wired the persistent host + preview scan offload (fused + linear kernels, Settings toggle). |
+| 1 | **Vulkan compute** port of the per-pixel spectral kernels (expose/print/scan) | **10–50×** (the real Lightroom lever) | No (GPU rounding) | XL — needs device + a compute-shader port. *NB:* an experimental default-OFF OpenGL ES **3D-LUT loupe** (`app/.../LutGpuPreview.kt`) is already in the tree — a different technique (a baked pointwise-look LUT sampled by GLES graphics, grain/halation forced off), **not** this per-kernel compute port; it does not subsume this item. Feasibility + exactness question settled in `docs/research/gpu-bit-exact.md` (#135): fp32-within-oracle-tolerance is the achievable bar. **In progress**: GPU M1 (#146) shipped the persistent scan host; M2 (#147) measured pointwise kernels; #148 Phase A chains filming -> printing -> scan through device-local ping-pong with one frame-input upload/readback (a cold or static-key-miss run separately copies 11 static tables), a combined f64 oracle, a 100-repeat determinism gate, and an executed 4,194,241-pixel software-Vulkan and current-Adreno runtime gate. Live product routing and spatial/stochastic stages remain. This is a direct shader graph, not a baked whole-look LUT. |
 | 2 | **Enlarger/expose spectral LUT** (`use_enlarger_lut` is now wired, opt-in/default-off; it LUT-accelerates the print expose integral like the scanner LUT — could extend to filming) | ~3–8× on the print route | No (~5e-5) | M–L, native |
 | 3 | **fp16 intermediate buffers** on the proxy path | ~1.5–2× + ½ memory/bandwidth | No (fp16) | M, native (NEON `__fp16`) |
 | 4 | **Per-stage caches** — ✅ SHIPPED (moved to "Already done" above: S1 film-density memo on both routes, S2 print-density memo, S3 Kotlin retained-result grade cache) | shipped: warm print edits 153–162 ms vs 402 cold; warm scan 144–159 vs 243 cold (512², 8 threads) | Yes (cached, identical) | done |

@@ -55,6 +55,56 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         set(v) { prefs.edit().putBoolean(KEY_GPU_PREVIEW, v).apply() }
 
     /**
+     * Pin the render pool to the device's performance cores.
+     *
+     * MEASURED A REGRESSION ON A WHOLE RENDER. Kept as a pref-only experiment
+     * switch; there is deliberately no Settings UI for it.
+     *
+     * The microbenchmark said 1.51x (SM-S948W, halation path, 1024x768: 71.86 ms
+     * unpinned vs 47.58 ms pinned), and capping the pool without pinning did NOT
+     * reproduce it, so core placement really was the mechanism THERE. It did not
+     * survive the end-to-end pipeline. A 12.5 MP export on the same device:
+     *
+     * ```
+     *   OFF  median 14476 ms          ON  median 20458 ms      1.41x SLOWER
+     *   grain          3620 -> 8612 ms  (2.38x) = 83% of the regression
+     *   filming_expose  177 ->  391 ms  (2.20x)
+     *   dir_couplers   1349 -> 1466 ms  (1.09x) — essentially immune
+     *   halation       2055 -> 2159 ms  (1.05x) — essentially immune
+     * ```
+     *
+     * Why: pinning also caps the pool to the big-core count (parallel.cpp), so ON is
+     * 2 workers on 2 prime cores against OFF's 8 workers across all 8 — 9.48 GHz of
+     * aggregate clock against 31.26 GHz. A 1.31x per-core clock edge cannot cover a
+     * 3.3x compute deficit. The microbenchmark was one spatial filter on a small
+     * fixture, where thread-spawn overhead dominates and 2 workers legitimately beat
+     * 8; a full-resolution render is nothing like that.
+     *
+     * Output is unaffected either way — affinity moves only WHERE a chunk runs, and
+     * every worker count is byte-identical under the parity gate's thread-invariance
+     * contract. That half held up. Default OFF, and it should stay off.
+     */
+    var bigCores: Boolean
+        get() = prefs.getBoolean(KEY_BIG_CORES, false)
+        set(v) { prefs.edit().putBoolean(KEY_BIG_CORES, v).apply() }
+
+    /**
+     * One-time cleanup of the ORIGINAL `big_cores` key.
+     *
+     * When the Settings row was removed, nothing wrote that key any more but
+     * EngineHolder still read and honoured it — so anyone who had ever flipped the
+     * switch was left permanently 1.41x slow, with no UI to discover it and no way
+     * to turn it off. The key above is deliberately a NEW name, so a stale value can
+     * never be honoured again; this drops the old one so it does not linger.
+     */
+    fun clearLegacyBigCores() {
+        if (prefs.contains(LEGACY_KEY_BIG_CORES)) {
+            prefs.edit().remove(LEGACY_KEY_BIG_CORES).apply()
+            Diag.i("cleared legacy big_cores pref (feature was measured 1.41x slower)")
+        }
+    }
+
+    /**
      * GPU ENGINE preview (Vulkan, GPU M1 #146) — distinct from [gpuPreview] (the
      * GLES LUT loupe overlay above): the film simulation itself runs its scan
      * stage on the GPU for interactive previews (~2e-6 from the CPU chain,
@@ -78,6 +128,23 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     var gpuExportEngine: Boolean
         get() = prefs.getBoolean(KEY_GPU_EXPORT, false)
         set(v) { prefs.edit().putBoolean(KEY_GPU_EXPORT, v).apply() }
+
+    /**
+     * PROGRESSIVE LADDER rung (perf lab). Longest edge of the live DRAFT render that
+     * runs while a slider is being dragged, before the crisp settle pass lands.
+     *
+     * Was the fixed constant [DRAFT_RENDER_MAX_PX]; made a setting so the coarse/fine
+     * trade can be swept on a real device instead of guessed. Lower tracks the finger
+     * more closely; higher makes the live frame a better preview of the settle result.
+     * Clamped to a band where the step-down is still meaningful — below 128 the frame
+     * is too coarse to judge a colour edit by, and above 512 the draft costs enough
+     * that it stops being a draft.
+     *
+     * Defaults to [DRAFT_RENDER_MAX_PX], so an untouched install renders as before.
+     */
+    var draftRenderMaxPx: Int
+        get() = prefs.getInt(KEY_DRAFT_MAX_PX, DRAFT_RENDER_MAX_PX).coerceIn(128, 512)
+        set(v) { prefs.edit().putInt(KEY_DRAFT_MAX_PX, v.coerceIn(128, 512)).apply() }
 
     var theme: ThemeMode
         get() = runCatching { ThemeMode.valueOf(prefs.getString(KEY_THEME, ThemeMode.SYSTEM.name)!!) }
@@ -145,6 +212,12 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
         private const val KEY_GPU_PREVIEW = "gpu_preview"
         private const val KEY_GPU_ENGINE = "gpu_engine_preview"
         private const val KEY_GPU_EXPORT = "gpu_engine_export"
+        private const val KEY_DRAFT_MAX_PX = "draft_render_max_px"
+        // Renamed from "big_cores". The old key must never be read again — see
+        // clearLegacyBigCores(). This one exists only so an A/B can still be driven
+        // from a shell without a UI; it is not a product setting.
+        private const val KEY_BIG_CORES = "big_cores_experiment"
+        private const val LEGACY_KEY_BIG_CORES = "big_cores"
         private const val KEY_THEME = "theme"
         private const val KEY_OUTPUT_CS = "output_color_space"
         private const val KEY_PREVIEW_MAX = "preview_max_size"

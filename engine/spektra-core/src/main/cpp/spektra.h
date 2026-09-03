@@ -13,7 +13,7 @@
  * This header is the stable contract between the JVM/JNI layer and the native
  * engine. It mirrors spektrafilm's public surface: simulate(image, params) and the
  * RuntimePhotoParams tree. The engine behind it is fully implemented and
- * parity-gated (38 host gates, .github/workflows/ci.yml `engine-parity`).
+ * parity-gated (39 host gates, .github/workflows/ci.yml `engine-parity`).
  * --------------------------------------------------------------------------------
  */
 #ifndef SPEKTRA_H
@@ -44,7 +44,14 @@ typedef enum {
     SPK_ERR_ASSET_IO = 3,
     SPK_ERR_OOM = 4,
     SPK_ERR_INTERNAL = 5,
+    SPK_ERR_PROFILE_INVALID = 6,
+    SPK_ERR_CANCELLED = 7,
 } spk_status;
+
+/* Cooperative cancellation callback used by the additive cancellable entry
+ * points below. Return non-zero to stop at the next deterministic stage/row
+ * boundary. The callback is invoked synchronously on the calling thread. */
+typedef int (*spk_cancel_check)(void* user_data);
 
 /* RGB→spectral upsampling method (settings.rgb_to_raw_method). */
 typedef enum { SPK_RGB2RAW_HANATOS2025 = 0, SPK_RGB2RAW_MALLETT2019 = 1 } spk_rgb2raw;
@@ -53,6 +60,18 @@ typedef enum { SPK_RGB2RAW_HANATOS2025 = 0, SPK_RGB2RAW_MALLETT2019 = 1 } spk_rg
 typedef enum {
     SPK_WB_AS_SHOT = 0, SPK_WB_DAYLIGHT = 1, SPK_WB_TUNGSTEN = 2, SPK_WB_CUSTOM = 3
 } spk_wb_mode;
+
+/* Optical diffusion-filter family (DiffusionFilterParams.filterFamily). Zero is
+ * the ABI/missing-getter sentinel and retains the historical Black Pro-Mist
+ * behavior for callers that do not populate the appended tail. The non-zero
+ * values map to native DiffusionFamily ordinal + 1. */
+typedef enum {
+    SPK_DIFFUSION_DEFAULT = 0,
+    SPK_DIFFUSION_GLIMMERGLASS = 1,
+    SPK_DIFFUSION_BLACK_PRO_MIST = 2,
+    SPK_DIFFUSION_PRO_MIST = 3,
+    SPK_DIFFUSION_CINEBLOOM = 4,
+} spk_diffusion_family;
 
 /* Opaque engine handle. Holds asset manager, profile catalog, and LUT caches. */
 typedef struct spk_engine spk_engine;
@@ -244,8 +263,10 @@ typedef struct {
      *   use_scanner_lut: WIRED. Gates the scanner LUT in scan() for BOTH the
      *     scan_film route (run_scan) and the print-scan route (run_print). When
      *     on, density_cmy->log_xyz is PCHIP-interpolated through a per-channel 3D
-     *     LUT built at lut_resolution; result is within ~5e-5 of the direct path
-     *     (NOT bit-exact by design). Gated by tests/test_scanner_lut_e2e.cpp.
+     *     LUT built at lut_resolution (NOT bit-exact by design). Error is
+     *     profile/domain dependent: at LUT17 the locked D50 fixture is <=5e-5,
+     *     while K75P 2383/2393 are about 0.0040/0.0073 vs direct. Each mode is
+     *     independently oracle-gated by tests/test_scanner_lut_e2e.cpp.
      *   use_enlarger_lut: WIRED (opt-in, default off). LUT-accelerates the enlarger
      *     expose on the print route (printing.cpp::print_expose), mirroring the
      *     oracle's spectral_compute_enlarger: cmy film density ->
@@ -340,6 +361,14 @@ typedef struct {
      * (f32→f64 widening is exact) and gated by the same scenario G
      * (direct-vs-materialized memcmp, AE-on and spatial-on included). */
     int32_t disable_buffer_memos;
+
+    /* --- additive selector fields (ABI-stable tail) ---
+     * These fields were previously exposed by Kotlin but never reached native.
+     * They live at the tail so the original flat-struct prefix remains stable. */
+    const char* enlarger_illuminant;    /* e.g. "TH-KG3" */
+    const char* input_color_space;      /* only "ProPhoto RGB" is supported */
+    int32_t camera_diffusion_family;    /* spk_diffusion_family */
+    int32_t enlarger_diffusion_family;  /* spk_diffusion_family */
 } spk_params;
 
 /* Initialise `p` to the physical defaults that mirror a default-constructed
@@ -373,14 +402,34 @@ void       spk_engine_destroy(spk_engine*);
  * film/print profile ids into `buf` (caller-provided). Sets `*needed` to required size. */
 spk_status spk_engine_list_profiles(spk_engine*, char* buf, size_t buf_len, size_t* needed);
 
+/* Stable shipping diagnostics for the bounded filming tc_lut memo. Writes one
+ * NUL-terminated `spk.tc_lut_cache.v1` JSON object and returns bytes excluding
+ * NUL. `cap` must be at least 2048; invalid arguments or insufficient capacity
+ * clear the buffer (when possible) and return 0. `cache_held_bytes` counts nodes
+ * retained by the cache; process MemoryDomain::Cache may be higher while a
+ * render still leases an already-evicted node. Cache admission is post-build
+ * residency accounting, not admission-before-builder-allocation. */
+int spk_engine_tc_lut_cache_stats_json(spk_engine*, char* buf, int cap);
+
 /* Simulation ------------------------------------------------------------------ */
 
 /* Full pipeline: RGB → negative → (print) → scan. `out` is allocated by the engine
  * (display-referred RGB in params.output_color_space); free with spk_image_free. */
 spk_status spk_simulate(spk_engine*, const spk_image* in, const spk_params*, spk_image* out);
 
+/* Additive cancellable form. Existing spk_simulate callers keep the exact same
+ * ABI and numerical path by using a null callback internally. On cancellation
+ * `out` remains empty and owns no allocation. */
+spk_status spk_simulate_cancellable(spk_engine*, const spk_image* in,
+                                    const spk_params*, spk_image* out,
+                                    spk_cancel_check, void* cancel_user_data);
+
 /* Downscaled fast path (to params.preview_max_size) for interactive tuning. */
 spk_status spk_simulate_preview(spk_engine*, const spk_image* in, const spk_params*, spk_image* out);
+spk_status spk_simulate_preview_cancellable(spk_engine*, const spk_image* in,
+                                            const spk_params*, spk_image* out,
+                                            spk_cancel_check,
+                                            void* cancel_user_data);
 
 /* GPU scan self-check state (diagnostics): 0 = not yet run, 1 = passed,
  * 2 = failed (GPU preview disabled for this process). Meaningful only when the
@@ -393,12 +442,83 @@ int spk_gpu_scan_state(void);
  * eligible frame yet; state 0 = never attempted. */
 uint64_t spk_gpu_scan_frames(void);
 
-/* Per-stage/per-filter wall-clock breakdown of the LAST render, formatted as
- * "stage=ms other=ms ..." (non-zero stages only) into `buf` (capacity `cap`);
- * returns bytes written. DIAGNOSTIC — reading the clock never changes output.
- * The app logs this once per render so we can see where interactive latency
- * goes (#146/#152). */
+/* EXPERIMENTAL GPU PRINT-EXPOSE offload (perf lab, first rung of full-chain
+ * GPU): the print route's 81-band spectral integral runs on the GPU, reusing
+ * the same validated linear kernel as the scan offload with a different fold of
+ * the per-band constants. Governed by the SAME allow_gpu_scan latch, so the
+ * existing preview/export toggles cover it with no new switch.
+ *
+ * State: 0 = the one-time on-device self-check has not run, 1 = passed, 2 =
+ * failed (CPU integral permanent for this process). */
+int spk_gpu_print_state(void);
+
+/* Frames whose print-expose integral actually ran on the GPU. 0 with state == 1
+ * means eligible but never engaged. Together with spk_gpu_print_state this makes
+ * the print offload externally observable, exactly like the scan one. */
+uint64_t spk_gpu_print_frames(void);
+
+/* Pin the render pool to the device's big cores (perf-lab, issue #117).
+ *
+ * A fork-join is only as fast as its slowest chunk, so one worker parked on an
+ * efficiency core sets the pace for the whole map no matter how many big cores
+ * sit idle. Pinning the pool to the cores whose cpuinfo_max_freq is within
+ * SPK_BIG_CORE_RATIO (default 0.80) of the fastest measured 1.51x on the
+ * default-ON spatial path on an SM-S948W, with the output checksum unchanged.
+ *
+ * This exists because the gate was an env var and an Android app cannot set its
+ * own pre-main environment, so the win was unreachable from the shipping build.
+ *
+ * mode: 1 = on, 0 = off, -1 = defer to SPK_BIG_CORES (the default; every
+ * existing host and CI invocation behaves exactly as before).
+ *
+ * Safe between renders, including mid-session — see kernels/parallel.h. Output
+ * is unaffected by construction: affinity changes only WHERE a chunk runs and
+ * how many workers split it, and every worker count is byte-identical. */
+void spk_set_big_cores(int mode);
+
+/* Cores currently classified as big, or 0 when pinning is off, detection failed,
+ * or the mask would cover every core (pinning to all cores is not pinning). Lets
+ * the caller report whether the setting actually did anything on this device. */
+int spk_big_core_count(void);
+
+/* Per-stage/per-filter wall-clock breakdown of the last COMPLETE render on the
+ * CURRENT CALLER THREAD, formatted as "stage=ms other=ms ..." (non-zero stages
+ * only) into `buf` (capacity `cap`); returns bytes written. Call this on the
+ * same thread immediately after a render entry point. An in-flight render never
+ * exposes a partial set. DIAGNOSTIC — reading the clock never changes output.
+ * The app logs this once per render (#146/#152/#163). */
 int spk_stage_timings(char* buf, int cap);
+
+/* Unique process-local id of that same completed render. The Android Perfetto
+ * section is named `spk.render.<kind>#<id>`, and the JSON below exposes the id
+ * as both render_id and trace_id for deterministic correlation. Returns 0 before
+ * the caller thread has completed a render. */
+uint64_t spk_stage_timing_render_id(void);
+
+/* Stable release-benchmark schema (`spk.stage_timings.v1`) for the current
+ * caller thread's last completed render. Includes render/trace id, render kind,
+ * native success/error outcome and status, wall/top-level totals, diffusion FFT
+ * fallbacks, every stage (including zero-valued gated-off effects), and the
+ * nested scan relationships. `cap` must be at least 2048; a smaller buffer is
+ * cleared and returns 0 rather than exposing truncated/invalid JSON. Returns
+ * bytes written, excluding NUL. App cancellation/supersession is a separate
+ * keyed `spk.render_outcome.v1` event because it may be known on another thread. */
+int spk_stage_timings_json(char* buf, int cap);
+
+/* DIAGNOSTIC. Number of times this render's diffusion stage chose the FFT path
+ * and fft_convolve_same REFUSED it (an allocation failure at the chosen
+ * transform size, in practice), so the direct O(w*h*ks^2) loop ran instead.
+ *
+ * That fallback is correct but can be ~100x slower and is otherwise INVISIBLE:
+ * no error, no log, just a slow render. Any measurement of the diffusion stage
+ * -- above all one that raises SPK_DIFFUSION_FFT_MAX -- must read this, because
+ * "the bigger transform did not help" and "the bigger transform never ran"
+ * produce identical timings.
+ *
+ * Current-thread and monotonic; spk_diffusion_reset_fft_fallbacks() zeroes the
+ * caller thread's count, so a caller can scope it to one render. */
+uint64_t spk_diffusion_fft_fallbacks(void);
+void spk_diffusion_reset_fft_fallbacks(void);
 
 void spk_image_free(spk_image*);
 
@@ -408,6 +528,11 @@ spk_status spk_simulate_tap(spk_engine*, const spk_image* in, const spk_params*,
                             const char* tap_name, spk_image* out);
 
 const char* spk_status_str(spk_status);
+
+/* Detail for the most recent status-returning C API call on this caller thread.
+ * Empty when that call produced no specific detail. The pointer remains valid
+ * until the next status-returning API call on the same thread. */
+const char* spk_last_error_message(void);
 
 /* LUT baking ------------------------------------------------------------------ */
 
@@ -443,8 +568,9 @@ const char* spk_status_str(spk_status);
  *
  * The `.cube` text (LUT_3D_SIZE N, TITLE, DOMAIN_MIN/MAX, N^3 RGB triples in
  * blue-fastest / red-slowest order) is written NUL-terminated into `out_text`.
- * `*needed` is always set to the required buffer size (including the NUL); if
- * `out_text` is null or `out_cap` is too small, returns SPK_ERR_BAD_ARGS so the
+ * `*needed` is always set to the required buffer size (including the NUL). A
+ * null `out_text` with non-null `needed` is a successful sizing query. A
+ * non-null buffer whose `out_cap` is too small returns SPK_ERR_BAD_ARGS so the
  * caller can resize and retry (the bake still runs to size it).
  */
 /*
@@ -466,6 +592,11 @@ const char* spk_status_str(spk_status);
 spk_status spk_bake_cube_lut(spk_engine*, const spk_params*, int lut_size,
                              int32_t shaper,
                              char* out_text, size_t out_cap, size_t* needed);
+spk_status spk_bake_cube_lut_cancellable(spk_engine*, const spk_params*,
+                                         int lut_size, int32_t shaper,
+                                         char* out_text, size_t out_cap,
+                                         size_t* needed, spk_cancel_check,
+                                         void* cancel_user_data);
 
 /*
  * Meter `in` and return the auto-exposure compensation in EV that a render of the
@@ -493,6 +624,10 @@ spk_status spk_bake_cube_lut(spk_engine*, const spk_params*, int lut_size,
  */
 spk_status spk_meter_exposure_ev(spk_engine*, const spk_image* in,
                                  const spk_params*, double* out_ev);
+spk_status spk_meter_exposure_ev_cancellable(spk_engine*, const spk_image* in,
+                                             const spk_params*, double* out_ev,
+                                             spk_cancel_check,
+                                             void* cancel_user_data);
 
 #ifdef __cplusplus
 } /* extern "C" */

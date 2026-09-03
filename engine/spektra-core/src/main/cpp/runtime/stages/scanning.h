@@ -93,9 +93,10 @@ struct ScanningParams {
     // The LUT covers EXACTLY the density_cmy -> log_xyz step (steps 1-4 of scan());
     // the post-LUT 10^log_xyz, optional glare, XYZ->RGB, blur/unsharp and CCTF are
     // identical to the direct path. Interpolation is NOT bit-exact vs the direct
-    // spectral evaluation (it trades a documented ~5e-5 tolerance for speed), so it
-    // is OPT-IN: use_lut defaults to false and the default engine path never
-    // constructs the LUT and stays byte-identical to today.
+    // spectral evaluation and its error is profile/domain dependent. At LUT17 the
+    // locked D50 fixture is <=5e-5, while K75P 2383/2393 are about 0.0040/0.0073.
+    // Therefore it is OPT-IN: use_lut defaults to false and the default engine path
+    // never constructs the LUT and stays byte-identical to today.
     //
     // Domain bounds (scanning.py::_density_to_rgb):
     //   scan_film : data_min = -film_render.grain.density_min,
@@ -158,8 +159,8 @@ struct ScanningParams {
     // gamut compress / glare / BW correction / blur / unsharp, 81-band profile)
     // AND the one-time on-device self-check passes, scan() runs the density->RGB
     // chain through the Vulkan scan_spectral kernel (fp32, ~2e-6 vs the CPU
-    // chain per the PR #145 device probe — tighter than the preview's scanner
-    // LUT at ~5e-5) and skips the LUT entirely. ANY failure falls through to the
+    // chain per the PR #145 device probe — tighter than every locked LUT17
+    // scanner case) and skips the LUT entirely. ANY failure falls through to the
     // unchanged CPU path.
     bool allow_gpu = false;
 };
@@ -177,8 +178,8 @@ uint64_t gpu_scan_frames_rendered();
 //   in  : density_cmy, length w*h*3.
 //   out : final RGB (sRGB, CCTF-encoded, clipped to [0,1]), length w*h*3.
 // `film` supplies channel_density / base_density / viewing illuminant. The scan
-// illuminant + XYZ->RGB matrix are the D50-derived constants in color_output.h
-// (the film's viewing_illuminant is D50 for the bundled negatives).
+// illuminant, normalization and XYZ->RGB matrix come from the exact registry key
+// in color_output.h (D50 and K75P are currently oracle-locked).
 //
 // Mirrors scanning.py exactly for the negative scan_film route:
 //   - black/white XYZ correction is skipped (negative film scan).

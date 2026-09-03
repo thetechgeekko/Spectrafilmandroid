@@ -1,4 +1,9 @@
-# On-device GPU numeric probe — the #135 E3 measurement (feeds #127)
+# On-device GPU numeric probe — [Research: can the GPU produce exact (byte-identical) results vs the CPU C++ engine?](https://github.com/thetechgeekko/Spektrafilm-android/issues/135), feeding [Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127)
+
+> **Follow-up (2026-08-31):** the probe's positive result now supports an eligible resident
+> pointwise filming → printing → scan product route on the frozen Android 16/Adreno artifacts.
+> It does not qualify spatial/stochastic stages, other devices/drivers, or a 1–2 second SLO. See the
+> current checkpoint in [../BIT_IDENTICAL_EXPORT_ROADMAP.md](../BIT_IDENTICAL_EXPORT_ROADMAP.md).
 
 **Question** ([gpu-bit-exact.md](gpu-bit-exact.md) §10.3, the decider for option B): on real
 device hardware, does the fp32 GPU scan integral sit inside the engine's oracle tolerance
@@ -60,10 +65,11 @@ default output path** (BW/glare corrections off, as in the goldens).
 poisoned beforehand (Vulkan Invariance Rule 7 verified, not assumed); the five 12 MP
 perf runs hash identically too.
 
-## Tier 0 — float-controls facts (answers two #135 open questions)
+## Tier 0 — float-controls facts from the GPU exactness research
 
 - `shaderFloat64` = **false** — confirms the fleet expectation on Adreno 8xx stock
-  Samsung driver 512.842.19; the 512.863.x fp64=true reports in the #135 research do
+  Samsung driver 512.842.19; the 512.863.x fp64=true reports in
+  [Research: can the GPU produce exact (byte-identical) results vs the CPU C++ engine?](https://github.com/thetechgeekko/Spektrafilm-android/issues/135) do
   not apply to this branch.
 - `shaderFloat16` = true, `storageBuffer16BitAccess` = true
   (`uniformAndStorageBuffer16BitAccess` = false).
@@ -103,7 +109,7 @@ export implications — GPU stays preview-only.
    ("oracle-verified on your device") is now a legitimate owner decision** — the
    standing law (GPU preview-only) is untouched until the owner makes it; this probe
    wires nothing into the app.
-2. For the **#127 preview route**, fp32 Vulkan compute is numerically over-qualified —
+2. For [Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127), fp32 Vulkan compute is numerically over-qualified —
    even fp16 (1e-2-class error) is visually plausible for a 640 px proxy, and the fp32
    kernel moves ~100 MPix/s through a deliberately naive per-call host.
 3. If the scan kernel ever feeds anything engine-facing, push **Mc·M** as the matrix
@@ -114,14 +120,14 @@ export implications — GPU stays preview-only.
    corrections and the spatial branch not in scope, and GPU NaN handling is
    driver behaviour, not spec — guard it explicitly before any export-path use.
    ~~One kernel (the scan integral)~~ — closed by the M2 measurement below
-   ([#147](https://github.com/thetechgeekko/Spektrafilm-android/issues/147)):
+   ([GPU M2: E3 device measurement — filming + printing integrals (probe extension; laptop session order)](https://github.com/thetechgeekko/Spektrafilm-android/issues/147)):
    the filming and printing integrals are now measured on the same device and
    sit inside the bar too, so **all three per-pixel pipeline integrals are
    oracle-tolerance-accurate in fp32 on this device**.
 
 ---
 
-# M2 — Filming + printing integrals (#147)
+# M2 — [GPU M2: E3 device measurement — filming + printing integrals (probe extension; laptop session order)](https://github.com/thetechgeekko/Spektrafilm-android/issues/147)
 
 *Same device and driver as above (SM-S948W / Adreno 840 / 512.842.19, re-verified in
 this run's `caps` capture). Captured 2026-08-27, repo commit `8d50c9e` + the
@@ -182,7 +188,7 @@ verbatim `10^lr → log10` round trip) + `print_develop`'s paper density-curve i
 
 1. **Every per-pixel integral of the pipeline (filming, printing, scan) is now
    measured on-device and sits inside the oracle bar in fp32 with ≥15× margin**,
-   deterministic across repeated dispatches. The #147 contingency (“if a kernel lands
+   deterministic across repeated dispatches. The M2 measurement contingency (“if a kernel lands
    outside, cut M3/M4 scope to the ones that pass”) is moot — nothing landed outside.
 2. The feared sub-ops — the density-curve LUT lookups and the DIR-coupler
    interpolation — cost nothing measurable beyond the pure exp10 integrals: filming's
@@ -197,8 +203,8 @@ verbatim `10^lr → log10` round trip) + `print_develop`'s paper density-curve i
 
 *Probe: `tools/gpu_probe/` (`build_push_run.sh` reproduces everything; raw captures in
 `tools/gpu_probe/captures/`, untracked). Research for
-[#127](https://github.com/thetechgeekko/Spektrafilm-android/issues/127) /
-[#135](https://github.com/thetechgeekko/Spektrafilm-android/issues/135) /
-[#147](https://github.com/thetechgeekko/Spektrafilm-android/issues/147), part of map
-[#117](https://github.com/thetechgeekko/Spektrafilm-android/issues/117). Film modeling
+[Decide: GPU preview route](https://github.com/thetechgeekko/Spektrafilm-android/issues/127),
+[Research: can the GPU produce exact (byte-identical) results vs the CPU C++ engine?](https://github.com/thetechgeekko/Spektrafilm-android/issues/135), and
+[GPU M2: E3 device measurement — filming + printing integrals (probe extension; laptop session order)](https://github.com/thetechgeekko/Spektrafilm-android/issues/147), part of
+[Wayfinder workstream: 1–2 s exact export + fast interactive preview](https://github.com/thetechgeekko/Spektrafilm-android/issues/117). Film modeling
 powered by spektrafilm (GPLv3).*

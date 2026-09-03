@@ -3,9 +3,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Update check pings the GitHub Releases API; opening the release page uses the browser. -->
+    <!-- The advisory update check makes one bounded HTTPS request to GitHub's API. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- A backgrounded export is moved to the little-cluster cpuset and runs ~4x
+         slower (measured 13894 ms -> 55631 ms on a 12.5 MP export), and becomes a
+         kill candidate for Samsung's device-health manager. ExportForegroundService
+         holds the process in the foreground scheduling group while it renders. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- API 33+: without this the ongoing-export notification is not shown. The
+         service still gets foreground priority either way, so no runtime prompt is
+         raised for it — the speed-up does not depend on the user granting this. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Legacy gallery export (API <= 28) writes to public Pictures storage.
          On API 29+ scoped storage is used via MediaStore and needs no permission. -->
@@ -14,28 +24,57 @@
         android:maxSdkVersion="28" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
+        android:fullBackupContent="@xml/backup_rules"
         android:largeHeap="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:restoreAnyVersion="false"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="false">
         <!-- Lets `adb shell simpleperf` attach to RELEASE builds (API 29+; ignored below).
              Grants profiling to the shell user only — no debugging surface is opened.
              Required by the docs/baseline capture wizard (issue #119). -->
         <profileable
             android:shell="true"
             tools:targetApi="29" />
+        <!-- singleTask: an incoming VIEW/SEND must reach the one live editor through
+             onNewIntent — a second Activity instance would fight the process-owned
+             export/session runtimes for ownership. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- #162 inbound import. content:// only — a file:// path is never adopted
+                 (no path trust, no pre-scoped-storage semantics). MIME is advisory here;
+                 the actual decode route is content-sniffed fail-closed (#190). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
         </activity>
+
+        <!-- Runs no work of its own: it exists only to keep the process in the
+             foreground scheduling group for the duration of an export. -->
+        <service
+            android:name=".ExportForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

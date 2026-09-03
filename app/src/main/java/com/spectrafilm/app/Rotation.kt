@@ -3,30 +3,36 @@
  *
  * Rotation is applied to the decoded [LinearImage] BEFORE it is handed to the engine,
  * so both the live preview render and the full-resolution export reflect the same
- * orientation. The engine's [LinearImage.data] is a direct, native-order ByteBuffer of
+ * orientation. A [LinearImage] lease exposes a direct, native-order ByteBuffer of
  * interleaved RGB float32 in row-major order: floatIndex = (y * width + x) * 3 + c.
  */
 package com.spectrafilm.app
 
 import androidx.exifinterface.media.ExifInterface
 import com.spectrafilm.engine.LinearImage
-import com.spectrafilm.engine.SimResult
+import com.spectrafilm.engine.NativeBufferOwner
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicReference
 
 // Allocate the backing buffer for a rotated/flipped LinearImage of [floats] float32 elements.
 // Above ~64 MB the buffer is allocated OFF the managed heap (native malloc) so a full-res
 // export rotation of a large image (e.g. a 12 MP photo = 144 MB) doesn't OOM the ~256 MB ART
 // heap — exactly the managed-buffer trap that hit the decode path. Small (preview-scale)
 // buffers stay managed (GC handles them). Returns the buffer + the matching LinearImage
-// onClose (null for managed). Falls back to managed if the native alloc fails.
+// onClose (null for managed). Large-buffer coordinator denial fails closed; it is
+// never reallocated on the ART heap outside the process budget.
 private const val ROT_OFFHEAP_THRESHOLD_FLOATS = 16_000_000  // ~64 MB of float32
 
-private fun allocRotBuf(floats: Int): Pair<ByteBuffer, ((ByteBuffer) -> Unit)?> {
+private fun allocRotBuf(floats: Int): Pair<ByteBuffer, AutoCloseable?> {
     if (floats > ROT_OFFHEAP_THRESHOLD_FLOATS) {
-        val nb = SimResult.allocDirectBuffer(floats.toLong() * 4)
-        if (nb != null) {
-            return nb.order(ByteOrder.nativeOrder()) to { b -> SimResult.freeDirectBuffer(b) }
+        val owner = NativeBufferOwner.allocate(floats.toLong() * 4)
+        val lease = owner.acquireDataLease()
+        owner.close()
+        return handoffOrClose(lease) { retainedLease ->
+            retainedLease.data.order(ByteOrder.nativeOrder()) to retainedLease
         }
     }
     // Long-widen the byte count (floats * 4 overflows Int above ~536M floats) and fail
@@ -34,6 +40,32 @@ private fun allocRotBuf(floats: Int): Pair<ByteBuffer, ((ByteBuffer) -> Unit)?> 
     val bytes = floats.toLong() * 4
     if (bytes > Int.MAX_VALUE) throw OutOfMemoryError("rotation buffer too large: $bytes bytes")
     return ByteBuffer.allocateDirect(bytes.toInt()).order(ByteOrder.nativeOrder()) to null
+}
+
+private fun checkedRotationBytes(width: Int, height: Int): Int {
+    require(width > 0 && height > 0) { "invalid rotation dimensions ${width}x$height" }
+    val bytes = try {
+        Math.multiplyExact(
+            Math.multiplyExact(width.toLong(), height.toLong()),
+            3L * Float.SIZE_BYTES,
+        )
+    } catch (failure: ArithmeticException) {
+        throw IllegalArgumentException("rotation dimensions overflow: ${width}x$height", failure)
+    }
+    require(bytes <= Int.MAX_VALUE) {
+        "rotation buffer exceeds ByteBuffer limit: $bytes bytes"
+    }
+    return bytes.toInt()
+}
+
+private fun LinearImage.checkedRotationSourceWindow(data: ByteBuffer): ByteBuffer {
+    val requiredBytes = checkedRotationBytes(width, height)
+    val logical = data.duplicate().order(ByteOrder.nativeOrder())
+    require(logical.remaining() >= requiredBytes) {
+        "rotation buffer is truncated: ${logical.remaining()} < $requiredBytes bytes"
+    }
+    logical.limit(logical.position() + requiredBytes)
+    return logical.slice().order(ByteOrder.nativeOrder())
 }
 
 /** Clockwise rotation applied to the source before simulation. */
@@ -104,109 +136,297 @@ data class ExifOrientation(val rotation: SourceRotation, val flipH: Boolean) {
  * FIRST (in the source pixel grid), then the clockwise rotation, matching the EXIF
  * decode convention where the stored orientation describes how to upright the pixels.
  */
-fun LinearImage.applyExif(orientation: ExifOrientation): LinearImage {
+fun LinearImage.applyExif(
+    orientation: ExifOrientation,
+    isCancelled: () -> Boolean = { false },
+): LinearImage {
     if (orientation.isIdentity) return this
-    val flipped = if (orientation.flipH) this.flippedHorizontal() else this
-    return flipped.rotated(orientation.rotation)
+    val flipped = if (orientation.flipH) this.flippedHorizontal(isCancelled) else this
+    return flipped.rotated(orientation.rotation, isCancelled)
 }
 
 /** Return a new [LinearImage] mirrored left-to-right (horizontal flip). */
-fun LinearImage.flippedHorizontal(): LinearImage {
+fun LinearImage.flippedHorizontal(
+    isCancelled: () -> Boolean = { false },
+): LinearImage {
+    if (isCancelled()) {
+        close()
+        throw CancellationException("source flip cancelled")
+    }
     val ch = 3
     val w = width
     val h = height
-    val src = data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
-    val (outBuf, onClose) = allocRotBuf(w * h * ch)
-    val dst = outBuf.asFloatBuffer()
-    for (y in 0 until h) {
-        for (x in 0 until w) {
-            val nx = w - 1 - x
-            val s = (y * w + x) * ch
-            val d = (y * w + nx) * ch
-            dst.put(d, src.get(s))
-            dst.put(d + 1, src.get(s + 1))
-            dst.put(d + 2, src.get(s + 2))
+    return acquireDataLease().use { sourceLease ->
+        val leasedData = sourceLease.data
+        val sourceWindow = try {
+            checkedRotationSourceWindow(leasedData)
+        } catch (failure: Throwable) {
+            close()
+            throw failure
+        }
+        val src = sourceWindow.asFloatBuffer()
+        val (outBuf, outputLease) = try {
+            allocRotBuf(checkedRotationBytes(w, h) / Float.SIZE_BYTES)
+        } catch (failure: Throwable) {
+            close()
+            throw failure
+        }
+        val flippedResult = if (outputLease != null) {
+            LinearImage.fromDataLease(outBuf, w, h, colorSpace, outputLease)
+        } else {
+            LinearImage(outBuf, w, h, colorSpace)
+        }
+        val dst = outBuf.asFloatBuffer()
+        try {
+            for (y in 0 until h) {
+                throwIfRotationCancelled(isCancelled)
+                for (x in 0 until w) {
+                    val nx = w - 1 - x
+                    val s = (y * w + x) * ch
+                    val d = (y * w + nx) * ch
+                    dst.put(d, src.get(s))
+                    dst.put(d + 1, src.get(s + 1))
+                    dst.put(d + 2, src.get(s + 2))
+                }
+            }
+            throwIfRotationCancelled(isCancelled)
+            close()
+            flippedResult
+        } catch (failure: Throwable) {
+            flippedResult.close()
+            close()
+            throw failure
         }
     }
-    // This op allocated a fresh buffer, so the input is no longer needed. If the input owns an
-    // off-heap native buffer (a full-res export decode) close() frees it; it is a no-op for the
-    // common managed (allocateDirect) inputs.
-    val flippedResult = LinearImage(outBuf, w, h, colorSpace, onClose = onClose)
-    close()
-    return flippedResult
 }
+
+// Below this many pixels a rotation is not worth spawning threads for; preview-scale
+// images stay single-threaded.
+private const val ROT_PARALLEL_MIN_PIXELS = 64_000L
+
+// Transpose tile edge, in pixels. 64x64x3 float32 is ~49 KB, so a tile plus its
+// destination run stays inside L2 while the runs are long enough (192 floats) for the
+// bulk write to pay for itself.
+private const val ROT_TILE = 64
+
+private fun throwIfRotationCancelled(isCancelled: () -> Boolean) {
+    if (isCancelled()) throw CancellationException("source rotation cancelled")
+}
+
+internal fun defaultRotWorkers(pixels: Long): Int =
+    if (pixels < ROT_PARALLEL_MIN_PIXELS) 1
+    else Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
 
 /**
  * Return a new [LinearImage] rotated clockwise by [rotation]. [NONE] returns the input
  * unchanged (no copy). 90/270 swap width and height. Operates on the float view of the
  * native ByteBuffer.
+ *
+ * ## Why this is not the obvious per-pixel loop
+ *
+ * It used to be, and it cost **1155 ms** of a 12.5 MP export — a flat surcharge on ANY
+ * non-zero rotation. The device measurement that found it noted that 180 degrees costs
+ * exactly what 90 does even though 180 transposes nothing, which said the cost was the
+ * loop SHAPE rather than the geometry: every branch did three `FloatBuffer.get()` and
+ * three scattered indexed `put()` per pixel, single-threaded — ~75 M bounds-checked
+ * buffer operations at 12.5 MP. See `docs/research/perf-lab.md` §16.6.
+ *
+ * So source rows are read in BULK into a plain FloatArray (sequential, unchecked), and
+ * 180 — a pure reversal — writes its destination row in bulk too, with no scatter at
+ * all. Only 90/270 still scatter, because their destination is a column.
+ *
+ * ## Worker-count invariance
+ *
+ * Work is split by SOURCE row. For every rotation a source row maps to a distinct
+ * destination row (180) or column (90/270), so no two workers ever write the same output
+ * element and the result is byte-identical for any worker count — the same contract
+ * `kernels/parallel` holds natively. `RotationTest` asserts it 1-vs-8, exactly as the
+ * engine parity suite does with `SPK_NUM_THREADS`.
  */
-fun LinearImage.rotated(rotation: SourceRotation): LinearImage {
+fun LinearImage.rotated(
+    rotation: SourceRotation,
+    isCancelled: () -> Boolean = { false },
+): LinearImage = rotatedWithWorkers(
+    rotation,
+    defaultRotWorkers(width.toLong() * height),
+    isCancelled,
+)
+
+internal fun LinearImage.rotatedWithWorkers(
+    rotation: SourceRotation,
+    workers: Int,
+    isCancelled: () -> Boolean = { false },
+): LinearImage {
     if (rotation == SourceRotation.NONE) return this
+    if (isCancelled()) {
+        close()
+        throw CancellationException("source rotation cancelled")
+    }
     val ch = 3
     val w = width
     val h = height
-    val src = data.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
-
-    fun newBuf(n: Int): Pair<ByteBuffer, ((ByteBuffer) -> Unit)?> = allocRotBuf(n)
-
-    // Each non-NONE branch allocates a fresh managed buffer; free the input afterwards so
-    // an off-heap full-res export source is reclaimed (no-op for managed inputs).
-    val rotated = when (rotation) {
-        SourceRotation.CW90 -> {
-            val nw = h
-            val nh = w
-            val (outBuf, onClose) = newBuf(nw * nh * ch)
-            val dst = outBuf.asFloatBuffer()
-            for (y in 0 until h) {
-                for (x in 0 until w) {
-                    val nx = h - 1 - y
-                    val ny = x
-                    val s = (y * w + x) * ch
-                    val d = (ny * nw + nx) * ch
-                    dst.put(d, src.get(s))
-                    dst.put(d + 1, src.get(s + 1))
-                    dst.put(d + 2, src.get(s + 2))
-                }
-            }
-            LinearImage(outBuf, nw, nh, colorSpace, onClose = onClose)
-        }
-        SourceRotation.CW180 -> {
-            val (outBuf, onClose) = newBuf(w * h * ch)
-            val dst = outBuf.asFloatBuffer()
-            for (y in 0 until h) {
-                for (x in 0 until w) {
-                    val nx = w - 1 - x
-                    val ny = h - 1 - y
-                    val s = (y * w + x) * ch
-                    val d = (ny * w + nx) * ch
-                    dst.put(d, src.get(s))
-                    dst.put(d + 1, src.get(s + 1))
-                    dst.put(d + 2, src.get(s + 2))
-                }
-            }
-            LinearImage(outBuf, w, h, colorSpace, onClose = onClose)
-        }
-        SourceRotation.CW270 -> {
-            val nw = h
-            val nh = w
-            val (outBuf, onClose) = newBuf(nw * nh * ch)
-            val dst = outBuf.asFloatBuffer()
-            for (y in 0 until h) {
-                for (x in 0 until w) {
-                    val nx = y
-                    val ny = w - 1 - x
-                    val s = (y * w + x) * ch
-                    val d = (ny * nw + nx) * ch
-                    dst.put(d, src.get(s))
-                    dst.put(d + 1, src.get(s + 1))
-                    dst.put(d + 2, src.get(s + 2))
-                }
-            }
-            LinearImage(outBuf, nw, nh, colorSpace, onClose = onClose)
-        }
-        SourceRotation.NONE -> this  // unreachable: NONE returned at the top
+    return acquireDataLease().use { sourceLease ->
+    val leasedData = sourceLease.data
+    val sourceWindow = try {
+        checkedRotationSourceWindow(leasedData)
+    } catch (failure: Throwable) {
+        close()
+        throw failure
     }
+    val transposed = rotation == SourceRotation.CW90 || rotation == SourceRotation.CW270
+    val nw = if (transposed) h else w
+    val nh = if (transposed) w else h
+    val (outBuf, outputLease) = try {
+        allocRotBuf(checkedRotationBytes(nw, nh) / Float.SIZE_BYTES)
+    } catch (failure: Throwable) {
+        close()
+        throw failure
+    }
+    val rotated = if (outputLease != null) {
+        LinearImage.fromDataLease(outBuf, nw, nh, colorSpace, outputLease)
+    } else {
+        LinearImage(outBuf, nw, nh, colorSpace)
+    }
+    val rowFloats = w * ch
+    val parallelFailure = AtomicReference<Throwable?>(null)
+
+    fun isWorkCancelled(): Boolean = parallelFailure.get() != null || isCancelled()
+
+    // 180: a source row becomes a destination row, reversed. Bulk in, reverse in a plain
+    // array, bulk out — no scatter anywhere.
+    fun reverseRows(src: FloatBuffer, dst: FloatBuffer, y0: Int, y1: Int) {
+        val row = FloatArray(rowFloats)
+        val out = FloatArray(rowFloats)
+        for (y in y0 until y1) {
+            throwIfRotationCancelled(::isWorkCancelled)
+            src.position(y * rowFloats)
+            src.get(row, 0, rowFloats)
+            var x = 0
+            while (x < w) {
+                val s = x * ch
+                val d = (w - 1 - x) * ch
+                out[d] = row[s]; out[d + 1] = row[s + 1]; out[d + 2] = row[s + 2]
+                x++
+            }
+            dst.position((h - 1 - y) * rowFloats)
+            dst.put(out, 0, rowFloats)
+        }
+    }
+
+    // 90/270: the destination is a COLUMN, so a row-at-a-time pass can only scatter. Work
+    // a tile at a time instead — then within a tile each source column's slice lands on a
+    // CONTIGUOUS destination column run, which bulk-writes. The transpose itself happens
+    // in plain FloatArrays, so the inner loop has no bounds-checked buffer ops at all.
+    fun transposeCols(src: FloatBuffer, dst: FloatBuffer, xStart: Int, xEnd: Int) {
+        val tile = FloatArray(ROT_TILE * ROT_TILE * ch)
+        val run = FloatArray(ROT_TILE * ch)
+        var xb = xStart
+        while (xb < xEnd) {
+            throwIfRotationCancelled(::isWorkCancelled)
+            val xw = minOf(ROT_TILE, xEnd - xb)
+            var yb = 0
+            while (yb < h) {
+                throwIfRotationCancelled(::isWorkCancelled)
+                val yh = minOf(ROT_TILE, h - yb)
+                for (j in 0 until yh) {
+                    src.position(((yb + j) * w + xb) * ch)
+                    src.get(tile, j * xw * ch, xw * ch)
+                }
+                for (i in 0 until xw) {
+                    val x = xb + i
+                    val drow: Int
+                    val dcol0: Int
+                    if (rotation == SourceRotation.CW90) {
+                        // (x,y) -> (h-1-y, x): destination row x, columns descending in y.
+                        drow = x
+                        dcol0 = h - (yb + yh)
+                        for (j in 0 until yh) {
+                            val k = (yh - 1 - j) * ch
+                            val s = (j * xw + i) * ch
+                            run[k] = tile[s]; run[k + 1] = tile[s + 1]; run[k + 2] = tile[s + 2]
+                        }
+                    } else {
+                        // (x,y) -> (y, w-1-x): destination row w-1-x, columns ascending in y.
+                        drow = w - 1 - x
+                        dcol0 = yb
+                        for (j in 0 until yh) {
+                            val k = j * ch
+                            val s = (j * xw + i) * ch
+                            run[k] = tile[s]; run[k + 1] = tile[s + 1]; run[k + 2] = tile[s + 2]
+                        }
+                    }
+                    dst.position((drow * nw + dcol0) * ch)
+                    dst.put(run, 0, yh * ch)
+                }
+                yb += yh
+            }
+            xb += xw
+        }
+    }
+
+    // Each worker takes its OWN buffer duplicates: a FloatBuffer's position is per-view,
+    // so sharing one across threads would corrupt the bulk transfers above.
+    fun work(a: Int, b: Int) {
+        val src = sourceWindow.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        val dst = outBuf.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+        if (transposed) transposeCols(src, dst, a, b) else reverseRows(src, dst, a, b)
+    }
+
+    // Split 180 by source ROW and 90/270 by source COLUMN. In both cases the destination
+    // ROW is then a function of the split variable alone, so every worker owns whole
+    // destination rows — no shared element, and no false sharing either.
+    try {
+        val axis = if (transposed) w else h
+        val n = workers.coerceIn(1, axis)
+        if (n == 1) {
+            work(0, axis)
+        } else {
+            val per = (axis + n - 1) / n
+            val threads = ArrayList<Thread>(n - 1)
+            fun guardedWork(a: Int, b: Int) {
+                try {
+                    work(a, b)
+                } catch (failure: Throwable) {
+                    parallelFailure.compareAndSet(null, failure)
+                }
+            }
+            try {
+                var start = per
+                while (start < axis) {
+                    val a = start
+                    val b = minOf(start + per, axis)
+                    val thread = Thread { guardedWork(a, b) }
+                    threads += thread
+                    thread.start()
+                    start = b
+                }
+                guardedWork(0, minOf(per, axis))
+            } catch (failure: Throwable) {
+                parallelFailure.compareAndSet(null, failure)
+            } finally {
+                var interrupted = false
+                for (thread in threads) {
+                    while (thread.isAlive) {
+                        try {
+                            thread.join()
+                        } catch (failure: InterruptedException) {
+                            interrupted = true
+                            parallelFailure.compareAndSet(null, failure)
+                        }
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt()
+            }
+            parallelFailure.get()?.let { throw it }
+        }
+        throwIfRotationCancelled(isCancelled)
+    } catch (failure: Throwable) {
+        rotated.close()
+        close()
+        throw failure
+    }
+
     close()
-    return rotated
+    rotated
+    }
 }

@@ -21,13 +21,21 @@
  *   /tmp/test_tiff_writer
  */
 #include "tiff_writer.h"
+#include "tiff_writer_jni_boundary.h"
 
+#include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <cstring>
 #include <map>
+#include <new>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+#include <dirent.h>
 
 using namespace spectrafilm;
 
@@ -167,6 +175,20 @@ void runCase(const char* label, TiffCompression comp, const std::vector<uint8_t>
     std::string path = std::string("/tmp/sf_tiff_test_") + label + ".tiff";
     TiffWriteResult wr = writeTiff16ToFile(pixels.data(), W, H, meta, comp, path);
     CHECK(wr.ok, "writer returned ok");
+
+    // #175: the file writer emits the header and the image strip as two spans so
+    // the whole file is never assembled in memory. That must not change a byte,
+    // so it is checked against the in-memory encoder on every case.
+    {
+        std::vector<uint8_t> inMemory;
+        const TiffWriteResult mem = writeTiff16ToMemory(pixels.data(), W, H, meta,
+                                                        comp, inMemory, nullptr);
+        std::vector<uint8_t> onDisk;
+        CHECK(mem.ok && readFile(path, onDisk), "in-memory encode and file both produced");
+        CHECK(onDisk.size() == inMemory.size() &&
+                  std::memcmp(onDisk.data(), inMemory.data(), inMemory.size()) == 0,
+              "two-span file write is byte-identical to the in-memory encode");
+    }
     if (!wr.ok) { std::printf("    error: %s\n", wr.error.c_str()); return; }
 
     std::vector<uint8_t> file;
@@ -258,6 +280,57 @@ void runCase(const char* label, TiffCompression comp, const std::vector<uint8_t>
 }
 
 // Write+readback a true 32-bit IEEE-float TIFF and assert tags + verbatim round-trip.
+// #175: the 16-bit path now quantises INSIDE the writer, from float samples, so the
+// caller no longer builds a uint16 image (75 MB at 12.5 MP). That is only safe if it
+// is byte-identical to the uint16 entry point -- the export contract pins the whole
+// container digest (#126) -- so this writes the same picture both ways and compares
+// the files. The pixel values below are chosen to hit every branch of the rounding:
+// negative, zero, exactly 1, above 1, NaN, and the .5 boundary.
+void runFloat16IdentityCase(const char* label, TiffCompression comp) {
+    std::printf("[float16-identity-%s]\n", label);
+
+    const int W = 7, H = 5;
+    std::vector<float> f(static_cast<size_t>(W) * H * 3);
+    for (size_t i = 0; i < f.size(); ++i)
+        f[i] = static_cast<float>(i) / static_cast<float>(f.size() - 1);
+    f[0] = -0.5f;
+    f[1] = 0.0f;
+    f[2] = 1.0f;
+    f[3] = 2.0f;
+    f[4] = std::numeric_limits<float>::quiet_NaN();
+    f[5] = 0.5f / 65535.0f;          // rounds to 1 only if +0.5 is applied
+    f[6] = 0.49f / 65535.0f;         // rounds to 0
+
+    // The quantisation the caller used to do, kept here verbatim as the reference.
+    std::vector<uint16_t> q(f.size());
+    for (size_t i = 0; i < f.size(); ++i) {
+        const float v = f[i];
+        if (!(v > 0.0f)) { q[i] = 0; continue; }
+        if (v >= 1.0f) { q[i] = 65535; continue; }
+        q[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+    }
+
+    TiffMetadata meta;
+    meta.software = "Spektrafilm-test";
+    meta.dateTime = "2026:05:29 12:00:00";
+    meta.exifColorSpace = 0xFFFF;
+    meta.writeExifIfd = true;
+
+    const std::string fromU16 = std::string("/tmp/sf_tiff_f16_u16_") + label + ".tiff";
+    const std::string fromFloat = std::string("/tmp/sf_tiff_f16_flt_") + label + ".tiff";
+    const TiffWriteResult a = writeTiff16ToFile(q.data(), W, H, meta, comp, fromU16);
+    const TiffWriteResult b = writeTiffFloatToFile(f.data(), W, H, meta, comp, fromFloat);
+    CHECK(a.ok && b.ok, "both writers returned ok");
+    if (!a.ok || !b.ok) return;
+    CHECK(a.bytesWritten == b.bytesWritten, "same byte count reported");
+
+    std::vector<uint8_t> ba, bb;
+    CHECK(readFile(fromU16, ba) && readFile(fromFloat, bb), "both files readable");
+    CHECK(ba == bb, "float-fed 16-bit TIFF is byte-identical to the uint16 one");
+    std::remove(fromU16.c_str());
+    std::remove(fromFloat.c_str());
+}
+
 void runFloatCase(const char* label, TiffCompression comp) {
     std::printf("[float-%s]\n", label);
 
@@ -325,6 +398,191 @@ void runFloatCase(const char* label, TiffCompression comp) {
     std::printf("    file: %s (%zu bytes)\n", path.c_str(), wr.bytesWritten);
 }
 
+struct CancelAfterPolls {
+    int polls = 0;
+    int cancelAt = 1;
+};
+
+bool cancelAfter(void* opaque) noexcept {
+    auto* state = static_cast<CancelAfterPolls*>(opaque);
+    return ++state->polls >= state->cancelAt;
+}
+
+struct TempStageCancellation {
+    const char* directory;
+    const char* filePrefix;
+};
+
+bool tempStageExists(void* opaque) noexcept {
+    const auto* state = static_cast<const TempStageCancellation*>(opaque);
+    DIR* directory = opendir(state->directory);
+    if (directory == nullptr) return false;
+    bool found = false;
+    const size_t prefixLength = std::strlen(state->filePrefix);
+    while (const dirent* entry = readdir(directory)) {
+        if (std::strncmp(entry->d_name, state->filePrefix, prefixLength) == 0) {
+            found = true;
+            break;
+        }
+    }
+    closedir(directory);
+    return found;
+}
+
+struct ConcurrentCancellation {
+    std::atomic<int> polls{0};
+    std::atomic<bool> cancelled{false};
+};
+
+bool blockUntilConcurrentCancel(void* opaque) noexcept {
+    auto* state = static_cast<ConcurrentCancellation*>(opaque);
+    const int poll = state->polls.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (poll == 2) {
+        while (!state->cancelled.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    }
+    return state->cancelled.load(std::memory_order_acquire);
+}
+
+void runSafetyCases() {
+    std::printf("[safety]\n");
+    const uint16_t onePixel[3] = {1, 2, 3};
+    TiffMetadata meta;
+    std::vector<uint8_t> out = {0xAA};
+
+    auto huge = writeTiff16ToMemory(onePixel, INT_MAX, INT_MAX, meta,
+                                    TiffCompression::None, out);
+    CHECK(!huge.ok, "overflow dimensions are rejected before allocation");
+    CHECK(out.empty(), "overflow failure publishes no partial memory output");
+
+    auto invalidPath = writeTiff16ToFile(
+        reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(1)),
+        1, 1, meta, TiffCompression::None, "");
+    CHECK(!invalidPath.ok && invalidPath.error == "empty output path",
+          "empty path is rejected before any pixel read");
+    static constexpr char kNulPath[] = "/tmp/sf_tiff_nul\0ignored.tiff";
+    const std::string nulPath(kNulPath, sizeof(kNulPath) - 1u);
+    invalidPath = writeTiff16ToFile(
+        onePixel, 1, 1, meta, TiffCompression::None, nulPath);
+    CHECK(!invalidPath.ok && invalidPath.error == "output path contains NUL",
+          "embedded-NUL path is rejected deterministically");
+
+    // Raw pixels fit in uint32, but the complete classic-TIFF layout does not.
+    auto layoutOverflow = writeTiff16ToMemory(
+        onePixel, 715827882, 1, meta, TiffCompression::None, out);
+    CHECK(!layoutOverflow.ok,
+          "classic TIFF rejects full-layout overflow before pixel access");
+    CHECK(out.empty(), "layout overflow publishes no partial memory output");
+
+    std::vector<uint16_t> pixels(4u * 8u * 3u, 0x1234);
+    CancelAfterPolls state{0, 3};
+    TiffCancellation cancellation{&state, cancelAfter};
+    auto cancelled = writeTiff16ToMemory(
+        pixels.data(), 4, 8, meta, TiffCompression::None, out, &cancellation);
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancellation is reported distinctly from write failure");
+    CHECK(state.polls == 3, "cancellation is polled while serialising rows");
+    CHECK(out.empty(), "cancelled encode publishes no partial memory output");
+
+    const std::string path = "/tmp/sf_tiff_cancelled.tiff";
+    {
+        FILE* existing = std::fopen(path.c_str(), "wb");
+        const uint8_t sentinel[] = {0x61, 0x62, 0x63};
+        std::fwrite(sentinel, 1, sizeof(sentinel), existing);
+        std::fclose(existing);
+    }
+    state = {0, 3};
+    cancelled = writeTiff16ToFile(
+        pixels.data(), 4, 8, meta, TiffCompression::None, path, &cancellation);
+    std::vector<uint8_t> unchanged;
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancelled file write returns cancellation");
+    CHECK(readFile(path, unchanged) && unchanged == std::vector<uint8_t>({0x61, 0x62, 0x63}),
+          "cancelled file write leaves the published destination unchanged");
+    std::remove(path.c_str());
+
+    const std::string stagedPath = "/tmp/sf_tiff_staged_cancel.tiff";
+    {
+        FILE* existing = std::fopen(stagedPath.c_str(), "wb");
+        const uint8_t sentinel[] = {0x31, 0x32, 0x33};
+        std::fwrite(sentinel, 1, sizeof(sentinel), existing);
+        std::fclose(existing);
+    }
+    TempStageCancellation stagedState{"/tmp", "sf_tiff_staged_cancel.tiff.tmp."};
+    TiffCancellation stagedCancellation{&stagedState, tempStageExists};
+    cancelled = writeTiff16ToFile(
+        pixels.data(), 4, 8, meta, TiffCompression::None,
+        stagedPath, &stagedCancellation);
+    unchanged.clear();
+    CHECK(!cancelled.ok && cancelled.cancelled,
+          "cancellation during staged output is reported");
+    CHECK(readFile(stagedPath, unchanged) && unchanged == std::vector<uint8_t>({0x31, 0x32, 0x33}),
+          "staged cancellation never replaces the destination");
+    CHECK(!tempStageExists(&stagedState),
+          "staged cancellation removes the incomplete temporary file");
+    std::remove(stagedPath.c_str());
+
+    ConcurrentCancellation concurrentState;
+    TiffCancellation concurrentCancellation{
+        &concurrentState, blockUntilConcurrentCancel,
+    };
+    TiffWriteResult concurrentResult;
+    out = {0xAA};
+    std::thread writer([&]() {
+        concurrentResult = writeTiff16ToMemory(
+            pixels.data(), 4, 8, meta, TiffCompression::None,
+            out, &concurrentCancellation);
+    });
+    while (concurrentState.polls.load(std::memory_order_acquire) < 2)
+        std::this_thread::yield();
+    concurrentState.cancelled.store(true, std::memory_order_release);
+    writer.join();
+    CHECK(!concurrentResult.ok && concurrentResult.cancelled && out.empty(),
+          "concurrent cancellation is race-free and publishes no memory output");
+}
+
+void runExceptionTranslationCases() {
+    using spectrafilm::tiffjni::NativeExceptionKind;
+    using spectrafilm::tiffjni::BufferWindow;
+    using spectrafilm::tiffjni::BufferWindowError;
+    using spectrafilm::tiffjni::containNativeExceptions;
+    using spectrafilm::tiffjni::stableMessage;
+
+    std::printf("[jni-exception-translation]\n");
+    NativeExceptionKind kind = NativeExceptionKind::None;
+    int value = containNativeExceptions<int>([]() -> int { throw std::bad_alloc(); }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::OutOfMemory,
+          "bad_alloc is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "TIFF write failed: out of memory") == 0,
+          "bad_alloc maps to a stable Kotlin error message");
+
+    value = containNativeExceptions<int>([]() -> int { throw std::runtime_error("unstable detail"); }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::Standard,
+          "std::exception is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "TIFF write failed: native exception") == 0,
+          "std::exception maps to a stable Kotlin error message");
+
+    value = containNativeExceptions<int>([]() -> int { throw 7; }, kind);
+    CHECK(value == 0 && kind == NativeExceptionKind::Unknown,
+          "unknown exception is contained and classified");
+    CHECK(std::strcmp(stableMessage(kind), "TIFF write failed: unknown native exception") == 0,
+          "unknown exception maps to a stable Kotlin error message");
+
+    BufferWindow window;
+    auto windowError = spectrafilm::tiffjni::validateBufferWindow(
+        4, 16, 20, 20, 12, window);
+    CHECK(windowError == BufferWindowError::None && window.offset == 4 && window.length == 12,
+          "direct-buffer validation honours the logical position and limit");
+    windowError = spectrafilm::tiffjni::validateBufferWindow(
+        4, 15, 20, 20, 12, window);
+    CHECK(windowError == BufferWindowError::TooSmall,
+          "direct-buffer validation rejects a short logical window");
+    windowError = spectrafilm::tiffjni::validateBufferWindow(
+        4, 16, 20, 19, 12, window);
+    CHECK(windowError == BufferWindowError::Malformed,
+          "direct-buffer validation rejects inconsistent capacities");
+}
+
 }  // namespace
 
 int main() {
@@ -338,8 +596,14 @@ int main() {
     runCase("no_icc", TiffCompression::None, {});
 
     // True 32-bit IEEE-float path (BitsPerSample=32, SampleFormat=3, verbatim samples).
+    runFloat16IdentityCase("uncompressed", TiffCompression::None);
+    runFloat16IdentityCase("packbits", TiffCompression::PackBits);
+
     runFloatCase("uncompressed", TiffCompression::None);
     runFloatCase("packbits", TiffCompression::PackBits);
+
+    runSafetyCases();
+    runExceptionTranslationCases();
 
     std::printf("\n%s (%d failure%s)\n",
                 g_failures == 0 ? "PASS" : "FAIL",

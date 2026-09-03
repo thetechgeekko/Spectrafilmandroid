@@ -1,0 +1,121 @@
+{
+  "schema": "spk.bench_corpus.v1",
+  "contract": "docs/BIT_IDENTICAL_EXPORT_ROADMAP.md#the-approved-export-contract-issue-126",
+  "source": {
+    "generator": "tools/baseline/corpus/make_source.py",
+    "format": "PNG",
+    "note": "Lossless and byte-pinned: a JPEG's bytes would depend on whichever encoder produced it, so the pinned input is a stored-block PNG the generator reproduces exactly.",
+    "width": 4080,
+    "height": 3060,
+    "bytes": 37460417,
+    "sha256": "66381a8ed2d1a6ab471690ec5c5725798a15e134ada94c7feeb43c59bdb93195"
+  },
+  "cells": [
+    {
+      "id": "BASE",
+      "gates": [
+        "C0",
+        "C3",
+        "SLO"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "print",
+      "effects": [],
+      "formats": [
+        "JPEG_Q95",
+        "PNG16",
+        "TIFF16",
+        "ULTRA_HDR"
+      ]
+    },
+    {
+      "id": "HEAVY",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "print",
+      "effects": [
+        "grain",
+        "halation",
+        "dir_couplers"
+      ],
+      "formats": [
+        "JPEG_Q95",
+        "PNG16",
+        "TIFF16",
+        "ULTRA_HDR"
+      ]
+    },
+    {
+      "id": "PRINT_GRAIN",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "print",
+      "effects": [
+        "grain"
+      ],
+      "formats": [
+        "PNG16",
+        "TIFF16"
+      ]
+    },
+    {
+      "id": "SCAN_CLEAN",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "scan",
+      "effects": [],
+      "formats": [
+        "PNG16",
+        "TIFF16"
+      ]
+    },
+    {
+      "id": "SCAN_GRAIN",
+      "gates": [
+        "C0",
+        "C3"
+      ],
+      "preset": "Portra 400 — Wedding Warm",
+      "route": "scan",
+      "effects": [
+        "grain"
+      ],
+      "formats": [
+        "PNG16",
+        "TIFF16"
+      ]
+    }
+  ],
+  "container_identity": {
+    "PNG16": "gated",
+    "TIFF16": "gated",
+    "JPEG_Q95": "unsupported",
+    "ULTRA_HDR": "unsupported"
+  },
+  "protocol": {
+    "gate_runs": 5,
+    "gate_runs_discarded": 1,
+    "smoke_runs_max": 3,
+    "slo_p50_ms": 2000,
+    "slo_p95_ms": 3000,
+    "tier_a": {
+      "model": "SM-S948W",
+      "sdk": 36,
+      "unplugged": true,
+      "min_battery_pct": 50,
+      "idle_between_runs_s": 60
+    },
+    "require_thermal_status": 0,
+    "max_thermal_wait_s": 300,
+    "slo_runs": 11
+  }
+}

@@ -1,0 +1,22 @@
+lib/libraw/patches/*.patch text eol=lf -whitespace
+lib/libraw/patches/README.md text eol=lf
+lib/libraw/cmake/LibRawVendor.cmake text eol=lf
+lib/libraw/compliance/license-route.txt text eol=lf
+lib/libraw/compliance/license-decision.json text eol=lf
+lib/libraw/compliance/spdx-created-at.txt text eol=lf
+lib/libraw/compliance/relink/CMakeLists.txt text eol=lf
+lib/libraw/compliance/relink/README.md text eol=lf
+lib/libraw/compliance/relink/unofficial_relink_marker.cpp text eol=lf
+lib/libraw/src/main/cpp/CMakeLists.txt text eol=lf
+lib/libraw/src/main/cpp/raw_decoder.cpp text eol=lf
+lib/libraw/src/main/cpp/raw_decoder.h text eol=lf
+lib/libraw/src/main/cpp/raw_decoder_jni.cpp text eol=lf
+LICENSE text eol=lf
+NOTICE.md text eol=lf
+docs/LICENSING.md text eol=lf
+lib/libraw/README.md text eol=lf
+lib/libraw/src/main/assets/third_party/libraw/* -text -whitespace
+app/src/main/assets/legal/spektrafilm/* -text
+tools/r8_check/check_release_dex.sh text eol=lf
+*.sh text eol=lf
+gradlew text eol=lf

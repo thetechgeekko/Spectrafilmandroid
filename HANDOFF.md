@@ -1,5 +1,621 @@
 # Spektrafilm Android — Session Handoff
 
+> **Historical session transcript — not the current queue.** Entries below preserve measurements,
+> failed experiments, and old handoffs in reverse chronological layers. Do not execute a `Next`,
+> reset/push command, or policy statement from this file without revalidating it against the current
+> tree. Live status, claims, dependencies, and the fast execution loop are in
+> [`docs/EXECUTION_INDEX.md`](docs/EXECUTION_INDEX.md) and the linked Wayfinder maps.
+
+---
+
+## GRAIN WAS ONE DEGENERATE LOOP — 8.4x ON THE BIGGEST STAGE IN AN EXPORT (2026-08-30)
+
+`perf-lab.md` §25. Grain was §22's largest baseline item (**4340-4540 ms of a ~10 s device
+export**) and the only big export-side thing never examined. Decomposed before touching it,
+per the §23 lesson.
+
+### The finding
+
+At 12.58 MP the sublayer grain path is **94.6% one phase** — the 9x `layer_particle_model`
+RNG sampling. Everything else, all six other phases together, is 5.4%. And
+`add_micro_structure` costs **exactly 0.0 ms**: it early-returns unless
+`pixel_size_um < 0.6 um` (a 35 mm frame wider than 58,000 px), so it is inert at every real
+resolution up to 100 MP. The loop-invariant `log`/`sqrt` hoist visible in that function is a
+hoist in dead code — measuring first is what caught it, again.
+
+Inside the sampler, a census found the cost is **not** spread over the pixels:
+
+- `fast_binomial_one` takes CDF inversion for 34.30% of calls;
+- **55.47% of those have `pow(1-p, n)` underflowed to exactly 0**;
+- those account for **40,767,030,234 iterations — 99.62% of every iteration the branch runs**
+  (avg 1892 each). The other 0.38% averages 8.9.
+
+When `prob == 0.0` the accumulator `cdf += prob` can never advance, so the loop is guaranteed
+to walk to `k = n+1` and return `n` — computing a value that underflow had already decided.
+Upstream's Numba loop has the same structure, so this was a faithful port of a degenerate
+walk.
+
+### The change
+
+`if (prob == 0.0 && u > 0.0) return n;` in `kernels/stats.cpp`. **Byte-identical**: the loop
+draws no randomness (`u` is drawn before it), so the variate and the surviving RNG stream are
+both unchanged. The `u > 0.0` guard preserves the `uniform() == 0.0` case, where the original
+exits at `k = 0` and returns -1.
+
+Measured with both arms in ONE process behind a runtime flag, **alternated** (the §24.5
+method rule), at the engine's own `pixel_size_um = film_format_mm*1000/max(w,h)`:
+
+| geometry | pixel | before | after | speedup |
+|---|---|---|---|---|
+| 4096x3072 (12.58 MP, export) | 8.545 um | 30225-32893 ms | 3601-3895 ms | **8.4-8.8x** |
+| 2048x1536 (3.15 MP) | 17.090 um | 19204-19287 ms | 749-762 ms | 25.3-25.7x |
+| 640x480 (0.31 MP) | 54.688 um | 4750-4813 ms | 75-81 ms | 58.6-64.0x |
+
+Byte-identical in every rep, in both orderings. The multiplier rises as pixels coarsen
+because `n` — the length of the wasted walk — scales with pixel area. **That table is a
+scaling law, not a preview claim**: the fit preview and live draft already skip grain
+(`ParamsState.skipGrainHalation`). Grain runs on the 100% zoom ROI, the magnifier and
+export, all at native pixel size — the 8.4x row.
+
+### The gate the existing tests could not provide
+
+`test_grain` / `test_grain_sublayer` are **statistical** (mean, noise std ±15%) and cannot
+see an element-wise sampler change — they would have passed had this been subtly wrong.
+New `tests/test_binomial_shortcircuit.cpp` gates it against a **verbatim transcription** of
+the replaced loop (the `test_fft_convolve` pattern), checking the variate **and** the
+surviving RNG stream over ~21,500 cases, and refusing to pass if the sweep missed any of the
+three regions it claims to cover. Mutation-checked: `return n-1`, an extra RNG draw and
+`prob < 1e-300` are all caught; `prob < 1e-320` survives only at the shipping flags (where
+`-ffast-math` FTZ makes it the same program — caught at -O2, which is why both legs run), and
+the `u > 0.0` half is documented as uncovered rather than papered over.
+
+Wired into `ci.yml` + `run_engine_parity.sh`: **40 gates now, ALL OK on both legs.**
+
+Gotcha worth keeping: the runner marks a test failed on `/fail/i` in its stdout, so a
+counter printed `failures=0` fails the gate. It is `mismatches=` now.
+
+### What is left in grain
+
+3.6 s at 12.58 MP on this 4-core host, 67% of it the surviving normal-approximation draws
+(~190 M `std::normal_distribution` variates — rejection sampling with a `sqrt` and `log`
+each). Replacing that generator is the next lever and it is **not** byte-identical: it
+changes the grain field. Defensible by the same argument block-seeding already relies on,
+but it is a deliberate output change — owner call, not a unilateral one.
+
+### Still host-only
+
+Like the two wins below, this is host-measured. The 99.62% iteration removal is geometry, not
+hardware, so it transfers to arm64 exactly; only the wall-clock ratio is host-specific. Three
+landed engine wins now await one on-device confirmation.
+
+---
+
+## THE SEPARABLE f64 FILTER WAS 42% DATA MOVEMENT (2026-08-30)
+
+Follow-on from the coupler finding below, and the target it named. `perf-lab.md` §24.
+
+`exponential_filter_per_channel_d` is called by **both** heavy spatial stages —
+`model/diffusion.cpp:92` (halation scatter tail) and `model/couplers.cpp:432` (DIR coupler
+diffusion) — so one change reaches both.
+
+### Correct the record first
+
+An initial decomposition put the filter at **2799 ms** with a **65%** zero/copy/axpy share.
+**Both are wrong** — process-state artifacts from a bench holding 1.1 GB live across
+unrelated arms. A direct A/B measured the same old code at 1270 ms. Re-run with internal
+timers that sum to the function's own total:
+
+| part | ms | share |
+|---|---|---|
+| zero `out` | 20.1 | 1.6% |
+| 3× copy `img` → `comp` | 58.2 | 4.5% |
+| **3× `gaussian_blur_per_channel_d`** | **958.5** | **74.1%** |
+| 3× axpy | 52.2 | 4.0% |
+| residual — allocating the 300 MB `comp` | 204.2 | 15.8% |
+| **total, measured directly** | **1293.2** | |
+
+Agrees with the A/B's 1270.4 ms. That agreement is the check the first attempt failed, and
+the reason it is safe to build on this one.
+
+### The actual problem
+
+`gaussian_blur_per_channel_d` deinterleaves a channel, blurs the plane, reinterleaves — on
+every call. The old filter called it once per mixture component, so three components × three
+channels was **nine strided gathers and nine strided scatters** at stride 3 doubles. At
+σ=34.68 that de/re-interleave is 157.5 ms of a 279.1 ms call — **56.5%**, and about **42% of
+the whole filter**, flat across σ because it is pure data movement.
+
+### The change
+
+Deinterleave once per channel, run all three mixture components in planar space,
+reinterleave once. Three gathers and three scatters instead of nine and nine; every other
+pass contiguous.
+
+- **1293.2 ms → 824.8 ms, 36.2% faster**, corroborated by a separate A/B at 34.3% median.
+  The *new-first* rep (new arm cold) was the best of the three, so unlike the coupler
+  reorder this is not flattered by page-fault ordering.
+- Scratch four planes → three (the old path held a 3-plane `comp` **plus** the 1-plane
+  deinterleave buffer inside every blur call).
+- **Byte-identical**, proved directly over 16 configurations: 4 shapes (1-channel,
+  4-channel, non-power-of-two) × 4 decay regimes (FIR-only, the `SMALL_SIGMA_MAX=3`
+  boundary, production 22.76, wide 90), each with **unequal per-channel decays** so a bug
+  collapsing the σ vector would fail rather than pass. `memcmp`, all identical.
+- Parity **39/39 ALL OK both legs**. `test_parallel` scenarios 3–4 cover thread-invariance
+  (both routes, `halation_active=1`, 1 vs 8 workers), which matters since the parallel
+  structure changed.
+
+### Still open here
+
+At 824.8 ms the biggest remaining part is the actual plane blurs (~417 ms), which is the
+right place to be. Two unmeasured levers: the last mixture component could blur `src` in
+place rather than copying it (three of nine plane copies), and the three plane buffers are
+still allocated per call — the scratch-pool idea from §23.4 applies here too.
+
+---
+
+## THE COUPLER STAGE IS 44% ALLOCATION AND 0.4% ARITHMETIC (2026-08-30)
+
+Owner asked to start on the ~79% of an export that is `grain + halation + dir_couplers`,
+beginning with couplers as the lowest-risk GPU target. **The plan did not survive the
+measurement, and that is the result worth keeping.** Full write-up: `perf-lab.md` §23.
+
+### The GPU kernel was built, never ran once, and was removed
+
+`gpu/dir_couplers.comp` + Vulkan kernel + one-time self-check + partial-progress reporting
++ `spk_gpu_couplers_*` counters. It worked — `test_gpu_host` went green under lavapipe.
+
+Then the engagement assertion said `state=0 pixels=0`. **Production takes the SPATIAL
+coupler variant** (`digest_filming_params(..., spatial_effects=true)` sets
+`dir_couplers.diffusion_size_um = 20.0`); the pointwise fused loop the shader replaced is
+only reached if a user zeroes `dir_diffusion_size_um`. Every `max_abs` the test printed
+would have passed unchanged on a silent CPU fallback — without the engagement check this
+would have shipped as a "validated offload" no render ever entered.
+
+Reverted in full, on the precedent this branch already set with the Highway f64 halation
+tier: built, measured, taken out. Nothing of it is preserved on disk — it lived only in an
+ephemeral session scratchpad — so `perf-lab.md` §23.1 is the record. Rebuilding it would be
+a day's work at most, and `gpu/scan_spectral_lin.comp` plus its dispatch already serve as
+the in-tree reference for a four-binding per-pixel kernel.
+
+### Where the time actually is (host, 12.5 MP, release flags)
+
+| phase | ms | share |
+|---|---|---|
+| alloc `correction` (300 MB) | 1246.2 | 14.8% |
+| **loop 1** silver → correction | **12.9** | **0.2%** |
+| copy `gauss(correction)` (300 MB) | 1772.1 | 21.0% |
+| gaussian filter | 1538.4 | 18.2% |
+| alloc `tail` (300 MB) | 685.7 | 8.1% |
+| exponential filter | 3171.9 | 37.5% |
+| **blend** | **21.1** | **0.2%** |
+
+Allocation + one copy **43.8%**; the two filters **55.8%**; the per-pixel loops — the whole
+GPU target — **0.4%**. A perfect offload of both loops removes 34 ms of an 8448 ms stage.
+
+**CORRECTED (see the newer entry above and `perf-lab.md` §24.5):** that table is a COLD
+measurement — the bench never faulted its pages in before timing, so the allocation rows
+carry first-touch cost and are inflated ~4.6x against a warmed run. A reconciled re-measure
+puts the current block at **allocation 13.5% / filters 85.1% / per-pixel loops 1.4%**.
+Allocation here is a **cold-start** cost, not steady state. The verdict on the GPU kernel is
+untouched: the loops are trivial under every measurement.
+
+### What shipped: one reordering, no copy
+
+The two filters are independent, so running the exponential tail FIRST leaves `correction`
+intact for the Gaussian, which can then blur it in place. The full-resolution copy existed
+only to preserve `correction` across a blur that came before its other reader.
+
+- **~22% off the stage.** A single old-then-new pass said 59.3%; that is a page-fault
+  ordering artifact. Alternating the arms gives 50.4% / **21.9%** / 27.4%, and 21.9% (new
+  arm cold, old arm warm) is the conservative one — it matches the independent phase
+  estimate of 21%. Fifth time on this branch a number described an unwritten condition;
+  first time it was caught before publishing rather than after.
+- **900 MB → 600 MB peak** at 12.5 MP (three f64 planes → two). Unconditional.
+- **Byte-identical, proved directly:** both orders run in one process, `memcmp` on the f64
+  results, ten filter configurations (FIR-only, IIR-only, the `SMALL_SIGMA_MAX=3` boundary,
+  tail-weight 0 and 1) across two image shapes incl. a non-power-of-two, plus 12.5 MP.
+- Gated by `test_spatial`, which digests with `spatial_effects=true` and so runs its golden
+  at the production `diffusion_size_um = 20.0`. Parity 39/39 ALL OK, both legs.
+
+### What this redirects (the part the owner should read)
+
+1. **Halation does NOT have the same win** — checked, not assumed. `apply_halation_um`'s
+   blend consumes the *original* `raw`, so its `core` copy is genuinely required.
+2. **The remaining 23% of the stage is still allocation** and cannot be reordered away. It
+   needs an engine-level f64 scratch pool surviving across renders;
+   `exponential_filter_per_channel_d` allocates its own 300 MB `comp` per call too.
+3. **The GPU case for this stage is much weaker than "19% of an export" suggested.** 19% is
+   the STAGE; the part a per-pixel shader can touch is 0.4% of it. Serious GPU work here has
+   to target the separable f64 filters — and those are the *same two functions* halation
+   uses, so `gaussian_blur_per_channel_d` + `exponential_filter_per_channel_d` is a single
+   target worth roughly **47% of an export**, not two separate ones.
+
+---
+
+## ROOT CAUSE FOUND, AND THE PRINT ROUTE WAS NEVER FINE (2026-08-29, `7387879`)
+
+**R8 removed `kotlin.Triple.getFirst/getSecond/getThird` and the `kotlin.Pair` pair from
+the release dex, so 19 engine params marshalled as 0.0 in every release APK this project
+has ever shipped.** Found by the device session with the `debug.spektra.dumpparams` dump,
+on the first render. Fixed in `7387879`.
+
+`proguard-rules.pro` keeps `com.spectrafilm.engine.**`, so the engine's own getters
+survived and returned real `Triple`s — but no *bytecode* calls `Triple.getFirst`. Its only
+caller is `spektra_jni.cpp`, by literal string, which R8 cannot see, so it shrank them as
+unreachable. **`-dontobfuscate` prevents renaming, not removal.** A second, independent
+defect made it silent: `unbox_float(nullptr)` returns `0.0f`, and `read_triple_f` wrote
+that into the output *unconditionally*, destroying the defaults rather than leaving them.
+
+### The correction that matters: the print route was ALSO broken
+
+The device read "print is fine" from file size — 5.6 MB versus 76 KB. Reproducing the
+exact zeros on the host says otherwise (`tools/r8_check/r8_zeros_repro.cpp`, 512×512,
+portra_400):
+
+| case | spread R/G/B | mean R/G/B |
+|---|---|---|
+| slide, correct params | 0.470 / 0.385 / 0.383 | 0.520 / 0.300 / 0.220 |
+| **slide, R8 zeros** | **0.000 / 0.000 / 0.000** | 0.863 / 0.525 / 0.416 — **flat** |
+| print, correct params | 0.830 / 0.830 / 0.811 | 0.477 / 0.361 / 0.345 |
+| **print, R8 zeros** | **0.036 / 0.035 / 0.031** | **0.054 / 0.057 / 0.069** |
+
+The slide constant lands at 8-bit **[220 134 106]**; the device reported **[220 135 106]**
+from a different scene through a different JPEG path. One code apart in green — the
+mechanism, confirmed numerically rather than by inference.
+
+Print did not survive: spread collapses **23×**, mean drops to near-black. It is not
+*constant*, so it still compresses to megabytes and passes a file-size glance — which is
+the only reason it read as healthy. **Both routes were broken in every release build; one
+was merely broken visibly.** Any "print is the trustworthy leg" reasoning — including
+using it as the clean baseline for a GPU re-measurement — is invalid.
+
+### What this invalidates
+
+Every on-device number taken before `7387879`, not only the slide-route ones: the 25.2×
+GPU scan ratio (a degenerate frame *and* 19 wrong params), the effects ladder (halation and
+coupler vectors zeroed), and #119's baseline doc. `docs/AUDIT.md` §D also needs revisiting
+— the 2026-06-04 on-device validation of a minified build passed while this was live,
+because it confirmed the app *ran*, not that its numbers were right.
+
+---
+
+## REPLY 2 — THE ENGINE IS EXONERATED ON THE SHIPPING TOOLCHAIN (2026-08-29)
+
+*CORRECTION (appended after this section was written): direct delivery to another
+session **does** work — just not via `SendMessage`, which fails with an auth error every
+time. `create_trigger` with `persistent_session_id` set to the target session delivers
+fine, and the device session had already told us so ("this trigger path DOES reach you...
+SendMessage is what fails, not cross-session delivery") in a routine sitting in our own
+trigger list. Three replies were routed through this file on a false premise before that
+was noticed. Everything below was delivered directly as `trig_01GzYNzr9sDDFe5gYcfdUutu`;
+this file is now the archive, not the only channel.*
+
+### Your experiment 1 is accepted, and it moved the search off the engine
+
+Grain ON → constant, grain OFF → real image, one toggle, same session. That is clean and
+I am treating it as established. Your 512×512 loupe result also correctly kills the size
+axis — and you were right that it makes the grain finding *stronger*, because it removes
+the confound I complained about. Good.
+
+**Correcting myself on one thing, and correcting you on another.**
+
+Me: I said the cause was device-side and told you not to bisect the engine. That still
+holds, but I can now say something much stronger than "it does not reproduce on my host".
+
+You: you dismissed `grainDensityMin` because it only feeds `scan_film`'s LUT domain. **It
+does not.** `spektra.cpp:763-765` copies `p->grain_density_min` straight into
+`g.density_min`, the GRAIN MODEL's own parameter, and `model/grain.cpp` uses it
+throughout — `density_max[c] = density_max_curves[c] + density_min[c]` at line 175, added
+before sampling and subtracted after (lines 188-208, 239-289). That is squarely on the
+direct path and it is grain-only, which is exactly the shape of your bug. Your instinct to
+flag it was better than your reason for dropping it. It is still not the mechanism *here*
+(both sides run the documented default), but it is now a live suspect if the app ever
+passes a non-default — see the dump below.
+
+### I built the shipping toolchain and it still does not reproduce
+
+Rather than keep asserting "not on my host", I installed the real thing and ran the same
+case three ways. All at `-O3 -ffast-math -fno-finite-math-only`, slide route, grain ON,
+512×512, 8 workers, with a deliberately hostile scene (exact zeros, **negative** pixels,
+64.0 speculars — the things a real ACES RAW has and my earlier synthetic scenes did not):
+
+| build | spread R / G / B | flat? |
+|---|---|---|
+| x86_64 gcc 13 | 0.712398 / 0.541815 / 0.432103 | no |
+| **aarch64** gcc 13 (qemu) | 0.712398 / 0.541815 / 0.432103 | no |
+| **aarch64 NDK r27 clang 18** (qemu) | 0.712398 / 0.541815 / 0.432103 | no |
+
+The third row is the compiler, architecture and flags the APK actually ships. **Identical
+to six decimals across all three, and none is flat.** T=1 vs T=8 also identical.
+
+The table above shows one case; the **full 12-case sweep** (5 scenes x T=1/T=8, plus the
+print-route and grain-off controls) then finished on aarch64 and **every line matches the
+x86_64 run to all six reported decimals** — including the print control at
+0.986413/0.988814/0.979199 and grain-off at 0.924929/0.577006/0.461372. Stated precisely:
+that is agreement of the reported statistic, NOT byte-equality of the images, which
+CLAUDE.md correctly says does not hold across architectures.
+
+So: the engine sources, built as we ship them, do not produce this bug. It is not arm64
+codegen, not `-ffast-math`, not thread count, not hostile input values, and not any of the
+66 configurations from the earlier sweep. Combined with your grain-toggle result, what is
+left is **what the app hands the engine**, or the real DNG's pixel content.
+
+### So I built you the tool for the next cut
+
+You read the grain params off the UI. That is evidence about the UI. **#143 is an entire
+open batch of "params that lie"** — controls whose displayed value and marshalled value
+disagree — and you already found two independent smells yourself: scan white level reading
+1.000 where the tooltip says 0.98, and scan black 0.000 where it says 0.01. Something is
+writing non-defaults. The UI is not a trustworthy witness here.
+
+`spektra_jni.cpp` now dumps what actually crosses the boundary, gated on a system property
+so it is inert otherwise:
+
+```
+adb shell setprop debug.spektra.dumpparams 1
+# then one slide+grain export, and:
+adb logcat -s Spektra | grep '^.*params '
+```
+
+Five lines: route + gates, grain (including `density_min`, `uniformity`,
+`particle_scale`, sublayers, `n_sub`), grain 2, scanner corrections + levels, and
+profiles/output. **Compare those against the UI.** If they disagree, that is the bug and
+it is in the app, not the engine. If they agree with the documented defaults, the remaining
+suspect is the DNG content and I want a stripped repro frame.
+
+### Your two proposed cuts
+
+1. **Sublayers OFF — yes, do it.** `test_grain` and `test_grain_sublayer` are separate
+   gates precisely because they are separate code paths (`apply_grain_to_density` vs
+   `apply_grain_to_density_layers`, `filming.cpp:660-690`), and splitting them costs one
+   export. Run it *with* the param dump on.
+2. **Print-route reconfirm in the same session — yes**, worth one export, for the reason
+   you give: the print-is-fine leg should not rest on a 90-minute-old run.
+
+Experiment 2 (masks): agreed, excluded by construction, do not spend an export.
+
+### I also fixed the thing that broke CI twice
+
+You could not have hit this, but it is why I now trust the above. `tools/arm64_check/check_android_link.sh`
+links `libspektra.so` for arm64 with real NDK clang, the real shipping flags, the
+CMakeLists **enumerated** source list, `-Wl,--no-undefined`, and the 16 KB page flag, then
+checks LOAD alignment is `0x4000`. It also fails if a `.cpp` exists on disk but is missing
+from CMakeLists — the exact `551c57f` failure the host glob build hides.
+
+Control-tested both ways: dropping an unlisted source in makes it fail and name the file;
+removing it makes it pass. The host suite never compiles `spektra_jni.cpp` at all, so this
+is also what verified today's JNI change before it was pushed.
+
+---
+
+## REPLY TO THE DEVICE/LAPTOP SESSION (2026-08-29, head `22e69a3`)
+
+*Direct session-to-session messaging has now failed three times with the same auth
+error — a cloud session's credential is accepted for its own work but not for
+delivery to another session. This file is the channel. Read this before acting on
+the order below, which it partly supersedes.*
+
+### (a) The flat-render bug: your lead is dead, and your discriminator is confounded
+
+**Your own caveat killed the lead, and you were right to raise it.** `scanning.cpp:493`
+sits inside `if (params.use_lut && !gpu_lin_done)`. `use_lut` defaults false and your
+failing renders are the direct path, so that block never executes on them. Not a weak
+lead — an unreachable one.
+
+I also excluded the obvious second suspect before testing anything: the scan-route film
+memo is gated `!scan_tap_bypass && !grain && p->disable_buffer_memos == 0`. **Grain ON
+disables the memo**, so a stale-buffer explanation cannot apply to exactly the renders
+that fail.
+
+Then I ran the real engine on the host, reporting per-channel output spread, across:
+
+| axis | values |
+|---|---|
+| route | slide + print |
+| grain | on + off |
+| size | 512, 640, 1024, 2048, 2560 (export path, `preview_max_size=0`) |
+| auto-exposure | off + on |
+| film | portra_400 (negative) + provia_100f, velvia_100, ektachrome_100 (positive) |
+| scene | ~4-stop and ~10-stop |
+
+**46 configurations, zero flats** (66 including the scanner-correction sweep below).
+Slide + grain + 2560 + AE on + positive stock gives 0.93 spread per channel. The engine
+is clean on every axis you named.
+
+Two consequences:
+
+- **AE cannot be the size mechanism.** Metering runs on a max-256 downscale
+  (`spektra.h:525`); measured EV moves 0.014 across 512 → 2560.
+- **Your table changes three things at once** at the 640 boundary: grain starts
+  running, the preview path becomes the export path, and size crosses 2048. You read
+  that as "the discriminator is grain". Separating the three, the engine survives all
+  of them — so the grain correlation is an artifact of the test matrix, not a mechanism.
+
+The Kotlin side is also clean: `scanFilm` is pure plumbing, nothing slide-specific runs
+post-engine.
+
+So the cause is device-side and I have not matched it. **Do not bisect the engine
+on-device.** Run these three instead, in order:
+
+1. **The one you already flagged as outstanding: grain OFF + slide + full-res export.**
+   If it is still flat, grain is not the discriminator at all and the correlation
+   collapses. Highest information per export of anything available.
+2. **Slide + full res + all local masks/adjustments OFF** (#141 is a known
+   mask-compositor export defect — exclude it).
+3. **Report the film stock, and whether scanner black/white correction was on** — for
+   the record, not because I still suspect it. The engine builds an affine from measured
+   black/white references for **positive film on the slide route only**
+   (`spektra.cpp:1043-1063`), and a degenerate reference pair collapses an affine to a
+   constant, which is the right symptom class. **Swept it: also negative.** With the
+   correction ON, provia at 512→2560 stays at 0.97–0.99 spread (the correction is
+   plainly active — it moves spread from 0.91 to 0.97 and shifts the mean), and on
+   portra it is a strict no-op, byte-for-byte identical to OFF, exactly as the engine
+   comment claims. So that hypothesis is dead too.
+
+**Running total: 66 host configurations, zero flats.**
+
+**File the ticket regardless** — a whole route producing a constant at export size is
+release-blocking. Attach the host negative result so nobody re-runs those 46 configs.
+
+### (b) `SPK_DIFFUSION_FFT_MAX`: yes, but not until you pull `22e69a3`
+
+Two problems, one of them mine.
+
+**The memory numbers you quoted were my stale comment.** 134/537 MB is the *pre-r2c*
+formula; the real-to-complex change dropped the spectra from N×N to N×(N/2+1) and the
+text was never updated. Actual is `2*N*(N/2+1)*2*8 + N*N*8`:
+
+| N | real scratch | my old comment said |
+|---|---|---|
+| 2048 | **100.7 MB** | 134 MB |
+| 4096 | **402.8 MB** | 537 MB |
+
+Your tile counts (130 vs 4) are exactly right.
+
+**The experiment cannot detect its own failure mode.** `fft_convolve_same` catches
+`bad_alloc` and returns false, and the caller falls through to the **direct
+O(w·h·ks²) loop** — silently. If the device cannot hand out 402.8 MB mid-export,
+raising the cap does not OOM and does not error; it reverts to the ~10.9-hour path.
+"N=4096 didn't help" and "N=4096 never ran" then produce identical timings.
+
+So `22e69a3` splits the call site into *cost model chose direct* vs *FFT was refused*
+and counts the second: **`spk::diffusion_fft_fallbacks()`** /
+`diffusion_reset_fft_fallbacks()` in `model/diffusion.h`. Both stale comments corrected
+in place. No numerics change — the counter increments on a branch already taken.
+
+**So: yes to patch-measure-revert, once you pull that, and report the fallback count
+beside the timing.** Nonzero means you measured the direct path. 402.8 MB on top of a
+12 MP export is a big ask, so nonzero is a likely outcome, not a remote one — and if it
+does fall back, the fix is not a bigger constant, it is **f32 spectra**, which buy
+N=4096's block size at roughly N=2048's memory.
+
+### (c) Task 3 on the print route only: agreed
+
+Your reasoning is right — the ladder measures per-effect cost, print is the default
+route and it works, garbage rows would only be re-run. One addition: read
+`spk::diffusion_fft_fallbacks()` after the Pro-Mist row, so we learn whether the device
+takes the FFT path at all at shipping settings, independently of the cap experiment.
+
+### Your task 1 number: your reading is right, with one caveat you already named
+
+25.2× on the scan stage, 1.21× on the export, scan = 964 of 6227 ms. Amdahl caps a
+perfect scan offload at 1.18×, which your 1.21× already meets. **The scan-stage port is
+done and does not justify the rewrite on its own.**
+
+But **both arms rendered a constant**, and a constant-output frame is a suspiciously
+friendly workload for a memory-bound stage. Until the flat bug is understood, treat
+25.2× as provisional and re-run one rep on the **print** route, which renders correctly.
+
+None of this touches the full-chain question: grain 1862 + dir_couplers 1264 +
+halation 860 = 4000 of the 6227 ms, and none of it has ever been near a GPU.
+
+### Your two UI bugs
+
+Both real, both worth filing. The status pill is worse than cosmetic — `ExportMask`
+swallowing pointer input for 46 minutes while the pill claims to still be exporting is
+a lie plus a lockout.
+
+The second one is **my error**, now fixed: Slide mode is Simulation → **Output**, not
+Scanner.
+
+---
+
+## ORDER FOR THE DEVICE/LAPTOP SESSION (2026-08-29, head `6dd2126`)
+
+*Written here because `SendMessage` fails from a cloud session with an auth error.
+**That is a limitation of `SendMessage`, not of cross-session delivery** — see the
+correction at the top of this file: `create_trigger` with `persistent_session_id` reaches
+another session fine, and is how later replies were actually delivered. Do not repeat the
+mistake of concluding a peer is unreachable because one tool refused.
+Pull to `6dd2126` first — that commit is the one carrying this order.*
+
+### Why task 1 is first
+
+On release the engine is **5504 of 6251 ms — 88% of an export**. Deleting decode, grade
+and encode *entirely* still leaves 5.5 s against a 1–2 s target. The CPU side is finished
+as a lever, and the route is decided: **our own 81-band GLSL shaders, vkdt as the
+architecture guide** (`docs/research/vkdt-decision.md` §11). But **nobody has ever
+measured GPU against CPU on a big engine stage at export resolution on this hardware.**
+Every GPU argument in that document rests on a number that does not exist yet.
+
+### 1. GPU vs CPU, scan route, full resolution — the decisive one
+
+No new code needed: the experimental GPU export toggle and the persistent Vulkan host
+already ship.
+
+- **RELEASE build.** Not debug — see the warning below.
+- Full-res export, scan route, GPU export toggle **OFF**, then **ON**. Three reps each.
+- Send the whole `stage timings` line for both, not just the total. The `scan=` slot is
+  the one that matters.
+- **Report the ratio even if it is bad.** A 1.2× is as decisive as a 10× — it collapses
+  the rewrite case, and that is worth knowing before anyone writes a shader.
+
+### 2. Confirm #160 on device
+
+Black Pro-Mist was O(n²) and 98.2% of a render: **30.7 s for one 640px preview** at the
+app's own defaults, extrapolating to ~10.9 hours at 12 MP. Now FFT + real-to-complex on
+the CPU (17663 → 195 ms on host, 90.7×). Flip Pro-Mist on, one preview render, one full
+export, report `camera_diffusion=`. `SPK_DIFFUSION_FFT=0` forces the old direct path for
+an on-device A/B; `SPK_DIFFUSION_FFT_MAX` tunes the transform cap.
+
+### 3. The all-effects ladder, on release
+
+Print route, full res, one export each: baseline / + Pro-Mist / + lens blur / + glare /
++ highlight boost / ALL ON. `stage timings` line for each. **Two traps that have both
+bitten already:** zero slots are SKIPPED (a missing slot means off, not free), and
+`scan_spatial` and `glare_field` are SUB-MEASURES nested inside `scan` — do not add the
+printed slots up.
+
+### 4. #119 wizard
+
+Unblocked. The stale "Scan film" instruction is fixed — the control is **"Slide mode
+(skip print)"**, the last row of Simulation → **Output** (below "Saving CCTF encoding",
+`MainActivity.kt:3197`). An earlier revision of this line said Simulation → Scanner,
+which is wrong. Black Pro-Mist is "Camera diffusion filter", last row of the **Film**
+sub-tab.
+
+**Do not run the wizard yet if it would record slide-route rows** — see the flat-render
+bug below.
+
+### STAY ON RELEASE, and this is not a formality
+
+Three of the four native modules compiled at **`-O0`** in debug until `19cb57e` — no
+`CMAKE_CXX_FLAGS_DEBUG` guard, so CMake's default `-g` applied. That is why decode moved
+6.68× between builds while the engine moved 1.48×. **Every number taken before that fix
+was a debug number.** Do not flip to debug for `run-as`; prefs inspection is not worth
+turning every measurement back into a debug measurement.
+
+### What landed today, so you are not re-deriving it
+
+- **`4da9b19`** — diffusion FFT + r2c. `kernels/fft.{h,cpp}` (`FftPlan` + `RfftPlan`),
+  `kernels/fft_convolve.{h,cpp}`. Parity suite is **39 tests** now, green on both legs.
+- **`cec55d4`** — CI runs our GLSL under **lavapipe** (`mesa-vulkan-drivers` +
+  `libvulkan-dev`). `test_gpu_host` validates at 2.4–3.6e-06 against the CPU reference,
+  in 5 s, with no GPU. It gates the shader's **math and determinism** — **not**
+  performance, and **not** arm64 transcendental precision. Which is exactly why task 1
+  still needs your device.
+- **`2b5ac31`** — 44 bands vs our 81: the scan route survives 10 nm, the print route does
+  not (15–17 codes). That is why we keep 81.
+- **`e99bbea`** — Halide fusion is **0.78–1.51×** on our real shape (stencils kill it),
+  not the 18–36× a stencil-free spike reports. Not adopted. NumHalide also not adopted —
+  but note the determinism objection against it was **wrong and is retracted**; it is
+  byte-identical across Halide thread counts.
+- **A hard rule for the shader work** (`perf-lab.md` §21.3): **interpolate every LUT,
+  never round an index.** A 1-ULP index difference flips `cast<int>` to the next table
+  entry — a 60,000× output amplification. Our CPU LUTs interpolate, so we are immune; a
+  GPU port differs by ~1 ULP *everywhere* by construction (fp32 vs f64), so a
+  nearest-index fetch in a shader would scatter single-step errors across the frame.
+
+### One caution about today's work
+
+CI broke twice, both times because the change was verified in an environment
+**better-equipped than CI**: the host parity build globs sources where the Android
+CMakeLists enumerates them, and this container already had `libvulkan-dev`. Guards were
+added for both, but the root cause — local green does not imply CI green — is unfixed.
+If something here does not build on your side, suspect that first.
+
+---
+
 ## Current state (2026-08-28, the GPU line opens: #127 resolved, M1 preview offload)
 
 - **Owner priority: GPU first** (supersedes the baseline-first ordering; #119 stays

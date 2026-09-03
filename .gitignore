@@ -44,5 +44,11 @@ __pycache__/
 .kotlin/
 **/.cxx/
 
+# Local verification caches and crash/coverage artifacts
+.gradle-user-home/
+*.gcov
+/crash-*
+/.hermes/plans/
+
 # Ephemeral agent worktrees (Claude Code isolation)
 .claude/worktrees/

@@ -15,14 +15,15 @@
  *
  * Build (from this directory):
  *   g++ -std=c++17 -I../../main/cpp \
+ *       -DUSE_ZLIB=1 \
  *       -include ../../main/cpp/raw_decoder.cpp \
  *       test_dng_sniffer.cpp -o /tmp/test_dng_sniffer
  *   /tmp/test_dng_sniffer
  *
  * Synthesizes little-endian TIFF/DNG headers covering: uncompressed (1),
- * lossless-JPEG/LJ92 (7), deflate (8), lossy (0x884C), old-JPEG (6), JPEG-XL
- * (0xCD42), and a Pixel-style layout (JPEG preview in IFD0 + raw plane in a
- * SubIFD) to prove the preview is not mistaken for the raw compression.
+ * lossless-JPEG/LJ92 (7), deflate (8/0x80B2), lossy (0x884C), old-JPEG (6),
+ * JPEG-XL (0xCD42), and a Pixel-style layout (JPEG preview in IFD0 + raw plane
+ * in a SubIFD) to prove the preview is not mistaken for the raw compression.
  */
 #include <cstdint>
 #include <cstdio>
@@ -74,12 +75,13 @@ std::vector<uint8_t> buildSingle(const std::vector<Tag>& tags) {
 // (NewSubFileType=0, given raw compression). Both carry a DNGVersion tag so the
 // sniffer recognizes it as a DNG.
 std::vector<uint8_t> buildPixel(int previewComp, int rawComp,
-                                uint32_t previewPx, uint32_t rawPx) {
+                                uint32_t previewPx, uint32_t rawPx,
+                                uint32_t rawSampleFormat = 1) {
     const size_t ifd0Off = 8;
     const int ifd0N = 6;  // NewSubFileType, Width, Length, Compression, DNGVersion, SubIFDs
     const size_t ifd0Size = 2 + ifd0N * 12 + 4;
     const size_t subOff = ifd0Off + ifd0Size;
-    const int subN = 5;   // NewSubFileType, Width, Length, Compression, DNGVersion
+    const int subN = 6;   // plus primary raw SampleFormat
     const size_t subSize = 2 + subN * 12 + 4;
     std::vector<uint8_t> b(subOff + subSize, 0);
     b[0] = 'I'; b[1] = 'I'; put16(b, 2, 42); put32(b, 4, (uint32_t)ifd0Off);
@@ -106,8 +108,40 @@ std::vector<uint8_t> buildPixel(int previewComp, int rawComp,
     emit(0x0100, 4, 1, rawPx);                    // ImageWidth
     emit(0x0101, 4, 1, 1);                        // ImageLength
     emit(0x0103, 3, 1, (uint32_t)rawComp);        // Compression
+    emit(0x0153, 3, 1, rawSampleFormat);           // SampleFormat
     emit(0xC612, 1, 4, 0x00000401);               // DNGVersion
     put32(b, e, 0);
+    return b;
+}
+
+// Attacker-controlled next-IFD chain. Only the last IFD names a DNG/compression;
+// a bounded diagnostic walker must stop before it instead of recursing forever.
+std::vector<uint8_t> buildLongNextIfdChain(size_t ifdCount) {
+    constexpr size_t kEntriesPerIfd = 2;
+    constexpr size_t kIfdBytes = 2 + kEntriesPerIfd * 12 + 4;
+    std::vector<uint8_t> b(8 + ifdCount * kIfdBytes, 0);
+    b[0] = 'I'; b[1] = 'I'; put16(b, 2, 42); put32(b, 4, 8);
+    for (size_t i = 0; i < ifdCount; ++i) {
+        const size_t off = 8 + i * kIfdBytes;
+        put16(b, off, static_cast<uint16_t>(kEntriesPerIfd));
+        size_t entry = off + 2;
+        if (i + 1 == ifdCount) {
+            put16(b, entry, 0xC612); put16(b, entry + 2, 1);
+            put32(b, entry + 4, 4); put32(b, entry + 8, 0x00000401);
+            entry += 12;
+            put16(b, entry, 0x0103); put16(b, entry + 2, 3);
+            put32(b, entry + 4, 1); put32(b, entry + 8, 0x884C);
+        } else {
+            put16(b, entry, 0x0001); put16(b, entry + 2, 4);
+            put32(b, entry + 4, 1); put32(b, entry + 8, 0);
+            entry += 12;
+            put16(b, entry, 0x0002); put16(b, entry + 2, 4);
+            put32(b, entry + 4, 1); put32(b, entry + 8, 0);
+        }
+        const uint32_t next = (i + 1 < ifdCount)
+            ? static_cast<uint32_t>(off + kIfdBytes) : 0U;
+        put32(b, off + 2 + kEntriesPerIfd * 12, next);
+    }
     return b;
 }
 
@@ -131,6 +165,8 @@ int main() {
       check("single/lossless-jpeg(LJ92)", compressionOf(b.data(), b.size(), &d), 7); }
     { auto b = buildSingle({{0x0103, 3, 1, 8}}); bool d;
       check("single/deflate", compressionOf(b.data(), b.size(), &d), 8); }
+    { auto b = buildSingle({{0x0103, 3, 1, 0x80B2}}); bool d;
+      check("single/adobe-deflate", compressionOf(b.data(), b.size(), &d), 0x80B2); }
     { auto b = buildSingle({{0x0103, 3, 1, 0x884C}}); bool d;
       check("single/lossy-jpeg", compressionOf(b.data(), b.size(), &d), 0x884C); }
     { auto b = buildSingle({{0x0103, 3, 1, 6}}); bool d;
@@ -164,10 +200,16 @@ int main() {
     { const char* s = "not a tiff at all"; bool d;
       check("junk/text", compressionOf((const uint8_t*)s, strlen(s), &d), -1); }
     { bool d; check("junk/too-short", compressionOf((const uint8_t*)"II", 2, &d), -1); }
+    { auto b = buildLongNextIfdChain(40); bool d = true;
+      check("hostile/next-IFD work budget", compressionOf(b.data(), b.size(), &d), -1);
+      check("hostile/budget stops late DNG tag", d ? 1 : 0, 0); }
+    { std::vector<uint8_t> b(8, 0); b[0] = 'I'; b[1] = 'I';
+      put16(b, 2, 42); put32(b, 4, UINT32_MAX); bool d = true;
+      check("hostile/wrapping IFD offset", compressionOf(b.data(), b.size(), &d), -1);
+      check("hostile/wrapping offset not DNG", d ? 1 : 0, 0); }
 
     // --- classifyUnpackFailure: only fallback codecs flagged ---
-    // (NDK build: no USE_JPEG; USE_ZLIB defined by CMake but not on host -> we
-    //  only assert the codec-independent classifications here.)
+    // Host CMake defines USE_ZLIB to match the shipping decoder wrapper.
     { auto b = buildPixel(7, 0x884C, 4080, 4080);
       check("classify/lossy -> LOSSY_JPEG_DNG",
             classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_LOSSY_JPEG_DNG); }
@@ -185,6 +227,18 @@ int main() {
     { auto b = buildPixel(7, 1, 4080, 4080);
       check("classify/uncompressed -> UNPACK",
             classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_UNPACK); }
+    { auto b = buildPixel(7, 8, 4080, 4080, 1);
+      check("classify/integer deflate -> DEFLATE_DNG",
+            classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }
+    { auto b = buildPixel(7, 8, 4080, 4080, 3);
+      check("classify/float deflate -> DEFLATE_DNG",
+            classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }
+    { auto b = buildPixel(7, 0x80B2, 4080, 4080, 1);
+      check("classify/integer 0x80B2 -> DEFLATE_DNG",
+            classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }
+    { auto b = buildPixel(7, 0x80B2, 4080, 4080, 3);
+      check("classify/float 0x80B2 -> DEFLATE_DNG",
+            classifyUnpackFailure(b.data(), b.size()), SFRAW_ERR_DEFLATE_DNG); }
     { uint8_t z[16] = {0};
       check("classify/non-dng -> UNPACK",
             classifyUnpackFailure(z, 16), SFRAW_ERR_UNPACK); }

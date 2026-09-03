@@ -3,6 +3,10 @@
 > **STATUS 2026-07-02: masking v1 SHIPPED** (linear/radial + luminance/color range, 13 local ops
 > incl Class-S spatial, draw-on-preview overlay, eyedroppers; per-component invert/value in
 > Mask.kt). Open: brush, polygon, AI Subject/Sky, XMP interop/export, Dehaze.
+>
+> The shipped app JSON interchange envelope is separately normative and
+> versioned: [MASK_JSON_SCHEMA.md](MASK_JSON_SCHEMA.md) and
+> [schema/spektrafilm-mask-v1.schema.json](schema/spektrafilm-mask-v1.schema.json).
 
 Synthesis of a 3-agent reverse-engineering sweep over our own decompile of the current Lightroom
 Android build (`docs/lightroom-re/` — `cr_*`/`ICB*` symbols), ExifTool's verbatim `crs` masking
@@ -234,7 +238,12 @@ does exposure-only. **The per-pixel math + fold are already correct and parity-f
 5. **Brush** + **Polygon**.
 6. **AI Subject/Sky** (LiteRT + guided filter).
 7. **Class-S** — ✅ **Clarity / Texture / Sharpness / Highlights / Shadows SHIPPED** (PR #103: `MaskSpatial`
-   box-blur USM + regional gain on the output luma; radii scale with the long edge). **Dehaze**
+   box-blur USM + regional gain on the output luma; radii scale with the long edge). Ticket #141 replaces
+   the full-frame alpha/luma/blur scratch with an exact row-streamed, radius-bounded compositor. Its
+   memory/publication contract, current-source device-requalification gate, historical measurements,
+   and still-open performance gap are in [MASK_COMPOSITOR_MEMORY.md](MASK_COMPOSITOR_MEMORY.md). The
+   final preview/export call sites must still pass the live cancellation token before closure.
+   **Dehaze**
    (Dark-Channel-Prior) remains — a separate algorithm.
 
 ## Sources

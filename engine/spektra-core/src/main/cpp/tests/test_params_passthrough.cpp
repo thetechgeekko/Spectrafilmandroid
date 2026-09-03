@@ -125,6 +125,18 @@ int main(int argc, char** argv) {
     base.film_profile = "kodak_portra_400";
     base.print_profile = "kodak_portra_endura";
     spk_default_params(&base);
+    // The schema fields that historically crossed JNI but were ignored must
+    // have explicit native defaults. These checks also protect old/native
+    // callers that do not populate the appended fields.
+    if (!base.enlarger_illuminant ||
+        std::string(base.enlarger_illuminant) != "TH-KG3" ||
+        !base.input_color_space ||
+        std::string(base.input_color_space) != "ProPhoto RGB" ||
+        base.camera_diffusion_family != SPK_DIFFUSION_BLACK_PRO_MIST ||
+        base.enlarger_diffusion_family != SPK_DIFFUSION_BLACK_PRO_MIST) {
+        std::fprintf(stderr, "parameter schema defaults are incomplete\n");
+        return 2;
+    }
     base.scan_film = 1;
 
     std::vector<float> ref_scan;
@@ -180,6 +192,27 @@ int main(int argc, char** argv) {
         check_changes("halation.halation_amount", max_abs_diff(a, c), 1e-6);
     }
 
+    // DiffusionFilterParams.filterFamily is a live family selector. Keep the
+    // comparison deterministic by disabling the stochastic branches and use a
+    // strong filter so the PSF family difference is observable on this fixture.
+    {
+        spk_params d0 = base;
+        d0.grain_active = 0;
+        d0.halation_active = 0;
+        d0.camera_diffusion_active = 1;
+        d0.camera_diffusion_strength = 1.0f;
+        d0.camera_diffusion_family = SPK_DIFFUSION_BLACK_PRO_MIST;
+        spk_params d1 = d0;
+        d1.camera_diffusion_family = SPK_DIFFUSION_GLIMMERGLASS;
+        std::vector<float> a, b;
+        if (!simulate(eng, &in, &d0, &a) || !simulate(eng, &in, &d1, &b)) {
+            std::fprintf(stderr, "camera diffusion family simulate failed\n");
+            spk_engine_destroy(eng);
+            return 2;
+        }
+        check_changes("camera.diffusion.filterFamily", mean_abs_diff(a, b), 1e-6);
+    }
+
     std::printf("=== spk_params pass-through (print route) ===\n");
 
     // Print-route baseline (scan_film off).
@@ -209,6 +242,51 @@ int main(int argc, char** argv) {
         std::vector<float> out;
         simulate(eng, &in, &p, &out);
         check_changes("enlarger.print_exposure=2", mean_abs_diff(ref_print, out), 1e-4);
+    }
+
+    {
+        spk_params d0 = pbase;
+        d0.grain_active = 0;
+        d0.enlarger_diffusion_active = 1;
+        d0.enlarger_diffusion_strength = 1.0f;
+        d0.enlarger_diffusion_family = SPK_DIFFUSION_BLACK_PRO_MIST;
+        spk_params d1 = d0;
+        d1.enlarger_diffusion_family = SPK_DIFFUSION_CINEBLOOM;
+        std::vector<float> a, b;
+        if (!simulate(eng, &in, &d0, &a) || !simulate(eng, &in, &d1, &b)) {
+            std::fprintf(stderr, "enlarger diffusion family simulate failed\n");
+            spk_engine_destroy(eng);
+            return 2;
+        }
+        check_changes("enlarger.diffusion.filterFamily", mean_abs_diff(a, b), 1e-6);
+    }
+
+    // Only TH-KG3 is currently backed by a native SPD. An explicit unsupported
+    // selector must fail closed rather than silently using TH-KG3.
+    {
+        spk_params p = pbase;
+        p.enlarger_illuminant = "D50";
+        spk_image out{};
+        if (spk_simulate(eng, &in, &p, &out) != SPK_ERR_BAD_ARGS) {
+            std::fprintf(stderr, "unsupported enlarger illuminant was accepted\n");
+            spk_image_free(&out);
+            spk_engine_destroy(eng);
+            return 1;
+        }
+    }
+
+    // InputColorSpace currently has one native implementation. It is therefore
+    // validated explicitly; an unknown value cannot be silently reinterpreted.
+    {
+        spk_params p = pbase;
+        p.input_color_space = "sRGB";
+        spk_image out{};
+        if (spk_simulate(eng, &in, &p, &out) != SPK_ERR_BAD_ARGS) {
+            std::fprintf(stderr, "unsupported input color space was accepted\n");
+            spk_image_free(&out);
+            spk_engine_destroy(eng);
+            return 1;
+        }
     }
 
     spk_engine_destroy(eng);

@@ -1,0 +1,72 @@
+diff --git a/src/decoders/decoders_libraw_dcrdefs.cpp b/src/decoders/decoders_libraw_dcrdefs.cpp
+--- a/src/decoders/decoders_libraw_dcrdefs.cpp
++++ b/src/decoders/decoders_libraw_dcrdefs.cpp
+@@ -85,14 +85,68 @@ void LibRaw::sony_ljpeg_load_raw()
+   INT64 save;
+   struct jhead jh;
+ 
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++  if (!raw_width || !raw_height || !tile_width || !tile_length)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  const INT64 work_tile_width =
++      tile_width < INT_MAX ? INT64(tile_width) : INT64(raw_width);
++  const INT64 work_tile_height =
++      tile_length < INT_MAX ? INT64(tile_length) : INT64(raw_height);
++  const INT64 tile_streams_across =
++      1 + (INT64(raw_width) - 1) / work_tile_width;
++  const INT64 tile_streams_down =
++      1 + (INT64(raw_height) - 1) / work_tile_height;
++  const INT64 compliant_streams_across =
++      1 + (INT64(raw_width) - 1) / 16;
++  const INT64 compliant_streams_down =
++      1 + (INT64(raw_height) - 1) / 16;
++  INT64 permitted_tile_streams =
++      compliant_streams_across * compliant_streams_down * 2;
++  permitted_tile_streams = MAX(permitted_tile_streams, INT64(4096));
++  permitted_tile_streams =
++      MIN(permitted_tile_streams, INT64(LIBRAW_MAX_TILE_STREAM_COUNT));
++  if (tile_streams_down < 1 ||
++      tile_streams_across > permitted_tile_streams / tile_streams_down)
++    throw LIBRAW_EXCEPTION_TOOBIG;
++  INT64 remaining_tile_streams = tile_streams_across * tile_streams_down;
++#endif
++
++  INT64 remaining_ljpeg_samples = INT64(raw_width) * INT64(raw_height) * 2;
++  const INT64 minimum_ljpeg_samples = INT64(4) * INT64(1024 * 1024);
++  const INT64 memory_ljpeg_samples =
++      INT64(imgdata.rawparams.max_raw_memory_mb) * INT64(1024 * 1024) /
++      INT64(sizeof(ushort));
++  remaining_ljpeg_samples = MAX(remaining_ljpeg_samples, minimum_ljpeg_samples);
++  remaining_ljpeg_samples = MIN(remaining_ljpeg_samples, memory_ljpeg_samples);
++
+   while (trow < raw_height)
+   {
+     checkCancel();
++#if defined(LIBRAW_MAX_TILE_STREAM_COUNT) && LIBRAW_MAX_TILE_STREAM_COUNT > 0
++    if (remaining_tile_streams < 1)
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    remaining_tile_streams--;
++#endif
++
+     save = ftell(ifp); // We're at
+     if (tile_length < INT_MAX)
+       fseek(ifp, get4(), SEEK_SET);
+     if (!ljpeg_start(&jh, 0))
+       break;
++    if (jh.clrs != 4)
++    {
++      ljpeg_end(&jh);
++      throw LIBRAW_EXCEPTION_IO_CORRUPT;
++    }
++    const INT64 jpeg_samples =
++        INT64(jh.wide) * INT64(jh.high) * INT64(jh.clrs);
++    if (jpeg_samples < 1 || jpeg_samples > remaining_ljpeg_samples)
++    {
++      ljpeg_end(&jh);
++      throw LIBRAW_EXCEPTION_TOOBIG;
++    }
++    remaining_ljpeg_samples -= jpeg_samples;
++
+     try
+     {
+       for (row = jrow = 0; jrow < (unsigned)jh.high && trow+row < raw_height-1; jrow++, row += 2)

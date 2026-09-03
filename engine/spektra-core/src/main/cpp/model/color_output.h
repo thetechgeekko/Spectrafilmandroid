@@ -13,13 +13,15 @@
  * encode in spektrafilm/runtime/stages/scanning.py.
  *
  * The XYZ->output-RGB matrix in colour bakes in chromatic adaptation from the
- * scan illuminant's xy to the output colourspace whitepoint. For the scan_film
- * route the scan illuminant is the film's viewing illuminant (D50 for
- * kodak_portra_400). The effective matrices below were extracted from
+ * scan illuminant's xy to the output colourspace whitepoint. For every route,
+ * the scan illuminant is the scanned profile's viewing illuminant. The
+ * effective matrices below were extracted from
  * colour-science via the parity oracle so they match bit-for-bit.
  */
 #ifndef SPK_MODEL_COLOR_OUTPUT_H
 #define SPK_MODEL_COLOR_OUTPUT_H
+
+#include <string_view>
 
 #include "spektra.h"  // spk_color_space
 
@@ -35,8 +37,15 @@ extern const float kIlluminantD50[81];
 // Used as the XYZ denominator in scanning's cmy_to_log_xyz.
 extern const double kNormD50;
 
+// --- K75P cinema-projector viewing illuminant -------------------------------
+// standard_illuminant("K75P") in upstream resolves to colour-science's
+// SDS_LIGHT_SOURCES["Kinoton 75P"], aligned to 380..780 @ 5 nm and normalized
+// to mean 1. Kodak 2383 and 2393 declare this exact identifier.
+extern const float kIlluminantK75P[81];
+extern const double kNormK75P;
+
 // Effective XYZ -> sRGB(linear) matrix from colour.XYZ_to_RGB with
-// illuminant = D50 xy (Bradford CAT to sRGB's D65 whitepoint baked in).
+// illuminant = D50 xy (CAT02 to sRGB's D65 whitepoint baked in).
 // Row-major 3x3: rgb = M . xyz.
 extern const float kXYZ_to_sRGB_D50[9];
 
@@ -55,8 +64,8 @@ float srgb_cctf_encode(float linear);
 
 // --- Per-output-space transforms --------------------------------------------
 // The scanning stage emits RGB in io.output_color_space. Each space has:
-//   * an effective XYZ->RGB matrix from colour.XYZ_to_RGB(..., illuminant=D50_xy)
-//     (CAT02 from the D50 scan whitepoint to the space's whitepoint + the
+//   * an effective XYZ->RGB matrix from colour.XYZ_to_RGB(..., illuminant=scan_xy)
+//     (CAT02 from the selected scan whitepoint to the space's whitepoint + the
 //     space's primaries baked in), and
 //   * a near-identity RGB->RGB matrix from colour.RGB_to_RGB(cs, cs, "CAT02")
 //     that colour applies inside _apply_cctf_encoding_and_clip *before* the CCTF
@@ -68,8 +77,30 @@ float srgb_cctf_encode(float linear);
 //
 // All matrices are row-major 3x3 (out = M . in), extracted from colour-science
 // via the parity oracle so they match bit-for-bit. Indexed by spk_color_space.
-extern const double kXYZ_to_RGB[6][9];
+extern const double kXYZ_to_RGB[6][9];       // D50 (legacy public name)
+extern const double kXYZ_to_RGB_K75P[6][9];
 extern const double kRGB_to_RGB_CCTF[6][9];
+
+// A profile viewing white is resolved exactly once and then passed unchanged
+// through every scan consumer: the spectral integral, glare/reference white,
+// output-space adaptation and GPU/LUT fast paths. `xyz_to_rgb` points at six
+// row-major 3x3 matrices indexed by spk_color_space.
+struct ViewingIlluminant {
+    const char* identifier;
+    const float* spectrum;
+    double normalization;
+    const double (*xyz_to_rgb)[9];
+};
+
+// Exact, case-sensitive registry lookup. Only identifiers whose spectrum,
+// normalization and adaptation matrices are oracle-locked are accepted.
+const ViewingIlluminant* find_viewing_illuminant(
+    std::string_view identifier) noexcept;
+
+// Fail-closed form used by render paths and profile validation. The diagnostic
+// names both the metadata field and the rejected identifier.
+const ViewingIlluminant& require_viewing_illuminant(
+    std::string_view identifier);
 
 // output_cctf_encode(): the per-space encode CCTF, applied component-wise after
 // the near-identity matrix. Mirrors colour's cctf_encoding for each colourspace:

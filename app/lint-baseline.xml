@@ -2,19 +2,30 @@
 <issues format="6" by="lint 8.7.3" type="baseline" client="gradle" dependencies="false" name="AGP (8.7.3)" variant="all" version="8.7.3">
 
     <issue
-        id="Instantiatable"
-        message="`MainActivity` must extend android.app.Activity"
-        errorLine1="            android:name=&quot;.MainActivity&quot;"
-        errorLine2="                          ~~~~~~~~~~~~~">
+        id="OldTargetApi"
+        message="Not targeting the latest versions of Android; compatibility modes apply. Consider testing and updating this version. Consult the `android.os.Build.VERSION_CODES` javadoc for details."
+        errorLine1="        targetSdk = 34"
+        errorLine2="        ~~~~~~~~~~~~~~">
+        <location
+            file="build.gradle.kts"
+            line="38"
+            column="9"/>
+    </issue>
+
+    <issue
+        id="UnusedAttribute"
+        message="Attribute `enableOnBackInvokedCallback` is only used in API level 33 and higher (current min is 24)"
+        errorLine1="        android:enableOnBackInvokedCallback=&quot;true&quot;"
+        errorLine2="        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
         <location
             file="src/main/AndroidManifest.xml"
-            line="20"
-            column="27"/>
+            line="29"
+            column="9"/>
     </issue>
 
     <issue
         id="AndroidGradlePluginVersion"
-        message="A newer version of com.android.application than 8.7.3 is available: 9.2.1"
+        message="A newer version of com.android.application than 8.7.3 is available: 9.4.0"
         errorLine1="agp = &quot;8.7.3&quot;"
         errorLine2="      ~~~~~~~">
         <location
@@ -25,7 +36,7 @@
 
     <issue
         id="AndroidGradlePluginVersion"
-        message="A newer version of com.android.application than 8.7.3 is available: 9.2.1"
+        message="A newer version of com.android.application than 8.7.3 is available: 9.4.0"
         errorLine1="agp = &quot;8.7.3&quot;"
         errorLine2="      ~~~~~~~">
         <location
@@ -36,7 +47,7 @@
 
     <issue
         id="AndroidGradlePluginVersion"
-        message="A newer version of com.android.application than 8.7.3 is available: 9.2.1"
+        message="A newer version of com.android.application than 8.7.3 is available: 9.4.0"
         errorLine1="agp = &quot;8.7.3&quot;"
         errorLine2="      ~~~~~~~">
         <location
@@ -47,7 +58,7 @@
 
     <issue
         id="AndroidGradlePluginVersion"
-        message="A newer version of com.android.library than 8.7.3 is available: 9.2.1"
+        message="A newer version of com.android.library than 8.7.3 is available: 9.4.0"
         errorLine1="agp = &quot;8.7.3&quot;"
         errorLine2="      ~~~~~~~">
         <location
@@ -58,7 +69,7 @@
 
     <issue
         id="AndroidGradlePluginVersion"
-        message="A newer version of com.android.library than 8.7.3 is available: 9.2.1"
+        message="A newer version of com.android.library than 8.7.3 is available: 9.4.0"
         errorLine1="agp = &quot;8.7.3&quot;"
         errorLine2="      ~~~~~~~">
         <location
@@ -69,299 +80,277 @@
 
     <issue
         id="AndroidGradlePluginVersion"
-        message="A newer version of com.android.library than 8.7.3 is available: 9.2.1"
+        message="A newer version of com.android.library than 8.7.3 is available: 9.4.0"
         errorLine1="agp = &quot;8.7.3&quot;"
         errorLine2="      ~~~~~~~">
         <location
             file="../gradle/libs.versions.toml"
             line="2"
             column="7"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of org.jetbrains.kotlin.plugin.compose than 2.0.21 is available: 2.4.0"
+        errorLine1="kotlin = &quot;2.0.21&quot;"
+        errorLine2="         ~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="3"
+            column="10"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of org.jetbrains.kotlin.plugin.compose than 2.0.21 is available: 2.4.0"
+        errorLine1="kotlin = &quot;2.0.21&quot;"
+        errorLine2="         ~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="3"
+            column="10"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of org.jetbrains.kotlin.plugin.compose than 2.0.21 is available: 2.4.0"
+        errorLine1="kotlin = &quot;2.0.21&quot;"
+        errorLine2="         ~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="3"
+            column="10"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.19.0"
+        errorLine1="coreKtx = &quot;1.13.1&quot;"
+        errorLine2="          ~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="4"
+            column="11"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.19.0"
+        errorLine1="coreKtx = &quot;1.13.1&quot;"
+        errorLine2="          ~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="4"
+            column="11"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.19.0"
+        errorLine1="coreKtx = &quot;1.13.1&quot;"
+        errorLine2="          ~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="4"
+            column="11"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.8.7 is available: 2.11.0"
+        errorLine1="lifecycle = &quot;2.8.7&quot;"
+        errorLine2="            ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="5"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.8.7 is available: 2.11.0"
+        errorLine1="lifecycle = &quot;2.8.7&quot;"
+        errorLine2="            ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="5"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.8.7 is available: 2.11.0"
+        errorLine1="lifecycle = &quot;2.8.7&quot;"
+        errorLine2="            ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="5"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.activity:activity-compose than 1.9.3 is available: 1.13.0"
+        errorLine1="activityCompose = &quot;1.9.3&quot;"
+        errorLine2="                  ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="6"
+            column="19"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.activity:activity-compose than 1.9.3 is available: 1.13.0"
+        errorLine1="activityCompose = &quot;1.9.3&quot;"
+        errorLine2="                  ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="6"
+            column="19"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.activity:activity-compose than 1.9.3 is available: 1.13.0"
+        errorLine1="activityCompose = &quot;1.9.3&quot;"
+        errorLine2="                  ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="6"
+            column="19"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.compose:compose-bom than 2024.10.01 is available: 2026.08.00"
+        errorLine1="composeBom = &quot;2024.10.01&quot;"
+        errorLine2="             ~~~~~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="7"
+            column="14"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.compose:compose-bom than 2024.10.01 is available: 2026.08.00"
+        errorLine1="composeBom = &quot;2024.10.01&quot;"
+        errorLine2="             ~~~~~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="7"
+            column="14"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.compose:compose-bom than 2024.10.01 is available: 2026.08.00"
+        errorLine1="composeBom = &quot;2024.10.01&quot;"
+        errorLine2="             ~~~~~~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="7"
+            column="14"/>
     </issue>
 
     <issue
         id="GradleDependency"
         message="A newer version of androidx.datastore:datastore-preferences than 1.1.1 is available: 1.2.1"
-        errorLine1="    implementation(&quot;androidx.datastore:datastore-preferences:1.1.1&quot;)"
-        errorLine2="                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        errorLine1="datastore = &quot;1.1.1&quot;"
+        errorLine2="            ~~~~~~~">
         <location
-            file="build.gradle.kts"
-            line="78"
-            column="20"/>
+            file="../gradle/libs.versions.toml"
+            line="9"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.datastore:datastore-preferences than 1.1.1 is available: 1.2.1"
+        errorLine1="datastore = &quot;1.1.1&quot;"
+        errorLine2="            ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="9"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.datastore:datastore-preferences than 1.1.1 is available: 1.2.1"
+        errorLine1="datastore = &quot;1.1.1&quot;"
+        errorLine2="            ~~~~~~~">
+        <location
+            file="../gradle/libs.versions.toml"
+            line="9"
+            column="13"/>
     </issue>
 
     <issue
         id="GradleDependency"
         message="A newer version of androidx.exifinterface:exifinterface than 1.3.7 is available: 1.4.2"
-        errorLine1="    implementation(&quot;androidx.exifinterface:exifinterface:1.3.7&quot;)"
-        errorLine2="                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        errorLine1="exifinterface = &quot;1.3.7&quot;"
+        errorLine2="                ~~~~~~~">
         <location
-            file="build.gradle.kts"
-            line="79"
-            column="20"/>
+            file="../gradle/libs.versions.toml"
+            line="10"
+            column="17"/>
     </issue>
 
     <issue
         id="GradleDependency"
-        message="A newer version of org.jetbrains.kotlin.android than 2.0.21 is available: 2.3.21"
-        errorLine1="kotlin = &quot;2.0.21&quot;"
-        errorLine2="         ~~~~~~~~">
+        message="A newer version of androidx.exifinterface:exifinterface than 1.3.7 is available: 1.4.2"
+        errorLine1="exifinterface = &quot;1.3.7&quot;"
+        errorLine2="                ~~~~~~~">
         <location
             file="../gradle/libs.versions.toml"
-            line="3"
-            column="10"/>
+            line="10"
+            column="17"/>
     </issue>
 
     <issue
         id="GradleDependency"
-        message="A newer version of org.jetbrains.kotlin.android than 2.0.21 is available: 2.3.21"
-        errorLine1="kotlin = &quot;2.0.21&quot;"
-        errorLine2="         ~~~~~~~~">
+        message="A newer version of androidx.exifinterface:exifinterface than 1.3.7 is available: 1.4.2"
+        errorLine1="exifinterface = &quot;1.3.7&quot;"
+        errorLine2="                ~~~~~~~">
         <location
             file="../gradle/libs.versions.toml"
-            line="3"
-            column="10"/>
+            line="10"
+            column="17"/>
     </issue>
 
     <issue
         id="GradleDependency"
-        message="A newer version of org.jetbrains.kotlin.android than 2.0.21 is available: 2.3.21"
-        errorLine1="kotlin = &quot;2.0.21&quot;"
-        errorLine2="         ~~~~~~~~">
+        message="A newer version of org.json:json than 20231013 is available: 20240303"
+        errorLine1="orgJson = &quot;20231013&quot;"
+        errorLine2="          ~~~~~~~~~~">
         <location
             file="../gradle/libs.versions.toml"
-            line="3"
-            column="10"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of org.jetbrains.kotlin.plugin.compose than 2.0.21 is available: 2.3.21"
-        errorLine1="kotlin = &quot;2.0.21&quot;"
-        errorLine2="         ~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="3"
-            column="10"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of org.jetbrains.kotlin.plugin.compose than 2.0.21 is available: 2.3.21"
-        errorLine1="kotlin = &quot;2.0.21&quot;"
-        errorLine2="         ~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="3"
-            column="10"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of org.jetbrains.kotlin.plugin.compose than 2.0.21 is available: 2.3.21"
-        errorLine1="kotlin = &quot;2.0.21&quot;"
-        errorLine2="         ~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="3"
-            column="10"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.18.0"
-        errorLine1="coreKtx = &quot;1.13.1&quot;"
-        errorLine2="          ~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="4"
+            line="11"
             column="11"/>
     </issue>
 
     <issue
         id="GradleDependency"
-        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.18.0"
-        errorLine1="coreKtx = &quot;1.13.1&quot;"
-        errorLine2="          ~~~~~~~~">
+        message="A newer version of org.json:json than 20231013 is available: 20240303"
+        errorLine1="orgJson = &quot;20231013&quot;"
+        errorLine2="          ~~~~~~~~~~">
         <location
             file="../gradle/libs.versions.toml"
-            line="4"
+            line="11"
             column="11"/>
     </issue>
 
     <issue
         id="GradleDependency"
-        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.18.0"
-        errorLine1="coreKtx = &quot;1.13.1&quot;"
-        errorLine2="          ~~~~~~~~">
+        message="A newer version of org.json:json than 20231013 is available: 20240303"
+        errorLine1="orgJson = &quot;20231013&quot;"
+        errorLine2="          ~~~~~~~~~~">
         <location
             file="../gradle/libs.versions.toml"
-            line="4"
+            line="11"
             column="11"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.8.7 is available: 2.10.0"
-        errorLine1="lifecycle = &quot;2.8.7&quot;"
-        errorLine2="            ~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="5"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.8.7 is available: 2.10.0"
-        errorLine1="lifecycle = &quot;2.8.7&quot;"
-        errorLine2="            ~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="5"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.lifecycle:lifecycle-runtime-ktx than 2.8.7 is available: 2.10.0"
-        errorLine1="lifecycle = &quot;2.8.7&quot;"
-        errorLine2="            ~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="5"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.activity:activity-compose than 1.9.3 is available: 1.13.0"
-        errorLine1="activityCompose = &quot;1.9.3&quot;"
-        errorLine2="                  ~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="6"
-            column="19"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.activity:activity-compose than 1.9.3 is available: 1.13.0"
-        errorLine1="activityCompose = &quot;1.9.3&quot;"
-        errorLine2="                  ~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="6"
-            column="19"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.activity:activity-compose than 1.9.3 is available: 1.13.0"
-        errorLine1="activityCompose = &quot;1.9.3&quot;"
-        errorLine2="                  ~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="6"
-            column="19"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.compose:compose-bom than 2024.10.01 is available: 2026.05.01"
-        errorLine1="composeBom = &quot;2024.10.01&quot;"
-        errorLine2="             ~~~~~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="7"
-            column="14"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.compose:compose-bom than 2024.10.01 is available: 2026.05.01"
-        errorLine1="composeBom = &quot;2024.10.01&quot;"
-        errorLine2="             ~~~~~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="7"
-            column="14"/>
-    </issue>
-
-    <issue
-        id="GradleDependency"
-        message="A newer version of androidx.compose:compose-bom than 2024.10.01 is available: 2026.05.01"
-        errorLine1="composeBom = &quot;2024.10.01&quot;"
-        errorLine2="             ~~~~~~~~~~~~">
-        <location
-            file="../gradle/libs.versions.toml"
-            line="7"
-            column="14"/>
-    </issue>
-
-    <issue
-        id="ComposableNaming"
-        message="Composable functions with a return type should start with a lowercase letter"
-        errorLine1="private fun LocalConfigurationHeightDp(): Int ="
-        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/spectrafilm/app/MainActivity.kt"
-            line="1948"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="AutoboxingStateCreation"
-        message="Prefer `mutableFloatStateOf` instead of `mutableStateOf`"
-        errorLine1="    var scale by remember { mutableStateOf(1f) }"
-        errorLine2="                            ~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/spectrafilm/app/Viewer.kt"
-            line="84"
-            column="29"/>
-    </issue>
-
-    <issue
-        id="AutoboxingStateCreation"
-        message="Prefer `mutableFloatStateOf` instead of `mutableStateOf`"
-        errorLine1="    var split by remember { mutableStateOf(0.5f) }"
-        errorLine2="                            ~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/spectrafilm/app/Viewer.kt"
-            line="205"
-            column="29"/>
-    </issue>
-
-    <issue
-        id="AutoboxingStateCreation"
-        message="Prefer `mutableIntStateOf` instead of `mutableStateOf`"
-        errorLine1="    var width by remember { mutableStateOf(0) }"
-        errorLine2="                            ~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/spectrafilm/app/Viewer.kt"
-            line="206"
-            column="29"/>
-    </issue>
-
-    <issue
-        id="UseTomlInstead"
-        message="Use version catalog instead"
-        errorLine1="    implementation(&quot;androidx.datastore:datastore-preferences:1.1.1&quot;)"
-        errorLine2="                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="build.gradle.kts"
-            line="78"
-            column="20"/>
-    </issue>
-
-    <issue
-        id="UseTomlInstead"
-        message="Use version catalog instead"
-        errorLine1="    implementation(&quot;androidx.exifinterface:exifinterface:1.3.7&quot;)"
-        errorLine2="                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="build.gradle.kts"
-            line="79"
-            column="20"/>
     </issue>
 
 </issues>

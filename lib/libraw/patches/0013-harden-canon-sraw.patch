@@ -1,0 +1,118 @@
+diff --git a/src/decoders/decoders_dcraw.cpp b/src/decoders/decoders_dcraw.cpp
+--- a/src/decoders/decoders_dcraw.cpp
++++ b/src/decoders/decoders_dcraw.cpp
+@@ -462,6 +462,9 @@ ushort *LibRaw::ljpeg_row(int jrow, struct jhead *jh)
+   int col, c, diff, pred, spred = 0;
+   ushort mark = 0, *row[3];
+ 
++  if (jrow < 0 || jrow >= jh->high)
++    throw LIBRAW_EXCEPTION_IO_CORRUPT;
++
+   // Use the optimized, unrolled version if possible.
+   if (!jh->sraw)
+     return ljpeg_row_unrolled(jrow, jh);
+@@ -717,8 +720,10 @@ void LibRaw::canon_sraw_load_raw()
+ {
+   struct jhead jh;
+   short *rp = 0, (*ip)[4];
+-  int jwide, slice, scol, ecol, row, col, jrow = 0, jcol = 0, pix[3], c;
+-  int v[3] = {0, 0, 0}, ver, hue;
++  int jwide, slice, scol, ecol, row, col, jrow = 0, jcol = 0, c;
++  INT64 pix[3];
++  INT64 ver;
++  int hue;
+   int saved_w = width, saved_h = height;
+   char *cp;
+ 
+@@ -746,6 +751,8 @@ void LibRaw::canon_sraw_load_raw()
+       ecol += cr2_slice[1] * 2 / jh.clrs;
+       if (!cr2_slice[0] || ecol > raw_width - 1)
+         ecol = raw_width & -2;
++      if (ecol <= scol)
++        break;
+       for (row = 0; row < height; row += (jh.clrs >> 1) - 1)
+       {
+         checkCancel();
+@@ -802,16 +809,34 @@ void LibRaw::canon_sraw_load_raw()
+ 
+   try
+   {
+-    for (cp = model2; *cp && !isdigit(*cp); cp++)
++    for (cp = model2; *cp && !isdigit((unsigned char)*cp); cp++)
+       ;
+-    sscanf(cp, "%d.%d.%d", v, v + 1, v + 2);
+-    ver = (v[0] * 1000 + v[1]) * 1000 + v[2];
++    INT64 versionParts[3] = {0, 0, 0};
++    for (c = 0; c < 3 && *cp; c++)
++    {
++      while (isdigit((unsigned char)*cp))
++      {
++        const int digit = *cp++ - '0';
++        versionParts[c] = MIN(INT64(INT_MAX),
++                              versionParts[c] * 10 + digit);
++      }
++      if (*cp != '.')
++        break;
++      cp++;
++    }
++    ver = (versionParts[0] * 1000 + versionParts[1]) * 1000 +
++        versionParts[2];
+     hue = (jh.sraw + 1) << 2;
+     if (unique_id >= 0x80000281ULL ||
+         (unique_id == 0x80000218ULL && ver > 1000006))
+       hue = jh.sraw << 1;
+     ip = (short(*)[4])image;
+     rp = ip[0];
++    const auto wrapSigned16 = [](INT64 value) {
++      const unsigned wrapped = unsigned(value) & 0xffffU;
++      return short(wrapped >= 0x8000U ? int(wrapped) - 0x10000
++                                      : int(wrapped));
++    };
+     for (row = 0; row < height; row++, ip += width)
+     {
+       checkCancel();
+@@ -845,21 +870,34 @@ void LibRaw::canon_sraw_load_raw()
+             (unique_id == CanonID_EOS_1D_Mark_IV) ||
+             (unique_id == CanonID_EOS_60D))
+         {
+-          rp[1] = (rp[1] << 2) + hue;
+-          rp[2] = (rp[2] << 2) + hue;
+-          pix[0] = rp[0] + ((50 * rp[1] + 22929 * rp[2]) >> 14);
+-          pix[1] = rp[0] + ((-5640 * rp[1] - 11751 * rp[2]) >> 14);
+-          pix[2] = rp[0] + ((29040 * rp[1] - 101 * rp[2]) >> 14);
++          rp[1] = wrapSigned16(INT64(rp[1]) * 4 + hue);
++          rp[2] = wrapSigned16(INT64(rp[2]) * 4 + hue);
++          pix[0] = INT64(rp[0]) +
++              ((INT64(50) * rp[1] + INT64(22929) * rp[2]) >> 14);
++          pix[1] = INT64(rp[0]) +
++              ((INT64(-5640) * rp[1] - INT64(11751) * rp[2]) >> 14);
++          pix[2] = INT64(rp[0]) +
++              ((INT64(29040) * rp[1] - INT64(101) * rp[2]) >> 14);
+         }
+         else
+         {
+           if (unique_id < CanonID_EOS_5D_Mark_II)
+-            rp[0] -= 512;
+-          pix[0] = rp[0] + rp[2];
+-          pix[2] = rp[0] + rp[1];
+-          pix[1] = rp[0] + ((-778 * rp[1] - (rp[2] << 11)) >> 12);
++            rp[0] = wrapSigned16(INT64(rp[0]) - 512);
++          pix[0] = INT64(rp[0]) + rp[2];
++          pix[2] = INT64(rp[0]) + rp[1];
++          pix[1] = INT64(rp[0]) +
++              ((INT64(-778) * rp[1] - INT64(rp[2]) * 2048) >> 12);
++        }
++        FORC3
++        {
++          const INT64 scaledPixel = pix[c] * INT64(sraw_mul[c]);
++          if (scaledPixel <= 0)
++            rp[c] = 0;
++          else if (scaledPixel >= INT64(32767) * 1024)
++            rp[c] = 32767;
++          else
++            rp[c] = short(scaledPixel / 1024);
+         }
+-        FORC3 rp[c] = CLIP15(pix[c] * sraw_mul[c] >> 10);
+       }
+   }
+   catch (...)

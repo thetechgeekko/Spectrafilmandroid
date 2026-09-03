@@ -31,6 +31,7 @@
  *     <input.f64> [goldens_root]
  */
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -39,6 +40,15 @@
 
 #include "spkvec_io.h"
 #include "spektra.h"
+
+// Non-public cache observability/configuration seams from spektra.cpp. They are
+// not declared in the public C header; shipping diagnostics uses the stable API.
+extern uint64_t spk_test_tc_lut_cache_hits(spk_engine* eng);
+extern uint64_t spk_test_tc_lut_cache_misses(spk_engine* eng);
+extern uint64_t spk_test_tc_lut_cache_evictions(spk_engine* eng);
+extern size_t spk_test_tc_lut_cache_dynamic_bytes(spk_engine* eng);
+extern void spk_test_tc_lut_cache_set_dynamic_budget(spk_engine* eng,
+                                                     size_t bytes);
 
 namespace {
 
@@ -127,6 +137,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "engine create failed: %s\n", spk_status_str(st));
         return 2;
     }
+    // One canonical 192x192x3 f64 tc_lut is ~885 kB (~864 KiB) including key/owner
+    // allocation. A 1 MiB dynamic budget therefore makes this e2e exercise a
+    // real eviction with only two distinct blur values.
+    spk_test_tc_lut_cache_set_dynamic_budget(eng, 1024u * 1024u);
+    const uint64_t tc_hits_before = spk_test_tc_lut_cache_hits(eng);
+    const uint64_t tc_misses_before = spk_test_tc_lut_cache_misses(eng);
 
     spkvec::Array gold_rgb = spkvec::read(golden_dir + "/final_rgb.spkvec");
     spkvec::Array gold_logr = spkvec::read(golden_dir + "/film_log_raw.spkvec");
@@ -181,6 +197,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     pass_rgb = check("spectral_blur_e2e final_rgb", out.data, gold_rgb.data);
+    const bool cache_engaged =
+        spk_test_tc_lut_cache_misses(eng) > tc_misses_before &&
+        spk_test_tc_lut_cache_hits(eng) >= tc_hits_before + 2;
+    std::printf("[tc_lut cache miss-then-hits] -> %s\n",
+                cache_engaged ? "PASS" : "FAIL");
 
     // --- Sanity: blur OFF (everything else equal) changes the output, proving the
     //     spectral blur is genuinely active end-to-end and is the sole driver of
@@ -203,10 +224,61 @@ int main(int argc, char** argv) {
                     blur_delta, blur_active ? "BLUR ACTIVE" : "BLUR INERT?!");
         spk_image_free(&out_off);
     }
+
+    // Force the blur=5 entry out with one same-sized blur=6 entry, then rebuild
+    // blur=5. The full final render must be byte-identical before/after eviction.
+    const uint64_t evictions_before = spk_test_tc_lut_cache_evictions(eng);
+    spk_params p_alt = p;
+    p_alt.spectral_gaussian_blur = 6.0f;
+    spk_image out_alt{};
+    bool eviction_happened = false;
+    bool eviction_bit_exact = false;
+    st = spk_simulate(eng, &in_img, &p_alt, &out_alt);
+    if (st == SPK_OK) {
+        spk_image_free(&out_alt);
+        eviction_happened =
+            spk_test_tc_lut_cache_evictions(eng) > evictions_before &&
+            spk_test_tc_lut_cache_dynamic_bytes(eng) <= 1024u * 1024u;
+        spk_image rebuilt{};
+        st = spk_simulate(eng, &in_img, &p, &rebuilt);
+        if (st == SPK_OK) {
+            const size_t bytes = static_cast<size_t>(npix) * 3 * sizeof(float);
+            eviction_bit_exact = std::memcmp(out.data, rebuilt.data, bytes) == 0;
+            spk_image_free(&rebuilt);
+        }
+    }
+    std::printf("[tc_lut eviction happened] -> %s\n",
+                eviction_happened ? "PASS" : "FAIL");
+    std::printf("[tc_lut before==after eviction] -> %s\n",
+                eviction_bit_exact ? "PASS (byte-identical)" : "FAIL");
+    char cache_json[2048]{};
+    const int cache_json_bytes = spk_engine_tc_lut_cache_stats_json(
+        eng, cache_json, static_cast<int>(sizeof(cache_json)));
+    char too_small[64] = {'x'};
+    const bool diagnostics_reject_small_buffer =
+        spk_engine_tc_lut_cache_stats_json(
+            eng, too_small, static_cast<int>(sizeof(too_small))) == 0 &&
+        too_small[0] == '\0';
+    const std::string cache_diagnostics = cache_json;
+    const bool shipping_diagnostics = cache_json_bytes > 0 &&
+        cache_diagnostics.find("\"schema\":\"spk.tc_lut_cache.v1\"") !=
+            std::string::npos &&
+        cache_diagnostics.find("\"hits\":") != std::string::npos &&
+        cache_diagnostics.find("\"misses\":") != std::string::npos &&
+        cache_diagnostics.find("\"evictions\":") != std::string::npos &&
+        cache_diagnostics.find("\"cache_held_bytes\":") != std::string::npos &&
+        cache_diagnostics.find("\"memory_boundary\":\"post-build-cache-residency\"") !=
+            std::string::npos;
+    std::printf("[shipping tc_lut diagnostics] -> %s\n",
+                shipping_diagnostics ? "PASS" : "FAIL");
+    std::printf("[shipping diagnostics small buffer] -> %s\n",
+                diagnostics_reject_small_buffer ? "PASS" : "FAIL");
     spk_image_free(&out);
 
     spk_engine_destroy(eng);
-    bool all = pass_logr && pass_cmy && pass_rgb && blur_active;
+    bool all = pass_logr && pass_cmy && pass_rgb && blur_active &&
+               cache_engaged && eviction_happened && eviction_bit_exact &&
+               shipping_diagnostics && diagnostics_reject_small_buffer;
     std::printf("%s\n", all ? "ALL PASS" : "FAIL");
     return all ? 0 : 1;
 }

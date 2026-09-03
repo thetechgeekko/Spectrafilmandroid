@@ -1,7 +1,8 @@
 /*
  * Spektrafilm for Android — lib:libraw build.
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
- * Decoding powered by LibRaw (LGPL-2.1; GPLv3-compatible, linked statically).
+ * Decoding powered by statically included, dual-offered LibRaw. The selected
+ * distribution route is a fail-closed release decision tracked by ticket #166.
  *
  * Android library wrapping the native RAW/DNG decoder (libsfraw.so, built via
  * CMake/NDK with LibRaw compiled in statically) plus the Kotlin RawDecoder facade.
@@ -27,10 +28,19 @@ android {
 
     defaultConfig {
         minSdk = 24
+        testInstrumentationRunner =
+            "com.spectrafilm.libraw.RawDecoderBoundaryInstrumentation"
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17"
                 arguments += "-DANDROID_STL=c++_shared"
+                // Make the shipping policy explicit so a stale external-native
+                // CMake cache cannot retain an earlier experimental OpenMP opt-in.
+                arguments += "-DSFRAW_ENABLE_OPENMP=OFF"
+                // Keep the audited LibRaw floating-point deflate parser compiled
+                // for corpus/security coverage. RawDecoder still routes float DNG
+                // before dcraw's quantizing bitmap stage; it is not native parity.
+                arguments += "-DSFRAW_WITH_ZLIB=ON"
             }
         }
         ndk {
@@ -68,4 +78,7 @@ dependencies {
     // coordinate is pinned literally here; swap for libs.coil.core once the host
     // adds it to gradle/libs.versions.toml.
     compileOnly("io.coil-kt.coil3:coil-core:3.0.4")
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    testImplementation(libs.junit)
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 }

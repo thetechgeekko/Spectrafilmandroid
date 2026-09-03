@@ -1,5 +1,8 @@
 # User-Driven Solutions — implementing what spektrafilm users actually want
 
+> **Research-backed idea inventory, not current execution priority.** Use the evidence below when a
+> Wayfinder ticket accepts a feature; use [EXECUTION_INDEX.md](EXECUTION_INDEX.md) for live work.
+
 **Purpose.** A research-backed plan to solve *every* problem real spektrafilm users report, on the
 Spectrafilmandroid app. The guiding rule (see the `spectrafilm-solutions` skill): **the app bends to
 the user, not the reverse** — keep the film physics honest, make the experience do what people want.
@@ -279,6 +282,12 @@ gesture/normalized-coord patterns wholesale.
 labels; Snapseed on-device segmentation.
 
 ## §5 — Performance / GPU / preview  ✅ synthesized
+
+> **Superseded policy snapshot.** The preview-only/CPU-export rule, 38-case count, implementation
+> ordering, and “stays CPU by design” statement below describe the 2026-08-27 proposal. Current
+> policy has 39 cases at both flag legs and separates Strict Exact CPU from device-qualified Fast
+> GPU preview/export. Use [BIT_IDENTICAL_EXPORT_ROADMAP.md](BIT_IDENTICAL_EXPORT_ROADMAP.md); retain
+> this section only as user-research history.
 
 **Hotspot:** the per-pixel 81-band expose integrals in `filming`+`printing` (and `scan`). **Policy:
 approximate proxy / exact export** — GPU/approximation is preview-only; export always runs the exact

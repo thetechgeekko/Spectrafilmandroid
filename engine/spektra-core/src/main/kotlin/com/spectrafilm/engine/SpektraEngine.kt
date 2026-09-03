@@ -16,9 +16,99 @@ package com.spectrafilm.engine
 
 import android.content.res.AssetManager
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantReadWriteLock
+
+/** Logical app purpose carried into native timing/Perfetto records. */
+enum class RenderKind(internal val nativeCode: Int) {
+    EXPORT(1),
+    PREVIEW(2),
+    MAGNIFIER(3),
+    ROI(4),
+    EXACT_RENDER(5),
+}
+
+/** App-level disposition of native work; distinct from native success/error. */
+enum class AppRenderOutcome(internal val nativeCode: Int) {
+    CONSUMED(1),
+    CANCELLED(2),
+    SUPERSEDED(3),
+    FAILED(4),
+}
+
+/** Stable stage ids used by the process-wide native/JVM memory budget. */
+enum class MemoryBudgetStage(internal val nativeCode: Int) {
+    UNKNOWN(0),
+    JNI_SIM_RESULT(1),
+    JNI_DIRECT_BUFFER(2),
+    DECODE(3),
+    FILMING(4),
+    SCANNING(5),
+    PRINTING(6),
+    SPATIAL(7),
+    GRAIN(8),
+    LUT(9),
+    WRITER(10),
+    GPU(11),
+}
+
+/** Thread-safe cooperative cancellation signal for a native engine call. */
+class RenderCancellation {
+    @Volatile private var requested = false
+    @Volatile internal var testPollObserver: (() -> Unit)? = null
+
+    val isCancellationRequested: Boolean
+        get() {
+            // Instrumentation-only synchronization point. Production tokens keep
+            // this null, paying only one predictable nullable read per bounded
+            // native poll. JNI invokes the getter only on the render owner thread.
+            testPollObserver?.invoke()
+            return requested
+        }
+
+    fun cancel() {
+        requested = true
+    }
+}
+
+/** Explicit lifetime authority for a direct-buffer view. */
+class DataLease internal constructor(
+    val data: ByteBuffer,
+    private val releaseLease: () -> Unit,
+) : AutoCloseable {
+    private val closed = AtomicBoolean(false)
+
+    override fun close() {
+        if (closed.compareAndSet(false, true)) releaseLease()
+    }
+}
+
+internal fun interface DataLeaseFactory {
+    fun create(data: ByteBuffer, release: () -> Unit): DataLease
+
+    companion object {
+        val DEFAULT = DataLeaseFactory { data, release -> DataLease(data, release) }
+    }
+}
+
+/** JNI-only result of a manual allocation; its token is required to release it. */
+internal class NativeBufferAllocation(
+    val data: ByteBuffer,
+    val token: Long,
+) {
+    init {
+        require(token > 0L) { "native allocation token must be positive" }
+    }
+}
 
 /**
- * A linear, scene-referred image: interleaved RGB float32, row-major.
+ * A linear, scene-referred image: packed interleaved RGB float32, row-major.
+ * Rows are contiguous (`rowStrideBytes == width * 3 * 4`); padded/strided input
+ * is not part of this API. The constructor buffer's [ByteBuffer.position] and
+ * limit are captured as the immutable logical sample window; each lease gets an
+ * independent view and JNI validates its remaining range before every native read.
  *
  * MEMORY OWNERSHIP — full-resolution buffers live OFF the managed heap. A
  * full-res RAW decode is ~140 MB; allocated as a JVM-managed direct ByteBuffer
@@ -27,78 +117,470 @@ import java.nio.ByteBuffer
  * (OutOfMemoryError). Following Adobe Lightroom — whose native engine keeps all
  * full-res pixels in native memory and never crosses them to the Java heap — the
  * large RAW/engine buffers are allocated natively (`malloc` + `NewDirectByteBuffer`)
- * and reclaimed via [onClose]. Small/proxy buffers stay managed ([onClose] null),
+ * and reclaimed through their owning [DataLease]. Small/proxy buffers stay managed,
  * so the GC handles them and [close] is a no-op.
  *
  * [close] must be called when an off-heap image is no longer needed (native memory
  * is NOT tracked by the GC). It is idempotent and safe on managed images.
  */
-class LinearImage(
-    val data: ByteBuffer,        // direct buffer, length = width*height*3*4 bytes
+class LinearImage private constructor(
+    data: ByteBuffer,            // direct buffer, length = width*height*3*4 bytes
     val width: Int,
     val height: Int,
     val colorSpace: String = "ProPhoto RGB",
-    private val onClose: ((ByteBuffer) -> Unit)? = null,
+    private val release: () -> Unit = {},
+    private val dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
 ) : AutoCloseable {
+    // Capture the caller's logical sample window once. A duplicate keeps later
+    // position/limit mutations on the constructor argument from changing what
+    // JNI reads, while retaining the same direct native allocation.
+    private val backingData = data.duplicate().order(data.order())
+
     init {
-        require(data.isDirect) { "LinearImage requires a direct ByteBuffer" }
+        require(backingData.isDirect) { "LinearImage requires a direct ByteBuffer" }
+        require(backingData.order() == ByteOrder.nativeOrder()) {
+            "LinearImage ByteBuffer must use native byte order"
+        }
         require(width > 0 && height > 0) { "invalid dimensions ${width}x$height" }
     }
 
-    private var closed = false
+    private val lifecycle = AtomicInteger(0)
+
+    /** Acquire a lease. Close it when the direct-buffer view is no longer in use. */
+    fun acquireDataLease(): DataLease {
+        while (true) {
+            val state = lifecycle.get()
+            check(state >= 0) { "LinearImage is closed" }
+            check(state != Int.MAX_VALUE) { "LinearImage has too many active leases" }
+            if (lifecycle.compareAndSet(state, state + 1)) break
+        }
+        return try {
+            dataLeaseFactory.create(
+                backingData.duplicate().order(ByteOrder.nativeOrder()),
+                ::releaseDataLease,
+            )
+        } catch (failure: Throwable) {
+            releaseDataLease()
+            throw failure
+        }
+    }
+
+    private fun releaseDataLease() {
+        if (lifecycle.decrementAndGet() == closedMarker) release()
+    }
 
     /** Free the backing native buffer if this image owns one; no-op for managed buffers. */
     override fun close() {
-        if (closed) return
-        closed = true
-        onClose?.invoke(data)
+        while (true) {
+            val state = lifecycle.get()
+            if (state < 0) return
+            if (lifecycle.compareAndSet(state, state or closedMarker)) {
+                if (state == 0) release()
+                return
+            }
+        }
+    }
+
+    private val closedMarker = Int.MIN_VALUE
+
+    /** Construct a managed direct-buffer image. */
+    constructor(
+        data: ByteBuffer,
+        width: Int,
+        height: Int,
+        colorSpace: String = "ProPhoto RGB",
+    ) : this(data, width, height, colorSpace, {})
+
+    companion object {
+
+        /**
+         * Transfer an already-acquired external lease to the returned image.
+         * If validation fails, the transfer is rolled back by closing [lease].
+         */
+        fun fromDataLease(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            colorSpace: String = "ProPhoto RGB",
+            lease: AutoCloseable,
+        ): LinearImage = try {
+            LinearImage(
+                data, width, height, colorSpace,
+                release = { lease.close() },
+            )
+        } catch (failure: Throwable) {
+            try {
+                lease.close()
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== failure) failure.addSuppressed(releaseFailure)
+            }
+            throw failure
+        }
+
+        internal fun forTest(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            colorSpace: String = "ProPhoto RGB",
+            release: () -> Unit,
+            dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
+        ): LinearImage = LinearImage(data, width, height, colorSpace, release, dataLeaseFactory)
+    }
+}
+
+/**
+ * Opaque owner for a manual native direct allocation. Callers can acquire a
+ * [DataLease] or transfer ownership to [LinearImage], but never receive the
+ * allocation's free capability or its backing buffer directly.
+ */
+class NativeBufferOwner private constructor(
+    data: ByteBuffer,
+    private val token: Long,
+    private val release: (ByteBuffer, Long) -> Unit,
+    private val dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
+) : AutoCloseable {
+    // JNI NewDirectByteBuffer does not tag its Java view with native byte order.
+    // This owner is the native allocation boundary, so normalize its private view;
+    // caller-owned LinearImage buffers remain strict and are never normalized here.
+    private val backingData = data.duplicate().order(ByteOrder.nativeOrder())
+    private val lifecycle = AtomicInteger(0)
+
+    init {
+        require(token > 0L) { "NativeBufferOwner token must be positive" }
+        require(backingData.isDirect) { "NativeBufferOwner requires a direct ByteBuffer" }
+        require(backingData.order() == ByteOrder.nativeOrder()) {
+            "NativeBufferOwner ByteBuffer must use native byte order"
+        }
+    }
+
+    fun acquireDataLease(): DataLease {
+        while (true) {
+            val state = lifecycle.get()
+            check(state >= 0) { "NativeBufferOwner is closed" }
+            check(state != Int.MAX_VALUE) { "NativeBufferOwner has too many active leases" }
+            if (lifecycle.compareAndSet(state, state + 1)) break
+        }
+        return try {
+            dataLeaseFactory.create(
+                backingData.duplicate().order(ByteOrder.nativeOrder()),
+                ::releaseDataLease,
+            )
+        } catch (failure: Throwable) {
+            releaseDataLease()
+            throw failure
+        }
+    }
+
+    fun transferToLinearImage(
+        width: Int,
+        height: Int,
+        colorSpace: String = "ProPhoto RGB",
+    ): LinearImage {
+        val lease = acquireDataLease()
+        return try {
+            LinearImage.fromDataLease(lease.data, width, height, colorSpace, lease)
+        } finally {
+            // The returned image owns the active lease. Closing this owner prevents
+            // a forgotten second close from retaining an extra allocation authority.
+            close()
+        }
+    }
+
+    private fun releaseDataLease() {
+        if (lifecycle.decrementAndGet() == CLOSED) release(backingData, token)
+    }
+
+    override fun close() {
+        while (true) {
+            val state = lifecycle.get()
+            if (state < 0) return
+            if (lifecycle.compareAndSet(state, state or CLOSED)) {
+                if (state == 0) release(backingData, token)
+                return
+            }
+        }
+    }
+
+    companion object {
+        private const val CLOSED = Int.MIN_VALUE
+
+        /**
+         * Allocate coordinator-admitted native memory or fail closed.
+         *
+         * A null JNI result is never permission to allocate the same bytes on
+         * the ART heap: that would bypass the process-wide ceiling precisely
+         * when admission denied a large export buffer.
+         */
+        fun allocate(size: Long): NativeBufferOwner {
+            require(size in 1..Int.MAX_VALUE.toLong()) {
+                "NativeBufferOwner size is invalid: $size"
+            }
+            val allocation = SimResult.allocateNativeBuffer(size)
+                ?: throw OutOfMemoryError(
+                    "native memory allocation denied or failed for $size bytes",
+                )
+            return fromNative(allocation)
+        }
+
+        private fun fromNative(allocation: NativeBufferAllocation): NativeBufferOwner = try {
+            NativeBufferOwner(allocation.data, allocation.token, SimResult::releaseNativeBuffer)
+        } catch (failure: Throwable) {
+            try {
+                SimResult.releaseNativeBuffer(allocation.data, allocation.token)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== failure) failure.addSuppressed(releaseFailure)
+            }
+            throw failure
+        }
+
+        internal fun forTest(
+            data: ByteBuffer,
+            dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
+            release: (ByteBuffer) -> Unit,
+        ): NativeBufferOwner =
+            try {
+                NativeBufferOwner(data, 1L, { buffer, _ -> release(buffer) }, dataLeaseFactory)
+            } catch (failure: Throwable) {
+                try {
+                    release(data)
+                } catch (releaseFailure: Throwable) {
+                    if (releaseFailure !== failure) failure.addSuppressed(releaseFailure)
+                }
+                throw failure
+            }
     }
 }
 
 /**
  * Result of a simulation: display-referred RGB in [SpektraParams.io].outputColorSpace.
- *
- * The engine output buffer is allocated in NATIVE memory (`malloc` +
- * `NewDirectByteBuffer`), off the ART managed heap (see [LinearImage]). Call [close]
- * once the result has been consumed (turned into a Bitmap, or written to a file) to
- * free it; it is idempotent.
+ * Its native bytes are released by [close], after every active [DataLease] drains.
  */
-class SimResult(
-    val data: ByteBuffer,
+class SimResult private constructor(
+    data: ByteBuffer,
     val width: Int,
     val height: Int,
     val colorSpace: ColorSpace,
+    /** Correlates this result with `spk.stage_timings.v1` and Perfetto. */
+    val renderId: Long,
+    private val allocationToken: Long,
+    private val release: (ByteBuffer, Long) -> Unit,
+    private val dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
 ) : AutoCloseable {
+    // NewDirectByteBuffer exposes BIG_ENDIAN metadata by default even when the
+    // underlying native floats use the device's native order. Keep an isolated,
+    // normalized view while preserving the exact allocation base for release.
+    private val backingData = data.duplicate().order(ByteOrder.nativeOrder())
 
-    private var closed = false
+    internal constructor(
+        data: ByteBuffer,
+        width: Int,
+        height: Int,
+        colorSpace: ColorSpace,
+        renderId: Long,
+        allocationToken: Long,
+    ) : this(data, width, height, colorSpace, renderId, allocationToken, ::freeDirectBuffer)
+
+    init {
+        try {
+            require(allocationToken > 0L) { "SimResult allocation token must be positive" }
+            require(backingData.isDirect) { "SimResult requires a direct ByteBuffer" }
+            require(backingData.order() == ByteOrder.nativeOrder()) {
+                "SimResult ByteBuffer must use native byte order"
+            }
+            require(width > 0 && height > 0) { "invalid dimensions ${width}x$height" }
+        } catch (failure: Throwable) {
+            try {
+                release(backingData, allocationToken)
+            } catch (releaseFailure: Throwable) {
+                if (releaseFailure !== failure) failure.addSuppressed(releaseFailure)
+            }
+            throw failure
+        }
+    }
+
+    private val lifecycle = AtomicInteger(0)
+
+    /**
+     * Read the native result while holding a lifetime lease. The buffer handed to
+     * [block] is a per-reader duplicate in native byte order, so position/limit
+     * mutations cannot race other readers. [close] may run concurrently, but the
+     * native allocation is not released until the last active reader returns.
+     */
+    /** Acquire a lease. Close it when the result bytes are no longer in use. */
+    fun acquireDataLease(): DataLease {
+        while (true) {
+            val state = lifecycle.get()
+            check(state >= 0) { "SimResult is closed" }
+            check(state != Int.MAX_VALUE) { "SimResult has too many active leases" }
+            if (lifecycle.compareAndSet(state, state + 1)) break
+        }
+        return try {
+            dataLeaseFactory.create(
+                backingData.duplicate().order(ByteOrder.nativeOrder()),
+                ::releaseDataLease,
+            )
+        } catch (failure: Throwable) {
+            releaseDataLease()
+            throw failure
+        }
+    }
+
+    private fun releaseDataLease() {
+        if (lifecycle.decrementAndGet() == CLOSED) release(backingData, allocationToken)
+    }
 
     override fun close() {
-        if (closed) return
-        closed = true
-        freeDirectBuffer(data)
+        while (true) {
+            val state = lifecycle.get()
+            if (state < 0) return
+            if (lifecycle.compareAndSet(state, state or CLOSED)) {
+                if (state == 0) release(backingData, allocationToken)
+                return
+            }
+        }
+    }
+
+    /** Report the app's final disposition; buffer cleanup alone is not consumption. */
+    fun reportOutcome(outcome: AppRenderOutcome) {
+        Companion.reportOutcome(renderId, outcome)
     }
 
     companion object {
+        private const val CLOSED = Int.MIN_VALUE
+
+        /**
+         * Wrap an externally owned, already-rendered buffer as a result (issue #179).
+         *
+         * The idle pre-render writes the engine's float output to disk and the export maps it
+         * back instead of re-running the engine. That mapping is not a native engine
+         * allocation, so it must never be freed through [freeDirectBuffer]: [release] is
+         * invoked exactly once, when the last lease closes, and the caller owns whatever it
+         * releases.
+         *
+         * [data] must be direct, in native byte order, and hold at least width*height*3
+         * floats. `renderId` is 0 because a restored payload is not a native render: it has no
+         * stage timings to correlate with and reports no outcome.
+         */
+        @JvmStatic
+        fun fromExternalBuffer(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            colorSpace: ColorSpace,
+            release: (ByteBuffer) -> Unit,
+        ): SimResult {
+            val needed = width.toLong() * height.toLong() * 3L * 4L
+            require(data.capacity().toLong() >= needed) {
+                "payload holds ${data.capacity()} bytes, need $needed for ${width}x$height"
+            }
+            return SimResult(
+                data, width, height, colorSpace, 0L, 1L,
+                { buffer, _ -> release(buffer) },
+            )
+        }
+
+        internal fun forTest(
+            data: ByteBuffer,
+            width: Int,
+            height: Int,
+            colorSpace: ColorSpace,
+            renderId: Long,
+            release: (ByteBuffer) -> Unit,
+            dataLeaseFactory: DataLeaseFactory = DataLeaseFactory.DEFAULT,
+        ): SimResult = SimResult(
+            data, width, height, colorSpace, renderId, 1L,
+            { buffer, _ -> release(buffer) }, dataLeaseFactory,
+        )
+
         /**
          * Free a native (`NewDirectByteBuffer`-wrapped `malloc`) engine-output buffer.
          * Implemented in spektra_jni.cpp; libspektra is already loaded by [SpektraEngine].
          */
-        @JvmStatic external fun freeDirectBuffer(buf: ByteBuffer)
+        @JvmStatic private external fun freeDirectBuffer(buf: ByteBuffer, token: Long)
 
         /**
          * Allocate an OFF-HEAP direct [ByteBuffer] of [size] bytes (native `malloc` +
          * `NewDirectByteBuffer`), or null on failure. Unlike `ByteBuffer.allocateDirect`
          * (a non-movable `byte[]` on the ~256 MB ART heap on Android), this lives in native
          * memory — use it for large export staging buffers so they don't OOM the managed
-         * heap. The caller MUST release it with [freeDirectBuffer]; NEVER pass a managed
-         * `allocateDirect` buffer to [freeDirectBuffer].
+         * heap. It is immediately wrapped by [NativeBufferOwner], which holds the only
+         * release authority.
          */
-        @JvmStatic external fun allocDirectBuffer(size: Long): ByteBuffer?
+        @JvmStatic private external fun allocDirectBuffer(size: Long): NativeBufferAllocation?
+
+        internal fun allocateNativeBuffer(size: Long): NativeBufferAllocation? = allocDirectBuffer(size)
+        internal fun releaseNativeBuffer(buffer: ByteBuffer, token: Long) =
+            freeDirectBuffer(buffer, token)
+
+        /**
+         * Emit a keyed app-disposition update for benchmark consumers. Native
+         * success does not imply publication: superseded coroutine work may be
+         * fully rendered and then deliberately discarded.
+         */
+        @JvmStatic fun reportOutcome(renderId: Long, outcome: AppRenderOutcome) {
+            if (renderId != 0L) nativeReportRenderOutcome(renderId, outcome.nativeCode)
+        }
+
+        @JvmStatic private external fun nativeReportRenderOutcome(
+            renderId: Long,
+            outcome: Int,
+        )
     }
 }
 
+/** A baked LUT plus the render id used by timing/Perfetto and app disposition. */
+data class LutBakeResult(
+    val text: String,
+    val renderId: Long,
+) {
+    fun reportOutcome(outcome: AppRenderOutcome) {
+        SimResult.reportOutcome(renderId, outcome)
+    }
+}
+
+internal class EngineHandleLease(initialHandle: Long) {
+    private var handle = initialHandle
+    private val lock = ReentrantReadWriteLock()
+
+    /** Publish a newly created handle before the owning engine becomes observable. */
+    fun initialize(createdHandle: Long) {
+        require(createdHandle != 0L) { "spektra: engine creation returned a null handle" }
+        check(handle == 0L) { "spektra: engine handle is already initialized" }
+        handle = createdHandle
+    }
+
+    fun <T> withLease(operation: String, block: (Long) -> T): T {
+        val readLock = lock.readLock()
+        readLock.lock()
+        try {
+            val leasedHandle = handle
+            check(leasedHandle != 0L) {
+                "spektra: $operation called on a closed engine"
+            }
+            return block(leasedHandle)
+        } finally {
+            readLock.unlock()
+        }
+    }
+
+    fun close(destroy: (Long) -> Unit) {
+        val writeLock = lock.writeLock()
+        writeLock.lock()
+        try {
+            val doomed = handle
+            if (doomed == 0L) return
+            handle = 0L
+            destroy(doomed)
+        } finally {
+            writeLock.unlock()
+        }
+    }
+
+    /** Deterministic test seam: true only after [thread] is queued for this lease lock. */
+    internal fun isQueuedForTest(thread: Thread): Boolean = lock.hasQueuedThread(thread)
+}
+
 class SpektraEngine private constructor(
-    handle: Long,
     // Held ONLY to keep the AssetManager alive for the engine's lifetime when the
     // engine was created in AAssetManager mode: the native AAssetManager* obtained
     // via AAssetManager_fromJava is valid only while this Java AssetManager is
@@ -106,20 +588,23 @@ class SpektraEngine private constructor(
     private val assetManager: AssetManager? = null,
 ) : AutoCloseable {
 
-    private val handle: Long = handle
-
-    @Volatile private var destroyed = false
+    // Construct the lock/owner before nativeCreate*. A successful raw native handle
+    // is therefore never waiting on a later Kotlin owner construction that can fail.
+    private val lifecycle = EngineHandleLease(0L)
 
     /** Filesystem mode: read bundled assets from an extracted [assetDir] on disk. */
-    constructor(assetDir: String? = null) : this(nativeCreate(assetDir), null)
-
-    init {
-        require(handle != 0L) { "spektra: engine creation returned a null handle" }
+    constructor(assetDir: String? = null) : this(assetManager = null) {
+        lifecycle.initialize(nativeCreate(assetDir))
     }
 
     /** Available film/print profile ids bundled in assets (see docs/ASSETS.md). */
-    fun listProfiles(): List<String> =
-        nativeListProfiles(handle).split('\n').filter { it.isNotBlank() }
+    fun listProfiles(): List<String> = withEngineLease("listProfiles") { leasedHandle ->
+        nativeListProfiles(leasedHandle).split('\n').filter { it.isNotBlank() }
+    }
+
+    /** Stable `spk.tc_lut_cache.v1` shipping diagnostics for this engine. */
+    fun tcLutCacheStatsJson(): String =
+        withEngineLease("tcLutCacheStatsJson", ::nativeTcLutCacheStatsJson)
 
     /**
      * Full pipeline: RGB → negative → (print) → scan. Heavy; call off the main
@@ -127,19 +612,35 @@ class SpektraEngine private constructor(
      * specific `spk_status` message) propagates; a null return without an
      * exception is reported as an unexpected fault.
      */
-    fun simulate(image: LinearImage, params: SpektraParams): SimResult {
-        check(!destroyed) { "spektra: simulate called on a closed engine" }
-        return nativeSimulate(handle, image.data, image.width, image.height,
-            image.colorSpace, params, /* preview = */ false)
-            ?: error("spektra: simulate returned null (handle=$handle)")
+    fun simulate(
+        image: LinearImage,
+        params: SpektraParams,
+        kind: RenderKind = RenderKind.EXACT_RENDER,
+        cancellation: RenderCancellation? = null,
+    ): SimResult = withEngineLease("simulate") { leasedHandle ->
+        image.acquireDataLease().use { lease ->
+            val data = lease.data
+            nativeSimulate(leasedHandle, data, image.width, image.height,
+                image.colorSpace, params, /* preview = */ false, kind.nativeCode,
+                cancellation)
+                ?: error("spektra: simulate returned null (handle=$leasedHandle)")
+        }
     }
 
     /** Downscaled fast path to [SettingsParams.previewMaxSize] for interactive tuning. */
-    fun simulatePreview(image: LinearImage, params: SpektraParams): SimResult {
-        check(!destroyed) { "spektra: simulatePreview called on a closed engine" }
-        return nativeSimulate(handle, image.data, image.width, image.height,
-            image.colorSpace, params, /* preview = */ true)
-            ?: error("spektra: simulatePreview returned null (handle=$handle)")
+    fun simulatePreview(
+        image: LinearImage,
+        params: SpektraParams,
+        kind: RenderKind = RenderKind.PREVIEW,
+        cancellation: RenderCancellation? = null,
+    ): SimResult = withEngineLease("simulatePreview") { leasedHandle ->
+        image.acquireDataLease().use { lease ->
+            val data = lease.data
+            nativeSimulate(leasedHandle, data, image.width, image.height,
+                image.colorSpace, params, /* preview = */ true, kind.nativeCode,
+                cancellation)
+                ?: error("spektra: simulatePreview returned null (handle=$leasedHandle)")
+        }
     }
 
     /**
@@ -167,10 +668,10 @@ class SpektraEngine private constructor(
         params: SpektraParams,
         size: Int = 33,
         shaper: Int = SHAPER_NONE,
-    ): String {
-        check(!destroyed) { "spektra: bakeCubeLut called on a closed engine" }
-        return nativeBakeCubeLut(handle, params, size, shaper)
-            ?: error("spektra: bakeCubeLut returned null (handle=$handle)")
+        cancellation: RenderCancellation? = null,
+    ): LutBakeResult = withEngineLease("bakeCubeLut") { leasedHandle ->
+        nativeBakeCubeLut(leasedHandle, params, size, shaper, cancellation)
+            ?: error("spektra: bakeCubeLut returned null (handle=$leasedHandle)")
     }
 
     /**
@@ -189,36 +690,56 @@ class SpektraEngine private constructor(
      * near-identically to the full-resolution original of the same scene. Cheap
      * relative to a render, but still off the main thread.
      */
-    fun meterExposureEv(image: LinearImage, params: SpektraParams): Double {
-        check(!destroyed) { "spektra: meterExposureEv called on a closed engine" }
-        return nativeMeterExposureEv(handle, image.data, image.width, image.height, params)
+    fun meterExposureEv(
+        image: LinearImage,
+        params: SpektraParams,
+        cancellation: RenderCancellation? = null,
+    ): Double = withEngineLease("meterExposureEv") { leasedHandle ->
+        image.acquireDataLease().use { lease ->
+            val data = lease.data
+            nativeMeterExposureEv(
+                leasedHandle, data, image.width, image.height, image.colorSpace,
+                params, cancellation,
+            )
+        }
     }
 
     /** Linear exposure gain (`2^ev`) for [image] under [params]. See [meterExposureEv]. */
-    fun exposureGain(image: LinearImage, params: SpektraParams): Float =
-        Math.pow(2.0, meterExposureEv(image, params)).toFloat()
+    fun exposureGain(
+        image: LinearImage,
+        params: SpektraParams,
+        cancellation: RenderCancellation? = null,
+    ): Float = Math.pow(2.0, meterExposureEv(image, params, cancellation)).toFloat()
 
     /** Destroy the native engine. Idempotent — a second call is a no-op (no double free). */
-    @Synchronized
     override fun close() {
-        if (destroyed || handle == 0L) return
-        destroyed = true
-        nativeDestroy(handle)
+        lifecycle.close(::nativeDestroy)
     }
+
+    private fun <T> withEngineLease(operation: String, block: (Long) -> T): T =
+        lifecycle.withLease(operation, block)
+
+    /** Instrumentation seam for proving close reached and blocked on an active render lease. */
+    internal fun isLifecycleCloseQueuedForTest(thread: Thread): Boolean =
+        lifecycle.isQueuedForTest(thread)
 
     // --- native bridge (see spektra_jni.cpp) ---
     private external fun nativeDestroy(handle: Long)
     private external fun nativeListProfiles(handle: Long): String
+    private external fun nativeTcLutCacheStatsJson(handle: Long): String
     private external fun nativeSimulate(
         handle: Long, inBuf: ByteBuffer, w: Int, h: Int, inCs: String,
-        params: SpektraParams, preview: Boolean,
+        params: SpektraParams, preview: Boolean, renderKind: Int,
+        cancellation: RenderCancellation?,
     ): SimResult?
     private external fun nativeMeterExposureEv(
-        handle: Long, inBuf: ByteBuffer, w: Int, h: Int, params: SpektraParams,
+        handle: Long, inBuf: ByteBuffer, w: Int, h: Int, inCs: String,
+        params: SpektraParams, cancellation: RenderCancellation?,
     ): Double
     private external fun nativeBakeCubeLut(
         handle: Long, params: SpektraParams, size: Int, shaper: Int,
-    ): String?
+        cancellation: RenderCancellation?,
+    ): LutBakeResult?
 
     companion object {
         init { System.loadLibrary("spektra") }
@@ -241,6 +762,72 @@ class SpektraEngine private constructor(
         const val SHAPER_NONE = 0
         const val SHAPER_SRGB = 1
 
+        /** Configure the shared native/JVM admission ceiling for this process. */
+        @JvmStatic
+        fun configureMemoryBudget(limitBytes: Long) {
+            require(limitBytes > 0L) { "memory budget limit must be positive" }
+            nativeConfigureMemoryBudget(limitBytes)
+        }
+
+        /**
+         * Account externally-owned ART/Bitmap bytes. A positive opaque token
+         * owns the reservation; `0L` means the request exceeded the ceiling.
+         */
+        @JvmStatic
+        fun reserveJvmMemory(
+            bytes: Long,
+            stage: MemoryBudgetStage = MemoryBudgetStage.UNKNOWN,
+        ): Long {
+            require(bytes > 0L) { "external JVM reservation must be positive" }
+            return nativeReserveJvmMemory(bytes, stage.nativeCode)
+        }
+
+        /** Release one external reservation; stale, duplicate, and zero tokens return false. */
+        @JvmStatic
+        fun releaseJvmMemory(token: Long): Boolean =
+            token > 0L && nativeReleaseJvmMemory(token)
+
+        /** Deterministic `spk.memory_budget.v1` diagnostic snapshot. */
+        @JvmStatic
+        fun memoryBudgetSnapshotJson(): String = nativeMemoryBudgetSnapshotJson()
+
+        /**
+         * Pin the render pool to the device's performance cores.
+         *
+         * A fork-join is only as fast as its slowest chunk, so one worker parked on an
+         * efficiency core sets the pace for the whole map however many big cores sit
+         * idle. Measured 1.51x on the default-ON spatial path (SM-S948W, two 4.74 GHz
+         * prime cores beating all eight) with the output checksum unchanged.
+         *
+         * Output is unaffected by construction: this changes only WHERE a chunk runs
+         * and how many workers split it, and every worker count is byte-identical —
+         * the thread-invariance the parity gate already asserts.
+         *
+         * @param mode 1 = on, 0 = off, -1 = defer to the `SPK_BIG_CORES` env var.
+         * Safe to call between renders, including mid-session.
+         */
+        @JvmStatic fun setBigCores(mode: Int) = nativeSetBigCores(mode)
+
+        /**
+         * Cores currently classified as "big", or 0 when pinning is off, detection
+         * failed, or the mask would cover every core (pinning to all cores is not
+         * pinning). Use it to report whether the setting did anything on this device.
+         */
+        @JvmStatic fun bigCoreCount(): Int = nativeBigCoreCount()
+
+        /** Instrumentation-only observation of the real Kotlin -> JNI marshaller. */
+        @JvmStatic
+        internal fun debugMarshalledParams(params: Any?): String =
+            nativeDebugMarshalledParams(params)
+
+        @JvmStatic private external fun nativeSetBigCores(mode: Int)
+        @JvmStatic private external fun nativeBigCoreCount(): Int
+        @JvmStatic private external fun nativeDebugMarshalledParams(params: Any?): String
+        @JvmStatic private external fun nativeConfigureMemoryBudget(limitBytes: Long)
+        @JvmStatic private external fun nativeReserveJvmMemory(bytes: Long, stageCode: Int): Long
+        @JvmStatic private external fun nativeReleaseJvmMemory(token: Long): Boolean
+        @JvmStatic private external fun nativeMemoryBudgetSnapshotJson(): String
+
         @JvmStatic private external fun nativeCreate(assetDir: String?): Long
         @JvmStatic private external fun nativeCreateFromAssets(assetManager: AssetManager): Long
 
@@ -255,7 +842,10 @@ class SpektraEngine private constructor(
          * (rather than fall back) when the AAssetManager path is unavailable.
          */
         @JvmStatic
-        fun fromAssets(assetManager: AssetManager): SpektraEngine =
-            SpektraEngine(nativeCreateFromAssets(assetManager), assetManager)
+        fun fromAssets(assetManager: AssetManager): SpektraEngine {
+            val engine = SpektraEngine(assetManager)
+            engine.lifecycle.initialize(nativeCreateFromAssets(assetManager))
+            return engine
+        }
     }
 }

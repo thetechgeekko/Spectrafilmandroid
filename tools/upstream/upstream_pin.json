@@ -1,0 +1,41 @@
+{
+  "schema": "spk.upstream_pin.v1",
+  "repository": "https://github.com/andreavolpato/spektrafilm",
+  "license": "GPL-3.0-only",
+  "license_note": "Profile JSON metadata was relicensed CC BY-SA upstream in the reviewed range; the Android bundle ships the GPLv3 c1d0e44 assets. Attribution 'Film modeling powered by spektrafilm' is mandatory.",
+  "oracle": {
+    "sha": "c1d0e44b962d80a51ea096d33faea346e4f3836c",
+    "date": "2026-05-23",
+    "subject": "docs: update high-res banner",
+    "role": "Numeric contract. Every committed golden vector reproduces bit-exactly at this commit and only this commit; the shipped default render is byte-pinned to it.",
+    "drift_child": {
+      "sha": "a9bccd6bf58764811eeb69883cdc9d86ab64ee18",
+      "note": "First diverging commit (filming raw-scaling change, film_log_raw max_abs ~4.44 vs golden). Everything after it needs its own newer-oracle golden."
+    }
+  },
+  "reviewed": {
+    "sha": "3bb2c2d2801ff68b92019cf1dbcbb133d60832bc",
+    "tree": "0aaea993e19825815306d62d089d39d52efd9ccc",
+    "date": "2026-06-06",
+    "subject": "fix: vlog midgray exposure",
+    "role": "Latest upstream main at review time (2026-09-01, unchanged since 2026-06-06). The c1d0e44..3bb2c2d range (37 commits) was inventoried item-by-item in docs/UPSTREAM_SYNC_2026-06-24.md; the parity manifest classifies every item.",
+    "review_date": "2026-09-01"
+  },
+  "track_only_branches": {
+    "dev": "6cd00c8d4f30b5b550f50f4bbd3753c9f2a48507",
+    "experimental": "28bf883e1672e884307edc75852549376e13644e",
+    "couplers-tuning-iterations": "a273e49b4243d19d7447df39c2b9880e9ec35a66",
+    "note": "Unmerged author R&D (N-channel/B&W, new upsampling, Langmuir couplers, grain rework). Track only; nothing is a self-contained opt-in today. The formerly reviewed reflectance-upsampling-methods branch no longer exists upstream."
+  },
+  "generation": {
+    "environment": "tools/parity/setup_env.sh (exports SPEKTRAFILM_ORACLE_REPO/SHA, stubs GUI deps)",
+    "goldens": "python tools/parity/gen_goldens.py --case <case>, at the oracle SHA",
+    "comparator": "tools/parity/ (spkvec comparator, CI 'parity' job)"
+  },
+  "assets": {
+    "path": "engine/spektra-core/src/main/assets/spektra",
+    "provenance": "Bundled from the oracle c1d0e44 tree (profiles/LUTs) plus Android-authored ICC/preset assets; the tree digest below is what CI verifies offline.",
+    "files": 216,
+    "tree_sha256": "f7ae37537ae503444cd8e445c036759dc5729a4a45669a1119ff957e0b70737a"
+  }
+}

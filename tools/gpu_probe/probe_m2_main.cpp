@@ -285,7 +285,9 @@ PrintTables build_print_tables(const spk::Profile& film, const spk::Profile& pap
     // Native digest, exactly as spektra.cpp's print route resolves it.
     spk::NdArray tc_lut = spk::build_filming_tc_lut(film, spectra_lut, kD55Illuminant);
     const double* enl = spk::enlarger_illuminant("TH-KG3");
-    double cc[3];
+    // The resolver is failure-atomic; initialize the schema fallback before a
+    // missing/invalid neutral-filter database can leave the triple unchanged.
+    double cc[3] = {0.0, 0.0, 0.0};
     spk::resolve_neutral_cc(filters_json, paper.stock, "TH-KG3", film.stock, cc);
     for (int k = 0; k < 3; ++k) cc_out[k] = cc[k];
     T.params = spk::digest_printing_params(cc, enl, /*midgray placeholder=*/1.0,

@@ -32,6 +32,13 @@ object EngineHolder {
     @Volatile private var instance: SpektraEngine? = null
 
     /**
+     * Read the shipping native cache diagnostics without creating a heavy engine
+     * merely because Settings was opened before the editor.
+     */
+    fun tcLutCacheStatsJson(): String = instance?.tcLutCacheStatsJson()
+        ?: """{"schema":"spk.tc_lut_cache.v1","status":"engine_not_initialized"}"""
+
+    /**
      * Return the shared engine, creating it on first use. Heavy on the first call
      * (asset wiring); call off the main thread.
      */
@@ -49,6 +56,20 @@ object EngineHolder {
      */
     private fun create(ctx: Context): SpektraEngine {
         val app = ctx.applicationContext
+        // Establish one shared native/JVM admission ceiling before the engine, caches, or first
+        // decoded frame can allocate. The policy is physical-RAM based and intentionally ignores
+        // largeHeap so native/GPU/writer allocations cannot escape an ART-only allowance.
+        AppMemoryBudget.configure(app)
+        // Apply the stored core-affinity choice before the first render. The engine
+        // gates this on an env var, which a running JVM cannot set for itself, so it
+        // has to be pushed in from here. Cheap and side-effect-free when off.
+        runCatching {
+            val settings = AppSettings.from(app)
+            settings.clearLegacyBigCores()
+            val on = settings.bigCores
+            SpektraEngine.setBigCores(if (on) 1 else 0)
+            if (on) Diag.i("big cores on (experiment) detected=${SpektraEngine.bigCoreCount()}")
+        }.onFailure { Diag.w("big cores apply failed: ${it.message}") }
         return runCatching { SpektraEngine.fromAssets(app.assets) }
             .onSuccess { Diag.i("engine create ok via=fromAssets") }
             .getOrElse { fromAssetsErr ->

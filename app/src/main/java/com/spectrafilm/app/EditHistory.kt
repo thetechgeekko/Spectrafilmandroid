@@ -14,7 +14,7 @@
  * snapshot when a new settled state differs, so one slider drag (which settles once) =
  * one undo entry.
  *
- * Stacks are capped (CAP) to bound memory; the oldest undo entry is dropped when full.
+ * Stacks are bounded by both entry count and encoded byte size; oldest entries are dropped first.
  * canUndo/canRedo are Compose state so the top-bar buttons recompose enable/disable.
  */
 package com.spectrafilm.app
@@ -25,6 +25,12 @@ import androidx.compose.runtime.setValue
 
 /** A single point-in-time editing state: the full params JSON + the manual rotation. */
 data class EditSnapshot(val paramsJson: String, val rotationDegrees: Int)
+
+/** Stable oldest-to-newest stack order used by the bounded editor-session document. */
+data class EditHistoryState(
+    val undo: List<EditSnapshot>,
+    val redo: List<EditSnapshot>,
+)
 
 /** What the editor's settle effect should do: optionally [push] a baseline, then adopt [committed]. */
 data class SettleAction(val push: EditSnapshot?, val committed: EditSnapshot?)
@@ -56,10 +62,19 @@ fun settleDecision(restoring: Boolean, committed: EditSnapshot?, now: EditSnapsh
  * Bounded undo/redo stacks of [EditSnapshot]s. Not thread-safe; all mutation happens on
  * the Compose/main thread (the editor never touches it off the main dispatcher).
  */
-class EditHistory(private val cap: Int = 50) {
+class EditHistory(
+    private val cap: Int = DEFAULT_CAP,
+    private val byteCap: Int = DEFAULT_BYTE_CAP,
+) {
+
+    init {
+        require(cap > 0) { "history cap must be positive" }
+        require(byteCap > 0) { "history byte cap must be positive" }
+    }
 
     private val undoStack = ArrayDeque<EditSnapshot>()
     private val redoStack = ArrayDeque<EditSnapshot>()
+    private var retainedBytes = 0L
 
     var canUndo by mutableStateOf(false)
         private set
@@ -78,8 +93,10 @@ class EditHistory(private val cap: Int = 50) {
      */
     fun push(snapshot: EditSnapshot) {
         undoStack.addLast(snapshot)
-        while (undoStack.size > cap) undoStack.removeFirst()
-        redoStack.clear()
+        retainedBytes += snapshot.retainedBytes()
+        while (undoStack.size > cap) removeFirst(undoStack)
+        clearStack(redoStack)
+        trimToByteCap(prefer = undoStack)
         refreshFlags()
     }
 
@@ -88,9 +105,11 @@ class EditHistory(private val cap: Int = 50) {
      * caller passes in) onto the redo stack. Returns null when there is nothing to undo.
      */
     fun undo(current: EditSnapshot): EditSnapshot? {
-        val prev = undoStack.removeLastOrNull() ?: return null
+        val prev = removeLast(undoStack) ?: return null
         redoStack.addLast(current)
-        while (redoStack.size > cap) redoStack.removeFirst()
+        retainedBytes += current.retainedBytes()
+        while (redoStack.size > cap) removeFirst(redoStack)
+        trimToByteCap(prefer = redoStack)
         refreshFlags()
         return prev
     }
@@ -100,17 +119,77 @@ class EditHistory(private val cap: Int = 50) {
      * Returns null when there is nothing to redo.
      */
     fun redo(current: EditSnapshot): EditSnapshot? {
-        val next = redoStack.removeLastOrNull() ?: return null
+        val next = removeLast(redoStack) ?: return null
         undoStack.addLast(current)
-        while (undoStack.size > cap) undoStack.removeFirst()
+        retainedBytes += current.retainedBytes()
+        while (undoStack.size > cap) removeFirst(undoStack)
+        trimToByteCap(prefer = undoStack)
         refreshFlags()
         return next
     }
 
     /** Drop all history (e.g. on a source change). Leaves both stacks empty. */
     fun clear() {
-        undoStack.clear()
-        redoStack.clear()
+        clearStack(undoStack)
+        clearStack(redoStack)
         refreshFlags()
+    }
+
+    /** Capture both branches without exposing the mutable deques. */
+    fun snapshotState(): EditHistoryState = EditHistoryState(
+        undo = undoStack.toList(),
+        redo = redoStack.toList(),
+    )
+
+    /** Replace both branches from a validated session document. */
+    fun restoreState(state: EditHistoryState) {
+        require(state.undo.size + state.redo.size <= cap) {
+            "restored history exceeds $cap entries"
+        }
+        val restoredBytes = (state.undo + state.redo).sumOf { it.retainedBytes() }
+        require(restoredBytes <= byteCap.toLong()) {
+            "restored history exceeds $byteCap bytes"
+        }
+        clearStack(undoStack)
+        clearStack(redoStack)
+        state.undo.forEach {
+            undoStack.addLast(it)
+            retainedBytes += it.retainedBytes()
+        }
+        state.redo.forEach {
+            redoStack.addLast(it)
+            retainedBytes += it.retainedBytes()
+        }
+        refreshFlags()
+    }
+
+    private fun trimToByteCap(prefer: ArrayDeque<EditSnapshot>) {
+        while (retainedBytes > byteCap) {
+            val fallback = if (prefer === undoStack) redoStack else undoStack
+            when {
+                fallback.isNotEmpty() -> removeFirst(fallback)
+                prefer.isNotEmpty() -> removeFirst(prefer)
+                else -> break
+            }
+        }
+    }
+
+    private fun removeFirst(stack: ArrayDeque<EditSnapshot>) {
+        retainedBytes -= stack.removeFirst().retainedBytes()
+    }
+
+    private fun removeLast(stack: ArrayDeque<EditSnapshot>): EditSnapshot? =
+        stack.removeLastOrNull()?.also { retainedBytes -= it.retainedBytes() }
+
+    private fun clearStack(stack: ArrayDeque<EditSnapshot>) {
+        while (stack.isNotEmpty()) removeFirst(stack)
+    }
+
+    private fun EditSnapshot.retainedBytes(): Long =
+        paramsJson.toByteArray(Charsets.UTF_8).size.toLong() + Int.SIZE_BYTES
+
+    companion object {
+        const val DEFAULT_CAP = 50
+        const val DEFAULT_BYTE_CAP = 8 * 1024 * 1024
     }
 }

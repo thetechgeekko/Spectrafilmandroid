@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spektrafilm for Android. GPLv3. -->
+<!-- Shared editor widgets (Widgets.kt): labels, dialog text and accessibility descriptions. -->
+<resources>
+    <!-- SectionCard header -->
+    <string name="widget_state_expanded">Expanded</string>
+    <string name="widget_state_collapsed">Collapsed</string>
+    <string name="widget_section_expand">Expand</string>
+    <string name="widget_section_collapse">Collapse</string>
+    <string name="widget_section_enable_switch">Enable %1$s</string>
+
+    <!-- HelpBadge ("?" affordance on a section header) -->
+    <string name="widget_help_badge_tooltip">What does \"%1$s\" do?</string>
+    <string name="widget_help_badge_description">About %1$s</string>
+    <string name="widget_help_badge_action">Show help</string>
+
+    <!-- AdvancedToggle -->
+    <string name="widget_advanced_hide">Hide advanced options</string>
+    <string name="widget_advanced_show">Show advanced options</string>
+
+    <!-- EnhancedSlider value pill (tap = type a value, double-tap = reset) -->
+    <string name="widget_value_pill_description">%1$s value %2$s</string>
+    <string name="widget_value_pill_enter_exact">Enter exact value for %1$s</string>
+    <string name="widget_value_pill_reset_default">Reset %1$s to default</string>
+
+    <!-- TripleSlider / PairSlider default component labels -->
+    <string name="widget_component_r">R</string>
+    <string name="widget_component_g">G</string>
+    <string name="widget_component_b">B</string>
+    <string name="widget_component_1">1</string>
+    <string name="widget_component_2">2</string>
+
+    <!-- NotYetActiveNote / GatedBlock -->
+    <string name="widget_not_yet_active_badge">not yet active</string>
+    <string name="widget_not_yet_active_detail">These controls are wired for a future engine update and have no effect yet.</string>
+
+    <!-- NumericEntryDialog -->
+    <string name="widget_numeric_entry_field_label">Value</string>
+    <string name="widget_numeric_entry_sign_toggle">Toggle sign</string>
+    <string name="widget_numeric_entry_range_hint">Enter a value between %1$s and %2$s.</string>
+    <string name="widget_numeric_entry_set">Set</string>
+    <string name="widget_numeric_entry_cancel">Cancel</string>
+
+    <!-- AutoExposureControl / metering-method popup -->
+    <string name="widget_ae_drag_handle">Drag handle</string>
+    <string name="widget_ae_dismiss_menu">Close metering menu</string>
+    <string name="widget_ae_metering_method">Metering method</string>
+    <string name="widget_ae_off_manual">Off / Manual</string>
+    <string name="widget_ae_description">Auto-exposure</string>
+    <string name="widget_ae_state_on">On, %1$s</string>
+    <string name="widget_ae_state_off">Off, manual exposure</string>
+    <string name="widget_ae_choose_method">choose metering method</string>
+    <string name="widget_ae_turn_on">turn on and choose metering method</string>
+    <string name="widget_ae_tooltip">Auto-exposure: tap to choose a metering pattern, or swipe up to expand. When off, exposure is fully manual.</string>
+    <!-- Quoted so aapt keeps the double spaces around the middle dot. -->
+    <string name="widget_ae_button_on">"Auto  ·  %1$s"</string>
+    <string name="widget_ae_button_off">Auto</string>
+    <string name="widget_ae_manual_exposure">Manual exposure</string>
+</resources>
