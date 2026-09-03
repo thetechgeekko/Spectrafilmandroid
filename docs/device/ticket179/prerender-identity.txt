@@ -1,0 +1,21 @@
+#179 pre-render payload identity, release build 6b9f193663d0fe88 (HEAD da8147a)
+SM-S948W, API 36, thermal status 0.
+
+adb shell am instrument -w -r -e ticket177_phase prerender \
+  -e ticket177_corpus <dir>/bench-corpus.json -e ticket177_source <dir>/bench-source.png \
+  -e ticket177_expect_app_sha256 6b9f193663d0fe88b5e5c29e9dea7f92ce03f7c06e19d268861cd5f01139e9f7 \
+  com.spectrafilm.app.test/com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation
+
+TICKET179_PRERENDER_JPEG_Q95: PASS live=70145513a444 restored=70145513a444 put_ms=83 restore_encode_ms=261 payload_bytes=149817600
+TICKET179_PRERENDER_PNG16:    PASS live=74237c9d8543 restored=74237c9d8543 put_ms=82 restore_encode_ms=781 payload_bytes=149817600
+TICKET179_PRERENDER_TIFF16:   PASS live=39f29adbf7f7 restored=39f29adbf7f7 put_ms=60 restore_encode_ms=540 payload_bytes=149817600
+TICKET179_PRERENDER: PASS
+
+The three `live=` digests are the same whole-container digests the #175 bench
+captures recorded for BASE on this build and on the previous one, so the payload
+round-trip is identical not only to its own live render but to every other
+encode of the same image this device has produced.
+
+payload_bytes = 4080 * 3060 * 3 * 4: the pre-encode float RGB result, which is
+what the payload stores -- the export from a restored payload therefore costs an
+encode and nothing else (261 / 781 / 540 ms above), against a 2000 ms p50 SLO.
