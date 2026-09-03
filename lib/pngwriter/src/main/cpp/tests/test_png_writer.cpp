@@ -497,6 +497,104 @@ void runExceptionTranslationCases() {
 
 }  // namespace
 
+// #175: the encoder now feeds deflate one scanline at a time instead of building
+// the whole filtered image first, and the float entry quantizes per row instead of
+// building a second full image. Those are MEMORY changes only -- PNG16 container
+// identity is a gated contract (the export benchmark compares whole-container
+// digests), so the bytes must not move by one.
+//
+// The reference here is the algorithm that was replaced: concatenate every filtered
+// scanline, then deflate the result in one pass with the same settings.
+static void runStreamingIdentityCases() {
+    std::printf("\n[streaming identity]\n");
+    const int W = 129, H = 97;   // several rows, and a row that is not a chunk multiple
+    const size_t rowSamples = static_cast<size_t>(W) * 3;
+    std::vector<uint16_t> pixels(rowSamples * H);
+    for (int y = 0; y < H; ++y) {
+        for (size_t x = 0; x < rowSamples; ++x) {
+            // Mixed compressible and incompressible content, so the deflate stream
+            // exercises both literal and match paths.
+            const size_t i = static_cast<size_t>(y) * rowSamples + x;
+            pixels[i] = static_cast<uint16_t>(((i * 2654435761u) >> 11) ^ (y << 7));
+            if ((x / 9) % 3 == 0) pixels[i] = static_cast<uint16_t>(0x1234 + y);
+        }
+    }
+
+    PngMetadata meta;
+    meta.software = "Spektrafilm-test";
+    std::vector<uint8_t> file;
+    const PngWriteResult res =
+        writePng16ToMemory(pixels.data(), W, H, meta, file, nullptr);
+    CHECK(res.ok, "streaming encode succeeds");
+    if (!res.ok) return;
+
+    // Legacy path: one filtered buffer, one deflate call.
+    std::vector<uint8_t> filtered;
+    filtered.reserve((1 + rowSamples * 2) * static_cast<size_t>(H));
+    for (int y = 0; y < H; ++y) {
+        filtered.push_back(0);
+        const uint16_t* src = pixels.data() + static_cast<size_t>(y) * rowSamples;
+        for (size_t x = 0; x < rowSamples; ++x) {
+            filtered.push_back(static_cast<uint8_t>(src[x] >> 8));
+            filtered.push_back(static_cast<uint8_t>(src[x] & 0xFF));
+        }
+    }
+    std::vector<uint8_t> oneShot;
+    {
+        z_stream stream{};
+        CHECK(deflateInit(&stream, Z_DEFAULT_COMPRESSION) == Z_OK, "reference deflate init");
+        oneShot.resize(static_cast<size_t>(compressBound(static_cast<uLong>(filtered.size()))));
+        stream.next_in = const_cast<Bytef*>(filtered.data());
+        stream.avail_in = static_cast<uInt>(filtered.size());
+        stream.next_out = oneShot.data();
+        stream.avail_out = static_cast<uInt>(oneShot.size());
+        const int rc = deflate(&stream, Z_FINISH);
+        CHECK(rc == Z_STREAM_END, "reference deflate completes in one pass");
+        oneShot.resize(oneShot.size() - stream.avail_out);
+        deflateEnd(&stream);
+    }
+
+    const std::vector<Chunk> chunks = parseChunks(file);
+    const Chunk* idat = nullptr;
+    for (const Chunk& c : chunks) if (std::strcmp(c.type, "IDAT") == 0) idat = &c;
+    CHECK(idat != nullptr, "IDAT present");
+    if (idat == nullptr) return;
+    CHECK(idat->dataLen == oneShot.size(), "IDAT length matches the whole-buffer deflate");
+    if (idat->dataLen == oneShot.size()) {
+        CHECK(std::memcmp(&file[idat->dataOff], oneShot.data(), oneShot.size()) == 0,
+              "IDAT bytes are IDENTICAL to the whole-buffer deflate");
+    }
+
+    // The float entry must produce the same file as quantizing first and writing.
+    std::vector<float> floats(pixels.size());
+    for (size_t i = 0; i < pixels.size(); ++i)
+        floats[i] = static_cast<float>(pixels[i]) / 65535.0f;
+    std::vector<uint16_t> requantized(pixels.size());
+    for (size_t i = 0; i < floats.size(); ++i) {
+        const float v = floats[i];
+        if (!(v > 0.0f)) { requantized[i] = 0; continue; }
+        if (v >= 1.0f) { requantized[i] = 65535; continue; }
+        requantized[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+    }
+    const std::string floatPath = "/tmp/sf_png_stream_float.png";
+    const std::string refPath = "/tmp/sf_png_stream_ref.png";
+    const PngWriteResult floatRes =
+        writePngFloatToFile(floats.data(), W, H, meta, floatPath, nullptr);
+    const PngWriteResult refRes =
+        writePng16ToFile(requantized.data(), W, H, meta, refPath, nullptr);
+    CHECK(floatRes.ok && refRes.ok, "float and uint16 file writes both succeed");
+    std::vector<uint8_t> floatFile, refFile;
+    if (readFile(floatPath, floatFile) && readFile(refPath, refFile)) {
+        CHECK(floatFile.size() == refFile.size() &&
+                  std::memcmp(floatFile.data(), refFile.data(), refFile.size()) == 0,
+              "row-quantized float write is byte-identical to the staged uint16 write");
+    } else {
+        CHECK(false, "both files readable");
+    }
+    std::remove(floatPath.c_str());
+    std::remove(refPath.c_str());
+}
+
 int main() {
     const int W = 5, H = 4;
 
@@ -543,6 +641,8 @@ int main() {
         meta.iccProfile = icc;
         runCase("no_software", pixels, W, H, meta);
     }
+
+    runStreamingIdentityCases();
 
     runSafetyCases();
     runExceptionTranslationCases();

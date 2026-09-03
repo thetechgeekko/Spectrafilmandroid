@@ -29,8 +29,10 @@
  *
  * IDAT deflate:
  *   We use zlib's deflate (compress2 / deflateInit2 with windowBits=15 for zlib
- *   wrapper, level Z_DEFAULT_COMPRESSION). The entire filtered scanline buffer is
- *   compressed in one shot. The resulting bytes become a single IDAT chunk.
+ *   wrapper, level Z_DEFAULT_COMPRESSION). Scanlines are fed to deflate ONE ROW AT
+ *   A TIME, so the filtered image is never materialised; the resulting bytes are
+ *   identical to compressing the whole buffer in one shot and become a single IDAT
+ *   chunk (see IdatDeflater, and the byte-identity case in tests/).
  *
  * Per-scanline filter byte:
  *   Each scanline is prefixed with a 1-byte filter type. We use filter 0 (None)
@@ -365,19 +367,147 @@ static ZlibStatus zlibCompress(const uint8_t* src, size_t srcLen,
     return ZlibStatus::Ok;
 }
 
+// ---- streaming IDAT --------------------------------------------------------
+//
+// The filtered image used to be materialised in full before compression: at
+// 12.5 MP that is a 75 MB buffer whose only purpose is to be read once, on top of
+// the 75 MB of uint16 samples and the ~75 MB of compressed output (#175).
+//
+// Feeding deflate one scanline at a time removes it. The compressed BYTES are
+// unchanged: this pushes exactly the same total stream through exactly the same
+// deflate settings with Z_NO_FLUSH, which is what the whole-buffer path above
+// already did in 64 KB pieces -- zlib inserts no sync point for Z_NO_FLUSH, so
+// where the input is split cannot change the output. tests/test_png_writer.cpp
+// asserts that byte-for-byte, because PNG16 container identity is a gated
+// contract, not a preference.
+class IdatDeflater final {
+public:
+    IdatDeflater(std::vector<uint8_t>& dst, const PngCancellation* cancellation) noexcept
+        : dst_(dst), cancellation_(cancellation) {}
+
+    IdatDeflater(const IdatDeflater&) = delete;
+    IdatDeflater& operator=(const IdatDeflater&) = delete;
+
+    ~IdatDeflater() {
+        if (open_) deflateEnd(&stream_);
+    }
+
+    bool init(std::string& errOut) {
+        if (deflateInit(&stream_, Z_DEFAULT_COMPRESSION) != Z_OK) {
+            errOut = "zlib initialisation failed";
+            return false;
+        }
+        open_ = true;
+        return true;
+    }
+
+    ZlibStatus push(const uint8_t* data, size_t len, std::string& errOut) {
+        return run(data, len, Z_NO_FLUSH, errOut);
+    }
+
+    ZlibStatus finish(std::string& errOut) {
+        return run(nullptr, 0, Z_FINISH, errOut);
+    }
+
+private:
+    ZlibStatus run(const uint8_t* data, size_t len, int flush, std::string& errOut) {
+        if (isCancelled(cancellation_)) { dst_.clear(); return ZlibStatus::Cancelled; }
+        stream_.next_in = len == 0
+            ? Z_NULL
+            : const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data));
+        stream_.avail_in = static_cast<uInt>(len);
+        int rc = Z_OK;
+        do {
+            if (isCancelled(cancellation_)) { dst_.clear(); return ZlibStatus::Cancelled; }
+            stream_.next_out = reinterpret_cast<Bytef*>(output_.data());
+            stream_.avail_out = static_cast<uInt>(output_.size());
+            rc = deflate(&stream_, flush);
+            if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+                dst_.clear();
+                errOut = "zlib deflate failed";
+                return ZlibStatus::Failed;
+            }
+            const size_t produced = output_.size() - stream_.avail_out;
+            if (produced > kPngMaxChunkLength - dst_.size()) {
+                dst_.clear();
+                errOut = "compressed PNG chunk exceeds format limits";
+                return ZlibStatus::Failed;
+            }
+            dst_.insert(dst_.end(), output_.data(), output_.data() + produced);
+        } while (stream_.avail_in != 0 || stream_.avail_out == 0 ||
+                 (flush == Z_FINISH && rc != Z_STREAM_END));
+        return ZlibStatus::Ok;
+    }
+
+    z_stream stream_{};
+    bool open_ = false;
+    std::vector<uint8_t>& dst_;
+    const PngCancellation* cancellation_ = nullptr;
+    std::array<uint8_t, 64u * 1024u> output_{};
+};
+
+// One scanline of uint16 samples at a time, so neither the caller's quantized
+// image nor a quantized copy of it has to exist in full.
+class RowSource {
+public:
+    virtual ~RowSource() = default;
+    // Returns rowSamples samples for row y, or nullptr on failure.
+    virtual const uint16_t* row(int y) = 0;
+};
+
+class U16RowSource final : public RowSource {
+public:
+    U16RowSource(const uint16_t* base, size_t rowSamples) noexcept
+        : base_(base), rowSamples_(rowSamples) {}
+    const uint16_t* row(int y) override {
+        return base_ + static_cast<size_t>(y) * rowSamples_;
+    }
+
+private:
+    const uint16_t* base_;
+    size_t rowSamples_;
+};
+
+// Quantizes float -> uint16 one row at a time. Identical arithmetic to the
+// whole-image loop it replaces, including the not-greater-than-zero test that
+// maps NaN to 0.
+class FloatRowSource final : public RowSource {
+public:
+    FloatRowSource(const float* base, size_t rowSamples)
+        : base_(base), rowSamples_(rowSamples), scratch_(rowSamples) {}
+    const uint16_t* row(int y) override {
+        const float* src = base_ + static_cast<size_t>(y) * rowSamples_;
+        for (size_t x = 0; x < rowSamples_; ++x) {
+            const float v = src[x];
+            if (!(v > 0.0f)) { scratch_[x] = 0; continue; }
+            if (v >= 1.0f) { scratch_[x] = 65535; continue; }
+            scratch_[x] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+        }
+        return scratch_.data();
+    }
+
+private:
+    const float* base_;
+    size_t rowSamples_;
+    std::vector<uint16_t> scratch_;
+};
+
 }  // namespace
 
 // ---- writePng16ToMemory ----------------------------------------------------
 
-PngWriteResult writePng16ToMemory(const uint16_t* rgb16, int width, int height,
-                                  const PngMetadata& meta,
-                                  std::vector<uint8_t>& outBytes,
-                                  const PngCancellation* cancellation) {
+// The whole encoder, driven one scanline at a time. Both public entry points are
+// thin wrappers: writePng16ToMemory hands it rows of the caller's buffer, and the
+// float entry hands it rows it quantizes on the way past, so neither a filtered
+// image nor a quantized copy is ever allocated in full (#175).
+static PngWriteResult writePngRows(RowSource& rows, int width, int height,
+                                   const PngMetadata& meta,
+                                   std::vector<uint8_t>& outBytes,
+                                   const PngCancellation* cancellation) {
     PngWriteResult res;
     outBytes.clear();
     MemoryOutputGuard outputGuard(outBytes);
 
-    if (rgb16 == nullptr) { res.error = "null pixel buffer"; return res; }
     uint64_t rowSamples64 = 0;
     uint64_t rowBytes64 = 0;
     uint64_t filtBufSize64 = 0;
@@ -482,34 +612,44 @@ PngWriteResult writePng16ToMemory(const uint16_t* rgb16, int width, int height,
     // ARM/x86); we emit (v>>8) then (v&0xFF) to get big-endian.
     {
         const size_t rowSamples = static_cast<size_t>(rowSamples64);
-        const size_t filtBufSize = static_cast<size_t>(filtBufSize64);
 
-        std::vector<uint8_t> filtBuf(filtBufSize);
+        // One scanline at a time: the filtered image is never materialised, so the
+        // 75 MB it cost at 12.5 MP is gone (#175). The compressed bytes are
+        // identical -- same stream, same settings, only the input chunking differs.
+        std::vector<uint8_t> idatData;
+        std::vector<uint8_t> filteredRow(static_cast<size_t>(rowBytes64) + 1u);
+        std::string zlibErr;
         {
-            uint8_t* dst = filtBuf.data();
-            const uint16_t* src = rgb16;
+            IdatDeflater deflater(idatData, cancellation);
+            if (!deflater.init(res.error)) return res;
             for (int y = 0; y < height; ++y) {
                 if (isCancelled(cancellation)) return cancelWithoutPublication();
+                const uint16_t* src = rows.row(y);
+                if (src == nullptr) {
+                    res.error = "IDAT: row source failed";
+                    return res;
+                }
+                uint8_t* dst = filteredRow.data();
                 *dst++ = 0;  // filter byte = 0 (None)
                 for (size_t x = 0; x < rowSamples; ++x) {
-                    if ((x & 0x7fffu) == 0u && isCancelled(cancellation))
-                        return cancelWithoutPublication();
-                    uint16_t v = *src++;
+                    const uint16_t v = src[x];
                     *dst++ = static_cast<uint8_t>(v >> 8);    // high byte first (big-endian)
                     *dst++ = static_cast<uint8_t>(v & 0xFF);  // low byte second
                 }
+                const ZlibStatus rowStatus =
+                    deflater.push(filteredRow.data(), filteredRow.size(), zlibErr);
+                if (rowStatus == ZlibStatus::Cancelled) return cancelWithoutPublication();
+                if (rowStatus == ZlibStatus::Failed) {
+                    res.error = "IDAT: " + zlibErr;
+                    return res;
+                }
             }
-        }
-
-        // Compress the filtered buffer.
-        std::vector<uint8_t> idatData;
-        std::string zlibErr;
-        const ZlibStatus idatStatus = zlibCompress(
-            filtBuf.data(), filtBuf.size(), idatData, zlibErr, cancellation);
-        if (idatStatus == ZlibStatus::Cancelled) return cancelWithoutPublication();
-        if (idatStatus == ZlibStatus::Failed) {
-            res.error = "IDAT: " + zlibErr;
-            return res;
+            const ZlibStatus endStatus = deflater.finish(zlibErr);
+            if (endStatus == ZlibStatus::Cancelled) return cancelWithoutPublication();
+            if (endStatus == ZlibStatus::Failed) {
+                res.error = "IDAT: " + zlibErr;
+                return res;
+            }
         }
         if (isCancelled(cancellation)) return cancelWithoutPublication();
 
@@ -532,19 +672,30 @@ PngWriteResult writePng16ToMemory(const uint16_t* rgb16, int width, int height,
     return res;
 }
 
+PngWriteResult writePng16ToMemory(const uint16_t* rgb16, int width, int height,
+                                  const PngMetadata& meta,
+                                  std::vector<uint8_t>& outBytes,
+                                  const PngCancellation* cancellation) {
+    PngWriteResult res;
+    outBytes.clear();
+    if (rgb16 == nullptr) { res.error = "null pixel buffer"; return res; }
+    uint64_t rowSamples64 = 0;
+    uint64_t rowBytes64 = 0;
+    uint64_t filtBufSize64 = 0;
+    if (!imageLayout(width, height, 2u, rowSamples64, rowBytes64,
+                     filtBufSize64, res.error)) return res;
+    U16RowSource rows(rgb16, static_cast<size_t>(rowSamples64));
+    return writePngRows(rows, width, height, meta, outBytes, cancellation);
+}
+
 // ---- writePng16ToFile ------------------------------------------------------
 
-PngWriteResult writePng16ToFile(const uint16_t* rgb16, int width, int height,
-                                const PngMetadata& meta,
-                                const std::string& path,
-                                const PngCancellation* cancellation) {
-    PngWriteResult pathResult;
-    if (!TempOutput::validatePath(path, pathResult.error)) return pathResult;
-    std::vector<uint8_t> bytes;
-    PngWriteResult res = writePng16ToMemory(
-        rgb16, width, height, meta, bytes, cancellation);
-    if (!res.ok) return res;
-
+// Publish encoded bytes through the same write-to-temp-then-rename protocol both
+// file entry points use, so a failed or cancelled write leaves no partial file.
+static PngWriteResult writeBytesToPath(const std::vector<uint8_t>& bytes,
+                                       const std::string& path,
+                                       PngWriteResult res,
+                                       const PngCancellation* cancellation) {
     TempOutput output;
     if (!output.open(path, res.error)) {
         res.ok = false;
@@ -573,6 +724,19 @@ PngWriteResult writePng16ToFile(const uint16_t* rgb16, int width, int height,
     return res;
 }
 
+PngWriteResult writePng16ToFile(const uint16_t* rgb16, int width, int height,
+                                const PngMetadata& meta,
+                                const std::string& path,
+                                const PngCancellation* cancellation) {
+    PngWriteResult pathResult;
+    if (!TempOutput::validatePath(path, pathResult.error)) return pathResult;
+    std::vector<uint8_t> bytes;
+    PngWriteResult res = writePng16ToMemory(
+        rgb16, width, height, meta, bytes, cancellation);
+    if (!res.ok) return res;
+    return writeBytesToPath(bytes, path, res, cancellation);
+}
+
 // ---- writePngFloatToFile ---------------------------------------------------
 
 PngWriteResult writePngFloatToFile(const float* rgbFloat, int width, int height,
@@ -594,22 +758,18 @@ PngWriteResult writePngFloatToFile(const float* rgbFloat, int width, int height,
     }
     if (isCancelled(cancellation)) return cancelledResult();
 
+    // Quantize a row at a time on the way into the encoder. This used to build a
+    // whole second image -- 75 MB at 12.5 MP, on top of the caller's float buffer
+    // and everything the encoder itself staged (#175). Same arithmetic, same
+    // output bytes; only the lifetime of the intermediate changed.
     const size_t rowSamples = static_cast<size_t>(rowSamples64);
-    std::vector<uint16_t> q(static_cast<size_t>(sampleCount64));
-    for (int y = 0; y < height; ++y) {
-        if (isCancelled(cancellation)) return cancelledResult();
-        const size_t rowStart = static_cast<size_t>(y) * rowSamples;
-        for (size_t x = 0; x < rowSamples; ++x) {
-            if ((x & 0x7fffu) == 0u && isCancelled(cancellation))
-                return cancelledResult();
-            const size_t i = rowStart + x;
-            float v = rgbFloat[i];
-            if (!(v > 0.0f)) { q[i] = 0; continue; }
-            if (v >= 1.0f) { q[i] = 65535; continue; }
-            q[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
-        }
-    }
-    return writePng16ToFile(q.data(), width, height, meta, path, cancellation);
+    if (!TempOutput::validatePath(path, res.error)) return res;
+    FloatRowSource rows(rgbFloat, rowSamples);
+    std::vector<uint8_t> bytes;
+    PngWriteResult encoded =
+        writePngRows(rows, width, height, meta, bytes, cancellation);
+    if (!encoded.ok) return encoded;
+    return writeBytesToPath(bytes, path, encoded, cancellation);
 }
 
 }  // namespace spectrafilm
