@@ -1272,12 +1272,9 @@ suspend fun saveSimResultAsPng16(
     }
     val w = result.width
     val h = result.height
-    val nSamples = checkedRgbFloatByteCount(w, h, "PNG16 export") / Float.SIZE_BYTES
-    val rgb16Bytes = try {
-        Math.multiplyExact(nSamples, Short.SIZE_BYTES)
-    } catch (failure: ArithmeticException) {
-        throw IllegalArgumentException("PNG16 uint16 buffer size overflow", failure)
-    }
+    // Still validated up front: the writer needs the same geometry to be sane, and
+    // failing here keeps the error at the caller rather than inside JNI.
+    checkedRgbFloatByteCount(w, h, "PNG16 export")
     val exportJob = currentCoroutineContext()[Job]
     fun ensureExportActive() {
         if (exportJob?.isActive == false) throw CancellationException("PNG16 export cancelled")
@@ -1290,30 +1287,18 @@ suspend fun saveSimResultAsPng16(
     val tmpFile = File.createTempFile("spectrafilm-export-", ".png.part", ctx.cacheDir)
 
     try {
-        // Quantise float [0,1] -> uint16 [0,65535] into an OFF-HEAP direct buffer (LE uint16).
-        // ByteBuffer.allocateDirect is a managed byte[] on Android — ~600 MB at 100 MP → ART OOM.
-        // Allocate through the global native coordinator and fail closed on
-        // denial; falling back to ART would escape the hard ceiling.
-        val nativeOwner = NativeBufferOwner.allocate(rgb16Bytes.toLong())
-        val nativeLease = nativeOwner.acquireDataLease()
-        val rgb16Buf = nativeLease.data
-            .order(ByteOrder.LITTLE_ENDIAN)
-        val encodedBytes = try {
-            result.acquireDataLease().use { lease ->
-                val data = lease.data
-                val floatBuf = checkedRgbFloatWindow(data, w, h, "PNG16 export")
-                for (i in 0 until nSamples) {
-                    if ((i and 4095) == 0) ensureExportActive()
-                    val v = floatBuf.get(i).coerceIn(0f, 1f)
-                    val u16 = (v * 65535f + 0.5f).toInt().coerceIn(0, 65535)
-                    rgb16Buf.put((u16 and 0xFF).toByte())
-                    rgb16Buf.put(((u16 shr 8) and 0xFF).toByte())
-                }
-            }
-            rgb16Buf.flip()
+        // The engine's float buffer goes straight to the writer, which quantises one
+        // row at a time (#175). This used to allocate a second full-size uint16
+        // buffer -- 75 MB at 12.5 MP -- and fill it by walking every sample in a JVM
+        // loop, for pixels the writer then consumed once. The writer's quantisation
+        // is the same arithmetic this loop used (clamp to [0,1], v*65535+0.5,
+        // truncate, NaN to 0), so the exported pixels are unchanged.
+        val encodedBytes = result.acquireDataLease().use { lease ->
+            ensureExportActive()
+            val floatBuf = checkedRgbFloatByteWindow(lease.data, w, h, "PNG16 export")
             runCancellablePngWrite { cancellation ->
-                PngWriter.write(
-                    rgb16 = rgb16Buf,
+                PngWriter.writeFloat(
+                    rgbFloat = floatBuf,
                     width = w,
                     height = h,
                     outPath = tmpFile.absolutePath,
@@ -1322,9 +1307,6 @@ suspend fun saveSimResultAsPng16(
                     cancellation = cancellation,
                 )
             }
-        } finally {
-            nativeLease.close()
-            nativeOwner.close()
         }
 
         ensureExportActive()

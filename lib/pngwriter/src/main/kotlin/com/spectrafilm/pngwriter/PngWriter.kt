@@ -148,6 +148,39 @@ object PngWriter {
     }
 
     /**
+     * Write a 16-bit RGB PNG directly from the engine's display-referred float
+     * output, quantising one row at a time inside the writer.
+     *
+     * This exists to avoid the caller building a second full-size buffer: at
+     * 12.5 MP the uint16 copy is 75 MB, and filling it walks 37.5 million samples
+     * in a JVM loop, for pixels the writer is about to consume once (#175).
+     *
+     * The quantisation is deliberately identical to that loop -- clamp to [0,1],
+     * `v * 65535 + 0.5`, truncate, NaN to 0 -- so the exported pixels do not move.
+     *
+     * @param rgbFloat direct ByteBuffer, width*height*3 native-order float samples
+     */
+    fun writeFloat(
+        rgbFloat: ByteBuffer,
+        width: Int,
+        height: Int,
+        outPath: String,
+        icc: ByteArray? = null,
+        software: String = "Spektrafilm",
+        cancellation: PngCancellationToken? = null,
+    ): Long {
+        checkedPngOutputPath(outPath)
+        val direct = packedPngBuffer(
+            rgbFloat, width, height, bytesPerSample = 4, cancellation = cancellation,
+        )
+        NativeLibrary.ensureLoaded()
+        return nativeWriteFloatBuffer(
+            direct, width, height, software, icc, outPath,
+            cancellation?.nativeSignal,
+        )
+    }
+
+    /**
      * Write a 16-bit RGB PNG from a [ShortArray] of width*height*3 samples
      * (interpreted as unsigned 16-bit, little-endian). Convenience overload for
      * callers that already have a short[].
@@ -224,6 +257,16 @@ object PngWriter {
     // --- native bridge (png_writer_jni.cpp / libsfpng.so) ---
     private external fun nativeWriteBuffer(
         rgb16: ByteBuffer,
+        width: Int,
+        height: Int,
+        software: String,
+        icc: ByteArray?,
+        outPath: String,
+        cancellationSignal: AtomicBoolean?,
+    ): Long
+
+    private external fun nativeWriteFloatBuffer(
+        rgbFloat: ByteBuffer,
         width: Int,
         height: Int,
         software: String,
