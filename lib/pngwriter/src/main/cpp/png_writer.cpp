@@ -392,12 +392,20 @@ public:
         if (open_) deflateEnd(&stream_);
     }
 
-    bool init(std::string& errOut) {
+    // [totalInputBytes] is only a sizing hint: without it the output vector grows
+    // geometrically and its reallocation transiently holds two copies, which on a
+    // 12.5 MP frame costs more than the buffer this class exists to remove.
+    bool init(uint64_t totalInputBytes, std::string& errOut) {
         if (deflateInit(&stream_, Z_DEFAULT_COMPRESSION) != Z_OK) {
             errOut = "zlib initialisation failed";
             return false;
         }
         open_ = true;
+        if (totalInputBytes > 0 &&
+            totalInputBytes <= static_cast<uint64_t>(std::numeric_limits<uLong>::max())) {
+            const uLong bound = compressBound(static_cast<uLong>(totalInputBytes));
+            if (bound <= kPngMaxChunkLength) dst_.reserve(static_cast<size_t>(bound));
+        }
         return true;
     }
 
@@ -621,7 +629,7 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
         std::string zlibErr;
         {
             IdatDeflater deflater(idatData, cancellation);
-            if (!deflater.init(res.error)) return res;
+            if (!deflater.init(filtBufSize64, res.error)) return res;
             for (int y = 0; y < height; ++y) {
                 if (isCancelled(cancellation)) return cancelWithoutPublication();
                 const uint16_t* src = rows.row(y);
