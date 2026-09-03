@@ -27,6 +27,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <cstring>
 #include <map>
 #include <new>
@@ -279,6 +280,57 @@ void runCase(const char* label, TiffCompression comp, const std::vector<uint8_t>
 }
 
 // Write+readback a true 32-bit IEEE-float TIFF and assert tags + verbatim round-trip.
+// #175: the 16-bit path now quantises INSIDE the writer, from float samples, so the
+// caller no longer builds a uint16 image (75 MB at 12.5 MP). That is only safe if it
+// is byte-identical to the uint16 entry point -- the export contract pins the whole
+// container digest (#126) -- so this writes the same picture both ways and compares
+// the files. The pixel values below are chosen to hit every branch of the rounding:
+// negative, zero, exactly 1, above 1, NaN, and the .5 boundary.
+void runFloat16IdentityCase(const char* label, TiffCompression comp) {
+    std::printf("[float16-identity-%s]\n", label);
+
+    const int W = 7, H = 5;
+    std::vector<float> f(static_cast<size_t>(W) * H * 3);
+    for (size_t i = 0; i < f.size(); ++i)
+        f[i] = static_cast<float>(i) / static_cast<float>(f.size() - 1);
+    f[0] = -0.5f;
+    f[1] = 0.0f;
+    f[2] = 1.0f;
+    f[3] = 2.0f;
+    f[4] = std::numeric_limits<float>::quiet_NaN();
+    f[5] = 0.5f / 65535.0f;          // rounds to 1 only if +0.5 is applied
+    f[6] = 0.49f / 65535.0f;         // rounds to 0
+
+    // The quantisation the caller used to do, kept here verbatim as the reference.
+    std::vector<uint16_t> q(f.size());
+    for (size_t i = 0; i < f.size(); ++i) {
+        const float v = f[i];
+        if (!(v > 0.0f)) { q[i] = 0; continue; }
+        if (v >= 1.0f) { q[i] = 65535; continue; }
+        q[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+    }
+
+    TiffMetadata meta;
+    meta.software = "Spektrafilm-test";
+    meta.dateTime = "2026:05:29 12:00:00";
+    meta.exifColorSpace = 0xFFFF;
+    meta.writeExifIfd = true;
+
+    const std::string fromU16 = std::string("/tmp/sf_tiff_f16_u16_") + label + ".tiff";
+    const std::string fromFloat = std::string("/tmp/sf_tiff_f16_flt_") + label + ".tiff";
+    const TiffWriteResult a = writeTiff16ToFile(q.data(), W, H, meta, comp, fromU16);
+    const TiffWriteResult b = writeTiffFloatToFile(f.data(), W, H, meta, comp, fromFloat);
+    CHECK(a.ok && b.ok, "both writers returned ok");
+    if (!a.ok || !b.ok) return;
+    CHECK(a.bytesWritten == b.bytesWritten, "same byte count reported");
+
+    std::vector<uint8_t> ba, bb;
+    CHECK(readFile(fromU16, ba) && readFile(fromFloat, bb), "both files readable");
+    CHECK(ba == bb, "float-fed 16-bit TIFF is byte-identical to the uint16 one");
+    std::remove(fromU16.c_str());
+    std::remove(fromFloat.c_str());
+}
+
 void runFloatCase(const char* label, TiffCompression comp) {
     std::printf("[float-%s]\n", label);
 
@@ -544,6 +596,9 @@ int main() {
     runCase("no_icc", TiffCompression::None, {});
 
     // True 32-bit IEEE-float path (BitsPerSample=32, SampleFormat=3, verbatim samples).
+    runFloat16IdentityCase("uncompressed", TiffCompression::None);
+    runFloat16IdentityCase("packbits", TiffCompression::PackBits);
+
     runFloatCase("uncompressed", TiffCompression::None);
     runFloatCase("packbits", TiffCompression::PackBits);
 

@@ -200,6 +200,39 @@ object TiffWriter {
      * @return number of bytes written
      * @throws IllegalStateException on write failure
      */
+    /**
+     * 16-bit TIFF written straight from the engine's float samples: the native writer
+     * quantises row by row (same clamp and rounding as [write], so the file is
+     * byte-identical), which removes the caller's full uint16 image -- 75 MB at
+     * 12.5 MP, and it had to be off-heap to exist at all (#175).
+     *
+     * @param rgbFloat direct ByteBuffer, width*height*3 little-endian float32 samples in [0,1]
+     * @return number of bytes written
+     * @throws IllegalStateException on write failure
+     */
+    fun writeFloat16(
+        rgbFloat: ByteBuffer,
+        width: Int,
+        height: Int,
+        outPath: String,
+        icc: ByteArray? = null,
+        exifColorSpace: ExifColorSpace = ExifColorSpace.UNCALIBRATED,
+        software: String = "Spektrafilm",
+        dateTime: String? = null,
+        packBits: Boolean = false,
+        cancellation: TiffCancellationToken? = null,
+    ): Long {
+        checkedTiffOutputPath(outPath)
+        val direct = packedTiffBuffer(
+            rgbFloat, width, height, bytesPerSample = 4, cancellation = cancellation,
+        )
+        NativeLibrary.ensureLoaded()
+        return nativeWriteFloat16Buffer(
+            direct, width, height, exifColorSpace.tagValue,
+            software, dateTime, icc, packBits, outPath, cancellation?.nativeSignal,
+        )
+    }
+
     fun writeFloat32(
         rgbFloat: ByteBuffer,
         width: Int,
@@ -233,6 +266,13 @@ object TiffWriter {
 
     private external fun nativeWriteShorts(
         rgb16: ShortArray, width: Int, height: Int, exifColorSpace: Int,
+        software: String, dateTime: String?, icc: ByteArray?,
+        packBits: Boolean, outPath: String,
+        cancellationSignal: AtomicBoolean?,
+    ): Long
+
+    private external fun nativeWriteFloat16Buffer(
+        rgbFloat: ByteBuffer, width: Int, height: Int, exifColorSpace: Int,
         software: String, dateTime: String?, icc: ByteArray?,
         packBits: Boolean, outPath: String,
         cancellationSignal: AtomicBoolean?,

@@ -877,12 +877,7 @@ suspend fun saveSimResultAsTiff(
     val float32 = descriptor.encoder == OutputEncoder.NATIVE_TIFF_FLOAT32
     val w = result.width
     val h = result.height
-    val nSamples = checkedRgbFloatByteCount(w, h, "TIFF export") / Float.SIZE_BYTES
-    val rgb16Bytes = try {
-        Math.multiplyExact(nSamples, Short.SIZE_BYTES)
-    } catch (failure: ArithmeticException) {
-        throw IllegalArgumentException("TIFF uint16 buffer size overflow", failure)
-    }
+    checkedRgbFloatByteCount(w, h, "TIFF export")
     val exportJob = currentCoroutineContext()[Job]
     fun ensureExportActive() {
         if (exportJob?.isActive == false) throw CancellationException("TIFF export cancelled")
@@ -914,32 +909,18 @@ suspend fun saveSimResultAsTiff(
                 }
             }
         } else {
-            // Quantise float [0,1] -> uint16 [0,65535] into an OFF-HEAP direct buffer (LE uint16).
-            // ByteBuffer.allocateDirect is a managed byte[] on Android — at 100 MP that's ~600 MB on
-            // the ~256 MB ART heap and OOMs. Allocate through the global native
-            // coordinator and fail closed on denial; bypassing into ART would
-            // violate the same hard ceiling. Freed after the writer consumes it.
-            val nativeOwner = NativeBufferOwner.allocate(rgb16Bytes.toLong())
-            val nativeLease = nativeOwner.acquireDataLease()
-            val rgb16Buf = nativeLease.data
-                .order(ByteOrder.LITTLE_ENDIAN)
-            try {
-                result.acquireDataLease().use { lease ->
-                    val data = lease.data
-                    val floatBuf = checkedRgbFloatWindow(data, w, h, "TIFF export")
-                    for (i in 0 until nSamples) {
-                        if ((i and 4095) == 0) ensureExportActive()
-                        val v = floatBuf.get(i).coerceIn(0f, 1f)
-                        val u16 = (v * 65535f + 0.5f).toInt().coerceIn(0, 65535)
-                        // Write as little-endian uint16 (low byte first).
-                        rgb16Buf.put((u16 and 0xFF).toByte())
-                        rgb16Buf.put(((u16 shr 8) and 0xFF).toByte())
-                    }
-                }
-                rgb16Buf.flip()
+            // 16-bit TIFF quantised INSIDE the writer, row by row, from the engine's
+            // float buffer. This used to quantise here into a second full image --
+            // 75 MB at 12.5 MP, and it had to be an off-heap native allocation
+            // because a direct ByteBuffer is a managed byte[] on Android and 100 MP
+            // would not fit the ART heap at all. Rounding is unchanged, so the file
+            // is byte-identical to what the uint16 entry point produced (#175).
+            result.acquireDataLease().use { lease ->
+                ensureExportActive()
+                val floatBuf = checkedRgbFloatByteWindow(lease.data, w, h, "TIFF export")
                 runCancellableTiffWrite { cancellation ->
-                    TiffWriter.write(
-                        rgb16 = rgb16Buf,
+                    TiffWriter.writeFloat16(
+                        rgbFloat = floatBuf,
                         width = w,
                         height = h,
                         outPath = tmpFile.absolutePath,
@@ -951,9 +932,6 @@ suspend fun saveSimResultAsTiff(
                         cancellation = cancellation,
                     )
                 }
-            } finally {
-                nativeLease.close()
-                nativeOwner.close()
             }
         }
 

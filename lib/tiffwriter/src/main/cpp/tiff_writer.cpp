@@ -854,6 +854,14 @@ TiffWriteResult writeTiff32fToFile(const float* rgbFloat, int width, int height,
     return publishAtomically(bytes, path, cancellation, std::move(res));
 }
 
+// Quantise float [0,1] -> LE uint16 bytes in ONE pass, straight into the strip.
+//
+// The old shape cost two full images on top of the engine's float buffer: a
+// uint16 plane, then the byte serialisation of it. At 12.5 MP that is 75 MB
+// twice, and a THIRD 75 MB before this existed, because the caller quantised in
+// Kotlin and handed the writer a uint16 buffer (#175). Rounding is unchanged --
+// same clamp, same +0.5 -- so the file is byte-identical to the uint16 entry
+// point and #126's container-identity level is untouched.
 TiffWriteResult writeTiffFloatToFile(const float* rgbFloat, int width, int height,
                                      const TiffMetadata& meta, TiffCompression compression,
                                      const std::string& path,
@@ -863,35 +871,39 @@ TiffWriteResult writeTiffFloatToFile(const float* rgbFloat, int width, int heigh
     if (rgbFloat == nullptr) { res.error = "null float buffer"; return res; }
     uint64_t rowSamples64 = 0;
     uint64_t rowBytes64 = 0;
-    uint64_t totalBytes64 = 0;
+    uint64_t rawStripBytes = 0;
     if (!imageLayout(width, height, 2u, rowSamples64, rowBytes64,
-                     totalBytes64, res.error) ||
-        !validateUncompressedLayout(totalBytes64, meta, res.error)) return res;
-    uint64_t sampleCount64 = 0;
-    if (!checkedMul(rowSamples64, static_cast<uint64_t>(height), sampleCount64) ||
-        sampleCount64 > static_cast<uint64_t>(SIZE_MAX)) {
-        res.error = "image sample count is too large";
-        return res;
-    }
+                     rawStripBytes, res.error) ||
+        !validateUncompressedLayout(rawStripBytes, meta, res.error)) return res;
     if (isCancelled(cancellation)) return cancelledResult();
 
     const size_t rowSamples = static_cast<size_t>(rowSamples64);
-    std::vector<uint16_t> q(static_cast<size_t>(sampleCount64));
+    std::vector<uint8_t> raw(static_cast<size_t>(rawStripBytes));
+    uint8_t* d = raw.data();
     for (int y = 0; y < height; ++y) {
         if (isCancelled(cancellation)) return cancelledResult();
-        const size_t rowStart = static_cast<size_t>(y) * rowSamples;
+        const float* row = rgbFloat + static_cast<size_t>(y) * rowSamples;
         for (size_t x = 0; x < rowSamples; ++x) {
             if ((x & 0x7fffu) == 0u && isCancelled(cancellation))
                 return cancelledResult();
-            const size_t i = rowStart + x;
-            const float v = rgbFloat[i];
-            if (!(v > 0.0f)) { q[i] = 0; continue; }
-            if (v >= 1.0f) { q[i] = 65535; continue; }
-            q[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+            const float v = row[x];
+            // NaN takes the first branch (every comparison with NaN is false),
+            // which is the same 0 the uint16 path produces for it.
+            uint16_t q;
+            if (!(v > 0.0f)) q = 0;
+            else if (v >= 1.0f) q = 65535;
+            else q = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+            *d++ = static_cast<uint8_t>(q & 0xFF);
+            *d++ = static_cast<uint8_t>((q >> 8) & 0xFF);
         }
     }
-    return writeTiff16ToFile(q.data(), width, height, meta, compression,
-                             path, cancellation);
+
+    std::vector<uint8_t> header;
+    std::vector<uint8_t> strip;
+    res = writeTiffSamplesToMemory(std::move(raw), width, height, 2, 1, meta,
+                                   compression, header, cancellation, &strip);
+    if (!res.ok) return res;
+    return publishAtomically(header, path, cancellation, std::move(res), &strip);
 }
 
 }  // namespace spectrafilm

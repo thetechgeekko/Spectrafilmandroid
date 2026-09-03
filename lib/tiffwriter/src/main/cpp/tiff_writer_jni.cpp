@@ -351,6 +351,42 @@ JNI_TIFF(jlong, nativeWriteShorts)(JNIEnv* env, jobject /*thiz*/, jshortArray rg
     });
 }
 
+// 16-bit TIFF written from the engine's FLOAT buffer: the quantisation happens
+// row by row inside the writer, so the caller never materialises a uint16 image
+// (#175 -- that buffer was 75 MB at 12.5 MP, on the managed heap).
+JNI_TIFF(jlong, nativeWriteFloat16Buffer)(JNIEnv* env, jobject /*thiz*/, jobject directBuffer,
+                                          jint width, jint height, jint exifColorSpace,
+                                          jstring software, jstring dateTime, jbyteArray iccBytes,
+                                          jboolean packBits, jstring outPath,
+                                          jobject cancellationSignal) {
+    return jniBoundary(env, [&]() -> jlong {
+        void* address = nullptr;
+        if (!validateDirectBuffer(env, directBuffer, width, height, 4u,
+                                  alignof(float), address)) return 0;
+
+        spectrafilm::TiffMetadata meta;
+        std::string path;
+        if (!outputPathValue(env, outPath, path)) return 0;
+
+        JavaCancellation javaCancellation;
+        if (!javaCancellation.initialise(env, cancellationSignal)) return 0;
+        if (javaCancellation.cancelledNow()) {
+            if (!javaCancellation.callbackFailed()) throwCancelled(env);
+            return 0;
+        }
+        if (!buildMeta(env, software, dateTime, exifColorSpace, iccBytes, meta)) return 0;
+        spectrafilm::TiffCancellation cancellation{&javaCancellation, JavaCancellation::poll};
+        const spectrafilm::TiffCancellation* cancellationPtr =
+            javaCancellation.present() ? &cancellation : nullptr;
+        const spectrafilm::TiffWriteResult result = spectrafilm::writeTiffFloatToFile(
+            static_cast<const float*>(address), width, height, meta,
+            compression(packBits), path, cancellationPtr);
+        if (javaCancellation.callbackFailed() || env->ExceptionCheck()) return 0;
+        if (!result.ok) { throwResult(env, result); return 0; }
+        return static_cast<jlong>(result.bytesWritten);
+    });
+}
+
 JNI_TIFF(jlong, nativeWriteFloatBuffer)(JNIEnv* env, jobject /*thiz*/, jobject directBuffer,
                                         jint width, jint height, jint exifColorSpace,
                                         jstring software, jstring dateTime, jbyteArray iccBytes,
