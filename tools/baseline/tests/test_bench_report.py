@@ -279,6 +279,16 @@ class GateTest(unittest.TestCase):
         capture["schema"] = "spk.bench_capture.v0"
         self.assertEqual(2, run(capture))
 
+    def test_a_smoke_capture_warns_that_it_has_no_thermal_governance(self):
+        # The harness applies the idle and the thermal wait only when gating, so a
+        # smoke capture drifts as the device heats. Comparing one against a gated
+        # baseline reads a thermal effect as a code regression.
+        capture = load_fixture()
+        capture["protocol"]["smoke"] = True
+        report = bench_report.render(capture, CORPUS)
+        self.assertIn("No thermal governance", report)
+        self.assertNotIn("No thermal governance", bench_report.render(load_fixture(), CORPUS))
+
     def test_report_names_the_capture_kind(self):
         capture = load_fixture()
         report = bench_report.render(capture, CORPUS)

@@ -2798,36 +2798,66 @@ re-baselined once, deliberately, against a pinned compressor configuration.
 The conclusion is that no multi-format library wins this: the cost is in DEFLATE
 and in what we feed it, and both are already in our hands.
 
-### 21.6 On the device, and a correction to 21.2
+### 21.6 On the device, and two corrections
 
-SM-S948W, API 36, unplugged, release build `e117db8f`, one render per cell/format
-(a reinstall invalidates the export cache, so every sample re-encoded). Baseline
-columns are the #119 capture.
+SM-S948W, API 36, unplugged, release build `e117db8f`. **Five independent
+captures**, one render per cell/format each; reinstalling the APK between captures
+changes `lastUpdateTime`, which is folded into the export cache's contract version,
+so every sample re-encoded rather than being served.
 
-| cell | format | encode before | encode now | speedup | file before | file now |
+The five captures are not equivalent, and that is the first thing to understand
+about them:
+
+| capture | BASE PNG16 | BASE TIFF16 | HEAVY PNG16 | HEAVY TIFF16 | battery |
+|---|---:|---:|---:|---:|---:|
+| 1 | 432 | 1058 | 1234 | 1227 | 26% |
+| 2 | **405** | **1044** | **1216** | 1258 | 25% |
+| 3 | 491 | 1404 | 1741 | 1641 | 24% |
+| 4 | 608 | 1538 | 1807 | 1621 | 24% |
+| 5 | 580 | 1533 | 1740 | 1622 | 23% |
+
+Everything slows by ~40% from the third capture onward, across formats that share
+no code. That is the device heating up: `runs=1` is below `gate_runs`, and the
+harness applies the protocol idle and the per-sample thermal wait **only when it
+is gating**. A smoke capture therefore has no cool-down at all, and fifteen minutes
+of back-to-back 12 MP renders walks the SoC into throttling. `bench_report` now
+prints that warning on any smoke capture, because this is easy to read as a code
+regression.
+
+Comparing the cool captures (1-2) against the #119 baseline, which was thermally
+gated:
+
+| cell | format | baseline p50 | now (cool) | speedup | file before | file now |
 |---|---|---:|---:|---:|---:|---:|
-| BASE | PNG16 | 1705 ms | **432 ms** | **3.95x** | 13.2 MB | **11.0 MB** |
-| HEAVY | PNG16 | 4316 ms | **1234 ms** | **3.50x** | 66.3 MB | **58.1 MB** |
-| BASE | TIFF16 | 1154 ms | 1058 ms | 1.09x | 71.4 MB | 71.4 MB |
-| HEAVY | TIFF16 | 1189 ms | 1227 ms | 0.97x | 71.4 MB | 71.4 MB |
+| BASE | PNG16 | 1705 ms | **405-432 ms** | **3.9-4.2x** | 13.2 MB | **11.0 MB** |
+| HEAVY | PNG16 | 4316 ms | **1216-1234 ms** | **3.5x** | 66.3 MB | **58.1 MB** |
+| BASE | TIFF16 | 1154 ms | 1044-1058 ms | 1.09-1.11x | 71.4 MB | 71.4 MB |
+| HEAVY | TIFF16 | 1189 ms | 1227-1258 ms | 0.94-0.97x | 71.4 MB | 71.4 MB |
 
-Host predicted 5.8x for PNG16 and the device gives 3.5-4.0x, which is what a
-4+4 big.LITTLE phone should give against a 24-core desktop: the little cores
-finish their bands later. TIFF is unchanged in time, as expected -- the two-span
-write is a memory change, and an uncompressed strip's cost is the write itself.
+Host predicted 5.8x for PNG16 and a cool device gives 3.5-4.2x, which is what a
+4+4 big.LITTLE phone should give against a 24-core desktop. TIFF is unchanged
+either way, as expected: the two-span write is a memory change, and an
+uncompressed strip's cost is the write itself. Even in the throttled captures
+PNG16 is still 2.5-2.8x faster than the baseline, so the win does not depend on a
+cool device -- only its size does.
 
-**The correction.** 21.2 quotes a synthetic smooth gradient where filter 2 took
-71.3 MB to 0.6 MB. That number is real but it is NOT representative: the app's own
-renders already compressed well (BASE PNG16 was 13.2 MB of a 71.4 MB raw image in
-the #119 baseline), because a film render is not a synthetic gradient. On real
-output filtering is worth **12-17%**, in line with the ~9% measured on the pulled
-export in 21.2 and nothing like two orders of magnitude. The speed win is the part
-that transferred.
+**Correction 1: the synthetic filter number.** 21.2 quotes a smooth gradient where
+filter 2 took 71.3 MB to 0.6 MB. That measurement is real but it is NOT
+representative, and leading with it overstated the case: the app's renders already
+compressed well (BASE PNG16 was 13.2 MB of a 71.4 MB raw image in the #119
+baseline), because a film render is not a synthetic gradient. On real output
+filtering is worth **12-17%**, in line with the ~9% measured on a pulled export.
+The speed win is the part that transferred.
 
-One number in this capture looks wrong and is not: HEAVY/JPEG_Q95 encode reads
-185 ms against a 110 ms baseline. JPEG does not go through the PNG writer at all;
-this is n = 1 after a 13-second render, i.e. a hot SoC, and the baseline figure is
-a p50 over five runs. It is noise, not a regression -- but it is exactly why n = 1
-is a smoke measurement and the reporter refuses to gate one.
+**Correction 2: JPEG is not slower.** A first single-capture reading had
+HEAVY/JPEG_Q95 at 185 ms against a 110 ms baseline and it was dismissed as noise.
+It is not noise, and it is not a regression either: JPEG never touches the PNG
+writer, and the effect is the same thermal drift above -- a JPEG encode that
+follows a 13-second HEAVY render on an ungoverned capture runs hot. Any comparison
+of the SHORT phases across these captures is invalid; only PNG16, where the change
+is multiples rather than percents, survives the contamination.
+
+A properly gated capture is still owed, and needs the phone charged past the 50%
+Tier A floor.
 
 *Film modeling powered by spektrafilm (GPLv3).*

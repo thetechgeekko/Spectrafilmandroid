@@ -298,6 +298,18 @@ def render(capture: dict, corpus: dict) -> str:
     app, device = capture["app"], capture["device"]
     protocol = capture["protocol"]
     lines.append(f"# Export benchmark capture ({'SMOKE' if protocol.get('smoke') else 'BASELINE'})")
+    if protocol.get("smoke"):
+        # A smoke capture runs below gate_runs, and the harness only applies the
+        # protocol idle and the per-sample thermal wait when it is gating. So a
+        # smoke run has NO cool-down at all: five back-to-back captures on a real
+        # device drifted ~40% slower from the third one onward, which reads as a
+        # regression if compared against a thermally gated baseline. Say so in the
+        # report rather than leaving it to be rediscovered.
+        lines.append("")
+        lines.append("> **No thermal governance in this capture.** Smoke runs skip the protocol "
+                     "idle and the per-sample thermal wait, so later samples run hotter than "
+                     "earlier ones. Compare within this capture's coolest samples, never "
+                     "against a gated baseline's p50.")
     lines.append("")
     lines.append(f"- app `{app.get('version_name')}` ({app.get('version_code')}), "
                  f"APK `{str(app.get('apk_sha256', ''))[:16]}...`")
