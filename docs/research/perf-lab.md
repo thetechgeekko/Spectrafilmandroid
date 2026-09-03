@@ -2798,4 +2798,36 @@ re-baselined once, deliberately, against a pinned compressor configuration.
 The conclusion is that no multi-format library wins this: the cost is in DEFLATE
 and in what we feed it, and both are already in our hands.
 
+### 21.6 On the device, and a correction to 21.2
+
+SM-S948W, API 36, unplugged, release build `e117db8f`, one render per cell/format
+(a reinstall invalidates the export cache, so every sample re-encoded). Baseline
+columns are the #119 capture.
+
+| cell | format | encode before | encode now | speedup | file before | file now |
+|---|---|---:|---:|---:|---:|---:|
+| BASE | PNG16 | 1705 ms | **432 ms** | **3.95x** | 13.2 MB | **11.0 MB** |
+| HEAVY | PNG16 | 4316 ms | **1234 ms** | **3.50x** | 66.3 MB | **58.1 MB** |
+| BASE | TIFF16 | 1154 ms | 1058 ms | 1.09x | 71.4 MB | 71.4 MB |
+| HEAVY | TIFF16 | 1189 ms | 1227 ms | 0.97x | 71.4 MB | 71.4 MB |
+
+Host predicted 5.8x for PNG16 and the device gives 3.5-4.0x, which is what a
+4+4 big.LITTLE phone should give against a 24-core desktop: the little cores
+finish their bands later. TIFF is unchanged in time, as expected -- the two-span
+write is a memory change, and an uncompressed strip's cost is the write itself.
+
+**The correction.** 21.2 quotes a synthetic smooth gradient where filter 2 took
+71.3 MB to 0.6 MB. That number is real but it is NOT representative: the app's own
+renders already compressed well (BASE PNG16 was 13.2 MB of a 71.4 MB raw image in
+the #119 baseline), because a film render is not a synthetic gradient. On real
+output filtering is worth **12-17%**, in line with the ~9% measured on the pulled
+export in 21.2 and nothing like two orders of magnitude. The speed win is the part
+that transferred.
+
+One number in this capture looks wrong and is not: HEAVY/JPEG_Q95 encode reads
+185 ms against a 110 ms baseline. JPEG does not go through the PNG writer at all;
+this is n = 1 after a 13-second render, i.e. a hot SoC, and the baseline figure is
+a p50 over five runs. It is noise, not a regression -- but it is exactly why n = 1
+is a smoke measurement and the reporter refuses to gate one.
+
 *Film modeling powered by spektrafilm (GPLv3).*
