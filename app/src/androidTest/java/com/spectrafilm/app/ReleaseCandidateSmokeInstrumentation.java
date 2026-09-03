@@ -55,6 +55,7 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
     private static final String ARG_TICKET177_SOURCE = "ticket177_source";
     private static final String ARG_TICKET177_RUNS = "ticket177_runs";
     private static final String ARG_TICKET177_CELLS = "ticket177_cells";
+    private static final String ARG_TICKET177_BYPASS_CACHE = "ticket177_bypass_cache";
     private static final String ARG_TICKET177_EXPECT_APP_SHA256 =
             "ticket177_expect_app_sha256";
 
@@ -215,7 +216,8 @@ public final class ReleaseCandidateSmokeInstrumentation extends Instrumentation 
                         "ticket177_expect_app_sha256 must be exactly 64 hex digits");
                 final String stream = Ticket177BenchmarkChecks.run(
                         getTargetContext(), corpus, source, runs,
-                        arguments.getString(ARG_TICKET177_CELLS, ""), expectedApp);
+                        arguments.getString(ARG_TICKET177_CELLS, ""), expectedApp,
+                        "1".equals(arguments.getString(ARG_TICKET177_BYPASS_CACHE, "0")));
                 results.putString("stream", stream);
                 if (!stream.contains("TICKET177_BENCH: PASS\n")) {
                     finish(Activity.RESULT_CANCELED, results);

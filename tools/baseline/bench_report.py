@@ -298,6 +298,11 @@ def render(capture: dict, corpus: dict) -> str:
     app, device = capture["app"], capture["device"]
     protocol = capture["protocol"]
     lines.append(f"# Export benchmark capture ({'SMOKE' if protocol.get('smoke') else 'BASELINE'})")
+    if protocol.get("cache_bypassed"):
+        lines.append("")
+        lines.append("> **Export cache bypassed.** Every sample encoded, so these are ENCODER "
+                     "timings. This capture cannot support an SLO claim, which is a claim "
+                     "about the cache-hit path.")
     if protocol.get("smoke"):
         # A smoke capture runs below gate_runs, and the harness only applies the
         # protocol idle and the per-sample thermal wait when it is gating. So a

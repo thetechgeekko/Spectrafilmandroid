@@ -67,6 +67,7 @@ object Ticket177BenchmarkChecks {
         runs: Int,
         cellFilter: String,
         expectedAppSha256: String,
+        bypassCache: Boolean,
     ): String {
         val corpus = JSONObject(String(readAllBytes(File(corpusPath)), Charsets.UTF_8))
         require(corpus.optString("schema") == "spk.bench_corpus.v1") {
@@ -97,7 +98,14 @@ object Ticket177BenchmarkChecks {
                 .put("requested_runs", runs)
                 .put("gate_runs", gateRuns)
                 // The host refuses to publish a baseline from a capture marked smoke.
-                .put("smoke", runs < gateRuns))
+                .put("smoke", runs < gateRuns)
+                // #175: a gated ENCODE measurement needs every sample to encode.
+                // Without this the second and later runs of a cell/format are cache
+                // hits that skip the encoder entirely, so the only way to repeat an
+                // encode was to reinstall between captures -- which meant giving up
+                // the protocol idle and the thermal wait, and those are exactly what
+                // a comparable measurement needs.
+                .put("cache_bypassed", bypassCache))
 
         // Create the engine once up front, exactly like the editor does before its first
         // render: asset wiring is process setup, not part of any measured export.
@@ -132,6 +140,7 @@ object Ticket177BenchmarkChecks {
                     val sample = measure(
                         context, cell, entry.value, entry.key, sourcePath, index,
                         cold = firstRender, thermalWait = cooled,
+                        bypassCache = bypassCache,
                     )
                     firstRender = false
                     samples.put(sample)
@@ -166,6 +175,7 @@ object Ticket177BenchmarkChecks {
         index: Int,
         cold: Boolean,
         thermalWait: JSONObject,
+        bypassCache: Boolean = false,
     ): JSONObject {
         val state = stateFor(context, cell)
         val params = state.toParams()
@@ -210,7 +220,7 @@ object Ticket177BenchmarkChecks {
         Debug.getMemoryInfo(Debug.MemoryInfo())
         val startMs = System.currentTimeMillis()
 
-        val hit = cacheKey?.let { cache.get(it) }
+        val hit = if (bypassCache) null else cacheKey?.let { cache.get(it) }
         if (hit != null) {
             val servedName = "spk-bench-" + cell.getString("id") + "-" + formatId + "-" + index
             val servedUri = ExportClock.pinned(PINNED_CLOCK_MILLIS) {
@@ -270,7 +280,9 @@ object Ticket177BenchmarkChecks {
         var encodeMs = 0L
         val name = "spk-bench-${cell.getString("id")}-$formatId-$index"
         val adopt: (File, Long, String) -> Unit = { file, len, sha ->
-            cacheKey?.let { cache.adopt(it, file, len, sha) }
+            // A bypassed capture must not populate the cache either, or the next
+            // sample would find the entry this one just wrote.
+            if (!bypassCache) cacheKey?.let { cache.adopt(it, file, len, sha) }
         }
         val published: Uri
         val result = try {

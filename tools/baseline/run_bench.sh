@@ -18,6 +18,12 @@ SERIAL=${4:-}
 # vanish entirely and `am` would read the next token as the value of -e ticket177_cells.
 # Both instrument invocations below therefore quote it for that second parse.
 
+# SPK_BENCH_BYPASS_CACHE=1 makes every sample encode instead of being served from
+# the export cache. Use it to measure the ENCODER under the full protocol (idle +
+# thermal wait); leave it off for an SLO capture, which is precisely a measurement
+# OF the cache-hit path.
+BYPASS_CACHE=${SPK_BENCH_BYPASS_CACHE:-0}
+
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # adb is a native binary: hand it native paths for LOCAL files (on Git Bash a /c/...
 # path is not a path at all once MSYS conversion is off).
@@ -80,6 +86,7 @@ if [ "${SPK_BENCH_DETACH:-0}" = "1" ]; then
     -e ticket177_source '$DEVICE_DIR/bench-source.png' \
     -e ticket177_runs $RUNS \
     -e ticket177_cells '$CELLS' \
+    -e ticket177_bypass_cache $BYPASS_CACHE \
     -e ticket177_expect_app_sha256 $APP_SHA \
     $PKG.test/$PKG.ReleaseCandidateSmokeInstrumentation \
     > /data/local/tmp/t177-instr.txt 2>&1 &" </dev/null
@@ -101,6 +108,7 @@ else
     -e ticket177_source "$DEVICE_DIR/bench-source.png" \
     -e ticket177_runs "$RUNS" \
     -e ticket177_cells "'$CELLS'" \
+    -e ticket177_bypass_cache "$BYPASS_CACHE" \
     -e ticket177_expect_app_sha256 "$APP_SHA" \
     $PKG.test/$PKG.ReleaseCandidateSmokeInstrumentation | tee "$OUT/instrumentation.txt"
 fi

@@ -289,6 +289,16 @@ class GateTest(unittest.TestCase):
         self.assertIn("No thermal governance", report)
         self.assertNotIn("No thermal governance", bench_report.render(load_fixture(), CORPUS))
 
+    def test_a_cache_bypassed_capture_says_it_cannot_support_an_slo_claim(self):
+        capture = load_fixture()
+        capture["protocol"]["cache_bypassed"] = True
+        report = bench_report.render(capture, CORPUS)
+        self.assertIn("Export cache bypassed", report)
+        # And the SLO check must not be satisfiable from it either.
+        capture["samples"] = [dict(s, served_from_cache=False) for s in capture["samples"]]
+        findings = bench_report.slo_findings(capture, CORPUS)
+        self.assertTrue(any("no cache-hit" in f for f in findings), findings)
+
     def test_report_names_the_capture_kind(self):
         capture = load_fixture()
         report = bench_report.render(capture, CORPUS)
