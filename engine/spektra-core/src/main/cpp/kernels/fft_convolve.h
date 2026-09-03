@@ -87,6 +87,13 @@ bool fft_convolve_same_denied_scratch_for_test(
     const double* padded, int pw, int ph, const double* kern, int ks,
     int w, int h, double* out, int out_stride, int out_offset,
     int max_transform = kFftConvMaxTransform);
+
+// Runs the transform size the caller names instead of the cost-selected one, so a
+// bench can time a size the model REJECTED. Without it the model can only be
+// checked against itself: fft_convolve_same never runs a size it did not pick.
+bool fft_convolve_same_forced_n_for_test(
+    const double* padded, int pw, int ph, const double* kern, int ks,
+    int w, int h, double* out, int out_stride, int out_offset, int forced_n);
 #endif
 
 // The transform size fft_convolve_same would choose. Exposed for tests and for

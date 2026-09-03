@@ -165,15 +165,20 @@ static bool fft_convolve_same_impl(const double* padded, int pw, int ph,
                                    int w, int h,
                                    double* out, int out_stride, int out_offset,
                                    int max_transform,
-                                   bool deny_scratch_for_test) {
+                                   bool deny_scratch_for_test,
+                                   int forced_n) {
     if (!padded || !kern || !out) return false;
     if (ks < 1 || (ks % 2) == 0) return false;          // odd kernels only
     if (w < 1 || h < 1) return false;
     if (pw != w + ks - 1 || ph != h + ks - 1) return false;
     if (out_stride < 1 || out_offset < 0 || out_offset >= out_stride) return false;
 
-    const int n = fft_convolve_transform_size(w, h, ks, max_transform);
-    if (n < ks + 1) return false;
+    // forced_n is the measurement seam: it runs a transform the cost model would
+    // have REJECTED, which is the only way to check the model's ranking against a
+    // stopwatch rather than against itself. Zero everywhere else.
+    const int n = forced_n > 0 ? forced_n
+                              : fft_convolve_transform_size(w, h, ks, max_transform);
+    if (n < ks + 1 || (n & (n - 1)) != 0) return false;
     const int block = n - ks + 1;                        // exact outputs per tile
     const int bins  = n / 2 + 1;                         // kept Hermitian columns
     const size_t spec_sz  = static_cast<size_t>(n) * bins * 2;
@@ -261,7 +266,7 @@ bool fft_convolve_same(const double* padded, int pw, int ph,
                        int max_transform) {
     return fft_convolve_same_impl(
         padded, pw, ph, kern, ks, w, h, out, out_stride, out_offset,
-        max_transform, /*deny_scratch_for_test=*/false);
+        max_transform, /*deny_scratch_for_test=*/false, /*forced_n=*/0);
 }
 
 #if defined(SPK_FFT_CONVOLVE_TEST_HOOKS)
@@ -271,7 +276,16 @@ bool fft_convolve_same_denied_scratch_for_test(
         int max_transform) {
     return fft_convolve_same_impl(
         padded, pw, ph, kern, ks, w, h, out, out_stride, out_offset,
-        max_transform, /*deny_scratch_for_test=*/true);
+        max_transform, /*deny_scratch_for_test=*/true, /*forced_n=*/0);
+}
+
+bool fft_convolve_same_forced_n_for_test(
+        const double* padded, int pw, int ph, const double* kern, int ks,
+        int w, int h, double* out, int out_stride, int out_offset,
+        int forced_n) {
+    return fft_convolve_same_impl(
+        padded, pw, ph, kern, ks, w, h, out, out_stride, out_offset,
+        forced_n, /*deny_scratch_for_test=*/false, forced_n);
 }
 #endif
 
