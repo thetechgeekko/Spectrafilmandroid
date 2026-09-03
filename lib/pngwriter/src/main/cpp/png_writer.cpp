@@ -168,6 +168,31 @@ public:
                                  : "cannot write temporary output";
             return false;
         }
+        written_ += size;
+        return true;
+    }
+
+    // Bytes written so far, i.e. the offset the next write lands at.
+    uint64_t offset() const noexcept { return written_; }
+
+    // Overwrite bytes already written, without disturbing the append position.
+    // A streamed IDAT does not know its own length until the last row is
+    // compressed, so the length field is written as a placeholder and patched
+    // here (#175).
+    bool patchAt(uint64_t offset, const uint8_t* data, size_t size,
+                 std::string& error) {
+        size_t done = 0;
+        while (done < size) {
+            const ssize_t written = ::pwrite(fd_, data + done, size - done,
+                                             static_cast<off_t>(offset + done));
+            if (written > 0) {
+                done += static_cast<size_t>(written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR) continue;
+            error = "cannot patch temporary output";
+            return false;
+        }
         return true;
     }
 
@@ -206,6 +231,7 @@ public:
 
 private:
     int fd_ = -1;
+    uint64_t written_ = 0;
     std::string path_;
     bool committed_ = false;
 };
@@ -380,9 +406,36 @@ static ZlibStatus zlibCompress(const uint8_t* src, size_t srcLen,
 // where the input is split cannot change the output. tests/test_png_writer.cpp
 // asserts that byte-for-byte, because PNG16 container identity is a gated
 // contract, not a preference.
+// Where compressed IDAT bytes go as they are produced: into a vector for the
+// in-memory encode, or straight to the file for the streaming one.
+class IdatSink {
+public:
+    virtual ~IdatSink() = default;
+    virtual bool take(const uint8_t* data, size_t len, std::string& errOut) = 0;
+    // Bytes accepted so far, checked against the PNG chunk limit.
+    virtual uint64_t accepted() const = 0;
+    // A failed or cancelled encode must publish nothing.
+    virtual void discard() = 0;
+};
+
+class VectorIdatSink final : public IdatSink {
+public:
+    explicit VectorIdatSink(std::vector<uint8_t>& dst) noexcept : dst_(dst) {}
+    bool take(const uint8_t* data, size_t len, std::string&) override {
+        dst_.insert(dst_.end(), data, data + len);
+        return true;
+    }
+    uint64_t accepted() const override { return dst_.size(); }
+    void discard() override { dst_.clear(); }
+    void reserve(size_t bytes) { dst_.reserve(bytes); }
+
+private:
+    std::vector<uint8_t>& dst_;
+};
+
 class IdatDeflater final {
 public:
-    IdatDeflater(std::vector<uint8_t>& dst, const PngCancellation* cancellation) noexcept
+    IdatDeflater(IdatSink& dst, const PngCancellation* cancellation) noexcept
         : dst_(dst), cancellation_(cancellation) {}
 
     IdatDeflater(const IdatDeflater&) = delete;
@@ -392,20 +445,12 @@ public:
         if (open_) deflateEnd(&stream_);
     }
 
-    // [totalInputBytes] is only a sizing hint: without it the output vector grows
-    // geometrically and its reallocation transiently holds two copies, which on a
-    // 12.5 MP frame costs more than the buffer this class exists to remove.
-    bool init(uint64_t totalInputBytes, std::string& errOut) {
+    bool init(std::string& errOut) {
         if (deflateInit(&stream_, Z_DEFAULT_COMPRESSION) != Z_OK) {
             errOut = "zlib initialisation failed";
             return false;
         }
         open_ = true;
-        if (totalInputBytes > 0 &&
-            totalInputBytes <= static_cast<uint64_t>(std::numeric_limits<uLong>::max())) {
-            const uLong bound = compressBound(static_cast<uLong>(totalInputBytes));
-            if (bound <= kPngMaxChunkLength) dst_.reserve(static_cast<size_t>(bound));
-        }
         return true;
     }
 
@@ -419,29 +464,32 @@ public:
 
 private:
     ZlibStatus run(const uint8_t* data, size_t len, int flush, std::string& errOut) {
-        if (isCancelled(cancellation_)) { dst_.clear(); return ZlibStatus::Cancelled; }
+        if (isCancelled(cancellation_)) { dst_.discard(); return ZlibStatus::Cancelled; }
         stream_.next_in = len == 0
             ? Z_NULL
             : const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data));
         stream_.avail_in = static_cast<uInt>(len);
         int rc = Z_OK;
         do {
-            if (isCancelled(cancellation_)) { dst_.clear(); return ZlibStatus::Cancelled; }
+            if (isCancelled(cancellation_)) { dst_.discard(); return ZlibStatus::Cancelled; }
             stream_.next_out = reinterpret_cast<Bytef*>(output_.data());
             stream_.avail_out = static_cast<uInt>(output_.size());
             rc = deflate(&stream_, flush);
             if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
-                dst_.clear();
+                dst_.discard();
                 errOut = "zlib deflate failed";
                 return ZlibStatus::Failed;
             }
             const size_t produced = output_.size() - stream_.avail_out;
-            if (produced > kPngMaxChunkLength - dst_.size()) {
-                dst_.clear();
+            if (produced > kPngMaxChunkLength - dst_.accepted()) {
+                dst_.discard();
                 errOut = "compressed PNG chunk exceeds format limits";
                 return ZlibStatus::Failed;
             }
-            dst_.insert(dst_.end(), output_.data(), output_.data() + produced);
+            if (produced != 0 && !dst_.take(output_.data(), produced, errOut)) {
+                dst_.discard();
+                return ZlibStatus::Failed;
+            }
         } while (stream_.avail_in != 0 || stream_.avail_out == 0 ||
                  (flush == Z_FINISH && rc != Z_STREAM_END));
         return ZlibStatus::Ok;
@@ -449,7 +497,7 @@ private:
 
     z_stream stream_{};
     bool open_ = false;
-    std::vector<uint8_t>& dst_;
+    IdatSink& dst_;
     const PngCancellation* cancellation_ = nullptr;
     std::array<uint8_t, 64u * 1024u> output_{};
 };
@@ -504,30 +552,16 @@ private:
 
 // ---- writePng16ToMemory ----------------------------------------------------
 
-// The whole encoder, driven one scanline at a time. Both public entry points are
-// thin wrappers: writePng16ToMemory hands it rows of the caller's buffer, and the
-// float entry hands it rows it quantizes on the way past, so neither a filtered
-// image nor a quantized copy is ever allocated in full (#175).
-static PngWriteResult writePngRows(RowSource& rows, int width, int height,
-                                   const PngMetadata& meta,
-                                   std::vector<uint8_t>& outBytes,
-                                   const PngCancellation* cancellation) {
-    PngWriteResult res;
-    outBytes.clear();
-    MemoryOutputGuard outputGuard(outBytes);
+// Signature, IHDR and the optional iCCP / tEXt chunks. Shared so the in-memory
+// encoder and the streaming file encoder cannot drift apart in what they emit
+// before the image data (#175).
+enum class HeaderStatus { Ok, Failed, Cancelled };
 
-    uint64_t rowSamples64 = 0;
-    uint64_t rowBytes64 = 0;
-    uint64_t filtBufSize64 = 0;
-    if (!imageLayout(width, height, 2u, rowSamples64, rowBytes64,
-                     filtBufSize64, res.error)) return res;
-    if (isCancelled(cancellation)) return cancelledResult();
-
-    auto cancelWithoutPublication = [&outBytes]() {
-        outBytes.clear();
-        return cancelledResult();
-    };
-
+static HeaderStatus appendPngHeaderChunks(std::vector<uint8_t>& outBytes,
+                                          int width, int height,
+                                          const PngMetadata& meta,
+                                          std::string& error,
+                                          const PngCancellation* cancellation) {
     // ---- 1. PNG signature --------------------------------------------------
     // \x89 P N G \r \n \x1a \n  (RFC 2083 §5.2)
     static const uint8_t kSig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
@@ -554,9 +588,9 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
         ihdr[11] = 0;   // filter method 0 (only defined value)
         ihdr[12] = 0;   // interlace = 0 (no interlace)
         const AppendStatus status = appendChunk(
-            outBytes, "IHDR", ihdr, 13, res.error, cancellation);
-        if (status == AppendStatus::Cancelled) return cancelWithoutPublication();
-        if (status == AppendStatus::Failed) return res;
+            outBytes, "IHDR", ihdr, 13, error, cancellation);
+        if (status == AppendStatus::Cancelled) return HeaderStatus::Cancelled;
+        if (status == AppendStatus::Failed) return HeaderStatus::Failed;
     }
 
     // ---- 3. iCCP chunk (optional: non-empty iccProfile) --------------------
@@ -568,12 +602,12 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
         const ZlibStatus iccStatus = zlibCompress(
             meta.iccProfile.data(), meta.iccProfile.size(), compressedIcc,
             zlibErr, cancellation);
-        if (iccStatus == ZlibStatus::Cancelled) return cancelWithoutPublication();
+        if (iccStatus == ZlibStatus::Cancelled) return HeaderStatus::Cancelled;
         if (iccStatus == ZlibStatus::Failed) {
-            res.error = "iCCP: " + zlibErr;
-            return res;
+            error = "iCCP: " + zlibErr;
+            return HeaderStatus::Failed;
         }
-        if (isCancelled(cancellation)) return cancelWithoutPublication();
+        if (isCancelled(cancellation)) return HeaderStatus::Cancelled;
 
         // Assemble iCCP chunk data.
         static const char kProfileName[] = "ICC Profile";  // including NUL
@@ -586,9 +620,9 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
         iccpData.push_back(0);  // compression method = 0 (zlib)
         iccpData.insert(iccpData.end(), compressedIcc.begin(), compressedIcc.end());
         const AppendStatus status = appendChunk(
-            outBytes, "iCCP", iccpData, res.error, cancellation);
-        if (status == AppendStatus::Cancelled) return cancelWithoutPublication();
-        if (status == AppendStatus::Failed) return res;
+            outBytes, "iCCP", iccpData, error, cancellation);
+        if (status == AppendStatus::Cancelled) return HeaderStatus::Cancelled;
+        if (status == AppendStatus::Failed) return HeaderStatus::Failed;
     }
 
     // ---- 4. tEXt chunk (optional: non-empty software) ----------------------
@@ -602,9 +636,43 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
                        reinterpret_cast<const uint8_t*>(kKeyword) + sizeof(kKeyword));
         txtData.insert(txtData.end(), meta.software.begin(), meta.software.end());
         const AppendStatus status = appendChunk(
-            outBytes, "tEXt", txtData, res.error, cancellation);
-        if (status == AppendStatus::Cancelled) return cancelWithoutPublication();
-        if (status == AppendStatus::Failed) return res;
+            outBytes, "tEXt", txtData, error, cancellation);
+        if (status == AppendStatus::Cancelled) return HeaderStatus::Cancelled;
+        if (status == AppendStatus::Failed) return HeaderStatus::Failed;
+    }
+
+    return HeaderStatus::Ok;
+}
+
+// The whole encoder, driven one scanline at a time. Both public entry points are
+// thin wrappers: writePng16ToMemory hands it rows of the caller's buffer, and the
+// float entry hands it rows it quantizes on the way past, so neither a filtered
+// image nor a quantized copy is ever allocated in full (#175).
+static PngWriteResult writePngRows(RowSource& rows, int width, int height,
+                                   const PngMetadata& meta,
+                                   std::vector<uint8_t>& outBytes,
+                                   const PngCancellation* cancellation) {
+    PngWriteResult res;
+    outBytes.clear();
+    MemoryOutputGuard outputGuard(outBytes);
+
+    uint64_t rowSamples64 = 0;
+    uint64_t rowBytes64 = 0;
+    uint64_t filtBufSize64 = 0;
+    if (!imageLayout(width, height, 2u, rowSamples64, rowBytes64,
+                     filtBufSize64, res.error)) return res;
+    if (isCancelled(cancellation)) return cancelledResult();
+
+    auto cancelWithoutPublication = [&outBytes]() {
+        outBytes.clear();
+        return cancelledResult();
+    };
+
+    switch (appendPngHeaderChunks(outBytes, width, height, meta, res.error,
+                                  cancellation)) {
+        case HeaderStatus::Cancelled: return cancelWithoutPublication();
+        case HeaderStatus::Failed:    return res;
+        case HeaderStatus::Ok:        break;
     }
 
     // ---- 5. IDAT chunk: build filtered scanline buffer, then deflate -------
@@ -628,8 +696,16 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
         std::vector<uint8_t> filteredRow(static_cast<size_t>(rowBytes64) + 1u);
         std::string zlibErr;
         {
-            IdatDeflater deflater(idatData, cancellation);
-            if (!deflater.init(filtBufSize64, res.error)) return res;
+            VectorIdatSink sink(idatData);
+            if (filtBufSize64 > 0 &&
+                filtBufSize64 <= static_cast<uint64_t>(std::numeric_limits<uLong>::max())) {
+                // Sizing hint only: without it the vector grows geometrically and its
+                // reallocation transiently holds two copies of the compressed image.
+                const uLong bound = compressBound(static_cast<uLong>(filtBufSize64));
+                if (bound <= kPngMaxChunkLength) sink.reserve(static_cast<size_t>(bound));
+            }
+            IdatDeflater deflater(sink, cancellation);
+            if (!deflater.init(res.error)) return res;
             for (int y = 0; y < height; ++y) {
                 if (isCancelled(cancellation)) return cancelWithoutPublication();
                 const uint16_t* src = rows.row(y);
@@ -732,17 +808,159 @@ static PngWriteResult writeBytesToPath(const std::vector<uint8_t>& bytes,
     return res;
 }
 
+// Compressed IDAT bytes straight to the temporary file, with the chunk CRC
+// accumulated as they go. Nothing image-sized is retained: at 12.5 MP this is what
+// removes the ~75 MB compressed buffer AND the ~75 MB assembled file (#175).
+class FileIdatSink final : public IdatSink {
+public:
+    FileIdatSink(TempOutput& out, std::string& error) noexcept
+        : out_(out), error_(error) {
+        crc_ = crc32(0L, Z_NULL, 0);
+        crc_ = crc32(crc_, reinterpret_cast<const Bytef*>("IDAT"), 4);
+    }
+
+    bool take(const uint8_t* data, size_t len, std::string& errOut) override {
+        if (!out_.write(data, len, errOut)) {
+            error_ = errOut;
+            failed_ = true;
+            return false;
+        }
+        crc_ = crc32(crc_, reinterpret_cast<const Bytef*>(data), static_cast<uInt>(len));
+        accepted_ += len;
+        return true;
+    }
+
+    uint64_t accepted() const override { return accepted_; }
+
+    // Nothing to undo: the temporary file is unlinked unless commit() succeeds, so
+    // a discarded stream never becomes a published file.
+    void discard() override { failed_ = true; }
+
+    uint32_t crc() const noexcept { return static_cast<uint32_t>(crc_); }
+    bool failed() const noexcept { return failed_; }
+
+private:
+    TempOutput& out_;
+    std::string& error_;
+    uLong crc_ = 0;
+    uint64_t accepted_ = 0;
+    bool failed_ = false;
+};
+
+// Encode straight into the file. The only buffers that scale with the image are
+// zlib's own window and one filtered scanline.
+static PngWriteResult writePngRowsToFile(RowSource& rows, int width, int height,
+                                         const PngMetadata& meta,
+                                         const std::string& path,
+                                         const PngCancellation* cancellation) {
+    PngWriteResult res;
+    uint64_t rowSamples64 = 0;
+    uint64_t rowBytes64 = 0;
+    uint64_t filtBufSize64 = 0;
+    if (!imageLayout(width, height, 2u, rowSamples64, rowBytes64,
+                     filtBufSize64, res.error)) return res;
+    if (!TempOutput::validatePath(path, res.error)) return res;
+    if (isCancelled(cancellation)) return cancelledResult();
+
+    TempOutput out;
+    if (!out.open(path, res.error)) return res;
+
+    std::vector<uint8_t> header;
+    switch (appendPngHeaderChunks(header, width, height, meta, res.error, cancellation)) {
+        case HeaderStatus::Cancelled: return cancelledResult();
+        case HeaderStatus::Failed:    return res;
+        case HeaderStatus::Ok:        break;
+    }
+    if (!out.write(header.data(), header.size(), res.error)) return res;
+
+    // IDAT: the length is only known once the last row is compressed, so reserve
+    // the field and patch it afterwards rather than buffering the whole chunk.
+    const uint64_t lengthOffset = out.offset();
+    const uint8_t placeholder[8] = {0, 0, 0, 0, 'I', 'D', 'A', 'T'};
+    if (!out.write(placeholder, sizeof(placeholder), res.error)) return res;
+
+    FileIdatSink sink(out, res.error);
+    IdatDeflater deflater(sink, cancellation);
+    if (!deflater.init(res.error)) return res;
+
+    const size_t rowSamples = static_cast<size_t>(rowSamples64);
+    std::vector<uint8_t> filteredRow(static_cast<size_t>(rowBytes64) + 1u);
+    std::string zlibErr;
+    for (int y = 0; y < height; ++y) {
+        if (isCancelled(cancellation)) return cancelledResult();
+        const uint16_t* src = rows.row(y);
+        if (src == nullptr) { res.error = "IDAT: row source failed"; return res; }
+        uint8_t* dst = filteredRow.data();
+        *dst++ = 0;  // filter byte = 0 (None)
+        for (size_t x = 0; x < rowSamples; ++x) {
+            const uint16_t v = src[x];
+            *dst++ = static_cast<uint8_t>(v >> 8);
+            *dst++ = static_cast<uint8_t>(v & 0xFF);
+        }
+        const ZlibStatus rowStatus =
+            deflater.push(filteredRow.data(), filteredRow.size(), zlibErr);
+        if (rowStatus == ZlibStatus::Cancelled) return cancelledResult();
+        if (rowStatus == ZlibStatus::Failed) {
+            res.error = sink.failed() && !res.error.empty() ? res.error
+                                                            : "IDAT: " + zlibErr;
+            return res;
+        }
+    }
+    const ZlibStatus endStatus = deflater.finish(zlibErr);
+    if (endStatus == ZlibStatus::Cancelled) return cancelledResult();
+    if (endStatus == ZlibStatus::Failed) {
+        res.error = sink.failed() && !res.error.empty() ? res.error : "IDAT: " + zlibErr;
+        return res;
+    }
+
+    uint8_t crcBytes[4];
+    const uint32_t crc = sink.crc();
+    crcBytes[0] = static_cast<uint8_t>((crc >> 24) & 0xFF);
+    crcBytes[1] = static_cast<uint8_t>((crc >> 16) & 0xFF);
+    crcBytes[2] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    crcBytes[3] = static_cast<uint8_t>(crc & 0xFF);
+    if (!out.write(crcBytes, sizeof(crcBytes), res.error)) return res;
+
+    if (sink.accepted() > kPngMaxChunkLength) {
+        res.error = "compressed PNG chunk exceeds format limits";
+        return res;
+    }
+    const uint32_t idatLength = static_cast<uint32_t>(sink.accepted());
+    uint8_t lengthBytes[4];
+    lengthBytes[0] = static_cast<uint8_t>((idatLength >> 24) & 0xFF);
+    lengthBytes[1] = static_cast<uint8_t>((idatLength >> 16) & 0xFF);
+    lengthBytes[2] = static_cast<uint8_t>((idatLength >> 8) & 0xFF);
+    lengthBytes[3] = static_cast<uint8_t>(idatLength & 0xFF);
+    if (!out.patchAt(lengthOffset, lengthBytes, sizeof(lengthBytes), res.error)) return res;
+
+    std::vector<uint8_t> tail;
+    const AppendStatus endChunk =
+        appendChunk(tail, "IEND", nullptr, 0, res.error, cancellation);
+    if (endChunk == AppendStatus::Cancelled) return cancelledResult();
+    if (endChunk == AppendStatus::Failed) return res;
+    if (!out.write(tail.data(), tail.size(), res.error)) return res;
+    if (isCancelled(cancellation)) return cancelledResult();
+
+    const uint64_t total = out.offset();
+    if (!out.commit(path, res.error)) return res;
+    res.ok = true;
+    res.bytesWritten = static_cast<size_t>(total);
+    return res;
+}
+
 PngWriteResult writePng16ToFile(const uint16_t* rgb16, int width, int height,
                                 const PngMetadata& meta,
                                 const std::string& path,
                                 const PngCancellation* cancellation) {
-    PngWriteResult pathResult;
-    if (!TempOutput::validatePath(path, pathResult.error)) return pathResult;
-    std::vector<uint8_t> bytes;
-    PngWriteResult res = writePng16ToMemory(
-        rgb16, width, height, meta, bytes, cancellation);
-    if (!res.ok) return res;
-    return writeBytesToPath(bytes, path, res, cancellation);
+    PngWriteResult res;
+    if (rgb16 == nullptr) { res.error = "null pixel buffer"; return res; }
+    uint64_t rowSamples64 = 0;
+    uint64_t rowBytes64 = 0;
+    uint64_t filtBufSize64 = 0;
+    if (!imageLayout(width, height, 2u, rowSamples64, rowBytes64,
+                     filtBufSize64, res.error)) return res;
+    U16RowSource rows(rgb16, static_cast<size_t>(rowSamples64));
+    return writePngRowsToFile(rows, width, height, meta, path, cancellation);
 }
 
 // ---- writePngFloatToFile ---------------------------------------------------
@@ -771,13 +989,8 @@ PngWriteResult writePngFloatToFile(const float* rgbFloat, int width, int height,
     // and everything the encoder itself staged (#175). Same arithmetic, same
     // output bytes; only the lifetime of the intermediate changed.
     const size_t rowSamples = static_cast<size_t>(rowSamples64);
-    if (!TempOutput::validatePath(path, res.error)) return res;
     FloatRowSource rows(rgbFloat, rowSamples);
-    std::vector<uint8_t> bytes;
-    PngWriteResult encoded =
-        writePngRows(rows, width, height, meta, bytes, cancellation);
-    if (!encoded.ok) return encoded;
-    return writeBytesToPath(bytes, path, encoded, cancellation);
+    return writePngRowsToFile(rows, width, height, meta, path, cancellation);
 }
 
 }  // namespace spectrafilm

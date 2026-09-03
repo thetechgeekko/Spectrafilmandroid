@@ -565,6 +565,27 @@ static void runStreamingIdentityCases() {
               "IDAT bytes are IDENTICAL to the whole-buffer deflate");
     }
 
+    // The file encoder streams and the memory encoder buffers, so they are two
+    // implementations of one format. They must agree byte for byte, or a container
+    // digest would depend on which entry point the caller happened to use.
+    {
+        const std::string streamPath = "/tmp/sf_png_stream_file.png";
+        const PngWriteResult fileRes =
+            writePng16ToFile(pixels.data(), W, H, meta, streamPath, nullptr);
+        CHECK(fileRes.ok, "streaming file write succeeds");
+        std::vector<uint8_t> streamed;
+        if (fileRes.ok && readFile(streamPath, streamed)) {
+            CHECK(streamed.size() == file.size() &&
+                      std::memcmp(streamed.data(), file.data(), file.size()) == 0,
+                  "streamed file is byte-identical to the in-memory encode");
+            CHECK(fileRes.bytesWritten == streamed.size(),
+                  "bytesWritten matches the streamed file size");
+        } else {
+            CHECK(false, "streamed file readable");
+        }
+        std::remove(streamPath.c_str());
+    }
+
     // The float entry must produce the same file as quantizing first and writing.
     std::vector<float> floats(pixels.size());
     for (size_t i = 0; i < pixels.size(); ++i)
