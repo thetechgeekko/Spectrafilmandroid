@@ -34,6 +34,28 @@ that unblocks #126 (numeric targets) and #127 (GPU preview route).
 
 *Film modeling powered by spektrafilm (GPLv3).*
 
+## Measuring the encoder vs measuring the cache
+
+Two different questions, and using the wrong capture for either produces a number
+that looks fine and means nothing.
+
+**The SLO** is a claim about the cache-hit path (#126/#179), so it needs the cache
+ON and enough runs to gate: `bash tools/baseline/run_bench.sh <apk> 11 BASE`. The
+first run of each cell/format renders and the rest are served, which is the point.
+
+**An encoder measurement** needs every sample to encode:
+
+```bash
+SPK_BENCH_BYPASS_CACHE=1 bash tools/baseline/run_bench.sh <apk> 5 "BASE,HEAVY"
+```
+
+Use at least `gate_runs` runs. Below that the capture is a smoke run, and the
+harness applies the protocol idle and the per-sample thermal wait **only when it is
+gating** -- so a smoke capture has no cool-down and drifts as the device heats.
+Five back-to-back smoke captures measured ~40% slower from the third one onward,
+across formats that share no code. The report prints a warning on both a bypassed
+capture and a smoke one; heed them.
+
 ## Export benchmark and digest gate (#177)
 
 Automated counterpart to the wizard above: one command records the whole evidence bundle
