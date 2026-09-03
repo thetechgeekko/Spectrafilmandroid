@@ -1,7 +1,7 @@
 # Export cache and idle pre-render — device evidence (#179)
 
 Device SM-S948W (Tier A hardware), API 36, unplugged for every sample, release build.
-Captured 2026-09-02. Raw capture: [`capture.json`](capture.json); host report:
+Captured 2026-09-02 and 2026-09-03. Raw capture: [`capture.json`](capture.json); host report:
 [`slo-report.md`](slo-report.md); gate output: [`gate-findings.txt`](gate-findings.txt).
 
 ## 1. Container cache — the warm export SLO
@@ -102,10 +102,10 @@ per-sample thermal wait never had to give up. Raw capture:
 
 | format | render (the one miss) | cache hits, n = 10 | p50 | p95 |
 |---|---:|---|---:|---:|
-| **JPEG_Q95** (SLO) | 5831 ms | — | **32 ms** | **68 ms** |
-| ULTRA_HDR | 6458 ms | — | 51 ms | 77 ms |
-| PNG16 | 6016 ms | — | 106 ms | 133 ms |
-| TIFF16 | 12030 ms | — | 340 ms | 413 ms |
+| **JPEG_Q95** (SLO) | 5831 ms | 29 … 68 ms | **32 ms** | **68 ms** |
+| ULTRA_HDR | 6458 ms | 32 … 77 ms | 51 ms | 77 ms |
+| PNG16 | 6016 ms | 79 … 133 ms | 106 ms | 133 ms |
+| TIFF16 | 12030 ms | 295 … 413 ms | 340 ms | 413 ms |
 
 The #126 SLO binds BASE/JPEG_Q95 on the cache-hit path, and the gate evaluates exactly that
 subset (10 warm hits, meeting the 11-run protocol's 10 after its discarded first run):
