@@ -2891,16 +2891,54 @@ Three things this capture settles that the smoke ones could not:
   touches the PNG writer) did not regress.
 
 **One container digest per cell/format across all five runs.** That is the C4
-evidence the parallel banded deflate needed: band boundaries are a pure function
-of height and worker count, the per-band `Z_SYNC_FLUSH` boundaries land in the
-same places every time, and `adler32_combine` reassembles the same stream -- so
-the whole file is byte-identical run to run, and #126's container-identity level
-survives the change.
+evidence the parallel banded deflate needed. Band boundaries are a pure function
+of the filtered row size and a fixed 2 MB target -- **worker count is not part of
+it**, bands are always concatenated in order, and a writer test pins 1-vs-8
+byte-identity -- so the file does not depend on thread scheduling, on core count,
+or on which device encodes it. #126's container-identity level survives the
+change (at its post-adoption C4 baseline; banding moved deflate block boundaries
+once, deliberately, and that re-baseline is recorded in 21.4).
 
 What this capture is NOT: the device was **plugged in** and at **26-28% battery**,
 both of which the reporter flags against the Tier A protocol, and every sample
 bypassed the cache. It is an encoder measurement. The SLO is a claim about the
 cache-hit path and needs its own capture (#179).
+
+### 21.8 TIFF, once the quantisation moved into the writer
+
+The TIFF16 export held THREE full images: the engine's float samples, a uint16
+plane quantised in Kotlin, and the writer's byte serialisation of that plane. The
+middle one is 75 MB at 12.5 MP and had to be an off-heap native allocation to
+exist at all -- a direct ByteBuffer is a managed byte[] on Android, and 100 MP
+does not fit the ART heap. The writer now quantises straight into the strip.
+
+Same protocol as 21.7 (`gate_runs` = 5, cache bypassed, thermal 0 throughout),
+BASE only, on the build that contains the change:
+
+| format | encode min/p50/max ms | previous p50 | change |
+|---|---|---:|---:|
+| JPEG_Q95 | 101 / 106 / 125 | 111 | - |
+| PNG16 | 376 / **393** / 418 | 398 | - |
+| TIFF16 | 346 / **366** / 381 | 958 | **2.62x** |
+| ULTRA_HDR | 104 / 112 / 128 | 115 | - |
+
+**All four container digests are identical to the previous capture's**, taken on a
+different APK build. That is the byte-identity claim measured rather than argued:
+the quantisation moved from Kotlin into C++ and the file did not change by one
+byte, so #126's container-identity level holds across the change AND across two
+independent builds of the app. The host suite asserts the same thing directly, by
+writing the same picture through both entry points and comparing the files.
+
+Where the 2.62x comes from: a per-sample Kotlin loop over 37.5 million samples,
+each doing a bounds-checked `FloatBuffer.get`, a `coerceIn`, a multiply, a
+`toInt`, a second `coerceIn` and two `ByteBuffer.put` calls, replaced by a C++
+loop writing two bytes per sample into a buffer it already owns.
+
+What this capture does NOT show is the memory saving. The harness samples PSS
+after the write, by which point the old build had already freed the buffer, and
+`vm_hwm` is a process-lifetime peak shared with every other cell in the capture.
+The removed allocation is structural -- one fewer 75 MB request through the
+memory budget, visible in the diff -- not something this instrument can see.
 
 ## 27. The transform-size cost model, checked against a stopwatch on the phone (#160)
 

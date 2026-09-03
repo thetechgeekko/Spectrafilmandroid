@@ -23,6 +23,26 @@
  * We compute every blob's final offset up front (a layout pass) so we can emit
  * the bytes in one forward sweep with no back-patching beyond what the layout
  * already fixed.
+ *
+ * STRIP AND BIGTIFF POLICY (#175), stated because both are easy to get silently
+ * wrong:
+ *
+ *   - ONE STRIP. Classic TIFF allows many; we emit one, because the reason to
+ *     split -- bounding the buffer the writer holds -- is better served by not
+ *     holding the image at all, and multiple strips would move the file's bytes
+ *     for callers who pin the whole-container digest (#126 C4). The remaining
+ *     buffer is the strip itself; an uncompressed strip's size is known before
+ *     any pixel exists, so it could be streamed row by row WITHOUT changing a
+ *     byte or adding a strip. That is the next rung if the ~75 MB at 12.5 MP
+ *     ever matters; PackBits cannot take it (its size is data-dependent).
+ *
+ *   - CLASSIC TIFF ONLY, and it REFUSES rather than truncates. Every offset and
+ *     length is accumulated in uint64 and the complete layout is proven to fit
+ *     uint32 before a single pixel is read (validateUncompressedLayout); failure
+ *     is an error string, never a wrapped offset. BigTIFF (0x002B, 64-bit
+ *     offsets) is deliberately NOT implemented: the limit is ~4 GB of image
+ *     data, i.e. past 700 MP at 16 bits x 3, which no export path on this
+ *     device can reach, and BigTIFF is read by materially fewer tools.
  */
 #include "tiff_writer.h"
 
