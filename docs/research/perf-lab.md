@@ -2857,7 +2857,96 @@ follows a 13-second HEAVY render on an ungoverned capture runs hot. Any comparis
 of the SHORT phases across these captures is invalid; only PNG16, where the change
 is multiples rather than percents, survives the contamination.
 
-A properly gated capture is still owed, and needs the phone charged past the 50%
-Tier A floor.
+### 21.7 The gated capture, which changes none of the conclusions
+
+`SPK_BENCH_BYPASS_CACHE=1 bash tools/baseline/run_bench.sh <apk> 5 "BASE,HEAVY"`.
+Five runs is `gate_runs`, so this capture -- unlike the five in 21.6 -- ran the
+60 s protocol idle and the per-sample thermal wait. Every sample encoded
+(`cache_bypassed: true`, 0 cache hits). **`thermal_status` was 0 on all 40
+samples** and the thermal wait never had to fire, which is the cool device 21.6
+did not have. Capture: `docs/device/ticket175/capture-gated-encode.json`.
+
+| cell | format | encode min/p50/max ms | #119 p50 | speedup | bytes |
+|---|---|---|---:|---:|---:|
+| BASE | JPEG_Q95 | 102 / **111** / 205 | 110-162 | - | 0.79 MB |
+| BASE | PNG16 | 383 / **398** / 409 | 1705 | **4.28x** | **11.0 MB** (was 13.2) |
+| BASE | TIFF16 | 926 / **958** / 997 | 1154 | 1.20x | 71.4 MB |
+| BASE | ULTRA_HDR | 99 / **115** / 144 | - | - | 0.79 MB |
+| HEAVY | JPEG_Q95 | 142 / **158** / 191 | 110-162 | - | 2.49 MB |
+| HEAVY | PNG16 | 1110 / **1132** / 1180 | 4316 | **3.81x** | **58.1 MB** (was 66.3) |
+| HEAVY | TIFF16 | 928 / **1009** / 1447 | 1189 | 1.18x | 71.4 MB |
+| HEAVY | ULTRA_HDR | 149 / **185** / 209 | - | - | 2.49 MB |
+
+Three things this capture settles that the smoke ones could not:
+
+- **The PNG16 win is 3.8-4.3x on a cool, protocol-governed device**, i.e. the
+  same as the cool smoke captures and not the 2.5-2.8x of the throttled ones.
+  The 21.6 reading was right; now it is gated.
+- **TIFF16 gained ~1.2x**, where 21.6's ungated pair read 0.94-1.11x. The
+  two-span write was sold as a memory change with no time cost; it is in fact a
+  small time win too, and it took a governed capture to see something that size.
+- **HEAVY/JPEG_Q95 is 158 ms, inside the 110-162 ms baseline range.** That closes
+  correction 2 in 21.6 with a measurement instead of an argument: the 185 ms
+  reading was thermal drift on an ungoverned capture, and JPEG (which never
+  touches the PNG writer) did not regress.
+
+**One container digest per cell/format across all five runs.** That is the C4
+evidence the parallel banded deflate needed: band boundaries are a pure function
+of height and worker count, the per-band `Z_SYNC_FLUSH` boundaries land in the
+same places every time, and `adler32_combine` reassembles the same stream -- so
+the whole file is byte-identical run to run, and #126's container-identity level
+survives the change.
+
+What this capture is NOT: the device was **plugged in** and at **26-28% battery**,
+both of which the reporter flags against the Tier A protocol, and every sample
+bypassed the cache. It is an encoder measurement. The SLO is a claim about the
+cache-hit path and needs its own capture (#179).
+
+## 27. The transform-size cost model, checked against a stopwatch on the phone (#160)
+
+20 left the diffusion FFT with a cost model choosing the transform size, and one
+honest gap: the ranking it encodes was measured on a 24-core desktop, it is
+size-dependent in BOTH directions, and it had never been checked on ARM.
+
+It could not be checked. `debug.spektra.fftmax` moves only the ceiling and the
+model still picks below it, so the app can never be made to run a size the model
+rejected -- the model could only ever be compared against itself. So
+`fft_convolve_same_forced_n_for_test` (compiled only under
+`SPK_FFT_CONVOLVE_TEST_HOOKS`, beside the existing scratch-denial seam) runs a
+caller-named size, and `tools/perf_lab/fft_conv_device_bench.cpp` times every
+candidate on the phone at the shipping release flags.
+
+One channel, best of 2, SM-S948W, thermal status 0. Full table and method:
+`docs/device/ticket160/README.md`.
+
+| case | ks | N | tiles | device ms | desktop ms |
+|---|---:|---:|---:|---:|---:|
+| 640 px | 273 | **512 (model)** | 6 | **49.7** | - |
+| | | 1024 | 1 | 58.7 | - |
+| 1536 px | 651 | 1024 | 20 | 686.9 | - |
+| | | **2048 (model)** | 2 | **402.6** | - |
+| | | 4096 | 1 | 1376.1 | - |
+| 12 MP | 1725 | 2048 | 130 | 8970.9 | 9298 |
+| | | **4096 (model)** | 4 | **1766.4** | 1861 |
+| | | 8192 | 1 | 3106.9 | 3094 |
+
+**The model picks the measured fastest size in every case**, and the old
+largest-N rule would have cost 5.1x at 12 MP and 3.4x at 1536 px. Note also that
+raising the ceiling *alone* would have made 1536 px worse (1376 ms at 4096) --
+the ceiling is a memory bound, the cost model is the choice, and 20's decision to
+separate them is what makes both sizes fast.
+
+The 12 MP device times land within 5% of the desktop's on a phone with a quarter
+of the cores. That is a memory-bound kernel: the column pass moves the whole
+spectrum per transform, both machines wait on bandwidth, and it is why a cost
+exponent of 2.8 -- far above `log2 N` -- transfers across the two machines
+unchanged.
+
+**Channel packing is not worth doing.** 20 left "pack two of the three real
+channels into one complex transform" on the table, worth about 1.5x on this
+stage. At 12 MP that is 5.3 s -> 3.5 s on an effect that is OFF by default, in a
+14 s export. It buys 1.8 s on a path most exports never take, for a nontrivial
+change to the one kernel whose exactness the whole parity suite leans on. Left
+undone deliberately.
 
 *Film modeling powered by spektrafilm (GPLv3).*
