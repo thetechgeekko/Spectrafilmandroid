@@ -35,10 +35,14 @@
  *   chunk (see IdatDeflater, and the byte-identity case in tests/).
  *
  * Per-scanline filter byte:
- *   Each scanline is prefixed with a 1-byte filter type. We use filter 0 (None)
- *   throughout — the sample bytes are passed through unchanged. Filter 0 is
- *   always correct per the PNG spec; for 16-bit RGB the benefit from Paeth/Sub
- *   is marginal enough that simplicity wins here.
+ *   Each scanline is prefixed with a 1-byte filter type. Each row picks between
+ *   filter 0 (None) and filter 2 (Up) by the minimum-sum-of-absolute-differences
+ *   score, so it can never be worse than passing the bytes through. This comment
+ *   used to say filter 0 was used throughout because "for 16-bit RGB the benefit
+ *   from Paeth/Sub is marginal": measured on a real 12.5 MP export that is ~9%
+ *   of the file on grainy output, and on a clean scan filter 2 took the encode
+ *   from 1251 ms / 71.3 MB to 151 ms / 0.6 MB (docs/research/perf-lab.md 21).
+ *   Sub and Paeth were measured too and are not worth their cost here.
  *
  * iCCP chunk:
  *   The raw ICC bytes are zlib-compressed (compress2) and stored as:
@@ -68,6 +72,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -393,19 +398,13 @@ static ZlibStatus zlibCompress(const uint8_t* src, size_t srcLen,
     return ZlibStatus::Ok;
 }
 
-// ---- streaming IDAT --------------------------------------------------------
+// ---- IDAT sinks ------------------------------------------------------------
 //
 // The filtered image used to be materialised in full before compression: at
 // 12.5 MP that is a 75 MB buffer whose only purpose is to be read once, on top of
-// the 75 MB of uint16 samples and the ~75 MB of compressed output (#175).
-//
-// Feeding deflate one scanline at a time removes it. The compressed BYTES are
-// unchanged: this pushes exactly the same total stream through exactly the same
-// deflate settings with Z_NO_FLUSH, which is what the whole-buffer path above
-// already did in 64 KB pieces -- zlib inserts no sync point for Z_NO_FLUSH, so
-// where the input is split cannot change the output. tests/test_png_writer.cpp
-// asserts that byte-for-byte, because PNG16 container identity is a gated
-// contract, not a preference.
+// the 75 MB of uint16 samples and the ~75 MB of compressed output (#175). Bands
+// are filtered and compressed on the fly instead, and land here.
+
 // Where compressed IDAT bytes go as they are produced: into a vector for the
 // in-memory encode, or straight to the file for the streaming one.
 class IdatSink {
@@ -433,90 +432,26 @@ private:
     std::vector<uint8_t>& dst_;
 };
 
-class IdatDeflater final {
-public:
-    IdatDeflater(IdatSink& dst, const PngCancellation* cancellation) noexcept
-        : dst_(dst), cancellation_(cancellation) {}
-
-    IdatDeflater(const IdatDeflater&) = delete;
-    IdatDeflater& operator=(const IdatDeflater&) = delete;
-
-    ~IdatDeflater() {
-        if (open_) deflateEnd(&stream_);
-    }
-
-    bool init(std::string& errOut) {
-        if (deflateInit(&stream_, Z_DEFAULT_COMPRESSION) != Z_OK) {
-            errOut = "zlib initialisation failed";
-            return false;
-        }
-        open_ = true;
-        return true;
-    }
-
-    ZlibStatus push(const uint8_t* data, size_t len, std::string& errOut) {
-        return run(data, len, Z_NO_FLUSH, errOut);
-    }
-
-    ZlibStatus finish(std::string& errOut) {
-        return run(nullptr, 0, Z_FINISH, errOut);
-    }
-
-private:
-    ZlibStatus run(const uint8_t* data, size_t len, int flush, std::string& errOut) {
-        if (isCancelled(cancellation_)) { dst_.discard(); return ZlibStatus::Cancelled; }
-        stream_.next_in = len == 0
-            ? Z_NULL
-            : const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data));
-        stream_.avail_in = static_cast<uInt>(len);
-        int rc = Z_OK;
-        do {
-            if (isCancelled(cancellation_)) { dst_.discard(); return ZlibStatus::Cancelled; }
-            stream_.next_out = reinterpret_cast<Bytef*>(output_.data());
-            stream_.avail_out = static_cast<uInt>(output_.size());
-            rc = deflate(&stream_, flush);
-            if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
-                dst_.discard();
-                errOut = "zlib deflate failed";
-                return ZlibStatus::Failed;
-            }
-            const size_t produced = output_.size() - stream_.avail_out;
-            if (produced > kPngMaxChunkLength - dst_.accepted()) {
-                dst_.discard();
-                errOut = "compressed PNG chunk exceeds format limits";
-                return ZlibStatus::Failed;
-            }
-            if (produced != 0 && !dst_.take(output_.data(), produced, errOut)) {
-                dst_.discard();
-                return ZlibStatus::Failed;
-            }
-        } while (stream_.avail_in != 0 || stream_.avail_out == 0 ||
-                 (flush == Z_FINISH && rc != Z_STREAM_END));
-        return ZlibStatus::Ok;
-    }
-
-    z_stream stream_{};
-    bool open_ = false;
-    IdatSink& dst_;
-    const PngCancellation* cancellation_ = nullptr;
-    std::array<uint8_t, 64u * 1024u> output_{};
-};
-
 // One scanline of uint16 samples at a time, so neither the caller's quantized
 // image nor a quantized copy of it has to exist in full.
+//
+// Rows are written into caller-owned storage rather than returned from internal
+// scratch: the encoder compresses several bands concurrently, and a shared scratch
+// row would be a data race the moment it did.
 class RowSource {
 public:
     virtual ~RowSource() = default;
-    // Returns rowSamples samples for row y, or nullptr on failure.
-    virtual const uint16_t* row(int y) = 0;
+    // Writes rowSamples samples for row y into dst.
+    virtual void rowInto(int y, uint16_t* dst) const = 0;
 };
 
 class U16RowSource final : public RowSource {
 public:
     U16RowSource(const uint16_t* base, size_t rowSamples) noexcept
         : base_(base), rowSamples_(rowSamples) {}
-    const uint16_t* row(int y) override {
-        return base_ + static_cast<size_t>(y) * rowSamples_;
+    void rowInto(int y, uint16_t* dst) const override {
+        std::memcpy(dst, base_ + static_cast<size_t>(y) * rowSamples_,
+                    rowSamples_ * sizeof(uint16_t));
     }
 
 private:
@@ -529,24 +464,249 @@ private:
 // maps NaN to 0.
 class FloatRowSource final : public RowSource {
 public:
-    FloatRowSource(const float* base, size_t rowSamples)
-        : base_(base), rowSamples_(rowSamples), scratch_(rowSamples) {}
-    const uint16_t* row(int y) override {
+    FloatRowSource(const float* base, size_t rowSamples) noexcept
+        : base_(base), rowSamples_(rowSamples) {}
+    void rowInto(int y, uint16_t* dst) const override {
         const float* src = base_ + static_cast<size_t>(y) * rowSamples_;
         for (size_t x = 0; x < rowSamples_; ++x) {
             const float v = src[x];
-            if (!(v > 0.0f)) { scratch_[x] = 0; continue; }
-            if (v >= 1.0f) { scratch_[x] = 65535; continue; }
-            scratch_[x] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+            if (!(v > 0.0f)) { dst[x] = 0; continue; }
+            if (v >= 1.0f) { dst[x] = 65535; continue; }
+            dst[x] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
         }
-        return scratch_.data();
     }
 
 private:
     const float* base_;
     size_t rowSamples_;
-    std::vector<uint16_t> scratch_;
 };
+
+// ---- filtering + parallel deflate ------------------------------------------
+//
+// Two changes that go together, both measured on a real 12.5 MP export
+// (docs/research/perf-lab.md 21):
+//
+// FILTERING. The writer used filter 0 (None) on every row, on the belief that
+// "for 16-bit RGB the benefit from Paeth/Sub is marginal". It is not: on a clean
+// scan, filter 2 (Up) took the encode from 1251 ms / 71.3 MB to 151 ms / 0.6 MB,
+// and on a grainy frame it is still ~9% smaller. Each row now picks between None
+// and Up by the standard minimum-sum-of-absolute-differences score, so the result
+// can never be worse than what shipped, and the choice costs ~30 ms.
+//
+// PARALLELISM. deflate ran serially on a phone with eight cores. The scanlines are
+// split into bands; each band is filtered and compressed on its own thread as a
+// RAW deflate stream ending in Z_SYNC_FLUSH, so no band emits a final block, and
+// the bands are concatenated under one zlib header and one adler32. That is still
+// a single deflate stream and therefore still a single IDAT -- only the block
+// boundaries move. Measured 1259 ms -> 173 ms at 8 workers with no size cost.
+//
+// The output is a pure function of (pixels, band layout, worker count is NOT part
+// of it): bands are fixed by row count and always concatenated in order, so the
+// bytes do not depend on thread scheduling. tests/ pins 1-vs-8 byte-identity.
+//
+// This DOES change container bytes versus the old filter-0 serial encode. Decoded
+// pixels are identical by construction; the whole-container digest is not, which
+// is the #126 C4 re-baseline this was adopted under.
+
+constexpr size_t kPngBandTargetBytes = 2u * 1024u * 1024u;
+
+int pngWorkerCount() {
+    if (const char* env = std::getenv("SPK_PNG_WORKERS")) {
+        const int v = std::atoi(env);
+        if (v >= 1) return v > 16 ? 16 : v;
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) return 1;
+    return hw > 8u ? 8 : static_cast<int>(hw);
+}
+
+// Filter one row into dst (which starts with the filter-type byte), choosing
+// between None and Up by absolute-difference score. bpp is 6 for 16-bit RGB.
+void filterRow(const uint8_t* cur, const uint8_t* prev, size_t rowBytes,
+               uint8_t* dst) {
+    // Sum for filter 0 is the data itself; for filter 2 it is cur - prev.
+    unsigned long noneScore = 0;
+    unsigned long upScore = 0;
+    for (size_t i = 0; i < rowBytes; ++i) {
+        const int8_t n = static_cast<int8_t>(cur[i]);
+        noneScore += static_cast<unsigned long>(n < 0 ? -n : n);
+        const uint8_t d = static_cast<uint8_t>(cur[i] - (prev ? prev[i] : 0));
+        const int8_t u = static_cast<int8_t>(d);
+        upScore += static_cast<unsigned long>(u < 0 ? -u : u);
+    }
+    if (upScore < noneScore) {
+        dst[0] = 2;
+        for (size_t i = 0; i < rowBytes; ++i)
+            dst[1 + i] = static_cast<uint8_t>(cur[i] - (prev ? prev[i] : 0));
+    } else {
+        dst[0] = 0;
+        std::memcpy(dst + 1, cur, rowBytes);
+    }
+}
+
+struct Band {
+    int y0 = 0;
+    int y1 = 0;                    // exclusive
+    bool last = false;
+    bool ok = false;
+    uLong adler = 0;               // of this band's FILTERED bytes
+    size_t filteredBytes = 0;
+    std::vector<uint8_t> deflated;
+    std::string error;
+};
+
+// Filter and compress one band. Self-contained so it can run on any thread.
+void runBand(const RowSource& rows, Band& band, int width, size_t rowSamples,
+             size_t rowBytes) {
+    (void)width;
+    const size_t filteredRowBytes = rowBytes + 1;
+    std::vector<uint16_t> current(rowSamples);
+    std::vector<uint16_t> previous(rowSamples);
+    std::vector<uint8_t> filteredRow(filteredRowBytes);
+    // The first row of a band needs the band above it, which is read from the
+    // source rather than shared, so bands stay independent.
+    const bool hasPrev = band.y0 > 0;
+    if (hasPrev) rows.rowInto(band.y0 - 1, previous.data());
+
+    z_stream stream{};
+    // Raw deflate (negative windowBits): the zlib header and adler32 are written
+    // once around the concatenation, not once per band.
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        band.error = "zlib initialisation failed";
+        return;
+    }
+    std::vector<uint8_t> out(64u * 1024u);
+    band.adler = adler32(0L, Z_NULL, 0);
+    band.deflated.clear();
+
+    for (int y = band.y0; y < band.y1; ++y) {
+        rows.rowInto(y, current.data());
+        const bool havePrev = (y > band.y0) || hasPrev;
+        // Samples are big-endian on the wire; filter the wire bytes, not the
+        // native ones, or the filter would be computed on a different image.
+        std::vector<uint8_t> wire(rowBytes);
+        for (size_t x = 0; x < rowSamples; ++x) {
+            wire[x * 2] = static_cast<uint8_t>(current[x] >> 8);
+            wire[x * 2 + 1] = static_cast<uint8_t>(current[x] & 0xFF);
+        }
+        std::vector<uint8_t> prevWire;
+        if (havePrev) {
+            prevWire.resize(rowBytes);
+            for (size_t x = 0; x < rowSamples; ++x) {
+                prevWire[x * 2] = static_cast<uint8_t>(previous[x] >> 8);
+                prevWire[x * 2 + 1] = static_cast<uint8_t>(previous[x] & 0xFF);
+            }
+        }
+        filterRow(wire.data(), havePrev ? prevWire.data() : nullptr, rowBytes,
+                  filteredRow.data());
+        band.adler = adler32(band.adler, filteredRow.data(),
+                             static_cast<uInt>(filteredRowBytes));
+        band.filteredBytes += filteredRowBytes;
+
+        stream.next_in = filteredRow.data();
+        stream.avail_in = static_cast<uInt>(filteredRowBytes);
+        const bool lastRow = (y + 1 == band.y1);
+        const int flush = (lastRow && band.last) ? Z_FINISH
+                        : (lastRow ? Z_SYNC_FLUSH : Z_NO_FLUSH);
+        int rc = Z_OK;
+        do {
+            stream.next_out = out.data();
+            stream.avail_out = static_cast<uInt>(out.size());
+            rc = deflate(&stream, flush);
+            if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+                band.error = "zlib deflate failed";
+                deflateEnd(&stream);
+                return;
+            }
+            const size_t produced = out.size() - stream.avail_out;
+            band.deflated.insert(band.deflated.end(), out.data(), out.data() + produced);
+        } while (stream.avail_in != 0 || stream.avail_out == 0 ||
+                 (flush == Z_FINISH && rc != Z_STREAM_END));
+
+        current.swap(previous);
+    }
+    deflateEnd(&stream);
+    band.ok = true;
+}
+
+// Emit the whole zlib stream (header, every band in order, adler32) into [sink].
+ZlibStatus deflateRowsBanded(const RowSource& rows, int width, int height,
+                             size_t rowSamples, size_t rowBytes, IdatSink& sink,
+                             const PngCancellation* cancellation,
+                             std::string& errOut) {
+    const size_t filteredRowBytes = rowBytes + 1;
+    int rowsPerBand = static_cast<int>(kPngBandTargetBytes / (filteredRowBytes | 1u));
+    if (rowsPerBand < 1) rowsPerBand = 1;
+    std::vector<Band> bands;
+    for (int y = 0; y < height; y += rowsPerBand) {
+        Band band;
+        band.y0 = y;
+        band.y1 = std::min(y + rowsPerBand, height);
+        bands.push_back(std::move(band));
+    }
+    if (bands.empty()) { errOut = "no rows to encode"; return ZlibStatus::Failed; }
+    bands.back().last = true;
+
+    const uint8_t header[2] = {0x78, 0x9C};  // deflate, 32K window, default level
+    if (!sink.take(header, sizeof(header), errOut)) return ZlibStatus::Failed;
+
+    const int workers = pngWorkerCount();
+    uLong adler = adler32(0L, Z_NULL, 0);
+    size_t next = 0;
+    while (next < bands.size()) {
+        if (isCancelled(cancellation)) { sink.discard(); return ZlibStatus::Cancelled; }
+        const size_t wave = std::min(static_cast<size_t>(workers), bands.size() - next);
+        std::vector<std::thread> threads;
+        threads.reserve(wave > 0 ? wave - 1 : 0);
+        for (size_t i = 1; i < wave; ++i) {
+            Band* band = &bands[next + i];
+            threads.emplace_back([&rows, band, width, rowSamples, rowBytes]() {
+                runBand(rows, *band, width, rowSamples, rowBytes);
+            });
+        }
+        // The caller's thread takes one band too rather than waiting on all of them.
+        runBand(rows, bands[next], width, rowSamples, rowBytes);
+        for (std::thread& t : threads) t.join();
+
+        for (size_t i = 0; i < wave; ++i) {
+            Band& band = bands[next + i];
+            if (!band.ok) {
+                errOut = band.error.empty() ? "band encode failed" : band.error;
+                sink.discard();
+                return ZlibStatus::Failed;
+            }
+            if (band.deflated.size() > kPngMaxChunkLength - sink.accepted()) {
+                errOut = "compressed PNG chunk exceeds format limits";
+                sink.discard();
+                return ZlibStatus::Failed;
+            }
+            if (!band.deflated.empty() &&
+                !sink.take(band.deflated.data(), band.deflated.size(), errOut)) {
+                sink.discard();
+                return ZlibStatus::Failed;
+            }
+            adler = adler32_combine(adler, band.adler,
+                                    static_cast<z_off_t>(band.filteredBytes));
+            // Release each band as it is written: the point of banding is that the
+            // whole compressed image never exists at once.
+            std::vector<uint8_t>().swap(band.deflated);
+        }
+        next += wave;
+    }
+
+    const uint8_t trailer[4] = {
+        static_cast<uint8_t>((adler >> 24) & 0xFF),
+        static_cast<uint8_t>((adler >> 16) & 0xFF),
+        static_cast<uint8_t>((adler >> 8) & 0xFF),
+        static_cast<uint8_t>(adler & 0xFF),
+    };
+    if (!sink.take(trailer, sizeof(trailer), errOut)) {
+        sink.discard();
+        return ZlibStatus::Failed;
+    }
+    return ZlibStatus::Ok;
+}
 
 }  // namespace
 
@@ -686,57 +846,27 @@ static PngWriteResult writePngRows(RowSource& rows, int width, int height,
     // Big-endian byte-swap: PNG samples are stored high-byte first.
     // Input rgb16 samples are native uint16 (little-endian machine words on
     // ARM/x86); we emit (v>>8) then (v&0xFF) to get big-endian.
+    std::vector<uint8_t> idatData;
     {
-        const size_t rowSamples = static_cast<size_t>(rowSamples64);
-
-        // One scanline at a time: the filtered image is never materialised, so the
-        // 75 MB it cost at 12.5 MP is gone (#175). The compressed bytes are
-        // identical -- same stream, same settings, only the input chunking differs.
-        std::vector<uint8_t> idatData;
-        std::vector<uint8_t> filteredRow(static_cast<size_t>(rowBytes64) + 1u);
-        std::string zlibErr;
-        {
-            VectorIdatSink sink(idatData);
-            if (filtBufSize64 > 0 &&
-                filtBufSize64 <= static_cast<uint64_t>(std::numeric_limits<uLong>::max())) {
-                // Sizing hint only: without it the vector grows geometrically and its
-                // reallocation transiently holds two copies of the compressed image.
-                const uLong bound = compressBound(static_cast<uLong>(filtBufSize64));
-                if (bound <= kPngMaxChunkLength) sink.reserve(static_cast<size_t>(bound));
-            }
-            IdatDeflater deflater(sink, cancellation);
-            if (!deflater.init(res.error)) return res;
-            for (int y = 0; y < height; ++y) {
-                if (isCancelled(cancellation)) return cancelWithoutPublication();
-                const uint16_t* src = rows.row(y);
-                if (src == nullptr) {
-                    res.error = "IDAT: row source failed";
-                    return res;
-                }
-                uint8_t* dst = filteredRow.data();
-                *dst++ = 0;  // filter byte = 0 (None)
-                for (size_t x = 0; x < rowSamples; ++x) {
-                    const uint16_t v = src[x];
-                    *dst++ = static_cast<uint8_t>(v >> 8);    // high byte first (big-endian)
-                    *dst++ = static_cast<uint8_t>(v & 0xFF);  // low byte second
-                }
-                const ZlibStatus rowStatus =
-                    deflater.push(filteredRow.data(), filteredRow.size(), zlibErr);
-                if (rowStatus == ZlibStatus::Cancelled) return cancelWithoutPublication();
-                if (rowStatus == ZlibStatus::Failed) {
-                    res.error = "IDAT: " + zlibErr;
-                    return res;
-                }
-            }
-            const ZlibStatus endStatus = deflater.finish(zlibErr);
-            if (endStatus == ZlibStatus::Cancelled) return cancelWithoutPublication();
-            if (endStatus == ZlibStatus::Failed) {
-                res.error = "IDAT: " + zlibErr;
-                return res;
-            }
+        VectorIdatSink sink(idatData);
+        if (filtBufSize64 > 0 &&
+            filtBufSize64 <= static_cast<uint64_t>(std::numeric_limits<uLong>::max())) {
+            // Sizing hint only: without it the vector grows geometrically and its
+            // reallocation transiently holds two copies of the compressed image.
+            const uLong bound = compressBound(static_cast<uLong>(filtBufSize64));
+            if (bound <= kPngMaxChunkLength) sink.reserve(static_cast<size_t>(bound));
         }
-        if (isCancelled(cancellation)) return cancelWithoutPublication();
-
+        std::string zlibErr;
+        const ZlibStatus status = deflateRowsBanded(
+            rows, width, height, static_cast<size_t>(rowSamples64),
+            static_cast<size_t>(rowBytes64), sink, cancellation, zlibErr);
+        if (status == ZlibStatus::Cancelled) return cancelWithoutPublication();
+        if (status == ZlibStatus::Failed) {
+            res.error = "IDAT: " + zlibErr;
+            return res;
+        }
+    }
+    {
         const AppendStatus status = appendChunk(
             outBytes, "IDAT", idatData, res.error, cancellation);
         if (status == AppendStatus::Cancelled) return cancelWithoutPublication();
@@ -846,37 +976,17 @@ static PngWriteResult writePngRowsToFile(RowSource& rows, int width, int height,
     if (!out.write(placeholder, sizeof(placeholder), res.error)) return res;
 
     FileIdatSink sink(out, res.error);
-    IdatDeflater deflater(sink, cancellation);
-    if (!deflater.init(res.error)) return res;
-
-    const size_t rowSamples = static_cast<size_t>(rowSamples64);
-    std::vector<uint8_t> filteredRow(static_cast<size_t>(rowBytes64) + 1u);
-    std::string zlibErr;
-    for (int y = 0; y < height; ++y) {
-        if (isCancelled(cancellation)) return cancelledResult();
-        const uint16_t* src = rows.row(y);
-        if (src == nullptr) { res.error = "IDAT: row source failed"; return res; }
-        uint8_t* dst = filteredRow.data();
-        *dst++ = 0;  // filter byte = 0 (None)
-        for (size_t x = 0; x < rowSamples; ++x) {
-            const uint16_t v = src[x];
-            *dst++ = static_cast<uint8_t>(v >> 8);
-            *dst++ = static_cast<uint8_t>(v & 0xFF);
-        }
-        const ZlibStatus rowStatus =
-            deflater.push(filteredRow.data(), filteredRow.size(), zlibErr);
-        if (rowStatus == ZlibStatus::Cancelled) return cancelledResult();
-        if (rowStatus == ZlibStatus::Failed) {
+    {
+        std::string zlibErr;
+        const ZlibStatus status = deflateRowsBanded(
+            rows, width, height, static_cast<size_t>(rowSamples64),
+            static_cast<size_t>(rowBytes64), sink, cancellation, zlibErr);
+        if (status == ZlibStatus::Cancelled) return cancelledResult();
+        if (status == ZlibStatus::Failed) {
             res.error = sink.failed() && !res.error.empty() ? res.error
                                                             : "IDAT: " + zlibErr;
             return res;
         }
-    }
-    const ZlibStatus endStatus = deflater.finish(zlibErr);
-    if (endStatus == ZlibStatus::Cancelled) return cancelledResult();
-    if (endStatus == ZlibStatus::Failed) {
-        res.error = sink.failed() && !res.error.empty() ? res.error : "IDAT: " + zlibErr;
-        return res;
     }
 
     uint8_t crcBytes[4];

@@ -283,18 +283,32 @@ void runCase(const char* label,
         CHECK(inflated.size() == filtRowBytes * static_cast<size_t>(H),
               "IDAT inflated size = (1 + W*3*2)*H");
 
-        // Verify filter bytes are all 0 (None) and pixel samples round-trip.
+        // Reconstruct the scanlines and compare pixels. Rows now choose between
+        // filter 0 (None) and filter 2 (Up) per row (#175), so this UNFILTERS
+        // rather than assuming a filter -- which is also what any decoder does.
         bool pixOk = true;
         bool filterOk = true;
-        for (int y = 0; y < H && (pixOk || filterOk); ++y) {
+        std::vector<uint8_t> recon(rowBytes * static_cast<size_t>(H));
+        for (int y = 0; y < H; ++y) {
             const uint8_t* row = inflated.data() + y * filtRowBytes;
-            if (row[0] != 0) { filterOk = false; }
-            // Samples start at row+1; each 16-bit sample is big-endian in file.
-            const uint8_t* s = row + 1;
+            const int type = row[0];
+            if (type != 0 && type != 2) { filterOk = false; }
+            uint8_t* cur = recon.data() + static_cast<size_t>(y) * rowBytes;
+            const uint8_t* prev =
+                y > 0 ? recon.data() + static_cast<size_t>(y - 1) * rowBytes : nullptr;
+            for (size_t i = 0; i < rowBytes; ++i) {
+                const uint8_t x = row[1 + i];
+                cur[i] = (type == 2)
+                    ? static_cast<uint8_t>(x + (prev ? prev[i] : 0))
+                    : x;
+            }
+        }
+        for (int y = 0; y < H && pixOk; ++y) {
+            const uint8_t* cur = recon.data() + static_cast<size_t>(y) * rowBytes;
             for (int x = 0; x < W * 3; ++x) {
-                uint16_t sampleBE = (static_cast<uint16_t>(s[x * 2]) << 8) |
-                                     static_cast<uint16_t>(s[x * 2 + 1]);
-                uint16_t orig = pixels[static_cast<size_t>(y) * W * 3 + x];
+                const uint16_t sampleBE = (static_cast<uint16_t>(cur[x * 2]) << 8) |
+                                           static_cast<uint16_t>(cur[x * 2 + 1]);
+                const uint16_t orig = pixels[static_cast<size_t>(y) * W * 3 + x];
                 if (sampleBE != orig) { pixOk = false; }
             }
         }
@@ -528,41 +542,32 @@ static void runStreamingIdentityCases() {
     CHECK(res.ok, "streaming encode succeeds");
     if (!res.ok) return;
 
-    // Legacy path: one filtered buffer, one deflate call.
-    std::vector<uint8_t> filtered;
-    filtered.reserve((1 + rowSamples * 2) * static_cast<size_t>(H));
-    for (int y = 0; y < H; ++y) {
-        filtered.push_back(0);
-        const uint16_t* src = pixels.data() + static_cast<size_t>(y) * rowSamples;
-        for (size_t x = 0; x < rowSamples; ++x) {
-            filtered.push_back(static_cast<uint8_t>(src[x] >> 8));
-            filtered.push_back(static_cast<uint8_t>(src[x] & 0xFF));
-        }
-    }
-    std::vector<uint8_t> oneShot;
-    {
-        z_stream stream{};
-        CHECK(deflateInit(&stream, Z_DEFAULT_COMPRESSION) == Z_OK, "reference deflate init");
-        oneShot.resize(static_cast<size_t>(compressBound(static_cast<uLong>(filtered.size()))));
-        stream.next_in = const_cast<Bytef*>(filtered.data());
-        stream.avail_in = static_cast<uInt>(filtered.size());
-        stream.next_out = oneShot.data();
-        stream.avail_out = static_cast<uInt>(oneShot.size());
-        const int rc = deflate(&stream, Z_FINISH);
-        CHECK(rc == Z_STREAM_END, "reference deflate completes in one pass");
-        oneShot.resize(oneShot.size() - stream.avail_out);
-        deflateEnd(&stream);
-    }
-
     const std::vector<Chunk> chunks = parseChunks(file);
     const Chunk* idat = nullptr;
     for (const Chunk& c : chunks) if (std::strcmp(c.type, "IDAT") == 0) idat = &c;
-    CHECK(idat != nullptr, "IDAT present");
+    CHECK(idat != nullptr, "exactly one IDAT chunk (bands stay one deflate stream)");
     if (idat == nullptr) return;
-    CHECK(idat->dataLen == oneShot.size(), "IDAT length matches the whole-buffer deflate");
-    if (idat->dataLen == oneShot.size()) {
-        CHECK(std::memcmp(&file[idat->dataOff], oneShot.data(), oneShot.size()) == 0,
-              "IDAT bytes are IDENTICAL to the whole-buffer deflate");
+    int idatCount = 0;
+    for (const Chunk& c : chunks) if (std::strcmp(c.type, "IDAT") == 0) idatCount++;
+    CHECK(idatCount == 1, "the banded encode still emits a single IDAT");
+
+    // The encode is parallel, so the bytes must not depend on how many threads ran.
+    // Bands are fixed by row count and concatenated in order, so this is a property
+    // of the design; it is asserted because a future change could break it silently.
+    {
+        setenv("SPK_PNG_WORKERS", "1", 1);
+        std::vector<uint8_t> serial;
+        const PngWriteResult one = writePng16ToMemory(pixels.data(), W, H, meta,
+                                                      serial, nullptr);
+        setenv("SPK_PNG_WORKERS", "8", 1);
+        std::vector<uint8_t> parallel;
+        const PngWriteResult eight = writePng16ToMemory(pixels.data(), W, H, meta,
+                                                        parallel, nullptr);
+        unsetenv("SPK_PNG_WORKERS");
+        CHECK(one.ok && eight.ok, "1-worker and 8-worker encodes both succeed");
+        CHECK(serial.size() == parallel.size() &&
+                  std::memcmp(serial.data(), parallel.data(), serial.size()) == 0,
+              "output is byte-identical at 1 and 8 workers");
     }
 
     // The file encoder streams and the memory encoder buffers, so they are two

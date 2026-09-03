@@ -52,6 +52,13 @@ target_include_directories(sfpng PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 find_library(z-lib z)
 target_link_libraries(sfpng ${z-lib})
 
+# Threads: the IDAT encode compresses bands concurrently (#175). Bionic provides
+# pthread inside libc, so Android needs no extra link; a host configuration does.
+if (NOT ANDROID)
+    find_package(Threads REQUIRED)
+    target_link_libraries(sfpng Threads::Threads)
+endif ()
+
 # Android system libs: log for diagnostics. Guarded so this CMakeLists can also
 # be configured for a host build if ever desired.
 if (ANDROID)
