@@ -408,10 +408,14 @@ struct Entry {
     uint32_t valueOffset = 0;   // file offset of out-of-line value, when !inlineVal
 };
 
+// Writes [bytes], then [tail] if given, through the temp-file-then-rename protocol.
+// The two-span form lets a TIFF write emit its header and its image strip without
+// concatenating them into one buffer first (#175).
 TiffWriteResult publishAtomically(const std::vector<uint8_t>& bytes,
                                   const std::string& path,
                                   const TiffCancellation* cancellation,
-                                  TiffWriteResult result) {
+                                  TiffWriteResult result,
+                                  const std::vector<uint8_t>* tail = nullptr) {
     TempOutput output;
     if (!output.open(path, result.error)) {
         result.ok = false;
@@ -419,16 +423,23 @@ TiffWriteResult publishAtomically(const std::vector<uint8_t>& bytes,
         return result;
     }
     constexpr size_t kWriteChunk = 64u * 1024u;
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        if (isCancelled(cancellation)) return cancelledResult();
-        const size_t count = std::min(kWriteChunk, bytes.size() - offset);
-        if (!output.write(bytes.data() + offset, count, result.error)) {
-            result.ok = false;
-            result.bytesWritten = 0;
-            return result;
+    const std::vector<uint8_t>* spans[2] = {&bytes, tail};
+    size_t written = 0;
+    for (int span = 0; span < 2; ++span) {
+        if (spans[span] == nullptr) continue;
+        const std::vector<uint8_t>& data = *spans[span];
+        size_t offset = 0;
+        while (offset < data.size()) {
+            if (isCancelled(cancellation)) return cancelledResult();
+            const size_t count = std::min(kWriteChunk, data.size() - offset);
+            if (!output.write(data.data() + offset, count, result.error)) {
+                result.ok = false;
+                result.bytesWritten = 0;
+                return result;
+            }
+            offset += count;
         }
-        offset += count;
+        written += data.size();
     }
     if (isCancelled(cancellation)) return cancelledResult();
     if (!output.commit(path, result.error)) {
@@ -436,7 +447,7 @@ TiffWriteResult publishAtomically(const std::vector<uint8_t>& bytes,
         result.bytesWritten = 0;
         return result;
     }
-    result.bytesWritten = bytes.size();
+    result.bytesWritten = written;
     return result;
 }
 
@@ -447,11 +458,17 @@ TiffWriteResult publishAtomically(const std::vector<uint8_t>& bytes,
 // 4 = float32); `sampleFormatValue` is the TIFF SampleFormat (1 = unsigned int, 3 = IEEE
 // float). The IFD / EXIF / ICC / strip layout is identical across bit depths — only
 // BitsPerSample, SampleFormat and the strip size differ — so both public writers share it.
+// [stripOut], when given, receives the image strip instead of it being copied into
+// [outBytes]. The strip is placed last in the layout, so a file writer can emit the
+// header and then the strip without ever holding a second copy of the image: at
+// 12.5 MP that copy is 75 MB, and it existed only to be written out and freed
+// (#175).
 static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int width, int height,
                                                 int bytesPerSample, uint16_t sampleFormatValue,
                                                 const TiffMetadata& meta, TiffCompression compression,
                                                 std::vector<uint8_t>& outBytes,
-                                                const TiffCancellation* cancellation) {
+                                                const TiffCancellation* cancellation,
+                                                std::vector<uint8_t>* stripOut = nullptr) {
     TiffWriteResult res;
     outBytes.clear();
     MemoryOutputGuard outputGuard(outBytes);
@@ -704,6 +721,14 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
 
     if (isCancelled(cancellation)) return cancelWithoutPublication();
     padTo(stripOffset);
+    if (stripOut != nullptr) {
+        // The caller writes the strip straight to the file after this header.
+        res.bytesWritten = outBytes.size() + strip.size();
+        *stripOut = std::move(strip);
+        res.ok = true;
+        outputGuard.publish();
+        return res;
+    }
     constexpr size_t kCopyChunk = 64u * 1024u;
     for (size_t offset = 0; offset < strip.size();) {
         if (isCancelled(cancellation)) return cancelWithoutPublication();
@@ -720,10 +745,11 @@ static TiffWriteResult writeTiffSamplesToMemory(std::vector<uint8_t> raw, int wi
     return res;
 }
 
-TiffWriteResult writeTiff16ToMemory(const uint16_t* rgb16, int width, int height,
-                                    const TiffMetadata& meta, TiffCompression compression,
-                                    std::vector<uint8_t>& outBytes,
-                                    const TiffCancellation* cancellation) {
+static TiffWriteResult writeTiff16Impl(const uint16_t* rgb16, int width, int height,
+                                       const TiffMetadata& meta, TiffCompression compression,
+                                       std::vector<uint8_t>& outBytes,
+                                       const TiffCancellation* cancellation,
+                                       std::vector<uint8_t>* stripOut) {
     outBytes.clear();
     if (rgb16 == nullptr) { TiffWriteResult res; res.error = "null pixel buffer"; return res; }
     TiffWriteResult res;
@@ -751,7 +777,16 @@ TiffWriteResult writeTiff16ToMemory(const uint16_t* rgb16, int width, int height
         }
     }
     return writeTiffSamplesToMemory(std::move(raw), width, height, 2, 1,
-                                    meta, compression, outBytes, cancellation);
+                                    meta, compression, outBytes, cancellation, stripOut);
+
+}
+
+TiffWriteResult writeTiff16ToMemory(const uint16_t* rgb16, int width, int height,
+                                    const TiffMetadata& meta, TiffCompression compression,
+                                    std::vector<uint8_t>& outBytes,
+                                    const TiffCancellation* cancellation) {
+    return writeTiff16Impl(rgb16, width, height, meta, compression, outBytes,
+                           cancellation, nullptr);
 }
 
 // True 32-bit IEEE-float TIFF (SampleFormat=3, BitsPerSample=32): the engine's float
@@ -796,11 +831,14 @@ TiffWriteResult writeTiff16ToFile(const uint16_t* rgb16, int width, int height,
                                   const TiffCancellation* cancellation) {
     TiffWriteResult pathResult;
     if (!TempOutput::validatePath(path, pathResult.error)) return pathResult;
-    std::vector<uint8_t> bytes;
-    TiffWriteResult res = writeTiff16ToMemory(
-        rgb16, width, height, meta, compression, bytes, cancellation);
+    // Header and strip are written as two spans, so the whole file is never
+    // assembled in memory: that copy was 75 MB at 12.5 MP (#175).
+    std::vector<uint8_t> header;
+    std::vector<uint8_t> strip;
+    TiffWriteResult res = writeTiff16Impl(
+        rgb16, width, height, meta, compression, header, cancellation, &strip);
     if (!res.ok) return res;
-    return publishAtomically(bytes, path, cancellation, std::move(res));
+    return publishAtomically(header, path, cancellation, std::move(res), &strip);
 }
 
 TiffWriteResult writeTiff32fToFile(const float* rgbFloat, int width, int height,

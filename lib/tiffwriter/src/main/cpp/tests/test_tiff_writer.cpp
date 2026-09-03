@@ -174,6 +174,20 @@ void runCase(const char* label, TiffCompression comp, const std::vector<uint8_t>
     std::string path = std::string("/tmp/sf_tiff_test_") + label + ".tiff";
     TiffWriteResult wr = writeTiff16ToFile(pixels.data(), W, H, meta, comp, path);
     CHECK(wr.ok, "writer returned ok");
+
+    // #175: the file writer emits the header and the image strip as two spans so
+    // the whole file is never assembled in memory. That must not change a byte,
+    // so it is checked against the in-memory encoder on every case.
+    {
+        std::vector<uint8_t> inMemory;
+        const TiffWriteResult mem = writeTiff16ToMemory(pixels.data(), W, H, meta,
+                                                        comp, inMemory, nullptr);
+        std::vector<uint8_t> onDisk;
+        CHECK(mem.ok && readFile(path, onDisk), "in-memory encode and file both produced");
+        CHECK(onDisk.size() == inMemory.size() &&
+                  std::memcmp(onDisk.data(), inMemory.data(), inMemory.size()) == 0,
+              "two-span file write is byte-identical to the in-memory encode");
+    }
     if (!wr.ok) { std::printf("    error: %s\n", wr.error.c_str()); return; }
 
     std::vector<uint8_t> file;
