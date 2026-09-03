@@ -2700,4 +2700,102 @@ now gated and tunable (§8–9), but the native model — the engine itself prod
 a coarse result and refining it, reusing work across levels — needs the memo
 structure reworked and is not a bench question either.
 
+## 21. The PNG16 encode: where its second actually goes (#175)
+
+The export baseline puts PNG16 encode at 1705 ms clean and 4316 ms on HEAVY at
+12.5 MP, and attributes the difference to grain being incompressible. That is
+right, but it hid a larger fact: **almost all of that time is one serial call to
+zlib, and the writer hands zlib data it cannot compress.**
+
+Measured on a REAL app export (3060x4080 PNG16 pulled off the release device, its
+IDAT inflated back to the exact filtered scanlines the shipping writer produced --
+`none=4080` rows, i.e. filter 0 on every row). Host, best of one run each.
+
+### 21.1 The compressor
+
+| backend | time | output | vs today |
+|---|---:|---:|---|
+| zlib 1.3 level 6 (ships today) | 1256 ms | 68.7 MB | 1.0x |
+| zlib-ng 2.2.4 level 6 | 1087 ms smooth / 1213 ms grainy | same | ~1.1x, and SLOWER on grain |
+| libdeflate 1.24 level 6 | 636 ms | 67.8 MB | **2.0x** |
+| libdeflate 1.24 level 1 | 375 ms | 71.5 MB | 3.4x, no compression |
+
+zlib-ng is the surprise: it is the usual recommendation for a drop-in zlib
+replacement, and on this payload it is a wash and sometimes a regression. Measure
+before adopting. libdeflate is a real 2x, but it has **no streaming API** -- it
+compresses a whole buffer -- so taking it would hand back the 75 MB of staging
+#175 just removed.
+
+### 21.2 The filter
+
+The writer uses filter 0 (None) on every row, with the comment that "for 16-bit
+RGB the benefit from Paeth/Sub is marginal". On a synthetic smooth gradient that
+is wrong by two orders of magnitude:
+
+| synthetic smooth 12.5 MP | filter | zlib | output |
+|---|---:|---:|---:|
+| filter 0 | 65 ms | 1251 ms | 71.3 MB (99.8% of raw) |
+| filter 2 (Up) | 29 ms | **151 ms** | **0.6 MB** |
+
+On the real export -- which carries grain, and grain is genuinely high-entropy --
+the win is real but ordinary:
+
+| real export | filter | zlib | output |
+|---|---:|---:|---:|
+| filter 0 (ships today) | 62 ms | 1256 ms | 68.7 MB (96.1%) |
+| filter 1 (Sub) | 35 ms | 1508 ms | 62.6 MB (87.7%) |
+| filter 2 (Up) | 29 ms | 1487 ms | 62.7 MB (87.8%) |
+| adaptive (min-sum, all 5) | 1347 ms | 1578 ms | 61.7 MB (86.4%) |
+
+So filtering is a ~9% SIZE win on grainy output and costs ~250 ms of extra deflate
+time; on clean output it is a size AND speed win of a different order. Adaptive
+selection is not worth 1.3 s of filtering for the last 1.5%: Up or Sub captures
+almost all of it for 30 ms.
+
+### 21.3 Parallelism, which beats both
+
+deflate is serial in the writer, on a phone with eight cores. pigz's approach --
+split the filtered scanlines into bands, compress each band as a raw deflate
+stream terminated with `Z_SYNC_FLUSH` so no band emits a final block, and
+concatenate under one zlib header/adler32 -- produces ONE valid deflate stream, so
+it stays a single IDAT. Only the block boundaries move.
+
+| workers | time | output | speedup |
+|---|---:|---:|---:|
+| serial (ships today) | 1259 ms | 68.7 MB | 1.0x |
+| 2 | 649 ms | 68.7 MB | 1.94x |
+| 4 | 331 ms | 68.7 MB | 3.81x |
+| **8** | **173 ms** | **68.7 MB** | **7.29x** |
+
+**No size cost at all** at this band count, no new dependency, and the round trip
+was verified (inflate the concatenation, `memcmp` against the input) so a faster
+wrong answer could not pass. This is the largest single lever measured on the
+export path, and it is ours to take without adopting anything.
+
+### 21.4 What adopting any of this costs
+
+All three change the container BYTES while leaving the decoded PIXELS identical.
+That distinction is the whole decision: C3 (decoded-pixel digest) is preserved by
+construction, C4 (whole-container digest) is not. #126 gates C4 for PNG16, so this
+is an owner call, not an implementation detail -- and the existing goldens would be
+re-baselined once, deliberately, against a pinned compressor configuration.
+
+### 21.5 The library survey, since it keeps coming up
+
+- **fpnge** is the fastest PNG encoder published and does support 16-bit RGB, but
+  it is x86-only (SSE4.1 minimum) with no NEON port, so it cannot serve arm64 --
+  which is the ABI that matters here.
+- **libspng** is fast and clean, but its encode speed is its deflate backend's
+  speed; it does not change the analysis above.
+- **libjpeg-turbo** is the right answer for JPEG and already the de-facto standard
+  (mozjpeg is ~4x slower for ~8% smaller). JPEG encode is 110-162 ms here, i.e.
+  not a bottleneck, so this is not urgent.
+- **libvips** is 4-8x faster than ImageMagick but drags in glib and a large
+  dependency graph; **OpenImageIO** is VFX-oriented with similar weight. Neither
+  is a sensible NDK dependency for one writer, and neither would beat a parallel
+  deflate we control.
+
+The conclusion is that no multi-format library wins this: the cost is in DEFLATE
+and in what we feed it, and both are already in our hands.
+
 *Film modeling powered by spektrafilm (GPLv3).*
