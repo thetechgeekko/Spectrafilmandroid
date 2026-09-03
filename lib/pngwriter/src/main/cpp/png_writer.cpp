@@ -774,40 +774,6 @@ PngWriteResult writePng16ToMemory(const uint16_t* rgb16, int width, int height,
 
 // ---- writePng16ToFile ------------------------------------------------------
 
-// Publish encoded bytes through the same write-to-temp-then-rename protocol both
-// file entry points use, so a failed or cancelled write leaves no partial file.
-static PngWriteResult writeBytesToPath(const std::vector<uint8_t>& bytes,
-                                       const std::string& path,
-                                       PngWriteResult res,
-                                       const PngCancellation* cancellation) {
-    TempOutput output;
-    if (!output.open(path, res.error)) {
-        res.ok = false;
-        res.bytesWritten = 0;
-        return res;
-    }
-    constexpr size_t kWriteChunk = 64u * 1024u;
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        if (isCancelled(cancellation)) return cancelledResult();
-        const size_t count = std::min(kWriteChunk, bytes.size() - offset);
-        if (!output.write(bytes.data() + offset, count, res.error)) {
-            res.ok = false;
-            res.bytesWritten = 0;
-            return res;
-        }
-        offset += count;
-    }
-    if (isCancelled(cancellation)) return cancelledResult();
-    if (!output.commit(path, res.error)) {
-        res.ok = false;
-        res.bytesWritten = 0;
-        return res;
-    }
-    res.bytesWritten = bytes.size();
-    return res;
-}
-
 // Compressed IDAT bytes straight to the temporary file, with the chunk CRC
 // accumulated as they go. Nothing image-sized is retained: at 12.5 MP this is what
 // removes the ~75 MB compressed buffer AND the ~75 MB assembled file (#175).
